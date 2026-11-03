@@ -38,7 +38,7 @@ const unpackHalf = (w: Uint32Array) => f16ToF32(new Uint8Array(w.buffer, w.byteO
 
 async function main() {
   const be = await createWebGPUBackend();
-  document.getElementById("device")!.textContent = `features: ${[...be.limits.features].join(", ") || "none"} · max binding ${(be.limits.maxStorageBufferBindingSize / 2 ** 20).toFixed(0)} MiB`;
+  document.getElementById("device")!.textContent = `features: ${[...be.limits.features].join(", ") || "none"}${be.limits.subgroupMinSize ? ` · subgroup size ≥ ${be.limits.subgroupMinSize}` : ""} · max binding ${(be.limits.maxStorageBufferBindingSize / 2 ** 20).toFixed(0)} MiB`;
   const step = be.alloc(32, "storage", "step");
   const results: Result[] = [];
 
@@ -112,6 +112,14 @@ async function main() {
         await run(S0, (ctx) => (ys = ops.linear(ctx, upload(x, [M, K]), W(wgu, [2 * I, K]), { silu: true, lanes })));
         check("matmul+silu", tag, await download(ys.buf, M * I), wantS, 2e-3 * Math.sqrt(K));
 
+        if (lanes <= (be.limits.subgroupMinSize ?? 0)) {
+          let yg!: Tensor;
+          await run(S0, (ctx) => (yg = ops.linear(ctx, upload(x, [M, K]), W(wgu, [2 * I, K]), { norm: { w: upload(nw, [K]), eps: 1e-5 }, silu: true, lanes, subgroups: true })));
+          check("matmul+norm+silu/sg", tag, await download(yg.buf, M * I), want, 2e-3 * Math.sqrt(K));
+          let yp!: Tensor;
+          await run(S0, (ctx) => (yp = ops.linear(ctx, upload(x, [M, K]), W(wgu, [2 * I, K]), { lanes, subgroups: true })));
+          check("matmul/sg", tag, await download(yp.buf, M * 2 * I), guPlain, 1e-3 * Math.sqrt(K));
+        }
         if (be.limits.features.has("shader-f16")) {
           let yh!: Tensor;
           await run(S0, (ctx) => (yh = ops.linear(ctx, upload(x, [M, K]), W(wgu, [2 * I, K]), { norm: { w: upload(nw, [K]), eps: 1e-5 }, silu: true, lanes, f16: true })));

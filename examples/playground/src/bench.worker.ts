@@ -50,6 +50,11 @@ export interface BenchResult {
   /** f16 matmul math vs the default f32: decode speed, step time and greedy agreement. */
   f16Math?: { decodeTokS: number; stepMs256: number; matching: number; of: number };
   kvF32Match?: { matching: number; of: number; stepMs1536: number };
+  /**
+   * Subgroup reductions in matmuls (GPUs with `subgroups` only): decode step time at position 256 with
+   * and without, alternating on the same weights; then a separate engine for speed and greedy agreement.
+   */
+  subgroups?: { minSize: number; stepMsOn: number; stepMsOff: number; decodeTokS: number; matching: number; of: number };
   /** Prefill step time with tiled attention (default) vs one workgroup per query row, alternating. */
   prefillAttention?: { T: number; pos0: number; tiledMs: number; rowsMs: number; tiledAttnMs: number; rowsAttnMs: number }[];
   /** Greedy decode under a JSON schema: speed, CPU mask time, and whether the output parses. */
@@ -242,7 +247,34 @@ scope.onmessage = async (e) => {
         text: text.slice(0, 300),
       },
     };
+    if (be.limits.subgroupMinSize) {
+      const step = async (on: boolean) => {
+        ops.setSubgroups(on);
+        const plan = engine.model.buildPlan(1);
+        ops.setSubgroups(false);
+        engine.model.setStep({ pos0: 256, lastRow: 0, seed: 1, temperature: 0 });
+        const ms = await gpuTime(be, plan.dispatches, 40);
+        plan.destroy();
+        return ms;
+      };
+      const on = [await step(true), await step(true)];
+      const off = [await step(false), await step(false)];
+      on.push(await step(true));
+      off.push(await step(false));
+      result.subgroups = { minSize: be.limits.subgroupMinSize, stepMsOn: Math.min(...on), stepMsOff: Math.min(...off), decodeTokS: 0, matching: 0, of: base!.length };
+    }
     engine.destroy();
+    if (result.subgroups) {
+      const esg = await createEngine(model, { quant, subgroups: true });
+      const got: number[] = [];
+      for await (const id of esg.generateTokens(ids, { temperature: 0, maxTokens: 128, stopTokenIds: [], stepsPerSubmit: 8 })) got.push(id);
+      const st = esg.lastStats!;
+      esg.destroy();
+      ops.setSubgroups(false);
+      let matching = 0;
+      while (matching < got.length && got[matching] === base![matching]) matching++;
+      Object.assign(result.subgroups, { decodeTokS: ((st.generatedTokens - 1) / st.decodeMs) * 1000, matching });
+    }
     if (be.limits.features.has("shader-f16")) {
       const e16 = await createEngine(model, { quant, f16Math: true });
       const got: number[] = [];

@@ -64,6 +64,12 @@ export interface MatmulVariant {
   epi: MatmulEpilogue;
   /** f16 x tile and 4-wide dot products (needs shader-f16); accumulation stays f32. */
   f16?: boolean;
+  /**
+   * Reduce with subgroup operations instead of workgroup-memory trees (needs `subgroups` and a
+   * subgroup size of at least `lanes`): a shuffle butterfly across each row's lanes, and subgroupAdd
+   * for the norm prologue. Assumes subgroups are runs of consecutive invocation indices.
+   */
+  sg?: boolean;
 }
 
 /** Rows of the output a workgroup produces for this variant. */
@@ -87,7 +93,8 @@ export function matmulSpec(v: MatmulVariant): KernelSpec {
   const rows = 256 / v.lanes;
   const silu = v.epi === "silu";
   const h = !!v.f16;
-  const key = `matmul/${v.wdtype}/mt${mt}/l${v.lanes}${v.norm ? "/norm" : ""}${v.bias ? "/bias" : ""}/${v.epi}${h ? "/f16" : ""}`;
+  const sg = !!v.sg;
+  const key = `matmul/${v.wdtype}/mt${mt}/l${v.lanes}${v.norm ? "/norm" : ""}${v.bias ? "/bias" : ""}/${v.epi}${h ? "/f16" : ""}${sg ? "/sg" : ""}`;
   const vt = h ? "vec4<f16>" : "vec4<f32>";
   const bindings: BindingKind[] = q4 ? ["uniform", "read", "read", "read"] : ["uniform", "read", "read"];
   let b = bindings.length;
@@ -117,6 +124,7 @@ export function matmulSpec(v: MatmulVariant): KernelSpec {
     }`;
   return spec(key, bindings, () => /* wgsl */ `
 ${h ? "enable f16;" : ""}
+${sg ? "enable subgroups;" : ""}
 struct P { M: u32, N: u32, K: u32, eps: f32 }
 @group(0) @binding(0) var<uniform> p: P;
 @group(0) @binding(1) var<storage, read> x: array<vec4<f32>>;
@@ -134,7 +142,7 @@ var<workgroup> xt: array<${vt}, ${mt * kc4}>;
 var<workgroup> red: array<f32, ${256 * mt}>;
 
 @compute @workgroup_size(256)
-fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) li: u32) {
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) li: u32${sg ? ", @builtin(subgroup_invocation_id) sid: u32, @builtin(subgroup_size) sgs: u32" : ""}) {
   let lane = li % LANES;
   let slot = lane % 8u;
   let phase = lane / 8u;
@@ -152,7 +160,27 @@ ${silu
   let last = arrayLength(&x) - 1u;
   var acc: array<f32, ${mt}>;
 ${q4 ? `  let shift = (slot % 2u) * 16u;` : ""}
-${v.norm
+${v.norm && sg
+  ? `
+  // RMSNorm prologue: sum of squares of each of the MT rows, per subgroup, then across subgroups.
+  for (var t = 0u; t < MT; t++) {
+    var ss = 0.0;
+    let m = m0 + t;
+    if (m < p.M) {
+      for (var c = li; c < xs4; c += 256u) { let xv = x[m * xs4 + c]; ss += dot(xv, xv); }
+    }
+    ss = subgroupAdd(ss);
+    if (sid == 0u) { red[t * 256u + li / sgs] = ss; }
+  }
+  workgroupBarrier();
+  if (li < MT) {
+    var total = 0.0;
+    for (var g = 0u; g < 256u / sgs; g++) { total += red[li * 256u + g]; }
+    red[li * 256u] = total;
+  }
+  workgroupBarrier();
+  // red[t * 256] now holds row t's sum of squares; it stays untouched until after the K loop.`
+  : v.norm
   ? `
   // RMSNorm prologue: sum of squares of each of the MT rows, reduced across the workgroup.
   for (var t = 0u; t < MT; t++) {
@@ -195,14 +223,22 @@ ${q4
     workgroupBarrier();
   }
 
-  for (var t = 0u; t < MT; t++) { red[t * 256u + li] = acc[t]; }
+${sg
+  ? `  // Butterfly across the row's lanes, which sit in one subgroup; lane 0 then holds each total.
+  for (var t = 0u; t < MT; t++) {
+    var v = acc[t];
+    for (var s = LANES / 2u; s > 0u; s >>= 1u) { v += subgroupShuffleXor(v, s); }
+    if (lane == 0u) { red[t * 256u + li] = v; }
+  }
+  workgroupBarrier();`
+  : `  for (var t = 0u; t < MT; t++) { red[t * 256u + li] = acc[t]; }
   workgroupBarrier();
   for (var s = LANES / 2u; s > 0u; s >>= 1u) {
     if (lane < s) {
       for (var t = 0u; t < MT; t++) { red[t * 256u + li] += red[t * 256u + li + s]; }
     }
     workgroupBarrier();
-  }
+  }`}
   if (lane < MT && m0 + lane < p.M) {
     ${store}
   }

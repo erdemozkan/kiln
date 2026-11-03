@@ -30,6 +30,11 @@ export interface LoadOptions {
   kvDtype?: KvDtype;
   /** f16 dot products in matmuls when the GPU has shader-f16 (default false; accumulation stays f32). */
   f16Math?: boolean;
+  /**
+   * Subgroup reductions in matmuls where the GPU has `subgroups` (default false until measured on more
+   * GPUs). Without the feature this is a no-op.
+   */
+  subgroups?: boolean;
   /** Fuse q/k/v and gate/up weights into single matmuls (default true). */
   fuse?: boolean;
   revision?: string;
@@ -53,6 +58,7 @@ export async function createEngine(modelId: string, opts: LoadOptions = {}): Pro
   const backend = opts.backend ?? (await createWebGPUBackend());
   const quant = opts.quant ?? "q4";
   ops.setMatmulF16(!!opts.f16Math && backend.limits.features.has("shader-f16"));
+  ops.setSubgroups(!!opts.subgroups);
   const { cfg, tokenizer, files } = ref.gguf ? await openGGUF(ref, opts.endpoint) : await openSafetensors(ref, opts.endpoint);
   try {
     const tuning =

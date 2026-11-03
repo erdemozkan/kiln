@@ -58,12 +58,20 @@ export interface LinearOptions {
   lanes?: MatmulLanes;
   /** f16 dot products (needs shader-f16). Defaults to `setMatmulF16`. */
   f16?: boolean;
+  /** Subgroup reductions where the device allows them for this variant. Defaults to `setSubgroups`. */
+  subgroups?: boolean;
 }
 
 let f16Default = false;
 /** Use f16 dot products in every matmul from now on (the caller checks for shader-f16). */
 export function setMatmulF16(on: boolean): void {
   f16Default = on;
+}
+
+let subgroupsDefault = false;
+/** Use subgroup reductions in matmuls from now on, where the device supports them. */
+export function setSubgroups(on: boolean): void {
+  subgroupsDefault = on;
 }
 
 /** Tuned lanes per row, keyed by `${wdtype}/mt${mt}/${N}x${K}`; filled by the autotuner. */
@@ -102,7 +110,9 @@ export function linear(ctx: Ctx, x: Tensor, w: Tensor, opts: LinearOptions | Ten
   const lanes = o.lanes ?? tunedLanes.get(lanesKey(wdtype, mt, N, K)) ?? 8;
   const f16 = o.f16 ?? f16Default;
   if (f16 && !ctx.backend.limits.features.has("shader-f16")) throw new Error("linear: f16 math needs the shader-f16 feature");
-  const spec = matmulSpec({ wdtype, mt, lanes, norm: !!o.norm, bias: !!o.bias, epi, f16 });
+  // The butterfly needs each row's lanes inside one subgroup.
+  const sg = (o.subgroups ?? subgroupsDefault) && lanes <= (ctx.backend.limits.subgroupMinSize ?? 0);
+  const spec = matmulSpec({ wdtype, mt, lanes, norm: !!o.norm, bias: !!o.bias, epi, f16, sg });
   const groups = Math.ceil(outN / matmulRowsPerGroup({ lanes, epi }));
   const grid: Grid = [Math.min(groups, MM_SLICE), Math.ceil(M / mt), Math.ceil(groups / MM_SLICE)];
   const bufs = [ctx.uniform([u32(M), u32(N), u32(K), f32(o.norm?.eps ?? 0)]), x.buf, ...weightBufs(w)];

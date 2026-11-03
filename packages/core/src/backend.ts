@@ -42,6 +42,8 @@ export interface DeviceLimits {
   readonly maxStorageBufferBindingSize: number;
   readonly maxComputeWorkgroupsPerDimension: number;
   readonly features: ReadonlySet<string>;
+  /** Smallest subgroup size the device may use (0 without the `subgroups` feature). */
+  readonly subgroupMinSize?: number;
 }
 
 export type BufUsage = "storage" | "uniform";

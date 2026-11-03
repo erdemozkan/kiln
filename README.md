@@ -201,8 +201,10 @@ Supported:
 
 Known limits, roughly in roadmap order:
 
-- Subgroup reductions are not implemented. The Intel development GPU does not expose `subgroups`;
-  the Apple M3 does (with `subgroup-size-control`), so they can now be built and verified there.
+- Subgroup reductions exist for matmuls only (`subgroups: true` at load: a shuffle butterfly across
+  each row's lanes and `subgroupAdd` for the fused norm) and are off by default: the Intel
+  development GPU has no `subgroups`, so they are not yet verified or measured. The kernel-check
+  page and the bench test them on GPUs that have the feature.
 - Kernels were tuned on one integrated GPU; the autotuner only chooses lanes per row, not tile sizes.
 - Matmul needs K to be a multiple of 32; attention needs head dim ≤ 256 and a multiple of 4.
 - Prefill attention does not split keys across workgroups, so a short prompt (few tiles) far into a long

@@ -37,7 +37,7 @@ class GPUBinding implements Binding {
   ) {}
 }
 
-const OPTIONAL_FEATURES: GPUFeatureName[] = ["shader-f16", "timestamp-query"];
+const OPTIONAL_FEATURES = ["shader-f16", "timestamp-query", "subgroups"] as GPUFeatureName[];
 
 export interface WebGPUOptions {
   powerPreference?: GPUPowerPreference;
@@ -59,9 +59,10 @@ export async function createWebGPUBackend(opts: WebGPUOptions = {}): Promise<Web
       maxStorageBuffersPerShaderStage: adapter.limits.maxStorageBuffersPerShaderStage,
     },
   });
-  const info = (adapter as GPUAdapter & { info?: GPUAdapterInfo }).info;
+  const info = (adapter as GPUAdapter & { info?: GPUAdapterInfo & { subgroupMinSize?: number } }).info;
   const deviceId = info ? [info.vendor, info.architecture, info.device, info.description].filter(Boolean).join("/") : "unknown";
-  return new WebGPUBackend(device, opts.validateKernels ?? true, deviceId);
+  const subgroupMinSize = device.features.has("subgroups" as GPUFeatureName) ? (info?.subgroupMinSize ?? 0) : 0;
+  return new WebGPUBackend(device, opts.validateKernels ?? true, deviceId, subgroupMinSize);
 }
 
 export class WebGPUBackend implements Backend {
@@ -77,12 +78,14 @@ export class WebGPUBackend implements Backend {
     readonly device: GPUDevice,
     private readonly validate: boolean,
     readonly deviceId = "unknown",
+    subgroupMinSize = 0,
   ) {
     this.limits = {
       maxBufferSize: device.limits.maxBufferSize,
       maxStorageBufferBindingSize: device.limits.maxStorageBufferBindingSize,
       maxComputeWorkgroupsPerDimension: device.limits.maxComputeWorkgroupsPerDimension,
       features: new Set(device.features as unknown as Iterable<string>),
+      subgroupMinSize,
     };
     device.lost.then((info) => {
       this.lostReason = `${info.reason}: ${info.message}`;
