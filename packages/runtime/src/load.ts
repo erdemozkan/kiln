@@ -1,0 +1,121 @@
+import type { Backend } from "@kiln/core";
+import { createWebGPUBackend } from "@kiln/backend-webgpu";
+import {
+  CachedHttpSource,
+  cacheKey,
+  evictCached,
+  fetchJSON,
+  fileUrl,
+  parseModelId,
+  readGGUFHeader,
+  readSafetensorsHeader,
+  safetensorsFiles,
+  type ByteSource,
+  type ModelRef,
+} from "@kiln/loader";
+import { ops, type KvDtype } from "@kiln/kernels";
+import { LlamaModel, configFromGGUF, configFromHF, ggufToHF, type LlamaConfig } from "@kiln/models";
+import { Tokenizer, type TokenizerJSON } from "@kiln/tokenizers";
+import { Engine } from "./engine";
+import { llamaMatmulShapes, tuneMatmuls } from "./tune";
+import { loadWeights, type LoadProgress, type Quant, type WeightFile } from "./weights";
+
+export interface LoadOptions {
+  /** Weight storage on the GPU. Default "q4". */
+  quant?: Quant;
+  /** KV cache length. Default 2048. */
+  maxSeq?: number;
+  /** KV cache storage, f16 (default) or f32. */
+  kvDtype?: KvDtype;
+  /** f16 dot products in matmuls when the GPU has shader-f16 (default false; accumulation stays f32). */
+  f16Math?: boolean;
+  /** Fuse q/k/v and gate/up weights into single matmuls (default true). */
+  fuse?: boolean;
+  revision?: string;
+  /** Hub endpoint, for mirrors or a local server. */
+  endpoint?: string;
+  backend?: Backend;
+  /**
+   * Time matmul variants on this GPU and keep the fastest per shape (default true). Runs while the
+   * weights download and is cached per device, so later loads only read the cached choice.
+   */
+  tune?: boolean;
+  onProgress?: (p: LoadProgress) => void;
+}
+
+/**
+ * Loads a model from the Hub: "org/repo" for safetensors or "org/repo/file.gguf" for GGUF.
+ * Weights stream into the GPU while downloading; in a worker they are cached in OPFS as they arrive.
+ */
+export async function createEngine(modelId: string, opts: LoadOptions = {}): Promise<Engine> {
+  const ref = parseModelId(modelId, opts.revision);
+  const backend = opts.backend ?? (await createWebGPUBackend());
+  const quant = opts.quant ?? "q4";
+  ops.setMatmulF16(!!opts.f16Math && backend.limits.features.has("shader-f16"));
+  const { cfg, tokenizer, files } = ref.gguf ? await openGGUF(ref, opts.endpoint) : await openSafetensors(ref, opts.endpoint);
+  try {
+    const tuning =
+      opts.tune === false
+        ? Promise.resolve()
+        : tuneMatmuls(backend, llamaMatmulShapes(cfg, quant === "q4" ? "q4" : "f32")).then(
+            () => undefined,
+            (err: unknown) => console.warn("[kiln] matmul tuning failed; using defaults:", err),
+          );
+    const weights = await loadWeights(backend, files, quant, opts.onProgress);
+    await tuning;
+    const model = new LlamaModel(backend, cfg, weights, { maxSeq: opts.maxSeq, kvDtype: opts.kvDtype, fuse: opts.fuse });
+    return new Engine(backend, model, tokenizer);
+  } finally {
+    for (const f of files) f.source.close?.();
+  }
+}
+
+async function open(ref: ModelRef, file: string, endpoint?: string) {
+  return CachedHttpSource.open(fileUrl(ref, file, endpoint), cacheKey(ref, file));
+}
+
+/**
+ * Opens a weight file and parses its header. If the header of a cached copy does not parse, the copy
+ * is treated as corrupt (an old cache written before flush watermarks, or damaged storage): it is
+ * evicted and downloaded once more. Network failures are not retried.
+ */
+async function openParsed<H>(ref: ModelRef, file: string, endpoint: string | undefined, parse: (s: ByteSource) => Promise<H>): Promise<{ source: ByteSource; header: H }> {
+  const source = await open(ref, file, endpoint);
+  try {
+    return { source, header: await parse(source) };
+  } catch (err) {
+    if (!(source instanceof CachedHttpSource) || source.failed) throw err;
+    console.warn(`[kiln] cached ${file} looks corrupt (${String(err)}); downloading it again`);
+    source.close();
+    await evictCached(cacheKey(ref, file));
+    const fresh = await open(ref, file, endpoint);
+    return { source: fresh, header: await parse(fresh) };
+  }
+}
+
+async function openSafetensors(ref: ModelRef, endpoint?: string): Promise<{ cfg: LlamaConfig; tokenizer: Tokenizer; files: WeightFile[] }> {
+  const [config, generation, tokJson, names] = await Promise.all([
+    fetchJSON<Record<string, unknown>>(fileUrl(ref, "config.json", endpoint)),
+    fetchJSON<Record<string, unknown>>(fileUrl(ref, "generation_config.json", endpoint), true),
+    fetchJSON<TokenizerJSON>(fileUrl(ref, "tokenizer.json", endpoint)),
+    safetensorsFiles(ref, endpoint),
+  ]);
+  const cfg = configFromHF(config!, generation);
+  const files: WeightFile[] = [];
+  for (const name of names) {
+    const { source, header } = await openParsed(ref, name, endpoint, readSafetensorsHeader);
+    files.push({ name, source, tensors: header.tensors });
+  }
+  return { cfg, tokenizer: Tokenizer.fromJSON(tokJson!), files };
+}
+
+async function openGGUF(ref: ModelRef, endpoint?: string): Promise<{ cfg: LlamaConfig; tokenizer: Tokenizer; files: WeightFile[] }> {
+  const file = ref.gguf!;
+  const { source, header: gguf } = await openParsed(ref, file, endpoint, readGGUFHeader);
+  const cfg = configFromGGUF(gguf.metadata, gguf.tensors.map((t) => t.name));
+  return {
+    cfg,
+    tokenizer: Tokenizer.fromGGUF(gguf.metadata),
+    files: [{ name: file, source, tensors: gguf.tensors, rename: ggufToHF }],
+  };
+}

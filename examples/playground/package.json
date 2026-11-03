@@ -1,0 +1,19 @@
+{
+  "name": "@kiln/playground",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite --port 5173 --strictPort",
+    "build": "vite build"
+  },
+  "dependencies": {
+    "@kiln/api": "*",
+    "@kiln/backend-webgpu": "*",
+    "@kiln/core": "*",
+    "@kiln/kernels": "*",
+    "@kiln/loader": "*"
+  },
+  "devDependencies": {
+    "vite": "4.5.3"
+  }
+}

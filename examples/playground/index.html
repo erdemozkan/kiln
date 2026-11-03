@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Kiln playground</title>
+    <link rel="stylesheet" href="/src/style.css" />
+  </head>
+  <body>
+    <main>
+      <h1>Kiln playground</h1>
+      <p class="sub">WebGPU inference straight from Hub safetensors or GGUF. <a href="/kernels.html">Kernel check</a></p>
+
+      <div class="row">
+        <input id="model" type="text" value="HuggingFaceTB/SmolLM2-135M-Instruct" aria-label="Model id" />
+        <select id="quant" aria-label="Weight format">
+          <option value="q4">q4</option>
+          <option value="f32">f32</option>
+        </select>
+        <button id="load">Load</button>
+      </div>
+      <progress id="progress" max="1" value="0"></progress>
+      <div id="status" class="status">Not loaded.</div>
+
+      <div id="log" class="log"></div>
+
+      <textarea id="prompt" placeholder="Ask something…" disabled>What is the capital of France? Answer in one sentence.</textarea>
+      <div class="row" style="margin-top: 8px">
+        <button id="send" disabled>Send</button>
+        <button id="stop" class="secondary" disabled>Stop</button>
+        <label class="status">temperature <input id="temp" type="number" value="0" min="0" max="2" step="0.1" style="width: 72px" /></label>
+        <label class="status">output
+          <select id="format" aria-label="Output format">
+            <option value="text">free text</option>
+            <option value="json">any JSON</option>
+            <option value="schema">JSON schema</option>
+          </select>
+        </label>
+      </div>
+      <textarea id="schema" class="schema" aria-label="JSON schema" spellcheck="false" hidden>{
+  "type": "object",
+  "properties": {
+    "city": { "type": "string" },
+    "country": { "type": "string" },
+    "population": { "type": "integer" },
+    "landmarks": { "type": "array", "items": { "type": "string" }, "maxItems": 3 }
+  },
+  "required": ["city", "country", "population", "landmarks"]
+}</textarea>
+      <div id="stats" class="status"></div>
+    </main>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

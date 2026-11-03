@@ -1,0 +1,23 @@
+{
+  "name": "kiln",
+  "private": true,
+  "type": "module",
+  "workspaces": [
+    "packages/*",
+    "examples/*"
+  ],
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json",
+    "test": "vitest run",
+    "dev": "npm run dev -w @kiln/playground",
+    "build:playground": "npm run build -w @kiln/playground"
+  },
+  "devDependencies": {
+    "@webgpu/types": "0.1.40",
+    "typescript": "5.4.5",
+    "vitest": "0.34.6"
+  },
+  "engines": {
+    "node": ">=16.13"
+  }
+}

@@ -1,0 +1,254 @@
+import { ActivationPool, Ctx, byteSize, packStep, q4ScaleBytes, view, type Backend, type Buf, type Dispatch, type StepParams, type Tensor } from "@kiln/core";
+import { ops, type KvDtype } from "@kiln/kernels";
+import { ropeInvFreq, type LlamaConfig } from "./config";
+
+/** A recorded forward pass for a fixed number of tokens. */
+export interface ForwardPlan {
+  readonly T: number;
+  /** The forward pass; the last dispatch samples, so it can be submitted separately from the rest. */
+  readonly dispatches: readonly Dispatch[];
+  /** u32 [T] token ids, written before each replay. */
+  readonly tokens: Buf;
+  /** u32 [1] sampled token for row `step.lastRow`. */
+  readonly out: Buf;
+  destroy(): void;
+}
+
+export interface LlamaOptions {
+  /** KV cache length in tokens. */
+  maxSeq?: number;
+  /** KV cache storage: f16 (default) halves the cache and the attention reads; f32 for exactness. */
+  kvDtype?: KvDtype;
+  /** Stack q/k/v and gate/up into single matmuls (default true). False keeps the unfused graph. */
+  fuse?: boolean;
+}
+
+export class MissingWeightError extends Error {}
+
+export class LlamaModel {
+  readonly maxSeq: number;
+  readonly kvDtype: KvDtype;
+  readonly step: Buf;
+  /** u32 [maxSeq] sampled ids, appended by `advance` dispatches (slot = step.n). */
+  readonly history: Buf;
+  /** u32 bitmask [ceil(vocab / 32)] of ids the repetition penalty applies to; set per call, updated by `advance`. */
+  readonly seen: Buf;
+  /** u32 [1 + ceil(vocab / 32)]: a flag, then the bitmask of ids sampling may choose (see `setAllowed`). */
+  readonly allowed: Buf;
+  /** Intermediates of every plan, shared: plans run one after another on the queue. */
+  readonly activations: ActivationPool;
+  private readonly kv: { k: Buf; v: Buf }[] = [];
+  private readonly invFreq: Tensor;
+  /** q/k/v stacked into one `qkv` weight (not for qk-norm models, which normalise q and k separately). */
+  private readonly fusedQkv: boolean;
+  /** gate/up stacked into one `gate_up` weight, consumed by the SiLU-gated matmul. */
+  private readonly fusedMlp: boolean;
+
+  constructor(
+    readonly backend: Backend,
+    readonly cfg: LlamaConfig,
+    private readonly weights: Map<string, Tensor>,
+    opts: LlamaOptions = {},
+  ) {
+    this.maxSeq = opts.maxSeq ?? 2048;
+    this.kvDtype = opts.kvDtype ?? "f16";
+    const kvBytes = this.kvDtype === "f16" ? 2 : 4;
+    this.step = backend.alloc(32, "storage", "step");
+    this.history = backend.alloc(this.maxSeq * 4, "storage", "history");
+    this.seen = backend.alloc(Math.ceil(cfg.vocabSize / 32) * 4, "storage", "seen");
+    this.allowed = backend.alloc((1 + Math.ceil(cfg.vocabSize / 32)) * 4, "storage", "allowed");
+    this.setAllowed(undefined);
+    this.activations = new ActivationPool(backend);
+    const row = cfg.numKvHeads * cfg.headDim;
+    for (let l = 0; l < cfg.numLayers; l++) {
+      this.kv.push({
+        k: backend.alloc(this.maxSeq * row * kvBytes, "storage", `kv/${l}/k`),
+        v: backend.alloc(this.maxSeq * row * kvBytes, "storage", `kv/${l}/v`),
+      });
+    }
+    const freq = ropeInvFreq(cfg);
+    const freqBuf = backend.alloc(freq.byteLength, "storage", "rope/inv_freq");
+    backend.write(freqBuf, 0, freq);
+    this.invFreq = { shape: [freq.length], dtype: "f32", buf: freqBuf };
+    this.w("model.embed_tokens.weight");
+    const fuse = opts.fuse ?? true;
+    this.fusedQkv = fuse && !cfg.qkNorm && this.fuse("self_attn", ["q_proj", "k_proj", "v_proj"], "qkv", cfg.attentionBias);
+    this.fusedMlp = fuse && this.fuse("mlp", ["gate_proj", "up_proj"], "gate_up", false);
+  }
+
+  /**
+   * Stacks per-layer weights along N (rows) into one tensor per layer so they run as one matmul,
+   * freeing the originals. Skipped (returns false) unless every part shares dtype and K.
+   */
+  private fuse(module: string, parts: string[], fused: string, withBias: boolean): boolean {
+    const names = (l: number, kind: string) => parts.map((p) => `model.layers.${l}.${module}.${p}.${kind}`);
+    for (let l = 0; l < this.cfg.numLayers; l++) {
+      const ts = names(l, "weight").map((n) => this.weights.get(n));
+      if (ts.some((t) => !t || t.dtype !== ts[0]!.dtype || t.shape[1] !== ts[0]!.shape[1])) return false;
+      if (withBias && names(l, "bias").some((n) => !this.weights.has(n))) return false;
+    }
+    for (let l = 0; l < this.cfg.numLayers; l++) {
+      this.stack(names(l, "weight"), `model.layers.${l}.${module}.${fused}.weight`);
+      if (withBias) this.stack(names(l, "bias"), `model.layers.${l}.${module}.${fused}.bias`);
+    }
+    return true;
+  }
+
+  private stack(parts: string[], name: string): void {
+    const ts = parts.map((n) => this.w(n));
+    const { dtype } = ts[0]!;
+    const shape = [ts.reduce((n, t) => n + t.shape[0]!, 0), ...ts[0]!.shape.slice(1)];
+    const copyPlane = (bytes: (t: Tensor) => number, plane: (t: Tensor) => Buf, label: string) => {
+      const dst = this.backend.alloc(ts.reduce((n, t) => n + bytes(t), 0), "storage", label);
+      let off = 0;
+      for (const t of ts) {
+        this.backend.copy(plane(t), 0, dst, off, bytes(t));
+        off += bytes(t);
+      }
+      return dst;
+    };
+    const buf = copyPlane((t) => byteSize(t.shape, dtype), (t) => t.buf, name);
+    const scales = dtype === "q4" ? copyPlane((t) => q4ScaleBytes(t.shape), (t) => t.scales!, `${name}/scales`) : undefined;
+    for (const [i, t] of ts.entries()) {
+      this.backend.free(t.buf);
+      if (t.scales) this.backend.free(t.scales);
+      this.weights.delete(parts[i]!);
+    }
+    this.weights.set(name, { shape, dtype, buf, scales });
+  }
+
+  /** GPU bytes held: weights, the KV cache, and the intermediates shared by every plan built so far. */
+  get memory(): { weights: number; kv: number; activations: number } {
+    let weights = 0;
+    for (const t of this.weights.values()) weights += t.buf.size + (t.scales?.size ?? 0);
+    const kv = this.kv.reduce((n, { k, v }) => n + k.size + v.size, 0);
+    return { weights, kv, activations: this.activations.bytes };
+  }
+
+  /** Marks the ids the repetition penalty starts from (the prompt); generated ids are added on the GPU. */
+  setSeen(ids: readonly number[]): void {
+    const mask = new Uint32Array(Math.ceil(this.cfg.vocabSize / 32));
+    for (const id of ids) if (id < this.cfg.vocabSize) mask[id >>> 5]! |= 1 << (id & 31);
+    this.backend.write(this.seen, 0, mask);
+  }
+
+  /** Restricts sampling to the ids set in `mask` (ceil(vocab / 32) u32 words), or lifts the restriction. */
+  setAllowed(mask: Uint32Array | undefined): void {
+    if (!mask) {
+      this.backend.write(this.allowed, 0, new Uint32Array(1));
+      return;
+    }
+    const words = Math.ceil(this.cfg.vocabSize / 32);
+    if (mask.length !== words) throw new Error(`allowed mask has ${mask.length} words, expected ${words}`);
+    const data = new Uint32Array(1 + words);
+    data[0] = 1;
+    data.set(mask, 1);
+    this.backend.write(this.allowed, 0, data);
+  }
+
+  setStep(s: StepParams): void {
+    this.backend.write(this.step, 0, packStep(s));
+  }
+
+  /** Records the forward pass for T tokens at positions step.pos0..pos0+T, then sampling. */
+  buildPlan(T: number): ForwardPlan {
+    const c = this.cfg;
+    const ctx = new Ctx(this.backend, this.step, `T${T}`, this.activations);
+    const tokens = ctx.buffer(T * 4, "tokens");
+    const out = ctx.buffer(4, "out");
+    const D = c.headDim;
+    const attnShape = { T, H: c.numHeads, Hkv: c.numKvHeads, D, maxSeq: this.maxSeq, kv: this.kvDtype };
+
+    const x = ops.embed(ctx, this.w("model.embed_tokens.weight"), tokens, T);
+    for (let l = 0; l < c.numLayers; l++) {
+      const p = `model.layers.${l}`;
+      const { k: kc, v: vc } = this.kv[l]!;
+      const inputNorm = { w: this.w(`${p}.input_layernorm.weight`), eps: c.rmsEps };
+      let q: Tensor;
+      if (this.fusedQkv) {
+        // RMSNorm → one qkv matmul (+bias) → RoPE fused with the cache write.
+        const qkv = ops.linear(ctx, x, this.w(`${p}.self_attn.qkv.weight`), { norm: inputNorm, bias: this.bias(`${p}.self_attn.qkv.bias`) });
+        q = ops.ropeKv(ctx, qkv, kc, vc, attnShape, this.invFreq, c.ropeInterleaved);
+      } else {
+        q = this.attentionInputs(ctx, x, l, T);
+      }
+      const a = ops.attention(ctx, q, kc, vc, attnShape);
+      ops.linear(ctx, a, this.w(`${p}.self_attn.o_proj.weight`), { residual: x });
+
+      const postNorm = { w: this.w(`${p}.post_attention_layernorm.weight`), eps: c.rmsEps };
+      let m: Tensor;
+      if (this.fusedMlp) {
+        m = ops.linear(ctx, x, this.w(`${p}.mlp.gate_up.weight`), { norm: postNorm, silu: true });
+      } else {
+        const h2 = ops.linear(ctx, x, this.w(`${p}.mlp.gate_proj.weight`), { norm: postNorm });
+        const u = ops.linear(ctx, x, this.w(`${p}.mlp.up_proj.weight`), { norm: postNorm });
+        m = ops.siluMul(ctx, h2, u);
+      }
+      ops.linear(ctx, m, this.w(`${p}.mlp.down_proj.weight`), { residual: x });
+    }
+    const last = ops.copyRow(ctx, view(x, [T, c.hiddenSize]));
+    const head = this.weights.get("lm_head.weight") ?? this.w("model.embed_tokens.weight");
+    const logits = ops.linear(ctx, last, head, { norm: { w: this.w("model.norm.weight"), eps: c.rmsEps } });
+    ops.sample(ctx, logits, out, this.seen, this.allowed);
+
+    return { T, dispatches: ctx.dispatches, tokens, out, destroy: () => ctx.destroy() };
+  }
+
+  /**
+   * Records the step advance that chains decode steps on the GPU: copies the id sampled into `sampled`
+   * to `tokens` and the history, and moves the position past the rows just processed.
+   */
+  buildAdvance(sampled: Buf, tokens: Buf): { dispatches: readonly Dispatch[]; destroy(): void } {
+    const ctx = new Ctx(this.backend, this.step, "advance");
+    ops.advance(ctx, sampled, tokens, this.history, this.seen);
+    return { dispatches: ctx.dispatches, destroy: () => ctx.destroy() };
+  }
+
+  destroy(): void {
+    for (const { k, v } of this.kv) {
+      this.backend.free(k);
+      this.backend.free(v);
+    }
+    for (const t of this.weights.values()) {
+      this.backend.free(t.buf);
+      if (t.scales) this.backend.free(t.scales);
+    }
+    this.backend.free(this.invFreq.buf);
+    this.backend.free(this.step);
+    this.backend.free(this.history);
+    this.backend.free(this.seen);
+    this.backend.free(this.allowed);
+    this.activations.destroy();
+  }
+
+  private w(name: string): Tensor {
+    const t = this.weights.get(name);
+    if (!t) throw new MissingWeightError(`weight "${name}" was not loaded`);
+    return t;
+  }
+
+  /** Unfused attention inputs (qk-norm models): separate q/k/v, per-head norms, RoPE, cache write. */
+  private attentionInputs(ctx: Ctx, x: Tensor, l: number, T: number): Tensor {
+    const c = this.cfg;
+    const D = c.headDim;
+    const p = `model.layers.${l}`;
+    const h = ops.rmsnorm(ctx, x, this.w(`${p}.input_layernorm.weight`), c.rmsEps);
+    let q = ops.linear(ctx, h, this.w(`${p}.self_attn.q_proj.weight`), this.bias(`${p}.self_attn.q_proj.bias`));
+    let k = ops.linear(ctx, h, this.w(`${p}.self_attn.k_proj.weight`), this.bias(`${p}.self_attn.k_proj.bias`));
+    const v = ops.linear(ctx, h, this.w(`${p}.self_attn.v_proj.weight`), this.bias(`${p}.self_attn.v_proj.bias`));
+    if (c.qkNorm) {
+      const qn = ops.rmsnorm(ctx, q, this.w(`${p}.self_attn.q_norm.weight`), c.rmsEps, D);
+      const kn = ops.rmsnorm(ctx, k, this.w(`${p}.self_attn.k_norm.weight`), c.rmsEps, D);
+      q = qn;
+      k = kn;
+    }
+    ops.rope(ctx, q, T, c.numHeads, D, this.invFreq, c.ropeInterleaved);
+    ops.rope(ctx, k, T, c.numKvHeads, D, this.invFreq, c.ropeInterleaved);
+    ops.kvWrite(ctx, k, v, this.kv[l]!.k, this.kv[l]!.v, T, this.maxSeq, this.kvDtype);
+    return q;
+  }
+
+  private bias(name: string): Tensor | undefined {
+    return this.cfg.attentionBias ? this.weights.get(name) : undefined;
+  }
+}
