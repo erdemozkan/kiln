@@ -26,7 +26,7 @@ const json = llm.chat(messages, { format: { type: "json", schema } }); // or { t
 | `@kiln/api` | Main-thread client, worker RPC, streaming `TextStream` |
 | `@kiln/runtime` | `Engine`: chunked prefill, pipelined decode, weight streaming |
 | `@kiln/models` | Code-defined architectures (Llama / Mistral / Qwen2 / Qwen3 / SmolLM), HF + GGUF config mapping |
-| `@kiln/tokenizers` | Byte-level BPE from `tokenizer.json` or GGUF metadata, streaming UTF-8 decode, a Jinja interpreter for chat templates |
+| `@kiln/tokenizers` | Byte-level and SentencePiece-style BPE from `tokenizer.json` or GGUF metadata, streaming UTF-8 decode, a Jinja interpreter for chat templates |
 | `@kiln/grammar` | JSON / JSON Schema / choice grammars as a byte-level pushdown matcher, token masks over a vocabulary trie |
 | `@kiln/kernels` | WGSL kernels, op wrappers, CPU reference implementations |
 | `@kiln/core` | Backend HAL interface, tensors, uniform packing, `Ctx` plan recorder |
@@ -182,7 +182,12 @@ Supported:
 - Models and formats: Llama-family decoders; safetensors F32/F16/BF16; GGUF F32/F16/BF16/Q4_0/Q4_1/
   Q5_0/Q5_1/Q8_0/Q4_K/Q5_K/Q6_K. K-quants and Q5 types are dequantized on load and stored as q4, or as
   f32 with `quant: "f32"`.
-- Text: byte-level BPE tokenizers. Chats are formatted by the model's own Jinja `chat_template`
+- Text: byte-level BPE (GPT-2, Llama 3, Qwen, SmolLM) and SentencePiece-style BPE with byte
+  fallback (Llama 2, TinyLlama, Mistral, Phi-3), from `tokenizer.json` or GGUF (`gpt2` and `llama`
+  vocabularies; the latter merge by piece score). On TinyLlama, Mistral v0.3 and Phi-3.5 the
+  SentencePiece path gives the same ids as the `sentencepiece` library on every test string (accents,
+  CJK, emoji through byte tokens, runs of spaces, tabs, code), and TinyLlama-1.1B-Chat chats from a
+  Q4_K_M GGUF with its own template (7.6 tok/s on the Intel GPU). Chats are formatted by the model's own Jinja `chat_template`
   (from `chat_template.jinja`, `tokenizer_config.json` or GGUF metadata), run by a Jinja2 subset with
   transformers' settings. It renders the templates of SmolLM2/3, Qwen2.5/3, Phi-3.5, TinyLlama,
   Mistral v0.3, DeepSeek-R1-Distill, Granite 3.3, Llama 3.2 and Gemma 2 byte-for-byte like jinja2
@@ -213,7 +218,7 @@ Known limits, roughly in roadmap order:
 - Constrained decoding runs one step per submit (each mask depends on the token before it). No regex
   or GBNF grammars, and `minimum`/`maximum`/`format` are not enforced.
 - K-quants are re-quantized to q4 on load (a second rounding) instead of being run natively.
-- SentencePiece tokenizers are not supported yet. Chat templates get `messages`, `bos_token`,
+- Unigram tokenizers (T5, XLM-R, some SentencePiece models) are not supported. Chat templates get `messages`, `bos_token`,
   `eos_token`, `add_generation_prompt` and `enable_thinking`, but no `tools` or `documents` yet.
 - Single storage binding per tensor: very large f32 embeddings can exceed `maxStorageBufferBindingSize`
   (use q4).

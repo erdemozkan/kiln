@@ -43,9 +43,22 @@ export interface TokenizerJSON {
     byte_fallback?: boolean;
   };
   added_tokens?: AddedToken[];
-  normalizer?: { type: string } | null;
+  normalizer?: { type: string; normalizers?: { type: string; prepend?: string; content?: string }[] } | null;
   pre_tokenizer?: Parameters<typeof compilePreTokenizer>[0];
 }
+
+/**
+ * How text maps to the symbols BPE merges.
+ * - byte-level (GPT-2, Llama 3, Qwen): UTF-8 bytes as printable stand-ins, split by a pre-tokenizer regex.
+ * - metaspace (SentencePiece BPE: Llama 2, Mistral, Phi-3, Gemma): spaces become "▁", a "▁" is
+ *   prepended, the whole text is one word of Unicode characters, and characters outside the vocabulary
+ *   fall back to `<0xXX>` byte tokens.
+ */
+type Scheme = { kind: "byte-level" } | { kind: "metaspace"; prepend: "always" | "first" | "never"; split: boolean };
+
+/** U+2581, SentencePiece's visible space. */
+const SPACE = "\u2581";
+const BYTE_TOKEN = /^<0x([0-9A-Fa-f]{2})>$/;
 
 export interface EncodeOptions {
   /** Parse special-token strings such as `<|im_start|>` as single tokens. Default true. */
@@ -59,6 +72,7 @@ export class Tokenizer {
   private readonly addedRe: RegExp | undefined;
   private readonly added = new Map<string, AddedToken>();
   readonly specialIds = new Set<number>();
+  private readonly scheme: Scheme;
   /** The model's chat template, when the loader found one. */
   chatTemplate: ChatTemplate | undefined;
 
@@ -67,9 +81,16 @@ export class Tokenizer {
     merges: readonly string[],
     addedTokens: readonly AddedToken[],
     private readonly pre: PreStep[],
-    private readonly opts: { ignoreMerges?: boolean; nfc?: boolean } = {},
+    private readonly opts: {
+      ignoreMerges?: boolean;
+      nfc?: boolean;
+      scheme?: Scheme;
+      /** SentencePiece scores by id, for GGUF "llama" vocabularies, which merge by score instead of a merge list. */
+      scores?: readonly number[];
+    } = {},
   ) {
     merges.forEach((m, i) => this.ranks.set(m, i));
+    this.scheme = opts.scheme ?? { kind: "byte-level" };
     for (const [tok, id] of vocab) this.idToToken[id] = tok;
     for (const t of addedTokens) {
       this.added.set(t.content, t);
@@ -86,21 +107,27 @@ export class Tokenizer {
   }
 
   static fromJSON(json: TokenizerJSON): Tokenizer {
-    if (json.model.type !== "BPE") throw new Error(`tokenizer model "${json.model.type}" is not supported yet (BPE only)`);
-    const usesByteLevel = JSON.stringify(json.pre_tokenizer ?? {}).includes("ByteLevel");
-    if (!usesByteLevel) throw new Error("only byte-level BPE tokenizers are supported in the MVP (Llama 3, Qwen, SmolLM)");
+    if (json.model.type !== "BPE") throw new Error(`tokenizer model "${json.model.type}" is not supported yet (BPE only; Unigram models such as T5 are not)`);
     const merges = json.model.merges.map((m) => (Array.isArray(m) ? m.join(" ") : m));
-    return new Tokenizer(new Map(Object.entries(json.model.vocab)), merges, json.added_tokens ?? [], compilePreTokenizer(json.pre_tokenizer), {
-      ignoreMerges: json.model.ignore_merges,
-      nfc: json.normalizer?.type === "NFC",
-    });
+    const vocab = new Map(Object.entries(json.model.vocab));
+    const added = json.added_tokens ?? [];
+    if (JSON.stringify(json.pre_tokenizer ?? {}).includes("ByteLevel")) {
+      return new Tokenizer(vocab, merges, added, compilePreTokenizer(json.pre_tokenizer), {
+        ignoreMerges: json.model.ignore_merges,
+        nfc: json.normalizer?.type === "NFC",
+      });
+    }
+    const scheme = metaspaceScheme(json);
+    if (!scheme) throw new Error("unsupported tokenizer: only byte-level BPE (GPT-2, Llama 3, Qwen) and SentencePiece-style BPE (Llama 2, Mistral, Phi-3) are supported");
+    return new Tokenizer(vocab, merges, added, [], { ignoreMerges: json.model.ignore_merges, scheme });
   }
 
-  /** Builds a tokenizer from GGUF `tokenizer.ggml.*` metadata ("gpt2" models only). */
+  /** Builds a tokenizer from GGUF `tokenizer.ggml.*` metadata: "gpt2" (byte-level BPE) or "llama" (SentencePiece). */
   static fromGGUF(meta: Map<string, unknown>): Tokenizer {
     const model = meta.get("tokenizer.ggml.model");
-    if (model !== "gpt2") throw new Error(`GGUF tokenizer model "${String(model)}" is not supported yet (gpt2 only)`);
+    if (model !== "gpt2" && model !== "llama") throw new Error(`GGUF tokenizer model "${String(model)}" is not supported yet (gpt2 and llama only)`);
     const tokens = meta.get("tokenizer.ggml.tokens") as string[];
+    if (model === "llama") return withTemplate(Tokenizer.fromSentencePieceGGUF(meta, tokens), meta, tokens);
     const types = (meta.get("tokenizer.ggml.token_type") as number[] | undefined) ?? [];
     const merges = (meta.get("tokenizer.ggml.merges") as string[] | undefined) ?? [];
     const pre = String(meta.get("tokenizer.ggml.pre") ?? "default");
@@ -115,13 +142,22 @@ export class Tokenizer {
     const re = toJsRegex(pattern);
     const steps: PreStep[] = [(ps) => ps.flatMap((p) => splitIsolated(p, re))];
     if (pre === "smollm") steps.unshift((ps) => ps.flatMap((p) => splitIsolated(p, /\p{N}/gu)));
-    const tok = new Tokenizer(vocab, merges, added, steps, { ignoreMerges: pre === "llama-bpe" || pre === "llama3" });
-    const source = meta.get("tokenizer.chat_template");
-    if (typeof source === "string") {
-      const name = (key: string) => (meta.has(key) ? tokens[Number(meta.get(key))] : undefined);
-      tok.chatTemplate = { source, bosToken: name("tokenizer.ggml.bos_token_id"), eosToken: name("tokenizer.ggml.eos_token_id") };
-    }
-    return tok;
+    return withTemplate(new Tokenizer(vocab, merges, added, steps, { ignoreMerges: pre === "llama-bpe" || pre === "llama3" }), meta, tokens);
+  }
+
+  /** GGUF "llama" vocabularies: SentencePiece pieces with scores; merges pick the highest-scoring piece. */
+  private static fromSentencePieceGGUF(meta: Map<string, unknown>, tokens: string[]): Tokenizer {
+    const types = (meta.get("tokenizer.ggml.token_type") as number[] | undefined) ?? [];
+    const scores = (meta.get("tokenizer.ggml.scores") as number[] | undefined) ?? [];
+    const vocab = new Map<string, number>();
+    const added: AddedToken[] = [];
+    tokens.forEach((t, id) => {
+      // 3 = control (<s>, </s>), 4 = user-defined; 6 = byte tokens, kept for the byte fallback.
+      if (types[id] === 3 || types[id] === 4) added.push({ id, content: t, special: types[id] === 3 });
+      else vocab.set(t, id);
+    });
+    const prefix = meta.get("tokenizer.ggml.add_space_prefix") !== false;
+    return new Tokenizer(vocab, [], added, [], { scheme: { kind: "metaspace", prepend: prefix ? "first" : "never", split: false }, scores });
   }
 
   get vocabSize(): number {
@@ -139,7 +175,10 @@ export class Tokenizer {
   tokenBytes(id: number): Uint8Array | undefined {
     const tok = this.idToToken[id];
     if (tok === undefined || this.added.has(tok)) return undefined;
-    return Uint8Array.from(Array.from(tok, (c) => BYTES.dec.get(c) ?? 63));
+    if (this.scheme.kind === "byte-level") return Uint8Array.from(Array.from(tok, (c) => BYTES.dec.get(c) ?? 63));
+    const byte = BYTE_TOKEN.exec(tok);
+    if (byte) return Uint8Array.of(parseInt(byte[1]!, 16));
+    return UTF8.encode(tok.replaceAll(SPACE, " "));
   }
 
   encode(text: string, opts: EncodeOptions = {}): number[] {
@@ -152,10 +191,18 @@ export class Tokenizer {
         ids.push(added.id);
         continue;
       }
+      if (this.scheme.kind === "metaspace") {
+        if (!seg) continue;
+        const { prepend, split } = this.scheme;
+        let s = seg.replaceAll(" ", SPACE);
+        if (prepend === "always" || (prepend === "first" && ids.length === 0 && text.startsWith(seg))) s = SPACE + s;
+        for (const p of split ? s.split(new RegExp(`(?=${SPACE})`)) : [s]) ids.push(...this.bpe(p));
+        continue;
+      }
       let pieces = [seg];
       for (const step of this.pre) pieces = step(pieces);
       for (const p of pieces) {
-        const mapped = Array.from(new TextEncoder().encode(p), (b) => BYTES.enc[b]).join("");
+        const mapped = Array.from(UTF8.encode(p), (b) => BYTES.enc[b]).join("");
         ids.push(...this.bpe(mapped));
       }
     }
@@ -170,17 +217,26 @@ export class Tokenizer {
   /** Incremental decoder that holds back incomplete UTF-8 sequences between tokens. */
   decoder(skipSpecial = true): { push(id: number): string; flush(): string } {
     const utf8 = new TextDecoder("utf-8");
+    // SentencePiece decoders drop the space the encoder prepended: the first one of the output.
+    let strip = this.scheme.kind === "metaspace" && this.scheme.prepend !== "never";
+    const out = (text: string) => {
+      if (strip && text) {
+        strip = false;
+        if (text.startsWith(" ")) return text.slice(1);
+      }
+      return text;
+    };
     return {
       push: (id) => {
         const tok = this.idToToken[id];
         if (tok === undefined) return "";
         if (this.added.has(tok)) {
           if (skipSpecial && this.specialIds.has(id)) return "";
-          return utf8.decode() + tok;
+          return out(utf8.decode() + tok);
         }
-        return utf8.decode(this.tokenBytes(id), { stream: true });
+        return out(utf8.decode(this.tokenBytes(id), { stream: true }));
       },
-      flush: () => utf8.decode(),
+      flush: () => out(utf8.decode()),
     };
   }
 
@@ -189,34 +245,122 @@ export class Tokenizer {
     if (hit) return hit;
     const direct = this.vocab.get(word);
     if (this.opts.ignoreMerges && direct !== undefined) return [direct];
-    let parts = Array.from(word);
-    while (parts.length > 1) {
-      let best = Infinity;
-      let pair = "";
-      for (let i = 0; i < parts.length - 1; i++) {
-        const key = `${parts[i]} ${parts[i + 1]}`;
-        const r = this.ranks.get(key);
-        if (r !== undefined && r < best) {
-          best = r;
-          pair = key;
+    const scores = this.opts.scores;
+    const rank = scores
+      ? (a: string, b: string) => {
+          const id = this.vocab.get(a + b);
+          return id === undefined ? undefined : -(scores[id] ?? 0);
         }
-      }
-      if (best === Infinity) break;
-      const merged: string[] = [];
-      for (let i = 0; i < parts.length; i++) {
-        if (i < parts.length - 1 && `${parts[i]} ${parts[i + 1]}` === pair) {
-          merged.push(parts[i]! + parts[i + 1]!);
-          i++;
-        } else merged.push(parts[i]!);
-      }
-      parts = merged;
-    }
-    const ids = parts.map((p) => {
+      : (a: string, b: string) => this.ranks.get(`${a} ${b}`);
+    const ids: number[] = [];
+    for (const p of mergeSymbols(Array.from(word), rank)) {
       const id = this.vocab.get(p);
-      if (id === undefined) throw new Error(`tokenizer: "${p}" is not in the vocabulary`);
-      return id;
-    });
-    if (this.cache.size < 50_000) this.cache.set(word, ids);
+      if (id !== undefined) ids.push(id);
+      else if (this.scheme.kind === "metaspace") {
+        for (const b of UTF8.encode(p)) {
+          const bid = this.vocab.get(`<0x${b.toString(16).toUpperCase().padStart(2, "0")}>`);
+          if (bid === undefined) throw new Error(`tokenizer: no byte token for 0x${b.toString(16)}`);
+          ids.push(bid);
+        }
+      } else throw new Error(`tokenizer: "${p}" is not in the vocabulary`);
+    }
+    // Byte-level words are short and repeat; SentencePiece words are whole texts.
+    if (word.length <= 64 && this.cache.size < 50_000) this.cache.set(word, ids);
     return ids;
   }
+}
+
+const UTF8 = new TextEncoder();
+
+function withTemplate(tok: Tokenizer, meta: Map<string, unknown>, tokens: string[]): Tokenizer {
+  const source = meta.get("tokenizer.chat_template");
+  if (typeof source === "string") {
+    const name = (key: string) => (meta.has(key) ? tokens[Number(meta.get(key))] : undefined);
+    tok.chatTemplate = { source, bosToken: name("tokenizer.ggml.bos_token_id"), eosToken: name("tokenizer.ggml.eos_token_id") };
+  }
+  return tok;
+}
+
+/** The SentencePiece-style scheme of a tokenizer.json, or undefined if it is not one. */
+function metaspaceScheme(json: TokenizerJSON): Scheme | undefined {
+  if (!json.model.byte_fallback) return undefined;
+  const norms = json.normalizer?.type === "Sequence" ? json.normalizer.normalizers ?? [] : json.normalizer ? [json.normalizer as { type: string; prepend?: string; content?: string }] : [];
+  const replaces = norms.some((n) => n.type === "Replace" && n.content === SPACE);
+  const prepends = norms.some((n) => n.type === "Prepend" && n.prepend === SPACE);
+  if (replaces) return { kind: "metaspace", prepend: prepends ? "always" : "never", split: false };
+  const pre = json.pre_tokenizer as { type: string; pretokenizers?: unknown[] } | null | undefined;
+  const steps = (pre?.type === "Sequence" ? pre.pretokenizers ?? [] : pre ? [pre] : []) as { type: string; prepend_scheme?: string; add_prefix_space?: boolean; split?: boolean; replacement?: string }[];
+  const ms = steps.find((p) => p.type === "Metaspace");
+  if (!ms || (ms.replacement && ms.replacement !== SPACE)) return undefined;
+  const prepend = ms.prepend_scheme === "first" || ms.prepend_scheme === "never" ? ms.prepend_scheme : ms.add_prefix_space === false ? "never" : "always";
+  return { kind: "metaspace", prepend, split: ms.split ?? true };
+}
+
+/**
+ * Byte-pair merging: repeatedly joins the adjacent pair with the lowest rank, leftmost first, until no
+ * pair has one. A heap over a linked list keeps this O(n log n), so a whole SentencePiece text (one
+ * word) costs little more than many short words.
+ */
+function mergeSymbols(symbols: string[], rank: (a: string, b: string) => number | undefined): string[] {
+  const n = symbols.length;
+  if (n < 2) return symbols;
+  const sym = [...symbols];
+  const prev = Int32Array.from({ length: n }, (_, i) => i - 1);
+  const next = Int32Array.from({ length: n }, (_, i) => (i + 1 < n ? i + 1 : -1));
+  const alive = new Uint8Array(n).fill(1);
+  // Heap of [rank, left index, left symbol, right symbol]; stale entries are skipped when popped.
+  type Cand = [number, number, string, string];
+  const heap: Cand[] = [];
+  const less = (a: Cand, b: Cand) => a[0] < b[0] || (a[0] === b[0] && a[1] < b[1]);
+  const pushCand = (c: Cand) => {
+    heap.push(c);
+    let i = heap.length - 1;
+    while (i > 0) {
+      const p = (i - 1) >> 1;
+      if (!less(heap[i]!, heap[p]!)) break;
+      [heap[i], heap[p]] = [heap[p]!, heap[i]!];
+      i = p;
+    }
+  };
+  const popCand = (): Cand => {
+    const top = heap[0]!;
+    const last = heap.pop()!;
+    if (heap.length) {
+      heap[0] = last;
+      let i = 0;
+      for (;;) {
+        const l = 2 * i + 1;
+        const r = l + 1;
+        let m = i;
+        if (l < heap.length && less(heap[l]!, heap[m]!)) m = l;
+        if (r < heap.length && less(heap[r]!, heap[m]!)) m = r;
+        if (m === i) break;
+        [heap[i], heap[m]] = [heap[m]!, heap[i]!];
+        i = m;
+      }
+    }
+    return top;
+  };
+  const consider = (i: number) => {
+    const j = next[i]!;
+    if (i < 0 || j < 0) return;
+    const r = rank(sym[i]!, sym[j]!);
+    if (r !== undefined) pushCand([r, i, sym[i]!, sym[j]!]);
+  };
+  for (let i = 0; i + 1 < n; i++) consider(i);
+  while (heap.length) {
+    const [, i, a, b] = popCand();
+    const j = next[i]!;
+    // Skip pairs a merge has since changed.
+    if (!alive[i] || j < 0 || sym[i] !== a || sym[j] !== b) continue;
+    sym[i] = a + b;
+    alive[j] = 0;
+    next[i] = next[j]!;
+    if (next[j]! >= 0) prev[next[j]!] = i;
+    consider(prev[i]!);
+    consider(i);
+  }
+  const out: string[] = [];
+  for (let i = 0; i >= 0; i = next[i]!) out.push(sym[i]!);
+  return out;
 }
