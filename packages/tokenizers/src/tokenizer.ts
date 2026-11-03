@@ -1,3 +1,4 @@
+import type { ChatTemplate } from "./chat";
 import { GPT2_PATTERN, LLAMA3_PATTERN, QWEN2_PATTERN, compilePreTokenizer, splitIsolated, toJsRegex, type PreStep } from "./pretokenize";
 
 /** GPT-2 byte ↔ printable-unicode table used by byte-level BPE. */
@@ -58,6 +59,8 @@ export class Tokenizer {
   private readonly addedRe: RegExp | undefined;
   private readonly added = new Map<string, AddedToken>();
   readonly specialIds = new Set<number>();
+  /** The model's chat template, when the loader found one. */
+  chatTemplate: ChatTemplate | undefined;
 
   constructor(
     private readonly vocab: Map<string, number>,
@@ -112,7 +115,13 @@ export class Tokenizer {
     const re = toJsRegex(pattern);
     const steps: PreStep[] = [(ps) => ps.flatMap((p) => splitIsolated(p, re))];
     if (pre === "smollm") steps.unshift((ps) => ps.flatMap((p) => splitIsolated(p, /\p{N}/gu)));
-    return new Tokenizer(vocab, merges, added, steps, { ignoreMerges: pre === "llama-bpe" || pre === "llama3" });
+    const tok = new Tokenizer(vocab, merges, added, steps, { ignoreMerges: pre === "llama-bpe" || pre === "llama3" });
+    const source = meta.get("tokenizer.chat_template");
+    if (typeof source === "string") {
+      const name = (key: string) => (meta.has(key) ? tokens[Number(meta.get(key))] : undefined);
+      tok.chatTemplate = { source, bosToken: name("tokenizer.ggml.bos_token_id"), eosToken: name("tokenizer.ggml.eos_token_id") };
+    }
+    return tok;
   }
 
   get vocabSize(): number {

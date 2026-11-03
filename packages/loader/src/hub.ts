@@ -37,6 +37,13 @@ export async function fetchJSON<T>(url: string, optional = false): Promise<T | u
   return (await res.json()) as T;
 }
 
+export async function fetchText(url: string, optional = false): Promise<string | undefined> {
+  const res = await fetch(url);
+  if (res.status === 404 && optional) return undefined;
+  if (!res.ok) throw new Error(`${url}: HTTP ${res.status}${res.status === 401 ? " (gated or private model?)" : ""}`);
+  return res.text();
+}
+
 /** Lists safetensors shards from the index file, or the single-file default. */
 export async function safetensorsFiles(ref: ModelRef, endpoint?: string): Promise<string[]> {
   const index = await fetchJSON<{ weight_map: Record<string, string> }>(fileUrl(ref, "model.safetensors.index.json", endpoint), true);

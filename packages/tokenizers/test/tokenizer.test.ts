@@ -69,4 +69,29 @@ describe("chat formats", () => {
       "<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
     );
   });
+
+  it("prefers the model's chat template and takes its stop tokens", () => {
+    const tok = tiny();
+    tok.chatTemplate = {
+      source: "{{ bos_token }}{% for m in messages %}[{{ m.role }}] {{ m.content }}<|end|>\n{% endfor %}{% if add_generation_prompt %}[assistant] {% endif %}",
+      bosToken: "<s>",
+      eosToken: "<|endoftext|>",
+    };
+    const f = detectChatFormat(tok);
+    expect(f.name).toBe("chat_template");
+    expect(f.render([{ role: "user", content: "hi" }])).toBe("<s>[user] hi<|end|>\n[assistant] ");
+    expect(f.stop).toEqual(["<|endoftext|>", "<|end|>"]);
+  });
+
+  it("falls back to a built-in format when the template uses unsupported Jinja", () => {
+    const tok = tiny();
+    tok.chatTemplate = { source: "{% filter upper %}x{% endfilter %}" };
+    const warn = console.warn;
+    console.warn = () => {};
+    try {
+      expect(detectChatFormat(tok).name).toBe("chatml");
+    } finally {
+      console.warn = warn;
+    }
+  });
 });

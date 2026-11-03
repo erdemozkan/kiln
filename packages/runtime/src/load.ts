@@ -5,6 +5,7 @@ import {
   cacheKey,
   evictCached,
   fetchJSON,
+  fetchText,
   fileUrl,
   parseModelId,
   readGGUFHeader,
@@ -15,7 +16,7 @@ import {
 } from "@kiln/loader";
 import { ops, type KvDtype } from "@kiln/kernels";
 import { LlamaModel, configFromGGUF, configFromHF, ggufToHF, type LlamaConfig } from "@kiln/models";
-import { Tokenizer, type TokenizerJSON } from "@kiln/tokenizers";
+import { Tokenizer, type ChatTemplate, type TokenizerJSON } from "@kiln/tokenizers";
 import { Engine } from "./engine";
 import { llamaMatmulShapes, tuneMatmuls } from "./tune";
 import { loadWeights, type LoadProgress, type Quant, type WeightFile } from "./weights";
@@ -94,10 +95,12 @@ async function openParsed<H>(ref: ModelRef, file: string, endpoint: string | und
 }
 
 async function openSafetensors(ref: ModelRef, endpoint?: string): Promise<{ cfg: LlamaConfig; tokenizer: Tokenizer; files: WeightFile[] }> {
-  const [config, generation, tokJson, names] = await Promise.all([
+  const [config, generation, tokJson, tokConfig, templateFile, names] = await Promise.all([
     fetchJSON<Record<string, unknown>>(fileUrl(ref, "config.json", endpoint)),
     fetchJSON<Record<string, unknown>>(fileUrl(ref, "generation_config.json", endpoint), true),
     fetchJSON<TokenizerJSON>(fileUrl(ref, "tokenizer.json", endpoint)),
+    fetchJSON<TokenizerConfig>(fileUrl(ref, "tokenizer_config.json", endpoint), true),
+    fetchText(fileUrl(ref, "chat_template.jinja", endpoint), true),
     safetensorsFiles(ref, endpoint),
   ]);
   const cfg = configFromHF(config!, generation);
@@ -106,7 +109,24 @@ async function openSafetensors(ref: ModelRef, endpoint?: string): Promise<{ cfg:
     const { source, header } = await openParsed(ref, name, endpoint, readSafetensorsHeader);
     files.push({ name, source, tensors: header.tensors });
   }
-  return { cfg, tokenizer: Tokenizer.fromJSON(tokJson!), files };
+  const tokenizer = Tokenizer.fromJSON(tokJson!);
+  tokenizer.chatTemplate = chatTemplate(tokConfig, templateFile);
+  return { cfg, tokenizer, files };
+}
+
+interface TokenizerConfig {
+  chat_template?: string | { name: string; template: string }[];
+  bos_token?: string | { content: string } | null;
+  eos_token?: string | { content: string } | null;
+}
+
+/** The default chat template: `chat_template.jinja` (newer repos) or the one in tokenizer_config.json. */
+function chatTemplate(cfg: TokenizerConfig | undefined, file: string | undefined): ChatTemplate | undefined {
+  const inline = cfg?.chat_template;
+  const source = file ?? (Array.isArray(inline) ? inline.find((t) => t.name === "default")?.template : inline);
+  if (!source) return undefined;
+  const token = (t: TokenizerConfig["bos_token"]) => (typeof t === "string" ? t : t?.content);
+  return { source, bosToken: token(cfg?.bos_token), eosToken: token(cfg?.eos_token) };
 }
 
 async function openGGUF(ref: ModelRef, endpoint?: string): Promise<{ cfg: LlamaConfig; tokenizer: Tokenizer; files: WeightFile[] }> {
