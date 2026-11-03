@@ -148,7 +148,26 @@ How it got there, each step measured in one session with identical greedy output
   identical 53-token output, 50 forward passes against 52, and 26.0 against 27.8 tok/s, since the
   8-row pass costs more than the two steps it saves.
 
-Where the remaining time goes at position 256: the 49152×576 LM head, gate/up and the projections run
+### Apple M3 (MacBook Air)
+
+Same model and build, Chromium 152 (Metal 3), one run, every check passing (184 kernel checks, same
+greedy ids at every chain length, f16 math and the f32 cache matching 128 of 128 greedy tokens):
+
+| | Apple M3 | Intel Gen-9 (above) |
+|---|---|---|
+| Decode step, GPU time (position 256 / 1536) | 3.4 / 3.8 ms | 15.7 / 19.1 ms |
+| Decode, end to end (1 / 4 / 8 steps per submit) | 302 / 307 / 307 tok/s | 39–53 / 59–69 / 71–74 tok/s |
+| Decode under a JSON schema | 241 tok/s | 33 tok/s |
+| 64-token prefill at position 1024, tiled / per-row attention | 44 / 74 ms | 234 / 329 ms |
+| 128-token prefill at position 1536, tiled / per-row | 98 / 188 ms | 522 / 808 ms |
+| Time to first token, 81 of 82 tokens cached / cold | 12 / 69 ms | 110–166 / 373–492 ms |
+| Copy bandwidth / fixed cost per dispatch | 82 GB/s / 1.5 µs | 13.8 GB/s / 11 µs |
+
+On the M3, chaining steps barely matters (302 → 307 tok/s): submit and readback latency is small there,
+whereas the Intel GPU gains 50% from it. The grammar costs more relative to the step (241 against
+302 tok/s), because a 3.4 ms step leaves little to hide the mask computation behind.
+
+Where the remaining time goes at position 256 on the Intel GPU: the 49152×576 LM head, gate/up and the projections run
 at about half the GPU's copy bandwidth (13.8 GB/s), and each of the 214 dispatches has about 11 µs of
 fixed cost.
 
@@ -174,8 +193,8 @@ Supported:
 
 Known limits, roughly in roadmap order:
 
-- Subgroup reductions are not implemented: this development GPU does not expose `subgroups`, so they
-  could not be verified.
+- Subgroup reductions are not implemented. The Intel development GPU does not expose `subgroups`;
+  the Apple M3 does (with `subgroup-size-control`), so they can now be built and verified there.
 - Kernels were tuned on one integrated GPU; the autotuner only chooses lanes per row, not tile sizes.
 - Matmul needs K to be a multiple of 32; attention needs head dim ≤ 256 and a multiple of 4.
 - Prefill attention does not split keys across workgroups, so a short prompt (few tiles) far into a long
