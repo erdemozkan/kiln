@@ -195,7 +195,9 @@ Supported:
   `items`, `minItems`/`maxItems`, `minLength`/`maxLength`, `enum`, `const`, `anyOf`/`oneOf`, local
   `$ref`, including recursive ones), or one of a list of strings. Properties come in declared order.
   Keywords that would change what matches but are not enforced (`pattern`, `not`, `if`, …) are
-  rejected rather than ignored.
+  rejected rather than ignored. Whitespace between tokens is compact by default (one space, no line
+  breaks): on SmolLM2-135M it cut a schema answer from 57 to 47 tokens and 1958 to 1521 ms, and
+  stopped the model repeating itself. `whitespace: "pretty"` allows indentation.
 
 Known limits, roughly in roadmap order:
 

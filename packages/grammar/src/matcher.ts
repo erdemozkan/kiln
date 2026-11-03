@@ -11,9 +11,22 @@ export type Node =
   | { kind: "lit"; bytes: Uint8Array }
   | { kind: "string"; minLength: number; maxLength: number }
   | { kind: "number"; integer: boolean }
-  | { kind: "object"; props: readonly Prop[]; additional: Node | undefined }
-  | { kind: "array"; items: Node; minItems: number; maxItems: number }
+  | { kind: "object"; props: readonly Prop[]; additional: Node | undefined; ws?: Whitespace }
+  | { kind: "array"; items: Node; minItems: number; maxItems: number; ws?: Whitespace }
   | { kind: "alt"; nodes: readonly Node[] };
+
+/** Whitespace allowed between the tokens of an object or array. */
+export interface Whitespace {
+  /** Longest run. */
+  max: number;
+  /** Newlines and tabs as well as spaces. */
+  breaks: boolean;
+}
+
+/** Enough for pretty-printing, too short to loop on. */
+export const PRETTY: Whitespace = { max: 32, breaks: true };
+/** One space at most, as in `{"a": 1, "b": [2, 3]}`. */
+export const COMPACT: Whitespace = { max: 1, breaks: false };
 
 export interface Prop {
   /** The key as JSON, without its opening quote: `name"`. */
@@ -90,19 +103,21 @@ const ch = (c: string) => c.charCodeAt(0);
 const NONE: Frame[][] = [];
 const DONE: Frame[][] = [[]];
 
-/** Longest whitespace run between tokens: enough for pretty-printing, too short to loop on. */
-export const MAX_WS = 32;
 /** Longest run of digits in each part of a number. */
 const MAX_DIGITS = 16;
 
 /** Optional whitespace. */
 class Ws implements Frame {
   readonly key: string;
-  constructor(readonly n = 0) {
-    this.key = `w${n}`;
+  constructor(
+    readonly rule: Whitespace = PRETTY,
+    readonly n = 0,
+  ) {
+    this.key = `w${rule.max}${rule.breaks ? "b" : ""}:${n}`;
   }
   step(b: number): Frame[][] {
-    return isWs(b) && this.n < MAX_WS ? [[new Ws(this.n + 1)]] : NONE;
+    const ok = this.rule.breaks ? isWs(b) : b === 0x20;
+    return ok && this.n < this.rule.max ? [[new Ws(this.rule, this.n + 1)]] : NONE;
   }
   eps(): Frame[][] {
     return DONE;
@@ -253,7 +268,7 @@ class Obj implements Frame {
     const { node, phase } = this;
     switch (phase) {
       case "open":
-        return b === ch("{") ? [[this.with("first"), new Ws()]] : NONE;
+        return b === ch("{") ? [[this.with("first"), new Ws(this.node.ws)]] : NONE;
       case "first":
       case "key": {
         if (b === ch("}")) return phase === "first" && this.canClose() ? DONE : NONE;
@@ -261,14 +276,14 @@ class Obj implements Frame {
         const out: Frame[][] = [];
         const cands = this.open();
         if (cands.length) out.push([this.with("inKey", this.idx, cands, 0)]);
-        if (node.additional) out.push([this.with("colon", this.idx, [-1]), new Ws(), new Str({ minLength: 0, maxLength: Infinity }, "body")]);
+        if (node.additional) out.push([this.with("colon", this.idx, [-1]), new Ws(this.node.ws), new Str({ minLength: 0, maxLength: Infinity }, "body")]);
         return out;
       }
       case "inKey": {
         const next = this.cands.filter((j) => node.props[j]!.key[this.pos] === b);
         const out: Frame[][] = [];
         const done = next.filter((j) => node.props[j]!.key.length === this.pos + 1);
-        for (const j of done) out.push([this.with("colon", this.idx, [j]), new Ws()]);
+        for (const j of done) out.push([this.with("colon", this.idx, [j]), new Ws(this.node.ws)]);
         const going = next.filter((j) => node.props[j]!.key.length > this.pos + 1);
         if (going.length) out.push([this.with("inKey", this.idx, going, this.pos + 1)]);
         return out;
@@ -277,11 +292,11 @@ class Obj implements Frame {
         if (b !== ch(":")) return NONE;
         const j = this.cands[0]!;
         const value = j < 0 ? node.additional! : node.props[j]!.value;
-        return [[this.with("after", j < 0 ? this.idx : j + 1), new Ws(), start(value), new Ws()]];
+        return [[this.with("after", j < 0 ? this.idx : j + 1), new Ws(this.node.ws), start(value), new Ws(this.node.ws)]];
       }
       case "after":
         if (b === ch("}")) return this.canClose() ? DONE : NONE;
-        if (b === ch(",") && (this.open().length > 0 || node.additional)) return [[this.with("key"), new Ws()]];
+        if (b === ch(",") && (this.open().length > 0 || node.additional)) return [[this.with("key"), new Ws(this.node.ws)]];
         return NONE;
     }
   }
@@ -301,13 +316,13 @@ class Arr implements Frame {
     this.key = `a${id}:${phase}:${node.maxItems < Infinity || node.minItems > 0 ? count : 0}`;
   }
   private item(count: number): Frame[] {
-    return [new Arr(this.node, this.id, "after", count), new Ws(), start(this.node.items)];
+    return [new Arr(this.node, this.id, "after", count), new Ws(this.node.ws), start(this.node.items)];
   }
   step(b: number): Frame[][] {
     const { node, phase, count } = this;
-    if (phase === "open") return b === ch("[") ? [[new Arr(node, this.id, "first"), new Ws()]] : NONE;
+    if (phase === "open") return b === ch("[") ? [[new Arr(node, this.id, "first"), new Ws(this.node.ws)]] : NONE;
     if (b === ch("]")) return (phase === "first" ? 0 : count) >= node.minItems ? DONE : NONE;
-    if (phase === "after" && b === ch(",") && count < node.maxItems) return [[...this.item(count + 1), new Ws()]];
+    if (phase === "after" && b === ch(",") && count < node.maxItems) return [[...this.item(count + 1), new Ws(this.node.ws)]];
     return NONE;
   }
   eps(): Frame[][] {

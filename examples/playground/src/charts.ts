@@ -134,6 +134,7 @@ export function dashboard(r: BenchResult, width = 788): string {
     charts.push(card("Decode speed", "end to end, tokens per second", columns([
       ...r.chained.map((c) => ({ label: `${c.stepsPerSubmit} per submit`, value: c.decodeTokS, unit: "tok/s", highlight: c.stepsPerSubmit === 4 })),
       ...(r.grammar ? [{ label: "JSON schema", value: r.grammar.decodeTokS, unit: "tok/s" }] : []),
+      ...(r.grammarPretty ? [{ label: "JSON, pretty", value: r.grammarPretty.decodeTokS, unit: "tok/s" }] : []),
     ])));
   }
   if (r.prefixReuse) {

@@ -14,12 +14,14 @@ const temp = $<HTMLInputElement>("temp");
 const stats = $("stats");
 const formatSel = $<HTMLSelectElement>("format");
 const schemaBox = $<HTMLTextAreaElement>("schema");
-formatSel.onchange = () => (schemaBox.hidden = formatSel.value !== "schema");
+formatSel.onchange = () => (schemaBox.hidden = !formatSel.value.startsWith("schema"));
 
 /** The selected output constraint; throws on a schema that is not valid JSON. */
 function format(): ResponseFormat | undefined {
   if (formatSel.value === "json") return { type: "json" };
-  if (formatSel.value === "schema") return { type: "json", schema: JSON.parse(schemaBox.value) };
+  if (formatSel.value.startsWith("schema")) {
+    return { type: "json", schema: JSON.parse(schemaBox.value), whitespace: formatSel.value === "schema-pretty" ? "pretty" : "compact" };
+  }
   return undefined;
 }
 

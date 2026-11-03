@@ -53,7 +53,10 @@ export interface BenchResult {
   /** Prefill step time with tiled attention (default) vs one workgroup per query row, alternating. */
   prefillAttention?: { T: number; pos0: number; tiledMs: number; rowsMs: number; tiledAttnMs: number; rowsAttnMs: number }[];
   /** Greedy decode under a JSON schema: speed, CPU mask time, and whether the output parses. */
+  /** Default (compact) whitespace. */
   grammar?: GrammarRun;
+  /** The same with `whitespace: "pretty"`. */
+  grammarPretty?: GrammarRun;
   e2e: { promptTokens: number; generated: number; ttftMs: number; decodeTokS: number; text: string };
 }
 
@@ -179,7 +182,7 @@ scope.onmessage = async (e) => {
         matches: warm.got.every((v, i) => v === want[i]) && cold.got.every((v, i) => v === want[i]),
       };
     }
-    const runs: GrammarRun[] = [];
+    const runs: Record<"pretty" | "compact", GrammarRun[]> = { pretty: [], compact: [] };
     {
       const schema = {
         type: "object",
@@ -187,9 +190,10 @@ scope.onmessage = async (e) => {
         required: ["city", "country", "population", "landmarks"],
       } as const;
       const prompt = engine.tokenizer.encode(engine.chatFormat!.render([{ role: "user", content: "Describe Paris as JSON." }]));
-      for (let rep = 0; rep < 2; rep++) {
+      // Alternating, so clock drift hits both alike; the first run also builds the token trie.
+      for (const whitespace of ["pretty", "compact", "pretty", "compact"] as const) {
         const got: number[] = [];
-        for await (const id of engine.generateTokens(prompt, { temperature: 0, maxTokens: 128, format: { type: "json", schema: schema as never } })) got.push(id);
+        for await (const id of engine.generateTokens(prompt, { temperature: 0, maxTokens: 128, format: { type: "json", schema: schema as never, whitespace } })) got.push(id);
         const gs = engine.lastStats!;
         const out = engine.tokenizer.decode(got);
         let valid = true;
@@ -198,7 +202,7 @@ scope.onmessage = async (e) => {
         } catch {
           valid = false;
         }
-        runs.push({
+        runs[whitespace].push({
           decodeTokS: gs.decodeMs ? ((gs.generatedTokens - 1) / gs.decodeMs) * 1000 : 0,
           tokens: gs.generatedTokens,
           ms: gs.decodeMs,
@@ -208,8 +212,9 @@ scope.onmessage = async (e) => {
         });
       }
     }
-    // The faster of two runs; the first also pays for building the token trie and cold masks.
-    const grammar = runs.reduce((a, b) => (b.decodeTokS > a.decodeTokS ? b : a));
+    const fastest = (rs: GrammarRun[]) => rs.reduce((a, b) => (b.decodeTokS > a.decodeTokS ? b : a));
+    const grammar = fastest(runs.compact);
+    const grammarPretty = fastest(runs.pretty);
     // Intermediates: one pool shared by every plan built so far (decode, prefill buckets, profiling).
     const mem = engine.model.memory;
     probe.weightMB = mem.weights / 2 ** 20;
@@ -226,6 +231,7 @@ scope.onmessage = async (e) => {
       prefixReuse,
       prefillAttention,
       grammar,
+      grammarPretty,
       lanes: Object.fromEntries(ops.matmulLanes()),
       loadMs,
       e2e: {

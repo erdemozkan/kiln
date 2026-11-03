@@ -1,4 +1,4 @@
-import type { Node, Prop } from "./matcher";
+import { COMPACT, PRETTY, type Node, type Prop, type Whitespace } from "./matcher";
 
 /** The JSON Schema subset `compileSchema` understands. */
 export interface JsonSchema {
@@ -27,8 +27,13 @@ type JsonType = "string" | "number" | "integer" | "boolean" | "null" | "object" 
 
 /** What generated text must look like. */
 export type ResponseFormat =
-  /** A JSON value; any JSON without a schema. */
-  | { type: "json"; schema?: JsonSchema }
+  /**
+   * A JSON value; any JSON without a schema. Whitespace between tokens is "compact" by default: one
+   * space at most, no line breaks. Small models given more pad the output with newlines and repeat
+   * themselves (SmolLM2-135M: 57 tokens instead of 47 for the same object). "pretty" allows runs of
+   * up to 32 spaces, tabs and newlines.
+   */
+  | { type: "json"; schema?: JsonSchema; whitespace?: "pretty" | "compact" }
   /** Exactly one of these strings. */
   | { type: "choice"; choices: string[] };
 
@@ -36,11 +41,11 @@ const utf8 = new TextEncoder();
 const lit = (s: string): Node => ({ kind: "lit", bytes: utf8.encode(s) });
 
 /** Grammar of any JSON value. */
-export function anyJson(): Node {
+export function anyJson(ws: Whitespace = PRETTY): Node {
   const any: Node & { nodes: Node[] } = { kind: "alt", nodes: [] };
   any.nodes.push(
-    { kind: "object", props: [], additional: any },
-    { kind: "array", items: any, minItems: 0, maxItems: Infinity },
+    { kind: "object", props: [], additional: any, ws },
+    { kind: "array", items: any, minItems: 0, maxItems: Infinity, ws },
     { kind: "string", minLength: 0, maxLength: Infinity },
     { kind: "number", integer: false },
     lit("true"),
@@ -53,7 +58,7 @@ export function anyJson(): Node {
 /** Keywords that would change what matches but are not implemented; ignoring them would accept wrong output. */
 const UNSUPPORTED = ["pattern", "patternProperties", "not", "if", "then", "else", "dependentRequired", "dependentSchemas", "propertyNames", "prefixItems", "contains", "uniqueItems"];
 
-export function compileSchema(root: JsonSchema): Node {
+export function compileSchema(root: JsonSchema, ws: Whitespace = PRETTY): Node {
   const refs = new Map<string, Node & { nodes: Node[] }>();
   let any: Node | undefined;
 
@@ -71,7 +76,7 @@ export function compileSchema(root: JsonSchema): Node {
   };
 
   const compile = (s: JsonSchema | boolean): Node => {
-    if (s === true) return (any ??= anyJson());
+    if (s === true) return (any ??= anyJson(ws));
     if (s === false) throw new Error("schema: `false` matches nothing");
     for (const k of UNSUPPORTED) if (k in s) throw new Error(`schema: "${k}" is not supported`);
     if (s.$ref) return resolve(s.$ref);
@@ -87,7 +92,7 @@ export function compileSchema(root: JsonSchema): Node {
     if (!types) {
       if (s.properties || s.additionalProperties !== undefined) return compileType(s, "object");
       if (s.items) return compileType(s, "array");
-      return (any ??= anyJson());
+      return (any ??= anyJson(ws));
     }
     const nodes = types.filter((t) => !(t === "integer" && types.includes("number"))).map((t) => compileType(s, t));
     return nodes.length === 1 ? nodes[0]! : { kind: "alt", nodes };
@@ -105,7 +110,7 @@ export function compileSchema(root: JsonSchema): Node {
       case "null":
         return lit("null");
       case "array":
-        return { kind: "array", items: s.items ? compile(s.items) : (any ??= anyJson()), minItems: s.minItems ?? 0, maxItems: s.maxItems ?? Infinity };
+        return { kind: "array", items: s.items ? compile(s.items) : (any ??= anyJson(ws)), minItems: s.minItems ?? 0, maxItems: s.maxItems ?? Infinity, ws };
       case "object": {
         const required = new Set(s.required ?? []);
         const props: Prop[] = Object.entries(s.properties ?? {}).map(([k, v]) => ({
@@ -114,7 +119,7 @@ export function compileSchema(root: JsonSchema): Node {
           required: required.has(k),
         }));
         const extra = s.additionalProperties ?? !s.properties;
-        return { kind: "object", props, additional: extra === false ? undefined : compile(extra) };
+        return { kind: "object", props, additional: extra === false ? undefined : compile(extra), ws };
       }
     }
   };
@@ -123,7 +128,10 @@ export function compileSchema(root: JsonSchema): Node {
 }
 
 export function compileFormat(f: ResponseFormat): Node {
-  if (f.type === "json") return f.schema ? compileSchema(f.schema) : anyJson();
+  if (f.type === "json") {
+    const ws = f.whitespace === "pretty" ? PRETTY : COMPACT;
+    return f.schema ? compileSchema(f.schema, ws) : anyJson(ws);
+  }
   if (f.type === "choice") {
     if (!f.choices.length) throw new Error("choice format needs at least one choice");
     return { kind: "alt", nodes: f.choices.map(lit) };

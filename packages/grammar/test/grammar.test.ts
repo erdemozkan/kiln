@@ -12,7 +12,7 @@ function match(f: ResponseFormat, text: string): { prefix: boolean; full: boolea
   }
   return { prefix: true, full: s.some(accepts) };
 }
-const json = (schema?: JsonSchema): ResponseFormat => ({ type: "json", schema });
+const json = (schema?: JsonSchema): ResponseFormat => ({ type: "json", schema, whitespace: "pretty" });
 const full = (f: ResponseFormat, t: string) => match(f, t).full;
 
 describe("JSON grammar", () => {
@@ -30,6 +30,20 @@ describe("JSON grammar", () => {
   it("caps whitespace runs and digits", () => {
     expect(match(json(), "[" + " ".repeat(40)).prefix).toBe(false);
     expect(match(json(), "1".repeat(17)).prefix).toBe(false);
+  });
+
+  it("allows only single spaces with compact whitespace", () => {
+    // The default.
+    const compact = (schema?: JsonSchema): ResponseFormat => ({ type: "json", schema });
+    expect(full(compact(), '{"a": [1, 2], "b": {"c": null}}')).toBe(true);
+    expect(full(compact(), '{"a":[1,2]}')).toBe(true);
+    expect(match(compact(), '{\n').prefix).toBe(false);
+    expect(match(compact(), '{"a":  1').prefix).toBe(false);
+    const s: JsonSchema = { type: "object", properties: { xs: { type: "array", items: { type: "object", properties: { n: { type: "integer" } } } } } };
+    expect(full(compact(s), '{"xs": [{"n": 1}, {"n": 2}]}')).toBe(true);
+    expect(match(compact(s), '{"xs": [{"n": 1},\n').prefix).toBe(false);
+    // Strings keep their content: whitespace rules apply between tokens only.
+    expect(full(compact(), '"a\\n  b  c"')).toBe(true);
   });
 
   const person: JsonSchema = {
