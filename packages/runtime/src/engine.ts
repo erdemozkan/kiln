@@ -63,6 +63,16 @@ export interface GenerateStats {
   speculation?: { passes: number; drafted: number; accepted: number };
 }
 
+/** K/V cache contents for a token prefix, from `Engine.exportCache` (see `LlamaModel.readKv`). */
+export interface CacheSnapshot {
+  tokens: number[];
+  kvDtype: string;
+  layers: number;
+  /** Bytes per position per layer, for K and for V each. */
+  rowBytes: number;
+  data: Uint8Array;
+}
+
 export interface TextDelta {
   text: string;
   tokenId: number;
@@ -392,6 +402,27 @@ export class Engine {
       this.trie = { trie: new TokenTrie(tokens), tokens };
     }
     return new GrammarMatcher(grammar, this.trie.trie, this.trie.tokens, this.model.cfg.vocabSize, stopIds);
+  }
+
+  /**
+   * The K/V of the tokens currently cached (the last call's prompt and reply), to restore with
+   * `importCache` in a later session so a shared prefix is not prefilled again.
+   */
+  async exportCache(): Promise<CacheSnapshot> {
+    if (this.busy) throw new Error("exportCache: the engine is generating");
+    const tokens = [...this.cached];
+    const m = this.model;
+    return { tokens, kvDtype: m.kvDtype, layers: m.cfg.numLayers, rowBytes: m.kvRowBytes, data: await m.readKv(tokens.length) };
+  }
+
+  /** Loads a snapshot from `exportCache`; returns false (and changes nothing) if it does not fit this model. */
+  importCache(s: CacheSnapshot): boolean {
+    const m = this.model;
+    if (this.busy || s.kvDtype !== m.kvDtype || s.layers !== m.cfg.numLayers || s.rowBytes !== m.kvRowBytes || s.tokens.length >= m.maxSeq) return false;
+    if (s.data.length !== s.layers * 2 * s.tokens.length * s.rowBytes) return false;
+    m.writeKv(s.tokens.length, s.data);
+    this.cached = [...s.tokens];
+    return true;
   }
 
   /** Forgets the cached prefix; the next call prefills its whole prompt. */

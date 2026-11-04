@@ -1,4 +1,4 @@
-import { createEngine, type Engine, type TextDelta } from "@kiln/runtime";
+import { createEngine, loadPromptCache, promptCacheName, savePromptCache, type Engine, type TextDelta } from "@kiln/runtime";
 import type { Request, Response } from "./protocol";
 
 /** The slice of DedicatedWorkerGlobalScope we use (lib.webworker conflicts with lib.dom in one program). */
@@ -8,6 +8,21 @@ const scope = self as unknown as {
 };
 let engine: Engine | undefined;
 const aborts = new Map<number, AbortController>();
+/** Prompt cache file of the loaded model (undefined when off), and the tokens last written to it. */
+let cacheName: string | undefined;
+let savedTokens: readonly number[] = [];
+let saving: Promise<void> = Promise.resolve();
+
+/** Writes the engine's cached K/V unless a call has started since or nothing changed. */
+async function saveCache(e: Engine, name: string): Promise<void> {
+  try {
+    const snap = await e.exportCache();
+    if (snap.tokens.length === savedTokens.length && snap.tokens.every((t, i) => t === savedTokens[i])) return;
+    if (await savePromptCache(name, snap)) savedTokens = snap.tokens;
+  } catch {
+    // Busy with the next call, or storage refused: the cache is only an optimisation.
+  }
+}
 
 const post = (msg: Response) => scope.postMessage(msg);
 
@@ -16,8 +31,13 @@ scope.onmessage = async (e: MessageEvent<Request>) => {
   try {
     switch (msg.type) {
       case "load": {
+        await saving;
         engine?.destroy();
         engine = await createEngine(msg.model, { ...msg.opts, onProgress: (progress) => post({ id: msg.id, type: "progress", progress }) });
+        cacheName = msg.opts.promptCache === false ? undefined : promptCacheName(msg.model, msg.opts);
+        savedTokens = [];
+        const snap = cacheName ? await loadPromptCache(cacheName) : undefined;
+        if (snap && engine.importCache(snap)) savedTokens = snap.tokens;
         const cfg = engine.model.cfg;
         post({
           id: msg.id,
@@ -31,6 +51,7 @@ scope.onmessage = async (e: MessageEvent<Request>) => {
             maxSeq: engine.model.maxSeq,
             chatFormat: engine.chatFormat?.name,
             backendFeatures: [...engine.backend.limits.features],
+            restoredTokens: savedTokens.length,
           },
         });
         break;
@@ -48,12 +69,17 @@ scope.onmessage = async (e: MessageEvent<Request>) => {
           aborts.delete(msg.id);
         }
         post({ id: msg.id, type: "done", stats: engine.lastStats });
+        // After the reply is out, so saving never delays it.
+        const e = engine;
+        const name = cacheName;
+        if (name) saving = saving.then(() => saveCache(e, name));
         break;
       }
       case "abort":
         aborts.get(msg.target)?.abort();
         break;
       case "unload":
+        await saving;
         engine?.destroy();
         engine = undefined;
         post({ id: msg.id, type: "done", stats: undefined });

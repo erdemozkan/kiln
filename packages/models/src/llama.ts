@@ -125,6 +125,34 @@ export class LlamaModel {
     return { weights, kv, activations: this.activations.bytes };
   }
 
+  /** Bytes of one position's K (or V) in one layer's cache. */
+  get kvRowBytes(): number {
+    return this.cfg.numKvHeads * this.cfg.headDim * (this.kvDtype === "f16" ? 2 : 4);
+  }
+
+  /**
+   * Copies the K/V of positions 0…n-1 out of every layer's cache: layer 0's K rows, then its V rows,
+   * then layer 1's, and so on. The copies are queued at once, so they read the cache as it stands
+   * when this is called, even if more work is submitted before they resolve.
+   */
+  async readKv(n: number): Promise<Uint8Array> {
+    const bytes = n * this.kvRowBytes;
+    const parts = this.kv.flatMap(({ k, v }) => [this.backend.readback(k, 0, bytes), this.backend.readback(v, 0, bytes)]);
+    const out = new Uint8Array(parts.length * bytes);
+    for (const [i, p] of (await Promise.all(parts)).entries()) out.set(new Uint8Array(p), i * bytes);
+    return out;
+  }
+
+  /** Writes K/V for positions 0…n-1 back into every layer's cache, in `readKv`'s layout. */
+  writeKv(n: number, data: Uint8Array): void {
+    const bytes = n * this.kvRowBytes;
+    if (n > this.maxSeq || data.length !== this.kv.length * 2 * bytes) throw new Error(`writeKv: ${data.length} bytes do not hold ${n} positions`);
+    for (const [l, { k, v }] of this.kv.entries()) {
+      this.backend.write(k, 0, data.subarray(2 * l * bytes, (2 * l + 1) * bytes));
+      this.backend.write(v, 0, data.subarray((2 * l + 1) * bytes, (2 * l + 2) * bytes));
+    }
+  }
+
   /** Marks the ids the repetition penalty starts from (the prompt); generated ids are added on the GPU. */
   setSeen(ids: readonly number[]): void {
     const mask = new Uint32Array(Math.ceil(this.cfg.vocabSize / 32));

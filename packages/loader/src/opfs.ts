@@ -224,6 +224,47 @@ export async function writeCacheJSON(name: string, value: unknown): Promise<void
   }
 }
 
+/** Reads a file from the cache directory (undefined if absent or unreadable). */
+export async function readCacheFile(name: string): Promise<Uint8Array | undefined> {
+  try {
+    const dir = await (await navigator.storage.getDirectory()).getDirectoryHandle(DIR);
+    return new Uint8Array(await (await (await dir.getFileHandle(name)).getFile()).arrayBuffer());
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Writes a file to the cache directory from parts, replacing it. Worker-only (sync handle); returns
+ * false on failure (a full store, say), which a cache can ignore. A short write leaves the file empty
+ * rather than truncated, so readers never see half of it.
+ */
+export async function writeCacheFile(name: string, parts: readonly Uint8Array[]): Promise<boolean> {
+  if (!opfsAvailable()) return false;
+  let h: SyncHandle | undefined;
+  try {
+    const dir = await (await navigator.storage.getDirectory()).getDirectoryHandle(DIR, { create: true });
+    h = await ((await dir.getFileHandle(name, { create: true })) as SyncFileHandle).createSyncAccessHandle();
+    h.truncate(0);
+    let at = 0;
+    for (const p of parts) {
+      if (h.write(p, { at }) !== p.length) throw new Error("short write");
+      at += p.length;
+    }
+    h.flush();
+    return true;
+  } catch {
+    try {
+      h?.truncate(0);
+    } catch {
+      // Nothing more to do; the reader rejects what does not parse.
+    }
+    return false;
+  } finally {
+    h?.close();
+  }
+}
+
 /** Deletes one cached file and its metadata. Silently keeps a file another tab or worker has open. */
 export async function evictCached(key: string): Promise<void> {
   const root = await navigator.storage.getDirectory();

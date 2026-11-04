@@ -57,7 +57,7 @@ loadBtn.onclick = async () => {
     });
     progress.value = 1;
     const i = model.info;
-    status.textContent = `Loaded ${i.model} (${i.family}, ${i.layers} layers, ctx ${i.maxSeq}, ${i.chatFormat ?? "no chat format"}) in ${((performance.now() - t0) / 1000).toFixed(1)} s`;
+    status.textContent = `Loaded ${i.model} (${i.family}, ${i.layers} layers, ctx ${i.maxSeq}, ${i.chatFormat ?? "no chat format"}) in ${((performance.now() - t0) / 1000).toFixed(1)} s${i.restoredTokens ? ` · ${i.restoredTokens} prompt tokens restored from cache` : ""}`;
     prompt.disabled = send.disabled = false;
     history.length = 0;
     log.textContent = "";

@@ -75,8 +75,13 @@ Key ideas:
   likely to pay; between passes it decodes as usual, two submits in flight. On SmolLM2-135M (Intel
   GPU, greedy) it runs 1.8× faster repeating a paragraph, 1.3× renaming a variable in code and 1.2×
   summarising, and 0.9–1.07× on free-form text. Not combined with grammars or the repetition penalty.
-- **The prompt prefix is reused.** The engine remembers which tokens' K/V are in the cache and only
-  prefills what changed, so a multi-turn chat prefills just the new turn.
+- **The prompt prefix is reused, across reloads too.** The engine remembers which tokens' K/V are in
+  the cache and only prefills what changed, so a multi-turn chat prefills just the new turn. The
+  worker also keeps the last call's K/V in OPFS (`promptCache`, on by default; about 23 KB per token
+  on SmolLM2-135M) and restores it at load, so after a page reload a shared system prompt is not
+  prefilled again: with a 214-token system prompt, time to first token fell from 1231 to 325 ms on
+  the Intel GPU, with the same reply. The file is keyed by model, revision, weight format and f16
+  math, written after the reply goes out, and a half-written file is ignored.
 - **1× memory while loading.** Weights stream row-chunk by row-chunk from the network into GPU buffers,
   quantized to q4 on the way if requested. Nothing holds the whole model in CPU memory.
 - **The download is the cache.** In a worker, `CachedHttpSource` writes the download into OPFS and serves
