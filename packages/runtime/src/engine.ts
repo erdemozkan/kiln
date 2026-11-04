@@ -2,6 +2,7 @@ import type { Backend, Buf, Dispatch } from "@kiln/core";
 import { GrammarMatcher, TokenTrie, compileFormat, type ResponseFormat } from "@kiln/grammar";
 import { LlamaModel, type ForwardPlan } from "@kiln/models";
 import { detectChatFormat, type ChatFormat, type ChatMessage, type Tokenizer } from "@kiln/tokenizers";
+import { DraftGate, acceptedLength, lookupDraft } from "./speculate";
 
 export interface GenerateOptions {
   maxTokens?: number;
@@ -35,6 +36,16 @@ export interface GenerateOptions {
    * Each step then waits for the CPU to compute the next token mask, so steps are not chained.
    */
   format?: ResponseFormat;
+  /**
+   * Speculative decoding by prompt lookup: when the last tokens appeared earlier in the prompt or the
+   * output, up to this many of the tokens that followed are guessed and checked in one forward pass
+   * (0 = off, default; 7 fills one 8-row matmul tile). Faster when the output repeats its input, and
+   * a check is only spent when it is likely to pay off on this GPU. Sampling draws the same random
+   * numbers either way, but the multi-row kernels round differently from single-token decode, so a
+   * near-tied token can come out differently, as with f16 math. Not combined with `format` or
+   * `repetitionPenalty` (those decode normally).
+   */
+  draftTokens?: number;
 }
 
 export interface GenerateStats {
@@ -48,6 +59,8 @@ export interface GenerateStats {
   ttftMs: number;
   /** CPU time spent computing grammar masks (format only). */
   maskMs?: number;
+  /** Speculative decoding (draftTokens): forward passes, draft tokens proposed and draft tokens kept. */
+  speculation?: { passes: number; drafted: number; accepted: number };
 }
 
 export interface TextDelta {
@@ -62,6 +75,7 @@ export class Engine {
   readonly chatFormat: ChatFormat | undefined;
   lastStats: GenerateStats | undefined;
   private readonly plans = new Map<number, ForwardPlan>();
+  private readonly verifyPlans = new Map<number, ForwardPlan>();
   private readonly advances = new Map<Buf, { dispatches: readonly Dispatch[]; destroy(): void }>();
   private readonly chains = new Map<number, Dispatch[]>();
   private readonly stopIds: Set<number>;
@@ -128,6 +142,7 @@ export class Engine {
     const stop = new Set([...this.stopIds, ...(opts.stopTokenIds ?? [])]);
     const t0 = performance.now();
     const grammar = opts.format ? this.matcher(opts.format, [...stop]) : undefined;
+    const draftTokens = grammar || sampling.repetitionPenalty !== 1 ? 0 : Math.max(0, Math.floor(opts.draftTokens ?? 0));
     this.busy = true;
     // Reuse the shared prefix, but always prefill at least the last prompt token to get its logits.
     let start = 0;
@@ -141,6 +156,8 @@ export class Engine {
     const readIds: number[] = [];
     let queued = 0;
     let failed = false;
+    /** Speculative decoding: prompt plus yielded ids; all but the last have K/V in the cache. */
+    let spoken: number[] | undefined;
 
     try {
       this.model.setSeen(promptIds);
@@ -163,6 +180,12 @@ export class Engine {
         this.backend.submit(plan.dispatches);
         pos += n;
         out = plan.out;
+      }
+
+      if (draftTokens > 0) {
+        spoken = [...promptIds];
+        yield* this.decodeSpeculative(out, spoken, { draftTokens, maxTokens, stop, signal: opts.signal, seed, temperature, sampling, stats, t0 });
+        return;
       }
 
       const decode = this.plan(1);
@@ -223,10 +246,139 @@ export class Engine {
       // Decode step j fed id j at position promptLength + j; every submitted step writes its K/V,
       // including steps still in flight, which run before anything submitted later. This also holds
       // when the consumer stops iterating early.
-      if (!failed) this.cached = [...promptIds, ...readIds.slice(0, Math.max(0, queued - 1))];
+      if (!failed) this.cached = spoken ? spoken.slice(0, -1) : [...promptIds, ...readIds.slice(0, Math.max(0, queued - 1))];
       this.lastStats = stats;
       this.busy = false;
     }
+  }
+
+  /**
+   * Decoding with prompt-lookup drafts. A verify pass feeds the last token plus a draft, samples every
+   * row, and keeps the draft up to the first token the model chose differently, plus the model's own
+   * token there. K/V written for rejected draft rows lie past the next pass's start, which overwrites
+   * them before anything reads them, so nothing has to be rolled back.
+   *
+   * Between passes, decoding runs as in plain mode: chained steps, two submits in flight, the first run
+   * starting straight from the id prefill sampled. Drafts are then looked up on the tokens one submit
+   * behind; once one looks worth a pass (`DraftGate`), no more steps are queued, and the pass drafts
+   * again from the up-to-date tokens.
+   */
+  private async *decodeSpeculative(
+    first: Buf,
+    spoken: number[],
+    o: {
+      draftTokens: number;
+      maxTokens: number;
+      stop: Set<number>;
+      signal: AbortSignal | undefined;
+      seed: number;
+      temperature: number;
+      sampling: { topK: number; topP: number; repetitionPenalty: number };
+      stats: GenerateStats;
+      t0: number;
+    },
+  ): AsyncGenerator<number> {
+    const { stats } = o;
+    const spec = (stats.speculation = { passes: 0, drafted: 0, accepted: 0 });
+    const gate = new DraftGate();
+    const step = { lastRow: 0, seed: o.seed, temperature: o.temperature, ...o.sampling };
+    const decode = this.plan(1);
+    const maxSeq = this.model.maxSeq;
+    const draftFor = () => lookupDraft(spoken, Math.min(o.draftTokens, maxSeq - spoken.length));
+    let emit: number[] = [];
+    let fromPrefill = true;
+    let tDecode = 0;
+    /** Records and yields ids; false once generation is over. */
+    const speak = function* (ids: Iterable<number>): Generator<number, boolean> {
+      for (const id of ids) {
+        if (o.stop.has(id) || o.signal?.aborted) return false;
+        spoken.push(id);
+        stats.generatedTokens++;
+        yield id;
+        if (stats.generatedTokens >= o.maxTokens) return false;
+      }
+      return true;
+    };
+    try {
+      for (;;) {
+        if (!(yield* speak(emit))) return;
+        emit = [];
+        const pos = spoken.length - 1;
+        const draft = fromPrefill ? [] : draftFor();
+        if (draft.length && gate.worth(draft.length)) {
+          const t = performance.now();
+          const plan = this.verifyPlan(1 + draft.length);
+          this.backend.write(plan.tokens, 0, Uint32Array.from([spoken[pos]!, ...draft]));
+          this.model.setStep({ pos0: pos, ...step });
+          this.backend.submit(plan.dispatches);
+          const sampled = new Uint32Array(await this.backend.readback(plan.out, 0, (1 + draft.length) * 4));
+          const n = acceptedLength(draft, sampled);
+          emit = Array.from(sampled.subarray(0, n + 1));
+          gate.verified(performance.now() - t, draft.length, n);
+          spec.passes++;
+          spec.drafted += draft.length;
+          spec.accepted += n;
+          continue;
+        }
+        // A plain run. Step j of the run feeds the id sampled by step j - 1 (the GPU advances itself).
+        // The first run starts from prefill's step state and only records the id it sampled.
+        const budget = Math.min(maxSeq - pos, o.maxTokens - stats.generatedTokens);
+        if (budget <= 0) return;
+        const reads: { ids: Promise<ArrayBuffer>; k: number }[] = [];
+        let queued = 0;
+        if (fromPrefill) {
+          this.backend.submit(this.advance(first, decode.tokens));
+          reads.push({ ids: this.backend.readback(this.model.history, 0, 4), k: 1 });
+          queued = 1;
+          fromPrefill = false;
+        } else {
+          this.backend.write(decode.tokens, 0, Uint32Array.of(spoken[pos]!));
+          this.model.setStep({ pos0: pos, n: 0, ...step });
+        }
+        const submit = () => {
+          const k = Math.min(4, budget - queued);
+          if (k <= 0) return;
+          this.backend.submit(this.chain(k));
+          reads.push({ ids: this.backend.readback(this.model.history, queued * 4, k * 4), k });
+          queued += k;
+        };
+        // Two submits in flight, as in plain decoding; the first run's prefill read is one of them.
+        if (!reads.length) submit();
+        submit();
+        let draining = false;
+        let t = performance.now();
+        while (reads.length) {
+          const r = reads.shift()!;
+          const ids = new Uint32Array(await r.ids);
+          const now = performance.now();
+          // The first read is prefill's own id: it says nothing about decode speed.
+          const firstRead = !tDecode;
+          if (firstRead) {
+            stats.ttftMs = stats.prefillMs = now - o.t0;
+            tDecode = now;
+          }
+          if (!(yield* speak(ids))) return;
+          if (draining) continue;
+          const d = draftFor();
+          const worth = d.length > 0 && gate.worth(d.length);
+          if (!firstRead) gate.plain(now - t, r.k, d.length > 0 && !worth);
+          t = now;
+          if (worth) draining = true;
+          else submit();
+        }
+      }
+    } finally {
+      stats.decodeMs = tDecode ? performance.now() - tDecode : 0;
+    }
+  }
+
+  private verifyPlan(T: number): ForwardPlan {
+    let p = this.verifyPlans.get(T);
+    if (!p) {
+      p = this.model.buildPlan(T, true);
+      this.verifyPlans.set(T, p);
+    }
+    return p;
   }
 
   private matcher(format: ResponseFormat, stopIds: number[]): GrammarMatcher {
@@ -245,8 +397,10 @@ export class Engine {
 
   destroy(): void {
     for (const p of this.plans.values()) p.destroy();
+    for (const p of this.verifyPlans.values()) p.destroy();
     for (const a of this.advances.values()) a.destroy();
     this.plans.clear();
+    this.verifyPlans.clear();
     this.advances.clear();
     this.chains.clear();
     this.model.destroy();

@@ -348,6 +348,23 @@ async function main() {
       const f = await freqOf(l, params, token, allowedIds);
       results.push({ kernel: "sample", case: name, error: Math.abs(f - p), tol: 0.08, pass: Math.abs(f - p) <= 0.08, note: `freq ${f.toFixed(3)}` });
     }
+
+    // Per-row sampling (speculative verification): row r must pick what a one-row step at pos0 + r picks.
+    const R = 6;
+    const rowsLogits = randn(R * V);
+    const rowsOut = be.alloc(R * 4, "storage", "rows-out");
+    for (const [name, params] of [["greedy", { temperature: 0 }], ["T=1, top-p 0.9", { temperature: 1, topP: 0.9 }], ["T=0.7, top-k 40", { temperature: 0.7, topK: 40 }]] as const) {
+      const at = { pos0: 10, lastRow: 0, seed: 7, ...params };
+      await run(at, (ctx) => ops.sampleRows(ctx, upload(rowsLogits, [R, V]), rowsOut, noneSeen, anyAllowed));
+      const got = [...new Uint32Array(await be.readback(rowsOut, 0, R * 4))];
+      const want: number[] = [];
+      for (let r = 0; r < R; r++) {
+        await run({ ...at, pos0: at.pos0 + r }, (ctx) => ops.sample(ctx, upload(rowsLogits.slice(r * V, (r + 1) * V), [1, V]), out, noneSeen, anyAllowed));
+        want.push(new Uint32Array(await be.readback(out, 0, 4))[0]!);
+      }
+      const same = got.every((id, r) => id === want[r]);
+      results.push({ kernel: "sample/rows", case: `${R} rows, ${name}`, error: same ? 0 : 1, tol: 0, pass: same, note: `${got.join(",")} vs ${want.join(",")}` });
+    }
   }
 
   render(results, be);

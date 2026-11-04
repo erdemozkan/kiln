@@ -65,6 +65,16 @@ Key ideas:
   same grammar positions. The sampler skips masked ids before top-k / top-p, so truncation applies among
   allowed tokens only. The forward pass needs only the last sampled id, so it is submitted before the
   mask is computed and the CPU work overlaps it.
+- **Speculative decoding by prompt lookup (opt-in, `draftTokens: 7`).** When the last tokens appeared
+  earlier in the prompt or the output, the tokens that followed are guessed and checked in one forward
+  pass that samples every row. The draft stands up to the first token the model chose differently.
+  Each row draws the random numbers a single-token step at its position would, so sampling with a
+  temperature verifies too. K/V of rejected rows is overwritten by the next pass before anything reads
+  it, so nothing is rolled back. A verify pass costs more than a decode step (3.5 steps for up to 8
+  rows on the Intel GPU), so the engine measures both as it goes and only checks a draft that is
+  likely to pay; between passes it decodes as usual, two submits in flight. On SmolLM2-135M (Intel
+  GPU, greedy) it runs 1.8× faster repeating a paragraph, 1.3× renaming a variable in code and 1.2×
+  summarising, and 0.9–1.07× on free-form text. Not combined with grammars or the repetition penalty.
 - **The prompt prefix is reused.** The engine remembers which tokens' K/V are in the cache and only
   prefills what changed, so a multi-turn chat prefills just the new turn.
 - **1× memory while loading.** Weights stream row-chunk by row-chunk from the network into GPU buffers,
@@ -175,7 +185,7 @@ fixed cost.
 
 ## Status
 
-Verified on this GPU: all kernel checks pass (184, including both prefill attention kernels, fused variants, f16 cache paths, grammar masks and
+Verified on this GPU: all kernel checks pass (187, including both prefill attention kernels, fused variants, f16 cache paths, grammar masks and
 sampling distributions). SmolLM2-135M-Instruct chats from Hub safetensors (q4, f32) and from a GGUF
 Q4_K_M file.
 
@@ -197,7 +207,9 @@ Supported:
   chatml / Llama 3 formats, and so do templates using Jinja the interpreter lacks (`{% filter %}`,
   `{% include %}`, …), with a warning.
 - Generation: temperature, top-k, top-p and HF-style repetition penalty, all on the GPU; prefix KV
-  reuse; f16 or f32 KV cache.
+  reuse; f16 or f32 KV cache; speculative decoding by prompt lookup. With drafts, 10 of 10 test
+  prompts (greedy and sampled) gave the same text as plain decoding. The verify pass uses the 8-row
+  kernels, which round differently from single-token decode, so a near-tied token can still differ.
 - Structured output: any JSON, JSON Schema (`type`, `properties`, `required`, `additionalProperties`,
   `items`, `minItems`/`maxItems`, `minLength`/`maxLength`, `enum`, `const`, `anyOf`/`oneOf`, local
   `$ref`, including recursive ones), or one of a list of strings. Properties come in declared order.

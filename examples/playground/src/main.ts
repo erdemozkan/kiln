@@ -11,6 +11,7 @@ const prompt = $<HTMLTextAreaElement>("prompt");
 const send = $<HTMLButtonElement>("send");
 const stop = $<HTMLButtonElement>("stop");
 const temp = $<HTMLInputElement>("temp");
+const draft = $<HTMLInputElement>("draft");
 const stats = $("stats");
 const formatSel = $<HTMLSelectElement>("format");
 const schemaBox = $<HTMLTextAreaElement>("schema");
@@ -81,8 +82,19 @@ send.onclick = async () => {
   let reply = "";
   try {
     const fmt = format();
-    // The repetition penalty would push structured output away from the quotes and braces it must repeat.
-    const stream = model.chat(history, { temperature: Number(temp.value), topP: 0.9, repetitionPenalty: fmt ? 1 : 1.1, maxTokens: 256, signal: abort.signal, enableThinking: false, format: fmt });
+    // The repetition penalty would push structured output away from the quotes and braces it must repeat,
+    // and speculative decoding does not combine with it.
+    const drafting = draft.checked && !fmt;
+    const stream = model.chat(history, {
+      temperature: Number(temp.value),
+      topP: 0.9,
+      repetitionPenalty: fmt || drafting ? 1 : 1.1,
+      maxTokens: 256,
+      signal: abort.signal,
+      enableThinking: false,
+      format: fmt,
+      draftTokens: drafting ? 7 : 0,
+    });
     for await (const delta of stream) {
       reply += delta;
       out.textContent = reply;
@@ -90,7 +102,7 @@ send.onclick = async () => {
     const s = await stream.stats;
     if (s) {
       const tps = s.decodeMs ? ((s.generatedTokens - 1) / s.decodeMs) * 1000 : 0;
-      stats.textContent = `${s.promptTokens} prompt tokens (${s.cachedTokens} cached) · TTFT ${s.ttftMs.toFixed(0)} ms · ${s.generatedTokens} tokens · ${tps.toFixed(1)} tok/s decode${s.maskMs !== undefined ? ` · masks ${s.maskMs.toFixed(0)} ms` : ""}`;
+      stats.textContent = `${s.promptTokens} prompt tokens (${s.cachedTokens} cached) · TTFT ${s.ttftMs.toFixed(0)} ms · ${s.generatedTokens} tokens · ${tps.toFixed(1)} tok/s decode${s.maskMs !== undefined ? ` · masks ${s.maskMs.toFixed(0)} ms` : ""}${s.speculation ? ` · ${s.speculation.accepted}/${s.speculation.drafted} draft tokens kept in ${s.speculation.passes} passes` : ""}`;
     }
     history.push({ role: "assistant", content: reply });
   } catch (err) {

@@ -239,6 +239,15 @@ export function sample(ctx: Ctx, logits: Tensor, out: Buf, seen: Buf, allowed: B
   ctx.run(sampleSpec(), [ctx.uniform([u32(V), u32(0), u32(0), u32(0)]), ctx.step, logits.buf, seen, allowed, out], [1, 1, 1]);
 }
 
+/**
+ * logits [T, V] → T token ids, row t sampled as a single-row step at position pos0 + t would be
+ * (same random numbers, so a sampled draft verifies exactly). Needs step.lastRow = 0.
+ */
+export function sampleRows(ctx: Ctx, logits: Tensor, out: Buf, seen: Buf, allowed: Buf): void {
+  const V = lastDim(logits);
+  ctx.run(sampleSpec(true), [ctx.uniform([u32(V), u32(0), u32(0), u32(0)]), ctx.step, logits.buf, seen, allowed, out], [1, rowsOf(logits), 1]);
+}
+
 /** GPU-side step advance: tokens[0] = sampled, history[step.n++] = sampled, mark seen, pos0 += lastRow + 1. */
 export function advance(ctx: Ctx, sampled: Buf, tokens: Buf, history: Buf, seen: Buf): void {
   ctx.run(advanceSpec(), [ctx.step, sampled, tokens, history, seen], [1, 1, 1]);

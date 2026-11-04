@@ -9,7 +9,7 @@ export interface ForwardPlan {
   readonly dispatches: readonly Dispatch[];
   /** u32 [T] token ids, written before each replay. */
   readonly tokens: Buf;
-  /** u32 [1] sampled token for row `step.lastRow`. */
+  /** u32 [1] sampled token for row `step.lastRow`; u32 [T], one per row, for a verify plan. */
   readonly out: Buf;
   destroy(): void;
 }
@@ -150,12 +150,16 @@ export class LlamaModel {
     this.backend.write(this.step, 0, packStep(s));
   }
 
-  /** Records the forward pass for T tokens at positions step.pos0..pos0+T, then sampling. */
-  buildPlan(T: number): ForwardPlan {
+  /**
+   * Records the forward pass for T tokens at positions step.pos0..pos0+T, then sampling. A `verify`
+   * plan samples every row (row t as the token after input t) instead of only `step.lastRow`, for
+   * checking draft tokens; it needs step.lastRow = 0.
+   */
+  buildPlan(T: number, verify = false): ForwardPlan {
     const c = this.cfg;
-    const ctx = new Ctx(this.backend, this.step, `T${T}`, this.activations);
+    const ctx = new Ctx(this.backend, this.step, `${verify ? "V" : "T"}${T}`, this.activations);
     const tokens = ctx.buffer(T * 4, "tokens");
-    const out = ctx.buffer(4, "out");
+    const out = ctx.buffer((verify ? T : 1) * 4, "out");
     const D = c.headDim;
     const attnShape = { T, H: c.numHeads, Hkv: c.numKvHeads, D, maxSeq: this.maxSeq, kv: this.kvDtype };
 
@@ -186,10 +190,11 @@ export class LlamaModel {
       }
       ops.linear(ctx, m, this.w(`${p}.mlp.down_proj.weight`), { residual: x });
     }
-    const last = ops.copyRow(ctx, view(x, [T, c.hiddenSize]));
+    const rows = verify ? view(x, [T, c.hiddenSize]) : ops.copyRow(ctx, view(x, [T, c.hiddenSize]));
     const head = this.weights.get("lm_head.weight") ?? this.w("model.embed_tokens.weight");
-    const logits = ops.linear(ctx, last, head, { norm: { w: this.w("model.norm.weight"), eps: c.rmsEps } });
-    ops.sample(ctx, logits, out, this.seen, this.allowed);
+    const logits = ops.linear(ctx, rows, head, { norm: { w: this.w("model.norm.weight"), eps: c.rmsEps } });
+    if (verify) ops.sampleRows(ctx, logits, out, this.seen, this.allowed);
+    else ops.sample(ctx, logits, out, this.seen, this.allowed);
 
     return { T, dispatches: ctx.dispatches, tokens, out, destroy: () => ctx.destroy() };
   }
