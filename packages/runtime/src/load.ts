@@ -3,7 +3,6 @@ import { createWebGPUBackend } from "@kiln/backend-webgpu";
 import {
   CachedHttpSource,
   cacheKey,
-  evictCached,
   fetchJSON,
   fetchText,
   fileUrl,
@@ -77,14 +76,14 @@ export async function createEngine(modelId: string, opts: LoadOptions = {}): Pro
   }
 }
 
-async function open(ref: ModelRef, file: string, endpoint?: string) {
-  return CachedHttpSource.open(fileUrl(ref, file, endpoint), cacheKey(ref, file));
+async function open(ref: ModelRef, file: string, endpoint?: string, fresh = false) {
+  return CachedHttpSource.open(fileUrl(ref, file, endpoint), cacheKey(ref, file), { fresh });
 }
 
 /**
  * Opens a weight file and parses its header. If the header of a cached copy does not parse, the copy
- * is treated as corrupt (an old cache written before flush watermarks, or damaged storage): it is
- * evicted and downloaded once more. Network failures are not retried.
+ * is treated as corrupt (an old cache written before flush watermarks, or damaged storage) and
+ * downloaded once more over the same file. Network failures are not retried.
  */
 async function openParsed<H>(ref: ModelRef, file: string, endpoint: string | undefined, parse: (s: ByteSource) => Promise<H>): Promise<{ source: ByteSource; header: H }> {
   const source = await open(ref, file, endpoint);
@@ -94,9 +93,15 @@ async function openParsed<H>(ref: ModelRef, file: string, endpoint: string | und
     if (!(source instanceof CachedHttpSource) || source.failed) throw err;
     console.warn(`[kiln] cached ${file} looks corrupt (${String(err)}); downloading it again`);
     source.close();
-    await evictCached(cacheKey(ref, file));
-    const fresh = await open(ref, file, endpoint);
-    return { source: fresh, header: await parse(fresh) };
+    // Overwritten in place rather than evicted: removing the file fails quietly while anything still
+    // holds it, and the next open would then trust the same bad bytes again.
+    const fresh = await open(ref, file, endpoint, true);
+    try {
+      return { source: fresh, header: await parse(fresh) };
+    } catch (err2) {
+      fresh.close?.();
+      throw err2;
+    }
   }
 }
 
@@ -111,9 +116,15 @@ async function openSafetensors(ref: ModelRef, endpoint?: string): Promise<{ cfg:
   ]);
   const cfg = configFromHF(config!, generation);
   const files: WeightFile[] = [];
-  for (const name of names) {
-    const { source, header } = await openParsed(ref, name, endpoint, readSafetensorsHeader);
-    files.push({ name, source, tensors: header.tensors });
+  try {
+    for (const name of names) {
+      const { source, header } = await openParsed(ref, name, endpoint, readSafetensorsHeader);
+      files.push({ name, source, tensors: header.tensors });
+    }
+  } catch (err) {
+    // Otherwise the shards already open keep their OPFS locks (and downloads) until the worker dies.
+    for (const f of files) f.source.close?.();
+    throw err;
   }
   const tokenizer = Tokenizer.fromJSON(tokJson!);
   tokenizer.chatTemplate = chatTemplate(tokConfig, templateFile);

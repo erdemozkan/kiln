@@ -25,13 +25,15 @@ export function opfsAvailable(): boolean {
  * The download *is* the cache: one streaming fetch writes into an OPFS file, and reads are served
  * from that file as soon as the bytes they need have landed. An interrupted download resumes from
  * the last flushed byte recorded in the metadata, never from the file size: a killed worker can leave
- * the file longer than the bytes that actually reached disk. Peak memory is one network chunk.
+ * the file longer than the bytes that actually reached disk, so that tail is cut off before resuming.
+ * Peak memory is one network chunk.
  */
 export class CachedHttpSource implements ByteSource {
   private have = 0;
   private complete = false;
   private failure: Error | undefined;
   private waiters: (() => void)[] = [];
+  private closed = false;
 
   private constructor(
     readonly name: string,
@@ -40,13 +42,16 @@ export class CachedHttpSource implements ByteSource {
     private readonly saveMeta: (meta: Meta) => Promise<void>,
   ) {}
 
-  /** `key` should pin the revision (e.g. repo@commit/file) so a new upload never reuses stale bytes. */
-  static async open(url: string, key: string): Promise<ByteSource> {
+  /**
+   * `key` should pin the revision (e.g. repo@commit/file) so a new upload never reuses stale bytes.
+   * `fresh` discards whatever is cached and downloads from the start.
+   */
+  static async open(url: string, key: string, { fresh = false } = {}): Promise<ByteSource> {
     if (!opfsAvailable()) return new HttpSource(url);
     const root = await navigator.storage.getDirectory();
     const dir = await root.getDirectoryHandle(DIR, { create: true });
     const fileName = encodeURIComponent(key);
-    const meta = await readMeta(dir, fileName);
+    const meta = fresh ? undefined : await readMeta(dir, fileName);
     const file = (await dir.getFileHandle(fileName, { create: true })) as SyncFileHandle;
     const handle = await file.createSyncAccessHandle().catch((err: unknown) => {
       if ((err as { name?: string }).name === "NoModificationAllowedError") {
@@ -62,6 +67,10 @@ export class CachedHttpSource implements ByteSource {
       src.complete = true;
     } else {
       src.have = Math.min(onDisk, meta?.complete ? 0 : meta?.flushed ?? 0);
+      // Nothing past the resume point is trusted. Leaving it would let the file reach full size with
+      // bytes that were never confirmed, and a later open would take that for a complete download.
+      handle.truncate(src.have);
+      handle.flush();
       await writeMeta(dir, fileName, { size: total, complete: false, flushed: src.have });
       void src.download(url);
     }
@@ -79,11 +88,21 @@ export class CachedHttpSource implements ByteSource {
       await new Promise<void>((r) => this.waiters.push(r));
     }
     const out = new Uint8Array(length);
-    this.handle.read(out, { at: offset });
+    // A short read means the bytes are not on disk after all; returning the zero-filled buffer would
+    // hand the parser garbage (a safetensors header length of 0, say). Chrome reports a broken backing
+    // file this way too, with an error code wrapped to a huge count (4294967292 for -4, not found).
+    const n = this.handle.read(out, { at: offset });
+    if (n !== length) {
+      // Marked incomplete, so the next open downloads the file again instead of failing the same way.
+      void this.saveMeta({ size: this.total, complete: false, flushed: 0 }).catch(() => undefined);
+      throw new CorruptCacheError(`${this.name}: cached read of ${length} bytes at ${offset} returned ${n}`);
+    }
     return out;
   }
 
   close(): void {
+    if (this.closed) return;
+    this.closed = true;
     this.handle.flush();
     this.handle.close();
   }
@@ -140,6 +159,11 @@ export class CachedHttpSource implements ByteSource {
   }
 }
 
+/** The cached bytes are inconsistent with their metadata; opening with `fresh` downloads them again. */
+export class CorruptCacheError extends Error {
+  override name = "CorruptCacheError";
+}
+
 interface Meta {
   size: number;
   complete: boolean;
@@ -192,7 +216,7 @@ export async function writeCacheJSON(name: string, value: unknown): Promise<void
   }
 }
 
-/** Deletes one cached file and its metadata (e.g. when its contents turn out to be corrupt). */
+/** Deletes one cached file and its metadata. Silently keeps a file another tab or worker has open. */
 export async function evictCached(key: string): Promise<void> {
   const root = await navigator.storage.getDirectory();
   const dir = await root.getDirectoryHandle(DIR, { create: true });
