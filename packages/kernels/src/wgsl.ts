@@ -819,8 +819,9 @@ fn main(${EW_ARGS}) {
  * - temperature 0 → argmax;
  * - otherwise top-k / top-p cut at a logit threshold found by bisection (count ≥ k, kept mass ≥ p),
  *   then Gumbel-max over the kept tokens, which is an exact sample of the truncated softmax.
- * With `rows`, workgroup y samples logits row y into out[y], drawing the random numbers a single-row
- * step at position pos0 + y would (speculative verification).
+ * With `rows`, workgroup y samples logits row y into out[y] under its own `allowed` row (flag word and
+ * bitmask, rows back to back), drawing the random numbers a single-row step at position pos0 + y
+ * would (speculative verification).
  */
 export function sampleSpec(rows = false): KernelSpec {
   return spec(rows ? "sample/rows" : "sample", ["uniform", "read", "read", "read", "read", "rw"], () => /* wgsl */ `
@@ -836,8 +837,9 @@ var<workgroup> bv: array<f32, 256>;
 var<workgroup> bi: array<u32, 256>;
 var<workgroup> rm: array<f32, 256>;
 const BISECT = 24u;
-/** Offset of the sampled row in logits. */
+/** Offsets of the sampled row in logits and in allowed. */
 var<private> base: u32;
+var<private> abase: u32;
 
 fn pcg(v: u32) -> u32 {
   let s = v * 747796405u + 2891336453u;
@@ -847,7 +849,7 @@ fn pcg(v: u32) -> u32 {
 
 /** Whether the grammar mask (if any) lets token i through. */
 fn ok(i: u32) -> bool {
-  return allowed[0] == 0u || ((allowed[1u + i / 32u] >> (i % 32u)) & 1u) == 1u;
+  return allowed[abase] == 0u || ((allowed[abase + 1u + i / 32u] >> (i % 32u)) & 1u) == 1u;
 }
 
 /** Penalised, temperature-scaled logit. */
@@ -891,6 +893,7 @@ fn reduceSums(li: u32, c: f32, m: f32) {
 fn main(@builtin(local_invocation_index) li: u32, @builtin(workgroup_id) wid: vec3<u32>) {
   let row = ${rows ? "wid.y" : "0u"};
   base = row * p.V;
+  abase = row * (1u + (p.V + 31u) / 32u);
   let sampling = st.temperature > 0.0;
   let truncate = sampling && (st.topK > 0u || st.topP < 1.0);
 

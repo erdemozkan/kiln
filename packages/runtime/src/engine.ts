@@ -1,6 +1,6 @@
 import type { Backend, Buf, Dispatch } from "@kiln/core";
 import { GrammarMatcher, TokenTrie, compileFormat, type ResponseFormat } from "@kiln/grammar";
-import { LlamaModel, type ForwardPlan } from "@kiln/models";
+import { LlamaModel, MAX_VERIFY_ROWS, type ForwardPlan } from "@kiln/models";
 import { detectChatFormat, type ChatFormat, type ChatMessage, type Tokenizer } from "@kiln/tokenizers";
 import { DraftGate, acceptedLength, lookupDraft } from "./speculate";
 
@@ -39,11 +39,12 @@ export interface GenerateOptions {
   /**
    * Speculative decoding by prompt lookup: when the last tokens appeared earlier in the prompt or the
    * output, up to this many of the tokens that followed are guessed and checked in one forward pass
-   * (0 = off, default; 7 fills one 8-row matmul tile). Faster when the output repeats its input, and
-   * a check is only spent when it is likely to pay off on this GPU. Sampling draws the same random
-   * numbers either way, but the multi-row kernels round differently from single-token decode, so a
-   * near-tied token can come out differently, as with f16 math. Not combined with `format` or
-   * `repetitionPenalty` (those decode normally).
+   * (0 = off, default; 7 fills one 8-row matmul tile; at most 31). Faster when the output repeats its
+   * input, and a check is only spent when it is likely to pay off on this GPU. Works with `format`:
+   * drafts are cut at the first token the grammar rejects and each row samples under its own mask.
+   * Sampling draws the same random numbers either way, but the multi-row kernels round differently
+   * from single-token decode, so a near-tied token can come out differently, as with f16 math. Not
+   * combined with `repetitionPenalty` (that decodes normally).
    */
   draftTokens?: number;
 }
@@ -152,7 +153,7 @@ export class Engine {
     const stop = new Set([...this.stopIds, ...(opts.stopTokenIds ?? [])]);
     const t0 = performance.now();
     const grammar = opts.format ? this.matcher(opts.format, [...stop]) : undefined;
-    const draftTokens = grammar || sampling.repetitionPenalty !== 1 ? 0 : Math.max(0, Math.floor(opts.draftTokens ?? 0));
+    const draftTokens = sampling.repetitionPenalty !== 1 ? 0 : Math.min(MAX_VERIFY_ROWS - 1, Math.max(0, Math.floor(opts.draftTokens ?? 0)));
     this.busy = true;
     // Reuse the shared prefix, but always prefill at least the last prompt token to get its logits.
     let start = 0;
@@ -194,7 +195,7 @@ export class Engine {
 
       if (draftTokens > 0) {
         spoken = [...promptIds];
-        yield* this.decodeSpeculative(out, spoken, { draftTokens, maxTokens, stop, signal: opts.signal, seed, temperature, sampling, stats, t0 });
+        yield* this.decodeSpeculative(out, spoken, { draftTokens, maxTokens, stop, signal: opts.signal, seed, temperature, sampling, stats, t0, grammar });
         return;
       }
 
@@ -276,6 +277,10 @@ export class Engine {
    * starting straight from the id prefill sampled. Drafts are then looked up on the tokens one submit
    * behind; once one looks worth a pass (`DraftGate`), no more steps are queued, and the pass drafts
    * again from the up-to-date tokens.
+   *
+   * With a grammar, a draft is cut at the first token the grammar rejects, and row r samples under the
+   * mask after the first r draft tokens; the masks are computed while the GPU runs the forward pass.
+   * Between passes it decodes one constrained step at a time, as plain constrained decoding does.
    */
   private async *decodeSpeculative(
     first: Buf,
@@ -290,26 +295,51 @@ export class Engine {
       sampling: { topK: number; topP: number; repetitionPenalty: number };
       stats: GenerateStats;
       t0: number;
+      grammar: GrammarMatcher | undefined;
     },
   ): AsyncGenerator<number> {
-    const { stats } = o;
+    const { stats, grammar } = o;
     const spec = (stats.speculation = { passes: 0, drafted: 0, accepted: 0 });
     const gate = new DraftGate();
     const step = { lastRow: 0, seed: o.seed, temperature: o.temperature, ...o.sampling };
     const decode = this.plan(1);
     const maxSeq = this.model.maxSeq;
-    const draftFor = () => lookupDraft(spoken, Math.min(o.draftTokens, maxSeq - spoken.length));
     let emit: number[] = [];
     let fromPrefill = true;
     let tDecode = 0;
+    const firstRead = (now: number) => {
+      if (tDecode) return false;
+      stats.ttftMs = stats.prefillMs = now - o.t0;
+      tDecode = now;
+      return true;
+    };
+    /** CPU time for masks goes to stats.maskMs. */
+    const mask = () => {
+      const t = performance.now();
+      const m = grammar!.mask();
+      stats.maskMs! += performance.now() - t;
+      return m;
+    };
+    /** The draft for the current tokens, cut where the grammar (if any) rejects it or at a stop token. */
+    const draftFor = () => {
+      const d = lookupDraft(spoken, Math.min(o.draftTokens, maxSeq - spoken.length));
+      if (!grammar) return d;
+      const at = grammar.save();
+      let k = 0;
+      while (k < d.length && !o.stop.has(d[k]!) && grammar.accept(d[k]!)) k++;
+      grammar.restore(at);
+      return d.slice(0, k);
+    };
     /** Records and yields ids; false once generation is over. */
     const speak = function* (ids: Iterable<number>): Generator<number, boolean> {
       for (const id of ids) {
         if (o.stop.has(id) || o.signal?.aborted) return false;
+        if (grammar && !grammar.accept(id)) throw new Error(`grammar: sampled token ${id} is not allowed (mask out of sync)`);
         spoken.push(id);
         stats.generatedTokens++;
         yield id;
-        if (stats.generatedTokens >= o.maxTokens) return false;
+        // A complete value that nothing can extend ends without another step.
+        if (stats.generatedTokens >= o.maxTokens || grammar?.finished) return false;
       }
       return true;
     };
@@ -324,14 +354,45 @@ export class Engine {
           const plan = this.verifyPlan(1 + draft.length);
           this.backend.write(plan.tokens, 0, Uint32Array.from([spoken[pos]!, ...draft]));
           this.model.setStep({ pos0: pos, ...step });
-          this.backend.submit(plan.dispatches);
+          // The forward pass runs while the CPU computes the row masks; sampling is submitted after.
+          this.backend.submit(plan.dispatches.slice(0, -1));
+          const masks: (Uint32Array | undefined)[] = [];
+          if (grammar) {
+            const at = grammar.save();
+            for (let r = 0; r <= draft.length; r++) {
+              masks.push(mask().slice());
+              if (r < draft.length) grammar.accept(draft[r]!);
+            }
+            grammar.restore(at);
+          } else masks.length = 1 + draft.length;
+          this.model.setAllowedRows(masks);
+          this.backend.submit(plan.dispatches.slice(-1));
           const sampled = new Uint32Array(await this.backend.readback(plan.out, 0, (1 + draft.length) * 4));
+          firstRead(performance.now());
           const n = acceptedLength(draft, sampled);
           emit = Array.from(sampled.subarray(0, n + 1));
           gate.verified(performance.now() - t, draft.length, n);
           spec.passes++;
           spec.drafted += draft.length;
           spec.accepted += n;
+          continue;
+        }
+        if (grammar) {
+          // One constrained step: forward, mask while it runs, then sampling and advance.
+          const t = performance.now();
+          if (fromPrefill) {
+            this.backend.submit(this.advance(first, decode.tokens));
+            fromPrefill = false;
+          } else {
+            this.backend.write(decode.tokens, 0, Uint32Array.of(spoken[pos]!));
+            this.model.setStep({ pos0: pos, n: 0, ...step });
+            this.backend.submit(decode.dispatches.slice(0, -1));
+            this.model.setAllowed(mask());
+            this.backend.submit(this.grammarTail());
+          }
+          emit = Array.from(new Uint32Array(await this.backend.readback(this.model.history, 0, 4)));
+          const now = performance.now();
+          if (!firstRead(now)) gate.plain(now - t, 1, draft.length > 0);
           continue;
         }
         // A plain run. Step j of the run feeds the id sampled by step j - 1 (the GPU advances itself).
@@ -366,16 +427,12 @@ export class Engine {
           const ids = new Uint32Array(await r.ids);
           const now = performance.now();
           // The first read is prefill's own id: it says nothing about decode speed.
-          const firstRead = !tDecode;
-          if (firstRead) {
-            stats.ttftMs = stats.prefillMs = now - o.t0;
-            tDecode = now;
-          }
+          const isFirst = firstRead(now);
           if (!(yield* speak(ids))) return;
           if (draining) continue;
           const d = draftFor();
           const worth = d.length > 0 && gate.worth(d.length);
-          if (!firstRead) gate.plain(now - t, r.k, d.length > 0 && !worth);
+          if (!isFirst) gate.plain(now - t, r.k, d.length > 0 && !worth);
           t = now;
           if (worth) draining = true;
           else submit();

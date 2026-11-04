@@ -365,6 +365,28 @@ async function main() {
       const same = got.every((id, r) => id === want[r]);
       results.push({ kernel: "sample/rows", case: `${R} rows, ${name}`, error: same ? 0 : 1, tol: 0, pass: same, note: `${got.join(",")} vs ${want.join(",")}` });
     }
+
+    // Per-row grammar masks: row r allows only its own few ids; row 2 is unconstrained.
+    const W = 1 + Math.ceil(V / 32);
+    const rowIds = Array.from({ length: R }, (_, r) => [r * 101 + 3, r * 211 + 17, r * 307 + 4000]);
+    const rowMasks = new Uint32Array(R * W);
+    for (const [r, ids] of rowIds.entries()) {
+      if (r === 2) continue;
+      rowMasks[r * W] = 1;
+      for (const id of ids) rowMasks[r * W + 1 + (id >>> 5)]! |= 1 << (id & 31);
+    }
+    for (const [name, params] of [["greedy", { temperature: 0 }], ["T=1", { temperature: 1 }]] as const) {
+      const at = { pos0: 3, lastRow: 0, seed: 11, ...params };
+      await run(at, (ctx) => ops.sampleRows(ctx, upload(rowsLogits, [R, V]), rowsOut, noneSeen, upload(rowMasks, [0]).buf));
+      const got = [...new Uint32Array(await be.readback(rowsOut, 0, R * 4))];
+      const want: number[] = [];
+      for (let r = 0; r < R; r++) {
+        await run({ ...at, pos0: at.pos0 + r }, (ctx) => ops.sample(ctx, upload(rowsLogits.slice(r * V, (r + 1) * V), [1, V]), out, noneSeen, r === 2 ? anyAllowed : only(rowIds[r]!)));
+        want.push(new Uint32Array(await be.readback(out, 0, 4))[0]!);
+      }
+      const same = got.every((id, r) => id === want[r]) && got.every((id, r) => r === 2 || rowIds[r]!.includes(id));
+      results.push({ kernel: "sample/rows", case: `${R} rows, per-row masks, ${name}`, error: same ? 0 : 1, tol: 0, pass: same, note: `${got.join(",")} vs ${want.join(",")}` });
+    }
   }
 
   render(results, be);

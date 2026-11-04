@@ -85,6 +85,9 @@ export class TokenTrie {
 /** Distinct masks kept per matcher; generation revisits the same grammar positions all the time. */
 const CACHE = 256;
 
+/** A matcher position from `GrammarMatcher.save`; opaque. */
+export type MatcherPosition = { readonly __position: unique symbol };
+
 /**
  * Tracks a grammar over generated tokens and gives the set of tokens allowed next, as a bitmask of
  * u32 words (bit id % 32 of word id / 32).
@@ -113,6 +116,15 @@ export class GrammarMatcher {
   /** Whether nothing but a stop token can follow. */
   get finished(): boolean {
     return this.states.every((s) => s === null);
+  }
+
+  /** The current position, to come back to with `restore` (cheap: states are never mutated). */
+  save(): MatcherPosition {
+    return this.states as unknown as MatcherPosition;
+  }
+
+  restore(p: MatcherPosition): void {
+    this.states = p as unknown as Stack[];
   }
 
   /** Advances past token `id`. Returns false (and leaves the state unchanged) if the grammar rejects it. */

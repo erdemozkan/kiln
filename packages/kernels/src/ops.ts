@@ -241,7 +241,8 @@ export function sample(ctx: Ctx, logits: Tensor, out: Buf, seen: Buf, allowed: B
 
 /**
  * logits [T, V] → T token ids, row t sampled as a single-row step at position pos0 + t would be
- * (same random numbers, so a sampled draft verifies exactly). Needs step.lastRow = 0.
+ * (same random numbers, so a sampled draft verifies exactly). Needs step.lastRow = 0. `allowed` holds
+ * one flag-and-bitmask row per logits row, 1 + ceil(V / 32) words each.
  */
 export function sampleRows(ctx: Ctx, logits: Tensor, out: Buf, seen: Buf, allowed: Buf): void {
   const V = lastDim(logits);

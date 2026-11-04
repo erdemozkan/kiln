@@ -25,6 +25,9 @@ export interface LlamaOptions {
 
 export class MissingWeightError extends Error {}
 
+/** Most rows a verify plan can have (the last token plus a draft of up to 31). */
+export const MAX_VERIFY_ROWS = 32;
+
 export class LlamaModel {
   readonly maxSeq: number;
   readonly kvDtype: KvDtype;
@@ -35,6 +38,8 @@ export class LlamaModel {
   readonly seen: Buf;
   /** u32 [1 + ceil(vocab / 32)]: a flag, then the bitmask of ids sampling may choose (see `setAllowed`). */
   readonly allowed: Buf;
+  /** The same per verify row, MAX_VERIFY_ROWS rows back to back (see `setAllowedRows`). */
+  readonly allowedRows: Buf;
   /** Intermediates of every plan, shared: plans run one after another on the queue. */
   readonly activations: ActivationPool;
   private readonly kv: { k: Buf; v: Buf }[] = [];
@@ -57,6 +62,7 @@ export class LlamaModel {
     this.history = backend.alloc(this.maxSeq * 4, "storage", "history");
     this.seen = backend.alloc(Math.ceil(cfg.vocabSize / 32) * 4, "storage", "seen");
     this.allowed = backend.alloc((1 + Math.ceil(cfg.vocabSize / 32)) * 4, "storage", "allowed");
+    this.allowedRows = backend.alloc(MAX_VERIFY_ROWS * (1 + Math.ceil(cfg.vocabSize / 32)) * 4, "storage", "allowed/rows");
     this.setAllowed(undefined);
     this.activations = new ActivationPool(backend);
     const row = cfg.numKvHeads * cfg.headDim;
@@ -174,6 +180,24 @@ export class LlamaModel {
     this.backend.write(this.allowed, 0, data);
   }
 
+  /** Per-row `setAllowed` for a verify plan: row r samples under masks[r], or freely where it is undefined. */
+  setAllowedRows(masks: readonly (Uint32Array | undefined)[]): void {
+    const words = Math.ceil(this.cfg.vocabSize / 32);
+    if (masks.length > MAX_VERIFY_ROWS) throw new Error(`setAllowedRows: ${masks.length} rows, at most ${MAX_VERIFY_ROWS}`);
+    for (const [r, mask] of masks.entries()) {
+      const at = r * (1 + words) * 4;
+      if (!mask) {
+        this.backend.write(this.allowedRows, at, new Uint32Array(1));
+        continue;
+      }
+      if (mask.length !== words) throw new Error(`allowed mask has ${mask.length} words, expected ${words}`);
+      const data = new Uint32Array(1 + words);
+      data[0] = 1;
+      data.set(mask, 1);
+      this.backend.write(this.allowedRows, at, data);
+    }
+  }
+
   setStep(s: StepParams): void {
     this.backend.write(this.step, 0, packStep(s));
   }
@@ -184,6 +208,7 @@ export class LlamaModel {
    * checking draft tokens; it needs step.lastRow = 0.
    */
   buildPlan(T: number, verify = false): ForwardPlan {
+    if (verify && T > MAX_VERIFY_ROWS) throw new Error(`verify plan of ${T} rows; at most ${MAX_VERIFY_ROWS}`);
     const c = this.cfg;
     const ctx = new Ctx(this.backend, this.step, `${verify ? "V" : "T"}${T}`, this.activations);
     const tokens = ctx.buffer(T * 4, "tokens");
@@ -221,7 +246,7 @@ export class LlamaModel {
     const rows = verify ? view(x, [T, c.hiddenSize]) : ops.copyRow(ctx, view(x, [T, c.hiddenSize]));
     const head = this.weights.get("lm_head.weight") ?? this.w("model.embed_tokens.weight");
     const logits = ops.linear(ctx, rows, head, { norm: { w: this.w("model.norm.weight"), eps: c.rmsEps } });
-    if (verify) ops.sampleRows(ctx, logits, out, this.seen, this.allowed);
+    if (verify) ops.sampleRows(ctx, logits, out, this.seen, this.allowedRows);
     else ops.sample(ctx, logits, out, this.seen, this.allowed);
 
     return { T, dispatches: ctx.dispatches, tokens, out, destroy: () => ctx.destroy() };
@@ -251,6 +276,7 @@ export class LlamaModel {
     this.backend.free(this.history);
     this.backend.free(this.seen);
     this.backend.free(this.allowed);
+    this.backend.free(this.allowedRows);
     this.activations.destroy();
   }
 
