@@ -6,6 +6,7 @@ import {
   fetchJSON,
   fetchText,
   fileUrl,
+  listRepoFiles,
   parseModelId,
   readGGUFHeader,
   readSafetensorsHeader,
@@ -106,13 +107,19 @@ async function openParsed<H>(ref: ModelRef, file: string, endpoint: string | und
 }
 
 async function openSafetensors(ref: ModelRef, endpoint?: string): Promise<{ cfg: LlamaConfig; tokenizer: Tokenizer; files: WeightFile[] }> {
+  // Required files start at once. Optional ones wait for the repo's file listing, so files that do
+  // not exist are not requested (each would log a 404); without a listing they are probed.
+  const listing = listRepoFiles(ref, endpoint);
+  const exists = (file: string) => listing.then((files) => !files || files.has(file));
+  const optionalJSON = async <T>(file: string) => ((await exists(file)) ? fetchJSON<T>(fileUrl(ref, file, endpoint), true) : undefined);
+  const optionalText = async (file: string) => ((await exists(file)) ? fetchText(fileUrl(ref, file, endpoint), true) : undefined);
   const [config, generation, tokJson, tokConfig, templateFile, names] = await Promise.all([
     fetchJSON<Record<string, unknown>>(fileUrl(ref, "config.json", endpoint)),
-    fetchJSON<Record<string, unknown>>(fileUrl(ref, "generation_config.json", endpoint), true),
+    optionalJSON<Record<string, unknown>>("generation_config.json"),
     fetchJSON<TokenizerJSON>(fileUrl(ref, "tokenizer.json", endpoint)),
-    fetchJSON<TokenizerConfig>(fileUrl(ref, "tokenizer_config.json", endpoint), true),
-    fetchText(fileUrl(ref, "chat_template.jinja", endpoint), true),
-    safetensorsFiles(ref, endpoint),
+    optionalJSON<TokenizerConfig>("tokenizer_config.json"),
+    optionalText("chat_template.jinja"),
+    listing.then((files) => safetensorsFiles(ref, endpoint, files)),
   ]);
   const cfg = configFromHF(config!, generation);
   const files: WeightFile[] = [];

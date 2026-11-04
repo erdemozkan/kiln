@@ -44,8 +44,27 @@ export async function fetchText(url: string, optional = false): Promise<string |
   return res.text();
 }
 
-/** Lists safetensors shards from the index file, or the single-file default. */
-export async function safetensorsFiles(ref: ModelRef, endpoint?: string): Promise<string[]> {
-  const index = await fetchJSON<{ weight_map: Record<string, string> }>(fileUrl(ref, "model.safetensors.index.json", endpoint), true);
+/**
+ * The repo's file names at this revision, from the Hub API. Undefined when the endpoint has no such
+ * API (a mirror or a static server) or refuses it; callers then probe for optional files instead.
+ */
+export async function listRepoFiles(ref: ModelRef, endpoint = "https://huggingface.co"): Promise<Set<string> | undefined> {
+  try {
+    const res = await fetch(`${endpoint}/api/models/${ref.repo}/revision/${encodeURIComponent(ref.revision)}?expand%5B%5D=siblings`);
+    if (!res.ok) return undefined;
+    const { siblings } = (await res.json()) as { siblings?: { rfilename: string }[] };
+    return siblings ? new Set(siblings.map((s) => s.rfilename)) : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Lists safetensors shards from the index file, or the single-file default. With the repo's file
+ * listing, the index is only requested when it exists.
+ */
+export async function safetensorsFiles(ref: ModelRef, endpoint?: string, files?: Set<string>): Promise<string[]> {
+  const name = "model.safetensors.index.json";
+  const index = files && !files.has(name) ? undefined : await fetchJSON<{ weight_map: Record<string, string> }>(fileUrl(ref, name, endpoint), true);
   return index ? [...new Set(Object.values(index.weight_map))].sort() : ["model.safetensors"];
 }
