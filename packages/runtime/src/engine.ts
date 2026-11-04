@@ -228,7 +228,11 @@ export class Engine {
               queued++;
             }
           }
-        } else if (queued < maxTokens) submitBatch();
+        } else if (queued < maxTokens && !opts.signal?.aborted && !ids.some((id) => stop.has(id))) {
+          // Once this batch ends the reply, nothing more is queued: steps past the end would only delay
+          // the next call, which waits for them on the queue. One batch may still be in flight.
+          submitBatch();
+        }
         for (const id of ids) {
           if (stop.has(id) || opts.signal?.aborted) {
             done = true;
