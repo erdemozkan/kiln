@@ -72,9 +72,11 @@ Key ideas:
 - **The download is the cache.** In a worker, `CachedHttpSource` writes the download into OPFS and serves
   reads from it as bytes land. Interrupted downloads resume from the last flushed byte recorded in the
   metadata (not the file size, which can include writes lost when a worker is killed), and a cached
-  file whose header no longer parses is evicted and downloaded again.
+  file whose header no longer parses, or whose bytes fail to read back, is downloaded again in place.
 
 ## Develop
+
+Needs Node 22.12 or newer (vite 7, vitest 5).
 
 ```bash
 npm install

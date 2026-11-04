@@ -15,9 +15,9 @@
   "devDependencies": {
     "@webgpu/types": "0.1.40",
     "typescript": "5.4.5",
-    "vitest": "0.34.6"
+    "vitest": "5.1.0"
   },
   "engines": {
-    "node": ">=16.13"
+    "node": ">=22.12"
   }
 }
