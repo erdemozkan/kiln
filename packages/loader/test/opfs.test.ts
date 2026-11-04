@@ -3,15 +3,21 @@ import { CachedHttpSource } from "../src";
 
 /** In-memory OPFS: just enough of the directory, file and sync-handle API for the cached source. */
 class FakeHandle {
+  /** Simulated storage failures: a read that throws or returns a wrapped error code, a write that stops landing. */
+  static readFails: "throw" | number | undefined;
+  static writeFailsAt: number | undefined;
   private open = true;
   constructor(private readonly file: { bytes: Uint8Array }) {}
   read(buf: Uint8Array, { at }: { at: number }): number {
+    if (FakeHandle.readFails === "throw") throw new Error("InvalidStateError: Failed to read the content");
+    if (FakeHandle.readFails !== undefined) return FakeHandle.readFails;
     const n = Math.max(0, Math.min(buf.length, this.file.bytes.length - at));
     buf.set(this.file.bytes.subarray(at, at + n));
     return n;
   }
   write(buf: Uint8Array, { at }: { at: number }): number {
     if (!this.open) throw new Error("InvalidStateError: handle closed");
+    if (FakeHandle.writeFailsAt !== undefined && at >= FakeHandle.writeFailsAt) return 0;
     if (at + buf.length > this.file.bytes.length) this.resize(at + buf.length);
     this.file.bytes.set(buf, at);
     return buf.length;
@@ -89,6 +95,8 @@ async function readAll(src: { read(o: number, n: number): Promise<Uint8Array>; c
 beforeEach(() => {
   files.clear();
   requests.length = 0;
+  FakeHandle.readFails = undefined;
+  FakeHandle.writeFailsAt = undefined;
   vi.stubGlobal("FileSystemSyncAccessHandle", FakeHandle);
   vi.stubGlobal("navigator", { storage: { getDirectory: async () => dir } });
   vi.stubGlobal("fetch", fakeFetch);
@@ -134,6 +142,29 @@ describe("CachedHttpSource", () => {
     expect(await readAll(await CachedHttpSource.open("u", KEY))).not.toEqual(BODY);
     expect(await readAll(await CachedHttpSource.open("u", KEY, { fresh: true }))).toEqual(BODY);
     expect(getMeta()).toMatchObject({ complete: true });
+  });
+
+  it.each([["returns a wrapped error code", 4294967292], ["throws", "throw" as const]])(
+    "a cached read that %s is reported as corrupt and queued for download",
+    async (_, failure) => {
+      await readAll(await CachedHttpSource.open("u", KEY));
+      FakeHandle.readFails = failure;
+      const src = await CachedHttpSource.open("u", KEY);
+      await expect(src.read(0, 8)).rejects.toMatchObject({ name: "CorruptCacheError" });
+      await new Promise((r) => setTimeout(r, 0));
+      src.close?.();
+      expect(getMeta()).toMatchObject({ complete: false, flushed: 0 });
+      FakeHandle.readFails = undefined;
+      expect(await readAll(await CachedHttpSource.open("u", KEY))).toEqual(BODY);
+    },
+  );
+
+  it("a write that does not land fails the download instead of caching a hole", async () => {
+    FakeHandle.writeFailsAt = 128;
+    const src = await CachedHttpSource.open("u", KEY);
+    await expect(src.read(0, BODY.length)).rejects.toThrow(/cache write of 64 bytes at 128 returned 0/);
+    src.close?.();
+    expect(getMeta()).toMatchObject({ complete: false });
   });
 
   it("closing twice is harmless", async () => {

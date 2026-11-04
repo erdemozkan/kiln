@@ -89,9 +89,15 @@ export class CachedHttpSource implements ByteSource {
     }
     const out = new Uint8Array(length);
     // A short read means the bytes are not on disk after all; returning the zero-filled buffer would
-    // hand the parser garbage (a safetensors header length of 0, say). Chrome reports a broken backing
-    // file this way too, with an error code wrapped to a huge count (4294967292 for -4, not found).
-    const n = this.handle.read(out, { at: offset });
+    // hand the parser garbage (a safetensors header length of 0, say). Chrome reports a failed read
+    // either as an error code wrapped to a huge count (4294967292 for -4, seen with in-memory storage)
+    // or, in newer versions, by throwing.
+    let n: number | string;
+    try {
+      n = this.handle.read(out, { at: offset });
+    } catch (err) {
+      n = String(err);
+    }
     if (n !== length) {
       // Marked incomplete, so the next open downloads the file again instead of failing the same way.
       void this.saveMeta({ size: this.total, complete: false, flushed: 0 }).catch(() => undefined);
@@ -129,7 +135,9 @@ export class CachedHttpSource implements ByteSource {
       for (;;) {
         const { done, value } = await reader.read();
         if (done) break;
-        this.handle.write(value, { at: this.have });
+        // Same failure reporting as reads: a short or wrapped count means the bytes did not land.
+        const n = this.handle.write(value, { at: this.have });
+        if (n !== value.byteLength) throw new Error(`${this.name}: cache write of ${value.byteLength} bytes at ${this.have} returned ${n} (storage full?)`);
         this.have += value.byteLength;
         // The last chunk wakes readers only after completion is recorded: the final reader's caller
         // may close the handle right away, and then the file would never be marked complete.
