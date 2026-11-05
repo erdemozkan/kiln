@@ -34,6 +34,8 @@ export class CachedHttpSource implements ByteSource {
   private failure: Error | undefined;
   private waiters: (() => void)[] = [];
   private closed = false;
+  /** Set once the cache stopped taking bytes: reads past `have` then go straight to the network. */
+  private spill: HttpSource | undefined;
 
   private constructor(
     readonly name: string,
@@ -83,10 +85,11 @@ export class CachedHttpSource implements ByteSource {
 
   async read(offset: number, length: number): Promise<Uint8Array> {
     if (offset + length > this.total) throw new RangeError(`${this.name}: read past end`);
-    while (!this.complete && this.have < offset + length) {
+    while (!this.complete && !this.spill && this.have < offset + length) {
       if (this.failure) throw this.failure;
       await new Promise<void>((r) => this.waiters.push(r));
     }
+    if (!this.complete && this.spill && this.have < offset + length) return this.spill.read(offset, length);
     const out = new Uint8Array(length);
     // A short read means the bytes are not on disk after all; returning the zero-filled buffer would
     // hand the parser garbage (a safetensors header length of 0, say). Chrome reports a failed read
@@ -137,7 +140,11 @@ export class CachedHttpSource implements ByteSource {
         if (done) break;
         // Same failure reporting as reads: a short or wrapped count means the bytes did not land.
         const n = this.handle.write(value, { at: this.have });
-        if (n !== value.byteLength) throw new Error(`${this.name}: cache write of ${value.byteLength} bytes at ${this.have} returned ${n} (storage full?)`);
+        if (n !== value.byteLength) {
+          await reader.cancel().catch(() => undefined);
+          await this.stopCaching(url, `cache write of ${value.byteLength} bytes at ${this.have} returned ${n}`);
+          return;
+        }
         this.have += value.byteLength;
         // The last chunk wakes readers only after completion is recorded: the final reader's caller
         // may close the handle right away, and then the file would never be marked complete.
@@ -157,6 +164,23 @@ export class CachedHttpSource implements ByteSource {
     } catch (err) {
       this.failure = err instanceof Error ? err : new Error(String(err));
     }
+    this.wake();
+  }
+
+  /**
+   * The store took no more bytes (full, or a per-file size limit; Chrome's in-memory storage stops at
+   * 2000 MiB). The cached part keeps serving reads, the rest is read over HTTP, and the next open
+   * resumes from the cached part.
+   */
+  private async stopCaching(url: string, why: string): Promise<void> {
+    console.warn(`[kiln] ${this.name}: ${why} (storage full?); reading the rest of the file from the network`);
+    try {
+      this.handle.flush();
+      await this.saveMeta({ size: this.total, complete: false, flushed: this.have });
+    } catch {
+      // The metadata keeps an older watermark, which is still safe.
+    }
+    this.spill = new HttpSource(url, this.name);
     this.wake();
   }
 

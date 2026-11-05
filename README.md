@@ -101,6 +101,9 @@ Key ideas:
   reads from it as bytes land. Interrupted downloads resume from the last flushed byte recorded in the
   metadata (not the file size, which can include writes lost when a worker is killed), and a cached
   file whose header no longer parses, or whose bytes fail to read back, is downloaded again in place.
+  When the store stops taking bytes (a full disk, or the 2000 MiB per-file limit of Chrome's
+  in-memory storage), the rest of the file is read over HTTP instead of failing the load, and the
+  next load resumes from the cached part.
 
 ## Develop
 
@@ -207,6 +210,22 @@ Verified on this GPU: all kernel checks pass (187, including both prefill attent
 sampling distributions). SmolLM2-135M-Instruct chats from Hub safetensors (q4, f32) and from a GGUF
 Q4_K_M file.
 
+Models run end to end (greedy answers to fixed questions checked by hand; tool calls where noted):
+
+| Architecture | Model | Source | Intel Iris Plus 650 |
+|---|---|---|---|
+| `llama` | SmolLM2-135M-Instruct | safetensors, GGUF Q4_K_M | |
+| `llama` | TinyLlama-1.1B-Chat | GGUF Q4_K_M | 7.6 tok/s |
+| `llama` | Llama-3.2-1B-Instruct (Llama 3 rope scaling) | safetensors (2.5 GB), GGUF Q4_K_M | 12–13 tok/s |
+| `qwen2` | Qwen2.5-0.5B-Instruct (tool calls, `toolChoice`) | safetensors | |
+| `qwen2` | Qwen2-0.5B merge, two shards | safetensors | |
+| `qwen2` | DeepSeek-R1-Distill-Qwen-1.5B (reasons, then answers) | GGUF Q4_K_M | 11 tok/s |
+| `qwen3` | Qwen3-0.6B (`toolChoice`) | safetensors | 20–32 tok/s |
+
+`mistral` loads through the same code as `llama` but has not been run (the smallest Mistral is 7B).
+Other architectures are rejected at load: SmolLM3, Granite, Phi-3, Gemma, mixture-of-experts
+models, Llama 4, and rope scaling other than Llama 3's.
+
 Supported:
 
 - Models and formats: Llama-family decoders; safetensors F32/F16/BF16; GGUF F32/F16/BF16/Q4_0/Q4_1/
@@ -228,7 +247,8 @@ Supported:
   transformers does (`tools` and `documents` are None when absent), and messages can carry
   `tool_calls` and the `tool` role. The test fixture's tool and document cases for SmolLM3,
   Qwen2.5/3, Mistral v0.3 and Granite 3.3 render byte-for-byte like jinja2. `parseToolCalls` reads
-  the `<tool_call>{…}</tool_call>` replies of Qwen and SmolLM3; on Qwen2.5-0.5B a call, its result
+  the `<tool_call>{…}</tool_call>` format (Qwen and SmolLM3 templates; SmolLM3 itself does not load
+  yet); on Qwen2.5-0.5B a call, its result
   and the final answer made a full round trip. Templates that never read `tools` (SmolLM2) and the
   built-in formats refuse tools rather than drop them. `toolChoice: "required"` (or one function by
   name) constrains the reply to exactly one `<tool_call>` whose name is a listed tool and whose

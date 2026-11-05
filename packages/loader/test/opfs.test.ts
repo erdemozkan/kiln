@@ -71,9 +71,11 @@ function fakeFetch(_url: string, init?: { headers?: Record<string, string> }) {
     status: m ? 206 : 200,
     ok: true,
     headers: { get: (h: string) => (h === "Content-Range" ? `bytes ${from}-${to - 1}/${BODY.length}` : String(part.length)) },
+    arrayBuffer: async () => part.slice().buffer,
     body: {
       getReader: () => ({
         read: async () => (pos >= part.length ? { done: true } : { done: false, value: part.slice(pos, (pos += 64)) }),
+        cancel: async () => void (pos = part.length),
       }),
       cancel: async () => undefined,
     },
@@ -159,12 +161,23 @@ describe("CachedHttpSource", () => {
     },
   );
 
-  it("a write that does not land fails the download instead of caching a hole", async () => {
+  it("a write that does not land switches the rest of the file to the network instead of caching a hole", async () => {
     FakeHandle.writeFailsAt = 128;
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
     const src = await CachedHttpSource.open("u", KEY);
-    await expect(src.read(0, BODY.length)).rejects.toThrow(/cache write of 64 bytes at 128 returned 0/);
+    expect(await src.read(200, 50)).toEqual(BODY.subarray(200, 250));
+    expect(await src.read(0, 64)).toEqual(BODY.subarray(0, 64)); // cached part, no request
+    expect(requests).toEqual(["bytes=0-0", "bytes=0-", "bytes=200-249"]); // size probe, download, network read
+    expect(await src.read(0, BODY.length)).toEqual(BODY);
+    expect(warn).toHaveBeenCalledWith(expect.stringMatching(/cache write of 64 bytes at 128 returned 0/));
     src.close?.();
-    expect(getMeta()).toMatchObject({ complete: false });
+    expect(getMeta()).toMatchObject({ complete: false, flushed: 128 });
+    // The next open resumes after the cached part.
+    FakeHandle.writeFailsAt = undefined;
+    requests.length = 0;
+    expect(await readAll(await CachedHttpSource.open("u", KEY))).toEqual(BODY);
+    expect(requests).toEqual(["bytes=128-"]);
+    warn.mockRestore();
   });
 
   it("closing twice is harmless", async () => {
