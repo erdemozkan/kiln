@@ -46,6 +46,8 @@ export interface LoadOptions {
    * weights download and is cached per device, so later loads only read the cached choice.
    */
   tune?: boolean;
+  /** Longest GPU work in one submit, in estimated ms (default 50; see `Engine.maxSubmitMs`). */
+  maxSubmitMs?: number;
   onProgress?: (p: LoadProgress) => void;
 }
 
@@ -71,7 +73,9 @@ export async function createEngine(modelId: string, opts: LoadOptions = {}): Pro
     const weights = await loadWeights(backend, files, quant, opts.onProgress);
     await tuning;
     const model = new LlamaModel(backend, cfg, weights, { maxSeq: opts.maxSeq, kvDtype: opts.kvDtype, fuse: opts.fuse });
-    return new Engine(backend, model, tokenizer);
+    const engine = new Engine(backend, model, tokenizer);
+    if (opts.maxSubmitMs !== undefined) engine.maxSubmitMs = opts.maxSubmitMs;
+    return engine;
   } finally {
     for (const f of files) f.source.close?.();
   }

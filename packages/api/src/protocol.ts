@@ -13,6 +13,8 @@ export interface WireLoadOptions {
    * reload does not prefill a shared prefix such as the system prompt again. A few MB per model.
    */
   promptCache?: boolean;
+  /** Longest GPU work in one submit, in estimated ms (default 50). */
+  maxSubmitMs?: number;
 }
 
 export interface ModelInfo {

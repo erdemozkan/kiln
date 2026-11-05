@@ -2,6 +2,7 @@ import type { Backend, Buf, Dispatch } from "@kiln/core";
 import { GrammarMatcher, TokenTrie, compileFormat, type ResponseFormat } from "@kiln/grammar";
 import { LlamaModel, MAX_VERIFY_ROWS, type ForwardPlan } from "@kiln/models";
 import { detectChatFormat, type ChatFormat, type ChatMessage, type Tokenizer } from "@kiln/tokenizers";
+import { SubmitPacer } from "./pace";
 import { DraftGate, acceptedLength, lookupDraft } from "./speculate";
 
 export interface GenerateOptions {
@@ -60,6 +61,8 @@ export interface GenerateStats {
   ttftMs: number;
   /** CPU time spent computing grammar masks (format only). */
   maskMs?: number;
+  /** GPU submits this call made (work over `maxSubmitMs` is cut into several). */
+  submits?: number;
   /** Speculative decoding (draftTokens): forward passes, draft tokens proposed and draft tokens kept. */
   speculation?: { passes: number; drafted: number; accepted: number };
 }
@@ -93,6 +96,15 @@ export class Engine {
   private busy = false;
   /** Tokens whose K/V currently sit in the cache at positions 0…n-1 (empty while generating). */
   private cached: number[] = [];
+  /**
+   * Longest GPU work in one submit, in estimated milliseconds (default 50). Longer work is cut into
+   * several submits so the display and other apps get the GPU in between (see `SubmitPacer`).
+   */
+  maxSubmitMs = 50;
+  /** GPU cost per dispatch of single-row plans and per dispatch-row of multi-row ones, as measured. */
+  private readonly pace = { rows1: new SubmitPacer(0.12), rows: new SubmitPacer(0.025) };
+  /** Submits since the current call started (GenerateStats.submits). */
+  private submits = 0;
   /** Token bytes in a prefix tree, built on the first constrained call. */
   private trie: { trie: TokenTrie; tokens: (Uint8Array | undefined)[] } | undefined;
 
@@ -163,6 +175,7 @@ export class Engine {
     }
     this.cached = [];
     const stats: GenerateStats = { promptTokens: promptIds.length, cachedTokens: start, generatedTokens: 0, prefillMs: 0, decodeMs: 0, ttftMs: 0 };
+    this.submits = 0;
     // Ids read back so far (including any past a stop token) and decode steps submitted.
     const readIds: number[] = [];
     let queued = 0;
@@ -179,6 +192,7 @@ export class Engine {
       } else this.model.setAllowed(undefined);
       let pos = start;
       let out = this.plan(1).out;
+      let prefillUnits = 0;
       while (pos < promptIds.length) {
         const remaining = promptIds.length - pos;
         const T = BUCKETS.find((b) => b >= remaining) ?? BUCKETS[BUCKETS.length - 1]!;
@@ -188,14 +202,14 @@ export class Engine {
         tokens.set(promptIds.slice(pos, pos + n));
         this.backend.write(plan.tokens, 0, tokens);
         this.model.setStep({ pos0: pos, lastRow: n - 1, seed, temperature, ...sampling });
-        this.backend.submit(plan.dispatches);
+        prefillUnits += this.submit(plan.dispatches, T);
         pos += n;
         out = plan.out;
       }
 
       if (draftTokens > 0) {
         spoken = [...promptIds];
-        yield* this.decodeSpeculative(out, spoken, { draftTokens, maxTokens, stop, signal: opts.signal, seed, temperature, sampling, stats, t0, grammar });
+        yield* this.decodeSpeculative(out, spoken, { draftTokens, maxTokens, stop, signal: opts.signal, seed, temperature, sampling, stats, t0, grammar, prefillUnits });
         return;
       }
 
@@ -203,24 +217,37 @@ export class Engine {
       // A grammar needs each sampled id on the CPU before the next mask exists.
       const K = grammar ? 1 : Math.max(1, Math.floor(opts.stepsPerSubmit ?? 4));
       const reads: Promise<ArrayBuffer>[] = [];
+      /** Single-row dispatches behind each read, for timing (0: not decode steps). */
+      const readUnits: number[] = [];
       const submitBatch = () => {
         // The first batch only records the id sampled by prefill; later ones run k decode steps.
         const k = queued === 0 ? 1 : Math.min(K, maxTokens - queued);
-        this.backend.submit(queued === 0 ? this.advance(out, decode.tokens) : this.chain(k));
+        if (queued === 0) {
+          this.submit(this.advance(out, decode.tokens));
+          readUnits.push(0);
+        } else readUnits.push(this.submit(this.chain(k)));
         reads.push(this.backend.readback(this.model.history, queued * 4, k * 4));
         queued += k;
       };
       submitBatch();
       if (!grammar && queued < maxTokens) submitBatch();
       let tDecode = 0;
+      let tRead = 0;
       let done = false;
       while (!done && reads.length > 0) {
         const ids = new Uint32Array(await reads.shift()!);
+        const units = readUnits.shift() ?? 0;
+        const now = performance.now();
         readIds.push(...ids);
         if (!tDecode) {
-          stats.ttftMs = stats.prefillMs = performance.now() - t0;
-          tDecode = performance.now();
+          stats.ttftMs = stats.prefillMs = now - t0;
+          tDecode = now;
+          this.pace.rows.observe(stats.prefillMs, prefillUnits);
+        } else if (units) {
+          // With the next batch already queued, the gap between reads is this batch's GPU time.
+          this.pace.rows1.observe(now - tRead, units);
         }
+        tRead = now;
         if (grammar) {
           const id = ids[0]!;
           if (!stop.has(id)) {
@@ -230,11 +257,12 @@ export class Engine {
             else if (queued < maxTokens) {
               // The forward pass only needs the id just sampled, so the GPU runs it while the CPU
               // computes the mask; the mask write is queued before the sampling dispatch that reads it.
-              this.backend.submit(decode.dispatches.slice(0, -1));
+              this.submit(decode.dispatches.slice(0, -1));
               const t = performance.now();
               this.model.setAllowed(grammar.mask());
               stats.maskMs! += performance.now() - t;
-              this.backend.submit(this.grammarTail());
+              this.submit(this.grammarTail());
+              readUnits.push(0);
               reads.push(this.backend.readback(this.model.history, queued * 4, 4));
               queued++;
             }
@@ -262,6 +290,7 @@ export class Engine {
       // including steps still in flight, which run before anything submitted later. This also holds
       // when the consumer stops iterating early.
       if (!failed) this.cached = spoken ? spoken.slice(0, -1) : [...promptIds, ...readIds.slice(0, Math.max(0, queued - 1))];
+      stats.submits = this.submits;
       this.lastStats = stats;
       this.busy = false;
     }
@@ -296,6 +325,7 @@ export class Engine {
       stats: GenerateStats;
       t0: number;
       grammar: GrammarMatcher | undefined;
+      prefillUnits: number;
     },
   ): AsyncGenerator<number> {
     const { stats, grammar } = o;
@@ -311,6 +341,7 @@ export class Engine {
       if (tDecode) return false;
       stats.ttftMs = stats.prefillMs = now - o.t0;
       tDecode = now;
+      this.pace.rows.observe(stats.prefillMs, o.prefillUnits);
       return true;
     };
     /** CPU time for masks goes to stats.maskMs. */
@@ -355,7 +386,7 @@ export class Engine {
           this.backend.write(plan.tokens, 0, Uint32Array.from([spoken[pos]!, ...draft]));
           this.model.setStep({ pos0: pos, ...step });
           // The forward pass runs while the CPU computes the row masks; sampling is submitted after.
-          this.backend.submit(plan.dispatches.slice(0, -1));
+          const units = this.submit(plan.dispatches.slice(0, -1), plan.T);
           const masks: (Uint32Array | undefined)[] = [];
           if (grammar) {
             const at = grammar.save();
@@ -366,12 +397,13 @@ export class Engine {
             grammar.restore(at);
           } else masks.length = 1 + draft.length;
           this.model.setAllowedRows(masks);
-          this.backend.submit(plan.dispatches.slice(-1));
+          this.submit(plan.dispatches.slice(-1), plan.T);
           const sampled = new Uint32Array(await this.backend.readback(plan.out, 0, (1 + draft.length) * 4));
           firstRead(performance.now());
           const n = acceptedLength(draft, sampled);
           emit = Array.from(sampled.subarray(0, n + 1));
           gate.verified(performance.now() - t, draft.length, n);
+          if (!grammar) this.pace.rows.observe(performance.now() - t, units);
           spec.passes++;
           spec.drafted += draft.length;
           spec.accepted += n;
@@ -381,14 +413,14 @@ export class Engine {
           // One constrained step: forward, mask while it runs, then sampling and advance.
           const t = performance.now();
           if (fromPrefill) {
-            this.backend.submit(this.advance(first, decode.tokens));
+            this.submit(this.advance(first, decode.tokens));
             fromPrefill = false;
           } else {
             this.backend.write(decode.tokens, 0, Uint32Array.of(spoken[pos]!));
             this.model.setStep({ pos0: pos, n: 0, ...step });
-            this.backend.submit(decode.dispatches.slice(0, -1));
+            this.submit(decode.dispatches.slice(0, -1));
             this.model.setAllowed(mask());
-            this.backend.submit(this.grammarTail());
+            this.submit(this.grammarTail());
           }
           emit = Array.from(new Uint32Array(await this.backend.readback(this.model.history, 0, 4)));
           const now = performance.now();
@@ -399,11 +431,11 @@ export class Engine {
         // The first run starts from prefill's step state and only records the id it sampled.
         const budget = Math.min(maxSeq - pos, o.maxTokens - stats.generatedTokens);
         if (budget <= 0) return;
-        const reads: { ids: Promise<ArrayBuffer>; k: number }[] = [];
+        const reads: { ids: Promise<ArrayBuffer>; k: number; units: number }[] = [];
         let queued = 0;
         if (fromPrefill) {
-          this.backend.submit(this.advance(first, decode.tokens));
-          reads.push({ ids: this.backend.readback(this.model.history, 0, 4), k: 1 });
+          this.submit(this.advance(first, decode.tokens));
+          reads.push({ ids: this.backend.readback(this.model.history, 0, 4), k: 1, units: 0 });
           queued = 1;
           fromPrefill = false;
         } else {
@@ -413,8 +445,8 @@ export class Engine {
         const submit = () => {
           const k = Math.min(4, budget - queued);
           if (k <= 0) return;
-          this.backend.submit(this.chain(k));
-          reads.push({ ids: this.backend.readback(this.model.history, queued * 4, k * 4), k });
+          const units = this.submit(this.chain(k));
+          reads.push({ ids: this.backend.readback(this.model.history, queued * 4, k * 4), k, units });
           queued += k;
         };
         // Two submits in flight, as in plain decoding; the first run's prefill read is one of them.
@@ -432,7 +464,10 @@ export class Engine {
           if (draining) continue;
           const d = draftFor();
           const worth = d.length > 0 && gate.worth(d.length);
-          if (!isFirst) gate.plain(now - t, r.k, d.length > 0 && !worth);
+          if (!isFirst) {
+            gate.plain(now - t, r.k, d.length > 0 && !worth);
+            this.pace.rows1.observe(now - t, r.units);
+          }
           t = now;
           if (worth) draining = true;
           else submit();
@@ -441,6 +476,21 @@ export class Engine {
     } finally {
       stats.decodeMs = tDecode ? performance.now() - tDecode : 0;
     }
+  }
+
+  /**
+   * Submits dispatches, cut into several submits when their estimated GPU time exceeds
+   * `maxSubmitMs`. A plan of T > 1 rows costs as if it had at least 8 (the matmul row tile). Returns
+   * the work's cost units, for `SubmitPacer.observe`.
+   */
+  private submit(dispatches: readonly Dispatch[], rows = 1): number {
+    const pacer = rows > 1 ? this.pace.rows : this.pace.rows1;
+    const units = dispatches.length * (rows > 1 ? Math.max(rows, 8) : 1);
+    for (const part of SubmitPacer.split(dispatches, pacer.pieces(units, dispatches.length, this.maxSubmitMs))) {
+      this.backend.submit(part);
+      this.submits++;
+    }
+    return units;
   }
 
   private verifyPlan(T: number): ForwardPlan {

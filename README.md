@@ -42,6 +42,12 @@ Key ideas:
   the sampled id back as the next input, appends it to a history buffer, marks it for the repetition
   penalty and moves the position forward. So `stepsPerSubmit` decode steps (default 4) go out in one
   submit and come back in one 16-byte readback, with two batches in flight.
+- **No submit hogs the GPU.** The GPU only switches to other work, such as drawing the screen, between
+  command buffers, and on a slow integrated GPU one 128-token prefill chunk can take most of a second;
+  that froze the display on the development Mac and once tripped macOS's GPU hang watchdog. So the
+  engine cuts work into submits of at most `maxSubmitMs` (default 50) of estimated GPU time, from costs
+  it measures as it runs and a slow-GPU guess before that. On SmolLM2-135M this made 36–39 submits per
+  call instead of 12, with the same decode speed and time to first token.
 - **Few, fat dispatches.** At load, q/k/v and gate/up weights are stacked into one matrix each. A decode
   layer is 7 dispatches: RMSNorm fused into the QKV matmul, RoPE fused with the KV-cache write, split-K
   attention + combine, o-proj with the residual add fused in, RMSNorm + gate/up + SiLU in one matmul, and
