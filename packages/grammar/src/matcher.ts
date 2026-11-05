@@ -13,7 +13,8 @@ export type Node =
   | { kind: "number"; integer: boolean }
   | { kind: "object"; props: readonly Prop[]; additional: Node | undefined; ws?: Whitespace }
   | { kind: "array"; items: Node; minItems: number; maxItems: number; ws?: Whitespace }
-  | { kind: "alt"; nodes: readonly Node[] };
+  | { kind: "alt"; nodes: readonly Node[] }
+  | { kind: "seq"; nodes: readonly Node[] };
 
 /** Whitespace allowed between the tokens of an object or array. */
 export interface Whitespace {
@@ -358,6 +359,24 @@ class Alt implements Frame {
   }
 }
 
+/** Grammars one after another, expanded without consuming anything. */
+class Seq implements Frame {
+  readonly key: string;
+  constructor(
+    readonly node: Extract<Node, { kind: "seq" }>,
+    id: string,
+  ) {
+    this.key = `q${id}`;
+  }
+  step(): Frame[][] {
+    return NONE;
+  }
+  eps(): Frame[][] {
+    // Replacements are bottom first: the last part lies deepest.
+    return [this.node.nodes.map(start).reverse()];
+  }
+}
+
 /** Distinct ids for grammar nodes, so frame keys tell positions in different nodes apart. */
 const ids = new WeakMap<object, string>();
 let nextId = 0;
@@ -382,5 +401,7 @@ export function start(node: Node): Frame {
       return new Arr(node, idOf(node));
     case "alt":
       return new Alt(node, idOf(node));
+    case "seq":
+      return new Seq(node, idOf(node));
   }
 }

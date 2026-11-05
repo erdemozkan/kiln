@@ -40,6 +40,13 @@ export interface GenerateOptions {
   /** Documents to ground the answer in (`chat` only), for templates that read `documents`. */
   documents?: ChatDocument[];
   /**
+   * "auto" (default): the model decides whether to call a tool, unconstrained. "required", or one
+   * function as `{ type: "function", function: { name } }`: the reply is exactly one call to one of
+   * `tools` (or that one), with arguments that follow its `parameters` schema (see the `tool_call`
+   * response format). Needs a template in the `<tool_call>` format; not combined with `format`.
+   */
+  toolChoice?: "auto" | "required" | { type: "function"; function: { name: string } };
+  /**
    * Constrain the output: `{ type: "json" }` for any JSON value, `{ type: "json", schema }` for a JSON
    * Schema (properties in declared order), `{ type: "choice", choices }` for one of a set of strings.
    * Each step then waits for the CPU to compute the next token mask, so steps are not chained.
@@ -142,7 +149,19 @@ export class Engine {
       tools: opts.tools,
       documents: opts.documents,
     });
-    yield* this.complete(prompt, opts);
+    yield* this.complete(prompt, this.forceToolCall(opts));
+  }
+
+  /** `opts` with `toolChoice` turned into a `tool_call` format. */
+  private forceToolCall(opts: GenerateOptions): GenerateOptions {
+    const choice = opts.toolChoice ?? "auto";
+    if (choice === "auto") return opts;
+    if (!opts.tools?.length) throw new Error("toolChoice needs tools");
+    if (opts.format) throw new Error("toolChoice and format cannot be combined");
+    if (!this.chatFormat?.toolCallTags) throw new Error("toolChoice needs a chat template that writes calls as <tool_call>{…}</tool_call>");
+    const tools = choice === "required" ? opts.tools : opts.tools.filter((t) => t.function.name === choice.function.name);
+    if (!tools.length) throw new Error(`toolChoice names ${JSON.stringify((choice as { function: { name: string } }).function.name)}, which is not among the tools`);
+    return { ...opts, format: { type: "tool_call", tools: tools.map((t) => ({ name: t.function.name, parameters: t.function.parameters })) } };
   }
 
   async *complete(prompt: string, opts: GenerateOptions = {}): AsyncGenerator<TextDelta> {

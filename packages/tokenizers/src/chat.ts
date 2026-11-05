@@ -45,6 +45,8 @@ export interface ChatFormat {
   render(messages: readonly ChatMessage[], opts?: RenderOptions): string;
   /** Token strings that end an assistant turn. */
   readonly stop: readonly string[];
+  /** True when the template asks for tool calls as `<tool_call>{…}</tool_call>` (what `parseToolCalls` reads). */
+  readonly toolCallTags?: boolean;
 }
 
 /** The built-in formats know no tool or document syntax; quietly dropping them would mislead the model. */
@@ -98,6 +100,7 @@ export function templateFormat(t: ChatTemplate): ChatFormat {
   return {
     name: "chat_template",
     stop,
+    toolCallTags: readsTools && t.source.includes("<tool_call>"),
     render(messages, opts = {}) {
       if (opts.tools?.length && !readsTools) throw new Error("this model's chat template has no tool support (it never reads `tools`)");
       if (opts.documents?.length && !readsDocuments) throw new Error("this model's chat template has no document support (it never reads `documents`)");

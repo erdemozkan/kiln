@@ -230,7 +230,11 @@ Supported:
   Qwen2.5/3, Mistral v0.3 and Granite 3.3 render byte-for-byte like jinja2. `parseToolCalls` reads
   the `<tool_call>{…}</tool_call>` replies of Qwen and SmolLM3; on Qwen2.5-0.5B a call, its result
   and the final answer made a full round trip. Templates that never read `tools` (SmolLM2) and the
-  built-in formats refuse tools rather than drop them.
+  built-in formats refuse tools rather than drop them. `toolChoice: "required"` (or one function by
+  name) constrains the reply to exactly one `<tool_call>` whose name is a listed tool and whose
+  arguments follow its `parameters` schema: where Qwen2.5-0.5B answered "What's the weather in
+  Paris?" with a question, it then called `get_weather` with `{"city": "Paris"}` (24 tokens, greedy
+  or sampled).
 - Generation: temperature, top-k, top-p and HF-style repetition penalty, all on the GPU; prefix KV
   reuse; f16 or f32 KV cache; speculative decoding by prompt lookup. With drafts, 10 of 10 test
   prompts (greedy and sampled) gave the same text as plain decoding. The verify pass uses the 8-row
@@ -256,7 +260,7 @@ Known limits, roughly in roadmap order:
 - The KV cache is contiguous: one sequence, no paging, and one reusable prefix (the last prompt).
 - Constrained decoding waits for the CPU's mask between forward passes (drafts let one pass check
   several tokens). No regex or GBNF grammars, and `minimum`/`maximum`/`format` are not enforced.
-  Tool calls are not constrained to the tool schemas.
+  `toolChoice` forces one call; under "auto" calls are not checked against the tool schemas.
 - K-quants are re-quantized to q4 on load (a second rounding) instead of being run natively.
 - Unigram tokenizers (T5, XLM-R, some SentencePiece models) are not supported. Tool calls in formats whose
   markers are special tokens (Mistral's `[TOOL_CALLS]`, Granite's `<|tool_call|>`) are dropped when

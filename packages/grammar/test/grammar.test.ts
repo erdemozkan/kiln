@@ -103,6 +103,40 @@ describe("JSON grammar", () => {
   });
 });
 
+describe("tool call grammar", () => {
+  const weather = { name: "get_weather", parameters: { type: "object", properties: { city: { type: "string" }, unit: { enum: ["celsius", "fahrenheit"] } }, required: ["city"] } } as const;
+  const time = { name: "get_time" };
+  const f: ResponseFormat = { type: "tool_call", tools: [weather as never, time] };
+
+  it("accepts one call to a listed tool with schema-valid arguments", () => {
+    for (const t of [
+      '<tool_call>\n{"name": "get_weather", "arguments": {"city": "Paris"}}\n</tool_call>',
+      '<tool_call>\n{"name":"get_weather","arguments":{"city":"Rome","unit":"celsius"}}\n</tool_call>',
+      '<tool_call>\n{"name": "get_time", "arguments": {"anything": [1]}}\n</tool_call>',
+    ]) {
+      expect(full(f, t), t).toBe(true);
+    }
+  });
+
+  it("rejects other names, bad arguments, and anything around the call", () => {
+    for (const t of [
+      '<tool_call>\n{"name": "get_wether", "arguments": {"city": "Paris"}}\n</tool_call>',
+      '<tool_call>\n{"name": "get_weather", "arguments": {}}\n</tool_call>',
+      '<tool_call>\n{"name": "get_weather", "arguments": {"city": "Paris", "unit": "kelvin"}}\n</tool_call>',
+      '<tool_call>\n{"name": "get_weather", "arguments": {"city": 3}}\n</tool_call>',
+      '<tool_call>\n{"arguments": {"city": "Paris"}, "name": "get_weather"}\n</tool_call>',
+      'Sure! <tool_call>\n{"name": "get_time", "arguments": {}}\n</tool_call>',
+      '<tool_call>\n{"name": "get_time", "arguments": {}}\n</tool_call> done',
+    ]) {
+      expect(match(f, t).full, t).toBe(false);
+    }
+    expect(match(f, '<tool_call>\n{"name": "get_').prefix).toBe(true);
+    expect(match(f, '<tool_call>\n{"name": "get_t').prefix).toBe(true);
+    expect(match(f, '<tool_call>\n{"name": "set_').prefix).toBe(false);
+    expect(() => compileFormat({ type: "tool_call", tools: [] })).toThrow(/at least one tool/);
+  });
+});
+
 describe("token masks", () => {
   // Single bytes plus some multi-byte tokens, a stop token (no bytes) and a padded vocabulary.
   const vocab = [...Array.from({ length: 256 }, (_, b) => String.fromCharCode(b)), '{"', '":', "name", 'name":', ' "', '",', "}", "true", "tr", "Ann", '"}'];

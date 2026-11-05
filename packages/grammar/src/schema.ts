@@ -35,7 +35,13 @@ export type ResponseFormat =
    */
   | { type: "json"; schema?: JsonSchema; whitespace?: "pretty" | "compact" }
   /** Exactly one of these strings. */
-  | { type: "choice"; choices: string[] };
+  | { type: "choice"; choices: string[] }
+  /**
+   * One call to one of these functions, as `<tool_call>\n{"name": …, "arguments": …}\n</tool_call>`
+   * (the format of Qwen, SmolLM3 and Hermes-style templates), with the arguments following the
+   * function's `parameters` schema. Whitespace inside the JSON is compact.
+   */
+  | { type: "tool_call"; tools: { name: string; parameters?: JsonSchema }[] };
 
 const utf8 = new TextEncoder();
 const lit = (s: string): Node => ({ kind: "lit", bytes: utf8.encode(s) });
@@ -136,5 +142,22 @@ export function compileFormat(f: ResponseFormat): Node {
     if (!f.choices.length) throw new Error("choice format needs at least one choice");
     return { kind: "alt", nodes: f.choices.map(lit) };
   }
+  if (f.type === "tool_call") return toolCallGrammar(f.tools);
   throw new Error(`unknown response format ${JSON.stringify(f)}`);
+}
+
+/** See the `tool_call` response format. */
+export function toolCallGrammar(tools: readonly { name: string; parameters?: JsonSchema }[]): Node {
+  if (!tools.length) throw new Error("tool_call format needs at least one tool");
+  const call = compileSchema(
+    {
+      anyOf: tools.map((t) => ({
+        type: "object",
+        properties: { name: { const: t.name }, arguments: t.parameters ?? { type: "object" } },
+        required: ["name", "arguments"],
+      })),
+    },
+    COMPACT,
+  );
+  return { kind: "seq", nodes: [lit("<tool_call>\n"), call, lit("\n</tool_call>")] };
 }
