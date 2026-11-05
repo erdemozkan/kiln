@@ -1,4 +1,4 @@
-import { f32, lastDim, numel, u32, type Buf, type Ctx, type Grid, type Tensor } from "@kiln/core";
+import { f32, isBlockQuant, lastDim, numel, u32, type Buf, type Ctx, type Grid, type Tensor, type WeightDType } from "@kiln/core";
 import {
   ATTN_CHUNK,
   ATTN_WG,
@@ -35,11 +35,16 @@ export function grid1d(threads: number): Grid {
 }
 
 function weightBufs(w: Tensor): Buf[] {
-  if (w.dtype === "q4") {
-    if (!w.scales) throw new Error("q4 tensor is missing its scales plane");
+  if (isBlockQuant(w.dtype)) {
+    if (!w.scales) throw new Error(`${w.dtype} tensor is missing its scales plane`);
     return [w.buf, w.scales];
   }
   return [w.buf];
+}
+
+function weightDType(w: Tensor): WeightDType {
+  if (w.dtype === "u32") throw new Error("a u32 tensor cannot be used as weights");
+  return w.dtype;
 }
 
 function rowsOf(x: Tensor): number {
@@ -78,7 +83,7 @@ export function setSubgroups(on: boolean): void {
 
 /** Tuned lanes per row, keyed by `${wdtype}/mt${mt}/${N}x${K}`; filled by the autotuner. */
 const tunedLanes = new Map<string, MatmulLanes>();
-export const lanesKey = (wdtype: "f32" | "q4", mt: 1 | 8, N: number, K: number): string => `${wdtype}/mt${mt}/${N}x${K}`;
+export const lanesKey = (wdtype: WeightDType, mt: 1 | 8, N: number, K: number): string => `${wdtype}/mt${mt}/${N}x${K}`;
 export function setMatmulLanes(key: string, lanes: MatmulLanes): void {
   tunedLanes.set(key, lanes);
 }
@@ -108,7 +113,7 @@ export function linear(ctx: Ctx, x: Tensor, w: Tensor, opts: LinearOptions | Ten
     return linear(ctx, xn, w, { ...o, norm: undefined });
   }
   const y = o.residual ?? ctx.alloc([M, outN]);
-  const wdtype = w.dtype === "q4" ? "q4" : "f32";
+  const wdtype = weightDType(w);
   const epi: MatmulEpilogue = o.gelu ? "gelu" : o.silu ? "silu" : o.residual ? "add" : "store";
   const lanes = o.lanes ?? tunedLanes.get(lanesKey(wdtype, mt, N, K)) ?? 8;
   const f16 = o.f16 ?? f16Default;
@@ -225,7 +230,7 @@ export function addInPlace(ctx: Ctx, a: Tensor, b: Tensor): void {
 export function embed(ctx: Ctx, table: Tensor, tokens: Buf, T: number, scale = 1): Tensor {
   const D = lastDim(table);
   const o = ctx.alloc([T, D]);
-  const spec = embedSpec(table.dtype === "q4" ? "q4" : "f32");
+  const spec = embedSpec(weightDType(table));
   ctx.run(spec, [ctx.uniform([u32(T), u32(D), f32(scale), u32(0)]), tokens, ...weightBufs(table), o.buf], grid1d(T * D));
   return o;
 }

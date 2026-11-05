@@ -241,3 +241,47 @@ export function dequantQ4(p: Q4Planes): Float32Array {
   for (let e = 0; e < out.length; e++) out[e] = (((p.nibbles[e >> 3]! >>> ((e & 7) * 4)) & 15) - 8) * p.scales[e >> 5]!;
   return out;
 }
+
+/** Kiln's GPU q8 layout: 4 sequential int8 per u32 (little-endian bytes) and one f32 scale per 32 values. */
+export interface Q8Planes {
+  bytes: Uint32Array;
+  scales: Float32Array;
+}
+
+/** Same rounding as llama.cpp Q8_0: d = amax / 127, q = round(x / d). */
+export function quantizeQ8(x: Float32Array): Q8Planes {
+  if (x.length % 32 !== 0) throw new Error(`quantizeQ8: length ${x.length} is not a multiple of 32`);
+  const bytes = new Uint32Array(x.length / 4);
+  const q = new Int8Array(bytes.buffer);
+  const scales = new Float32Array(x.length / 32);
+  for (let b = 0; b < scales.length; b++) {
+    let amax = 0;
+    for (let j = 0; j < 32; j++) amax = Math.max(amax, Math.abs(x[b * 32 + j]!));
+    const d = amax / 127;
+    const id = d ? 1 / d : 0;
+    scales[b] = d;
+    for (let j = 0; j < 32; j++) q[b * 32 + j] = Math.round(x[b * 32 + j]! * id);
+  }
+  return { bytes, scales };
+}
+
+/** GGUF Q8_0 blocks (f16 scale, 32 int8) into Kiln planes; exact. */
+export function repackQ8_0(src: Uint8Array, n: number): Q8Planes {
+  const bytes = new Uint32Array(n / 4);
+  const q = new Uint8Array(bytes.buffer);
+  const scales = new Float32Array(n / 32);
+  const dv = new DataView(src.buffer, src.byteOffset, src.byteLength);
+  for (let b = 0; b < n / 32; b++) {
+    const o = b * 34;
+    scales[b] = f16Table[dv.getUint16(o, true)]!;
+    q.set(src.subarray(o + 2, o + 34), b * 32);
+  }
+  return { bytes, scales };
+}
+
+export function dequantQ8(p: Q8Planes): Float32Array {
+  const q = new Int8Array(p.bytes.buffer, p.bytes.byteOffset, p.bytes.byteLength);
+  const out = new Float32Array(q.length);
+  for (let e = 0; e < out.length; e++) out[e] = q[e]! * p.scales[e >> 5]!;
+  return out;
+}

@@ -4,13 +4,17 @@ import {
   UnsupportedTensorError,
   bf16ToF32,
   dequantQ4,
+  dequantQ8,
+  dequantQ8_0,
   f16ToF32,
   parseGGUF,
   parseModelId,
   quantizeQ4,
+  quantizeQ8,
   readGGUFHeader,
   readSafetensorsHeader,
   repackQ4_0,
+  repackQ8_0,
 } from "../src";
 
 function safetensors(header: object, data: Uint8Array): Uint8Array {
@@ -109,6 +113,30 @@ describe("conversion", () => {
     const y = dequantQ4(repackQ4_0(block, 32));
     expect([...y.subarray(0, 16)]).toEqual(Array.from({ length: 16 }, (_, j) => j - 8));
     expect([...y.subarray(16)]).toEqual(Array.from({ length: 16 }, (_, j) => 7 - j));
+  });
+
+  it("q8 round-trips within half a step, with 4 int8 per word in element order", () => {
+    const x = Float32Array.from({ length: 128 }, (_, i) => Math.sin(i * 0.7) * (1 + (i % 32) / 8));
+    const p = quantizeQ8(x);
+    const y = dequantQ8(p);
+    for (let i = 0; i < x.length; i++) expect(Math.abs(x[i]! - y[i]!)).toBeLessThanOrEqual(p.scales[i >> 5]! / 2 + 1e-6);
+    // The block's largest magnitude maps to ±127; the low byte of word 0 is element 0.
+    const one = quantizeQ8(Float32Array.from({ length: 32 }, (_, j) => (j === 0 ? -2 : j === 1 ? 1 : 0)));
+    expect(one.scales[0]).toBeCloseTo(2 / 127, 7);
+    expect(one.bytes[0]! & 0xff).toBe(0x81); // -127
+    expect((one.bytes[0]! >> 8) & 0xff).toBe(64); // round(63.5)
+  });
+
+  it("repacks GGUF Q8_0 blocks exactly", () => {
+    const blocks = new Uint8Array(68);
+    const dv = new DataView(blocks.buffer);
+    dv.setUint16(0, 0x3800, true); // 0.5
+    dv.setUint16(34, 0x4000, true); // 2.0
+    for (let j = 0; j < 32; j++) {
+      dv.setInt8(2 + j, j - 16);
+      dv.setInt8(36 + j, 127 - j * 8);
+    }
+    expect([...dequantQ8(repackQ8_0(blocks, 64))]).toEqual([...dequantQ8_0(blocks, 64)]);
   });
 });
 

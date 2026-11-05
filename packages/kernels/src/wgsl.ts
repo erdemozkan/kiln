@@ -1,4 +1,4 @@
-import { STEP_WGSL, type BindingKind, type KernelSpec } from "@kiln/core";
+import { STEP_WGSL, type BindingKind, type KernelSpec, type WeightDType } from "@kiln/core";
 
 /**
  * Baseline WGSL kernels. They favour clarity over speed: correct first, then specialised
@@ -60,7 +60,7 @@ const GELU_WGSL = (x: string) => `(0.5 * ${x} * (1.0 + tanh(clamp(0.7978845608 *
 const actWgsl = (epi: "silu" | "gelu", x: string) => (epi === "gelu" ? GELU_WGSL(x) : `(${x} / (1.0 + exp(-${x})))`);
 
 export interface MatmulVariant {
-  wdtype: "f32" | "q4";
+  wdtype: WeightDType;
   /** Tokens per workgroup: 1 for decode, 8 for prefill. */
   mt: 1 | 8;
   lanes: MatmulLanes;
@@ -93,11 +93,13 @@ export const matmulRowsPerGroup = (v: Pick<MatmulVariant, "lanes" | "epi">): num
  * tile of x is staged in workgroup memory once and shared by all rows. Within a 32-element block lane l
  * handles vec4 slot l % 8, and lanes l / 8 = 0, 1, … take every (lanes / 8)-th block, so consecutive lanes
  * read consecutive vec4s of the tile (no bank conflicts) and consecutive bytes of the weights (coalesced).
- * For q4 a block is one scale plus 4 u32 of nibbles; slot s decodes half (s % 2) of word s / 2.
+ * For q4 a block is one scale plus 4 u32 of nibbles; slot s decodes half (s % 2) of word s / 2. For q8 a
+ * block is one scale plus 8 u32 of int8s, and slot s decodes word s.
  * More lanes per row means more workgroups for small N, which matters on GPUs with many cores.
  */
 export function matmulSpec(v: MatmulVariant): KernelSpec {
   const q4 = v.wdtype === "q4";
+  const quant = v.wdtype !== "f32";
   const kc4 = MM_KC / 4;
   const mt = v.mt;
   const rows = 256 / v.lanes;
@@ -106,7 +108,7 @@ export function matmulSpec(v: MatmulVariant): KernelSpec {
   const sg = !!v.sg;
   const key = `matmul/${v.wdtype}/mt${mt}/l${v.lanes}${v.norm ? "/norm" : ""}${v.bias ? "/bias" : ""}/${v.epi}${h ? "/f16" : ""}${sg ? "/sg" : ""}`;
   const vt = h ? "vec4<f16>" : "vec4<f32>";
-  const bindings: BindingKind[] = q4 ? ["uniform", "read", "read", "read"] : ["uniform", "read", "read"];
+  const bindings: BindingKind[] = quant ? ["uniform", "read", "read", "read"] : ["uniform", "read", "read"];
   let b = bindings.length;
   const decl: string[] = [];
   if (v.norm) {
@@ -138,7 +140,7 @@ ${sg ? "enable subgroups;" : ""}
 struct P { M: u32, N: u32, K: u32, eps: f32 }
 @group(0) @binding(0) var<uniform> p: P;
 @group(0) @binding(1) var<storage, read> x: array<vec4<f32>>;
-${q4
+${quant
   ? `@group(0) @binding(2) var<storage, read> wq: array<u32>;
 @group(0) @binding(3) var<storage, read> ws: array<f32>;`
   : `@group(0) @binding(2) var<storage, read> w: array<vec4<f32>>;`}
@@ -226,6 +228,9 @@ ${v.norm && sg
 ${q4
   ? `        let word = wq[(b0 + bi) * 4u + slot / 2u] >> shift;
         let wv = (${vt}(vec4<u32>(word, word >> 4u, word >> 8u, word >> 12u) & vec4<u32>(15u)) - ${h ? "8.0h" : "8.0"}) * ${h ? `f16(ws[b0 + bi])` : `ws[b0 + bi]`};`
+  : quant
+  ? `        let word = wq[(b0 + bi) * 8u + slot];
+        let wv = ${vt}(bitcast<vec4<i32>>(vec4<u32>(word << 24u, word << 16u, word << 8u, word)) >> vec4<u32>(24u)) * ${h ? `f16(ws[b0 + bi])` : `ws[b0 + bi]`};`
   : `        let wv = ${h ? `vec4<f16>(w[(b0 + bi) * 8u + slot])` : `w[(b0 + bi) * 8u + slot]`};`}
         for (var t = 0u; t < MT; t++) { acc[t] += ${h ? "f32(" : ""}dot(xt[t * KC4 + bi * 8u + slot], wv)${h ? ")" : ""}; }
       }
@@ -797,13 +802,13 @@ fn main(${EW_ARGS}) {
 }
 
 /** Gathers embedding rows for token ids. */
-export function embedSpec(wdtype: "f32" | "q4"): KernelSpec {
-  const q4 = wdtype === "q4";
-  return spec(`embed/${wdtype}`, q4 ? ["uniform", "read", "read", "read", "rw"] : ["uniform", "read", "read", "rw"], () => /* wgsl */ `
+export function embedSpec(wdtype: WeightDType): KernelSpec {
+  const quant = wdtype !== "f32";
+  return spec(`embed/${wdtype}`, quant ? ["uniform", "read", "read", "read", "rw"] : ["uniform", "read", "read", "rw"], () => /* wgsl */ `
 struct P { T: u32, D: u32, scale: f32, _b: u32 }
 @group(0) @binding(0) var<uniform> p: P;
 @group(0) @binding(1) var<storage, read> tokens: array<u32>;
-${q4
+${quant
   ? `@group(0) @binding(2) var<storage, read> wq: array<u32>;
 @group(0) @binding(3) var<storage, read> ws: array<f32>;
 @group(0) @binding(4) var<storage, read_write> o: array<f32>;`
@@ -815,8 +820,11 @@ fn main(${EW_ARGS}) {
   ${FLAT}
   if (idx >= p.T * p.D) { return; }
   let e = tokens[idx / p.D] * p.D + idx % p.D;
-${q4
+${wdtype === "q4"
   ? `  let q = f32((wq[e / 8u] >> (4u * (e % 8u))) & 15u) - 8.0;
+  o[idx] = q * ws[e / 32u] * p.scale;`
+  : quant
+  ? `  let q = f32(bitcast<i32>(wq[e / 4u] << (24u - 8u * (e % 4u))) >> 24u);
   o[idx] = q * ws[e / 32u] * p.scale;`
   : `  o[idx] = w[e] * p.scale;`}
 }`);

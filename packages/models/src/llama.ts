@@ -1,4 +1,4 @@
-import { ActivationPool, Ctx, byteSize, packStep, q4ScaleBytes, view, type Backend, type Buf, type Dispatch, type StepParams, type Tensor } from "@kiln/core";
+import { ActivationPool, Ctx, byteSize, isBlockQuant, packStep, q4ScaleBytes, view, type Backend, type Buf, type Dispatch, type StepParams, type Tensor } from "@kiln/core";
 import { ops, type KvDtype } from "@kiln/kernels";
 import { ropeInvFreq, type LlamaConfig } from "./config";
 
@@ -122,7 +122,7 @@ export class LlamaModel {
       return dst;
     };
     const buf = copyPlane((t) => byteSize(t.shape, dtype), (t) => t.buf, name);
-    const scales = dtype === "q4" ? copyPlane((t) => q4ScaleBytes(t.shape), (t) => t.scales!, `${name}/scales`) : undefined;
+    const scales = isBlockQuant(dtype) ? copyPlane((t) => q4ScaleBytes(t.shape), (t) => t.scales!, `${name}/scales`) : undefined;
     for (const [i, t] of ts.entries()) {
       this.backend.free(t.buf);
       if (t.scales) this.backend.free(t.scales);

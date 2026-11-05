@@ -22,7 +22,7 @@ import { llamaMatmulShapes, tuneMatmuls } from "./tune";
 import { loadWeights, type LoadProgress, type Quant, type WeightFile } from "./weights";
 
 export interface LoadOptions {
-  /** Weight storage on the GPU. Default "q4". */
+  /** Weight storage on the GPU: "q4" (default), "q8" or "f32". See `Quant`. */
   quant?: Quant;
   /** KV cache length. Default 2048. */
   maxSeq?: number;
@@ -66,7 +66,7 @@ export async function createEngine(modelId: string, opts: LoadOptions = {}): Pro
     const tuning =
       opts.tune === false
         ? Promise.resolve()
-        : tuneMatmuls(backend, llamaMatmulShapes(cfg, quant === "q4" ? "q4" : "f32")).then(
+        : tuneMatmuls(backend, llamaMatmulShapes(cfg, quant)).then(
             () => undefined,
             (err: unknown) => console.warn("[kiln] matmul tuning failed; using defaults:", err),
           );

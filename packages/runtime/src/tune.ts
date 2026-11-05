@@ -1,4 +1,4 @@
-import { Ctx, type Backend, type Tensor } from "@kiln/core";
+import { Ctx, byteSize, type Backend, type Tensor, type WeightDType } from "@kiln/core";
 import { ops, type MatmulLanes } from "@kiln/kernels";
 import { readCacheJSON, writeCacheJSON } from "@kiln/loader";
 import type { LlamaConfig } from "@kiln/models";
@@ -11,7 +11,7 @@ const LANES: readonly MatmulLanes[] = [8, 16, 32];
 const MAX_SCRATCH = 64 * 2 ** 20;
 
 export interface MatmulShape {
-  wdtype: "f32" | "q4";
+  wdtype: WeightDType;
   mt: 1 | 8;
   N: number;
   K: number;
@@ -20,7 +20,7 @@ export interface MatmulShape {
 }
 
 /** The matmuls a Llama forward pass runs, for decode (mt 1) and prefill (mt 8). */
-export function llamaMatmulShapes(cfg: LlamaConfig, wdtype: "f32" | "q4"): MatmulShape[] {
+export function llamaMatmulShapes(cfg: LlamaConfig, wdtype: WeightDType): MatmulShape[] {
   const { hiddenSize: Hd, intermediateSize: I, numHeads: H, numKvHeads: Hkv, headDim: D } = cfg;
   const out: MatmulShape[] = [];
   for (const mt of [1, 8] as const) {
@@ -52,13 +52,14 @@ export async function tuneMatmuls(be: Backend, shapes: readonly MatmulShape[]): 
 }
 
 async function fastest(be: Backend, s: MatmulShape): Promise<MatmulLanes | undefined> {
-  const wBytes = s.wdtype === "q4" ? (s.N * s.K) / 2 : s.N * s.K * 4;
+  const wBytes = byteSize([s.N, s.K], s.wdtype);
+  const quant = s.wdtype !== "f32";
   if (wBytes > MAX_SCRATCH) return undefined;
   const M = s.mt === 1 ? 1 : 64;
-  const bufs = [be.alloc(M * s.K * 4), be.alloc(wBytes), be.alloc(s.wdtype === "q4" ? (s.N * s.K) / 8 : 4), be.alloc(s.K * 4), be.alloc(32)];
+  const bufs = [be.alloc(M * s.K * 4), be.alloc(wBytes), be.alloc(quant ? (s.N * s.K) / 8 : 4), be.alloc(s.K * 4), be.alloc(32)];
   const [xb, wb, sb, nb, step] = bufs as [typeof bufs[0], typeof bufs[0], typeof bufs[0], typeof bufs[0], typeof bufs[0]];
   const x: Tensor = { shape: [M, s.K], dtype: "f32", buf: xb };
-  const w: Tensor = s.wdtype === "q4" ? { shape: [s.N, s.K], dtype: "q4", buf: wb, scales: sb } : { shape: [s.N, s.K], dtype: "f32", buf: wb };
+  const w: Tensor = quant ? { shape: [s.N, s.K], dtype: s.wdtype, buf: wb, scales: sb } : { shape: [s.N, s.K], dtype: "f32", buf: wb };
   const norm = s.norm ? { w: { shape: [s.K], dtype: "f32" as const, buf: nb }, eps: 1e-5 } : undefined;
   // Enough repeats that the timed work dwarfs submit overhead, scaled down for big shapes.
   const reps = Math.max(4, Math.min(30, Math.round((8 * 2 ** 20) / wBytes)));

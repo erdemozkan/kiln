@@ -31,7 +31,7 @@ const json = llm.chat(messages, { format: { type: "json", schema } }); // or { t
 | `@kiln/kernels` | WGSL kernels, op wrappers, CPU reference implementations |
 | `@kiln/core` | Backend HAL interface, tensors, uniform packing, `Ctx` plan recorder |
 | `@kiln/backend-webgpu` | WebGPU backend: explicit bind group layouts, pipeline cache, staging pool, error reporting |
-| `@kiln/loader` | Byte sources (HTTP range, OPFS cache), safetensors/GGUF parsers, dtype conversion, q4 quantization |
+| `@kiln/loader` | Byte sources (HTTP range, OPFS cache), safetensors/GGUF parsers, dtype conversion, q4 and q8 quantization |
 
 Key ideas:
 
@@ -96,7 +96,7 @@ Key ideas:
   the Intel GPU, with the same reply. The file is keyed by model, revision, weight format and f16
   math, written after the reply goes out, and a half-written file is ignored.
 - **1× memory while loading.** Weights stream row-chunk by row-chunk from the network into GPU buffers,
-  quantized to q4 on the way if requested. Nothing holds the whole model in CPU memory.
+  quantized to q4 or q8 on the way if requested. Nothing holds the whole model in CPU memory.
 - **The download is the cache.** In a worker, `CachedHttpSource` writes the download into OPFS and serves
   reads from it as bytes land. Interrupted downloads resume from the last flushed byte recorded in the
   metadata (not the file size, which can include writes lost when a worker is killed), and a cached
@@ -206,7 +206,7 @@ fixed cost.
 
 ## Status
 
-Verified on this GPU: all kernel checks pass (249, including both prefill attention kernels, fused variants, f16 cache paths,
+Verified on this GPU: all kernel checks pass (320, including q4 and q8 weights in every matmul variant, both prefill attention kernels, fused variants, f16 cache paths,
 sliding-window attention, GELU gating, grammar masks and sampling distributions). SmolLM2-135M-Instruct chats from Hub safetensors (q4, f32) and from a GGUF
 Q4_K_M file.
 
@@ -222,14 +222,15 @@ Models run end to end (greedy answers to fixed questions checked by hand; tool c
 | `qwen2` | DeepSeek-R1-Distill-Qwen-1.5B (reasons, then answers) | GGUF Q4_K_M | 11 tok/s |
 | `qwen3` | Qwen3-0.6B (`toolChoice`) | safetensors | 20–32 tok/s |
 | `gemma3_text` | Gemma 3 1B-it (sliding window: recalls a fact 1,100 tokens back) | safetensors (unsloth mirror) | 12–20 tok/s |
-| `gemma3_text` | Gemma 3 270M-it, with `quant: "f32"` | safetensors | 25–40 tok/s |
+| `gemma3_text` | Gemma 3 270M-it, with `quant: "q8"` or `"f32"` | safetensors | 25–40 tok/s |
 
 Gemma 3 was checked token by token against an independent NumPy forward pass written from
-transformers' `modeling_gemma3`: greedy output matched on every prompt tried, for 1B in q4 and 270M
-in f32. On a 1,138-token prompt, where the fact asked about lies outside the sliding layers' 512-token
+transformers' `modeling_gemma3`: greedy output matched on every prompt tried, for 1B in q4 and q8 and 270M
+in q8 and f32. On a 1,138-token prompt, where the fact asked about lies outside the sliding layers' 512-token
 window, 1B in q4 gave the same answer tokens as the reference (then a newline before ending the turn,
 where the reference ended at once). The 270M model does not survive q4: its first answer token wins by 1.4 logits, q4 flips it,
-and the reply turns to nonsense, so load it with `quant: "f32"`.
+and the reply turns to nonsense, so load it with `quant: "q8"` (same tokens as f32 at a quarter of
+the memory).
 
 `mistral` loads through the same code as `llama` but has not been run (the smallest Mistral is 7B).
 Other architectures are rejected at load: SmolLM3, Granite, Phi-3, Gemma 1/2, multimodal Gemma 3
@@ -239,8 +240,10 @@ Llama 3's. Gemma 3 loads from safetensors only (GGUF `gemma3` is not mapped yet)
 Supported:
 
 - Models and formats: Llama-family decoders; safetensors F32/F16/BF16; GGUF F32/F16/BF16/Q4_0/Q4_1/
-  Q5_0/Q5_1/Q8_0/Q4_K/Q5_K/Q6_K. K-quants and Q5 types are dequantized on load and stored as q4, or as
-  f32 with `quant: "f32"`.
+  Q5_0/Q5_1/Q8_0/Q4_K/Q5_K/Q6_K. Weights are stored on the GPU as `quant: "q4"` (default; 4-bit
+  blocks of 32, an eighth of f32), `"q8"` (8-bit blocks, a quarter, close to f32 in accuracy) or
+  `"f32"`. GGUF Q4_0 stays q4 and Q8_0 is repacked into q8 without rounding (unless q4 is asked for);
+  K-quants and Q5 types are dequantized on load and re-quantized.
 - Text: byte-level BPE (GPT-2, Llama 3, Qwen, SmolLM) and SentencePiece-style BPE with byte
   fallback (Llama 2, TinyLlama, Mistral, Phi-3), from `tokenizer.json` or GGUF (`gpt2` and `llama`
   vocabularies; the latter merge by piece score). On TinyLlama, Mistral v0.3 and Phi-3.5 the
@@ -291,10 +294,10 @@ Known limits, roughly in roadmap order:
 - Constrained decoding waits for the CPU's mask between forward passes (drafts let one pass check
   several tokens). No regex or GBNF grammars, and `minimum`/`maximum`/`format` are not enforced.
   `toolChoice` forces one call; under "auto" calls are not checked against the tool schemas.
-- K-quants are re-quantized to q4 on load (a second rounding) instead of being run natively.
+- K-quants are re-quantized to q4 or q8 on load (a second rounding) instead of being run natively.
 - Unigram tokenizers (T5, XLM-R, some SentencePiece models) are not supported. Tool calls in formats whose
   markers are special tokens (Mistral's `[TOOL_CALLS]`, Granite's `<|tool_call|>`) are dropped when
   decoding, so `parseToolCalls` only reads the `<tool_call>` format.
 - Single storage binding per tensor: very large f32 embeddings can exceed `maxStorageBufferBindingSize`
-  (use q4).
+  (use q4 or q8).
 - WebGPU only; WASM fallback, WebNN and Node/Dawn backends come later.

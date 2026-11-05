@@ -49,7 +49,7 @@ loadBtn.onclick = async () => {
   try {
     await model?.unload();
     model = await load(modelInput.value.trim(), {
-      quant: quant.value as "q4" | "f32",
+      quant: quant.value as "q4" | "q8" | "f32",
       onProgress: (p) => {
         progress.value = p.total ? p.loaded / p.total : 0;
         status.textContent = `${p.file}: ${(p.loaded / 2 ** 20).toFixed(0)} / ${(p.total / 2 ** 20).toFixed(0)} MiB`;

@@ -1,7 +1,7 @@
 import { createWebGPUBackend, type WebGPUBackend } from "@kiln/backend-webgpu";
 import { Ctx, packStep, type Buf, type StepParams, type Tensor } from "@kiln/core";
 import { ops, ref } from "@kiln/kernels";
-import { dequantQ4, f16ToF32, quantizeQ4 } from "@kiln/loader";
+import { dequantQ4, dequantQ8, f16ToF32, quantizeQ4, quantizeQ8 } from "@kiln/loader";
 
 interface Result {
   kernel: string;
@@ -52,6 +52,15 @@ async function main() {
     const t = upload(p.nibbles, shape);
     return { ...t, dtype: "q4", scales: upload(p.scales, [p.scales.length]).buf };
   };
+  const uploadQ8 = (data: Float32Array, shape: number[]): Tensor => {
+    const p = quantizeQ8(data);
+    const t = upload(p.bytes, shape);
+    return { ...t, dtype: "q8", scales: upload(p.scales, [p.scales.length]).buf };
+  };
+  type WD = "f32" | "q4" | "q8";
+  const uploadW = (wd: WD, data: Float32Array, shape: number[]) => (wd === "q4" ? uploadQ4(data, shape) : wd === "q8" ? uploadQ8(data, shape) : upload(data, shape));
+  /** The values the GPU should see for weights stored as `wd`. */
+  const asStored = (wd: WD, data: Float32Array) => (wd === "q4" ? dequantQ4(quantizeQ4(data)) : wd === "q8" ? dequantQ8(quantizeQ8(data)) : data);
   const download = async (buf: Buf, n: number) => new Float32Array(await be.readback(buf, 0, n * 4));
   const run = async (s: StepParams, build: (ctx: Ctx) => void) => {
     be.write(step, 0, packStep(s));
@@ -76,17 +85,19 @@ async function main() {
     let yq!: Tensor;
     await run(S0, (ctx) => (yq = ops.linear(ctx, upload(x, [M, K]), uploadQ4(w, [N, K]))));
     check("matmul/q4", `M${M} N${N} K${K}`, await download(yq.buf, M * N), ref.matmulRef(x, dequantQ4(quantizeQ4(w)), M, N, K), 1e-3 * Math.sqrt(K));
+    await run(S0, (ctx) => (yq = ops.linear(ctx, upload(x, [M, K]), uploadQ8(w, [N, K]))));
+    check("matmul/q8", `M${M} N${N} K${K}`, await download(yq.buf, M * N), ref.matmulRef(x, dequantQ8(quantizeQ8(w)), M, N, K), 1e-3 * Math.sqrt(K));
   }
 
   // Fused matmul variants: every lanes setting, with norm prologue, SiLU gating, residual add and bias.
   for (const lanes of [8, 16, 32] as const) {
     for (const [M, I, K] of [[1, 40, 96], [5, 24, 256], [19, 70, 576]] as const) {
-      for (const q4 of [false, true]) {
+      for (const wd of ["f32", "q4", "q8"] as const) {
         const x = randn(M * K);
         const nw = randn(K);
         const wgu = randn(2 * I * K);
-        const deq = q4 ? dequantQ4(quantizeQ4(wgu)) : wgu;
-        const W = (t: Float32Array, shape: number[]) => (q4 ? uploadQ4(t, shape) : upload(t, shape));
+        const deq = asStored(wd, wgu);
+        const W = (t: Float32Array, shape: number[]) => uploadW(wd, t, shape);
         const xn = ref.rmsnormRef(x, nw, K, 1e-5);
         const gu = ref.matmulRef(xn, deq, M, 2 * I, K);
         const want = new Float32Array(M * I);
@@ -96,7 +107,7 @@ async function main() {
         }
         let y!: Tensor;
         await run(S0, (ctx) => (y = ops.linear(ctx, upload(x, [M, K]), W(wgu, [2 * I, K]), { norm: { w: upload(nw, [K]), eps: 1e-5 }, silu: true, lanes })));
-        const tag = `${q4 ? "q4" : "f32"} l${lanes} M${M} K${K}`;
+        const tag = `${wd} l${lanes} M${M} K${K}`;
         check("matmul+norm+silu", tag, await download(y.buf, M * I), want, 2e-3 * Math.sqrt(K));
 
         let yn!: Tensor;
@@ -139,7 +150,7 @@ async function main() {
         const res = randn(M * I);
         const bias = randn(I);
         const w2 = randn(I * K);
-        const deq2 = q4 ? dequantQ4(quantizeQ4(w2)) : w2;
+        const deq2 = asStored(wd, w2);
         const plain = ref.matmulRef(x, deq2, M, I, K);
         const wantAdd = res.map((r, j) => r + plain[j]! + bias[j % I]!);
         const rt = upload(res, [M, I]);
@@ -302,6 +313,11 @@ async function main() {
     check("embed/q4", `V${V} D${D}`, await download(o.buf, wantQ.length), wantQ, 1e-6);
     await run(S0, (ctx) => (o = ops.embed(ctx, uploadQ4(table, [V, D]), upload(ids, [4]).buf, ids.length, 25.25)));
     check("embed/q4/scaled", `V${V} D${D} ×25.25`, await download(o.buf, wantQ.length), wantQ.map((v) => v * 25.25), 1e-4);
+    const deq8 = dequantQ8(quantizeQ8(table));
+    const want8 = new Float32Array(ids.length * D);
+    ids.forEach((id, t) => want8.set(deq8.subarray(id * D, (id + 1) * D), t * D));
+    await run(S0, (ctx) => (o = ops.embed(ctx, uploadQ8(table, [V, D]), upload(ids, [4]).buf, ids.length, 25.25)));
+    check("embed/q8/scaled", `V${V} D${D} ×25.25`, await download(o.buf, want8.length), want8.map((v) => v * 25.25), 1e-4);
   }
 
   {

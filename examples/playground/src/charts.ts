@@ -74,7 +74,7 @@ function pairs(rows: { label: string; a: number; b: number }[], aName: string, b
 function kernelName(k: string): string {
   const m = /^matmul\/\w+\/mt\d+ (\d+)x(\d+)\+?(.*)$/.exec(k);
   if (m) return `matmul ${m[1]}×${m[2]}${m[3] ? ` · ${m[3]}` : ""}`;
-  return k.replace(/\/(f16|f32|q4)$/, "").replace(/\//g, " ");
+  return k.replace(/\/(f16|f32|q4|q8)$/, "").replace(/\//g, " ");
 }
 
 /** One 100% stacked bar per plan: each kernel's share of the summed kernel time. */

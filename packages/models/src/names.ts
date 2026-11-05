@@ -28,7 +28,7 @@ export function ggufToHF(name: string): string | undefined {
   return mapped ? `model.layers.${m[1]}.${mapped}.${m[3]}` : undefined;
 }
 
-/** Linear and embedding matrices can be stored as q4; norms and biases stay f32. */
+/** Linear and embedding matrices can be stored as q4 or q8; norms and biases stay f32. */
 export function isQuantizable(name: string, shape: readonly number[]): boolean {
   return shape.length === 2 && name.endsWith(".weight") && !name.includes("norm") && shape[1]! % 32 === 0;
 }

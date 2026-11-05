@@ -98,7 +98,7 @@ export class Ctx {
   }
 
   alloc(shape: readonly number[], dtype: DType = "f32"): Tensor {
-    if (dtype === "q4") throw new Error("Ctx.alloc: q4 intermediates are not supported");
+    if (dtype === "q4" || dtype === "q8") throw new Error(`Ctx.alloc: ${dtype} intermediates are not supported`);
     this.assertOpen();
     return { shape, dtype, buf: new PlannedBuf(roundUp(byteSize(shape, dtype), 16), `${this.label}/act`) };
   }

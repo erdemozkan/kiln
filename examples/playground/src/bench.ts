@@ -4,7 +4,7 @@ import { dashboard } from "./charts";
 const $ = <T extends HTMLElement>(id: string) => document.getElementById(id) as T;
 const out = $("out");
 
-async function bench(model: string, quant: "q4" | "f32"): Promise<BenchResult> {
+async function bench(model: string, quant: "q4" | "q8" | "f32"): Promise<BenchResult> {
   const worker = new Worker(new URL("./bench.worker.ts", import.meta.url), { type: "module" });
   try {
     return await new Promise<BenchResult>((resolve, reject) => {
@@ -62,7 +62,7 @@ $<HTMLButtonElement>("run").onclick = async () => {
   const btn = $<HTMLButtonElement>("run");
   btn.disabled = true;
   try {
-    const r = await bench($<HTMLInputElement>("model").value.trim(), $<HTMLSelectElement>("quant").value as "q4" | "f32");
+    const r = await bench($<HTMLInputElement>("model").value.trim(), $<HTMLSelectElement>("quant").value as "q4" | "q8" | "f32");
     render(r);
     try {
       localStorage.setItem(LAST, JSON.stringify({ at: Date.now(), r }));

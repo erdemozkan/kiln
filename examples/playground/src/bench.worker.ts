@@ -67,7 +67,7 @@ export interface BenchResult {
 
 const scope = self as unknown as {
   postMessage(msg: unknown): void;
-  onmessage: ((e: MessageEvent<{ model: string; quant: "q4" | "f32" }>) => void) | null;
+  onmessage: ((e: MessageEvent<{ model: string; quant: "q4" | "q8" | "f32" }>) => void) | null;
 };
 
 async function gpuTime(be: WebGPUBackend, dispatches: readonly Dispatch[], reps: number): Promise<number> {

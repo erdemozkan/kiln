@@ -1,8 +1,12 @@
-import { q4ScaleBytes, type Backend, type Tensor } from "@kiln/core";
-import { quantizeQ4, repackQ4_0, rowBytes, toF32, type ByteSource, type TensorEntry } from "@kiln/loader";
+import { byteSize, q4ScaleBytes, type Backend, type Tensor } from "@kiln/core";
+import { quantizeQ4, quantizeQ8, repackQ4_0, repackQ8_0, rowBytes, toF32, type ByteSource, type TensorEntry } from "@kiln/loader";
 import { isQuantizable } from "@kiln/models";
 
-export type Quant = "f32" | "q4";
+/**
+ * Weight storage on the GPU for linear and embedding matrices: f32, q8 (8-bit, a quarter of f32 and
+ * close to it in accuracy) or q4 (4-bit, an eighth). Norms and biases always stay f32.
+ */
+export type Quant = "f32" | "q8" | "q4";
 
 export interface LoadProgress {
   file: string;
@@ -29,7 +33,8 @@ const CHUNK = 8 * 2 ** 20;
 
 /**
  * Streams tensors from their sources straight into GPU buffers, converting row-chunks on the way:
- * F16/BF16/Q8_0 → f32 or q4, GGUF Q4_0 → repacked q4. The full model never sits in CPU memory.
+ * F16/BF16/K-quants → f32, q8 or q4; GGUF Q8_0 → repacked q8 (unless q4 is asked for), GGUF Q4_0 →
+ * repacked q4 whatever the setting. The full model never sits in CPU memory.
  */
 export async function loadWeights(
   backend: Backend,
@@ -68,24 +73,33 @@ async function loadTensor(
   const shape = e.shape.length === 1 ? e.shape : [e.shape.slice(0, -1).reduce((a, b) => a * b, 1), e.shape[e.shape.length - 1]!];
   const cols = shape[shape.length - 1]!;
   const rows = shape.length === 2 ? shape[0]! : 1;
-  const toQ4 = isQuantizable(name, shape) && (quant === "q4" || e.type === "Q4_0");
-  if (e.type === "Q4_0" && !toQ4) throw new Error(`${name}: Q4_0 tensor with shape [${shape}] cannot stay quantized`);
+  const quantizable = isQuantizable(name, shape);
+  if (e.type === "Q4_0" && !quantizable) throw new Error(`${name}: Q4_0 tensor with shape [${shape}] cannot stay quantized`);
+  const dtype = !quantizable ? "f32" : quant === "q4" || e.type === "Q4_0" ? "q4" : quant === "q8" || e.type === "Q8_0" && quant !== "f32" ? "q8" : "f32";
 
   const srcRow = rowBytes(e.type, cols);
   const rowsPerChunk = Math.max(1, Math.floor(CHUNK / srcRow));
 
-  if (toQ4) {
-    const buf = backend.alloc(rows * cols / 2, "storage", name);
+  if (dtype !== "f32") {
+    const perRow = byteSize([cols], dtype);
+    const buf = backend.alloc(rows * perRow, "storage", name);
     const scales = backend.alloc(q4ScaleBytes(shape), "storage", `${name}/scales`);
     for (let r = 0; r < rows; r += rowsPerChunk) {
       const n = Math.min(rowsPerChunk, rows - r);
       const bytes = await src.read(e.offset + r * srcRow, n * srcRow);
-      const planes = e.type === "Q4_0" ? repackQ4_0(bytes, n * cols) : quantizeQ4(toF32(e.type, bytes, n * cols));
-      backend.write(buf, (r * cols) / 2, planes.nibbles);
+      let planes: { data: Uint32Array; scales: Float32Array };
+      if (dtype === "q4") {
+        const p = e.type === "Q4_0" ? repackQ4_0(bytes, n * cols) : quantizeQ4(toF32(e.type as Exclude<typeof e.type, "Q4_0">, bytes, n * cols));
+        planes = { data: p.nibbles, scales: p.scales };
+      } else {
+        const p = e.type === "Q8_0" ? repackQ8_0(bytes, n * cols) : quantizeQ8(toF32(e.type as Exclude<typeof e.type, "Q4_0">, bytes, n * cols));
+        planes = { data: p.bytes, scales: p.scales };
+      }
+      backend.write(buf, r * perRow, planes.data);
       backend.write(scales, (r * cols) / 8, planes.scales);
       onBytes(n * srcRow);
     }
-    return { shape, dtype: "q4", buf, scales };
+    return { shape, dtype, buf, scales };
   }
 
   const buf = backend.alloc(rows * cols * 4, "storage", name);
