@@ -86,7 +86,7 @@ export class LlamaModel {
     };
     this.invFreq = freqs(ropeInvFreq(cfg), "rope/inv_freq");
     this.localInvFreq =
-      cfg.ropeLocalTheta !== undefined && cfg.ropeLocalTheta !== cfg.ropeTheta
+      cfg.ropeLocalTheta !== undefined && (cfg.ropeLocalTheta !== cfg.ropeTheta || cfg.ropeLinear)
         ? freqs(ropeInvFreq({ headDim: cfg.headDim, ropeTheta: cfg.ropeLocalTheta }), "rope/inv_freq/local")
         : this.invFreq;
     this.w("model.embed_tokens.weight");

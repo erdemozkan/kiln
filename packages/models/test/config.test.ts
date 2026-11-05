@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { UnsupportedModelError, configFromGGUF, configFromHF, ggufToHF, isQuantizable, ropeInvFreq } from "../src";
+import { UnsupportedModelError, configFromGGUF, configFromHF, ggufToHF, isQuantizable, multimodalTextName, ropeInvFreq } from "../src";
 
 const qwen3 = {
   model_type: "qwen3",
@@ -67,7 +67,34 @@ describe("configFromHF", () => {
     // Older configs give a period instead of a list.
     expect(configFromHF({ ...gemma, sliding_window_pattern: 6 }).slidingLayers).toEqual(c.slidingLayers);
     expect(() => configFromHF({ ...gemma, final_logit_softcapping: 30 })).toThrow(/softcapping/);
-    expect(() => configFromHF({ ...gemma, model_type: "gemma3" })).toThrow(/multimodal/);
+    expect(() => configFromHF({ ...gemma, model_type: "gemma3" })).toThrow(/text_config/);
+  });
+
+  it("maps the multimodal Gemma 3 (4B) to its language model, with linear rope scaling on global layers", () => {
+    // google/gemma-3-4b-it's text_config leaves most fields to Gemma3TextConfig's defaults.
+    const c = configFromHF(
+      {
+        model_type: "gemma3",
+        eos_token_id: [1, 106],
+        text_config: { model_type: "gemma3_text", hidden_size: 2560, intermediate_size: 10240, num_hidden_layers: 34, rope_scaling: { factor: 8.0, rope_type: "linear" }, sliding_window: 1024 },
+        vision_config: { model_type: "siglip_vision_model" },
+        torch_dtype: "bfloat16",
+      },
+      { eos_token_id: [1, 106] },
+    );
+    expect(c).toMatchObject({ family: "gemma3", numHeads: 8, numKvHeads: 4, headDim: 256, vocabSize: 262208, slidingWindow: 1024, ropeLinear: 8, ropeTheta: 1e6, ropeLocalTheta: 10000, attnScale: 1 / 16, eosTokenIds: [1, 106] });
+    expect(c.embedScale).toBe(50.5); // sqrt(2560) = 50.596 in bf16
+    expect(c.slidingLayers!.filter((s) => !s)).toHaveLength(5);
+    const global = ropeInvFreq(c);
+    const local = ropeInvFreq({ headDim: 256, ropeTheta: 10000 });
+    expect(global[1]).toBeCloseTo(1e6 ** (-2 / 256) / 8, 7);
+    expect(local[1]).toBeCloseTo(1e4 ** (-2 / 256), 7);
+    expect(() => configFromHF({ model_type: "gemma3", text_config: { rope_scaling: { rope_type: "yarn", factor: 4 } } })).toThrow(/yarn/);
+    expect(multimodalTextName("language_model.model.layers.3.mlp.up_proj.weight")).toBe("model.layers.3.mlp.up_proj.weight");
+    expect(multimodalTextName("model.language_model.layers.3.mlp.up_proj.weight")).toBe("model.layers.3.mlp.up_proj.weight");
+    expect(multimodalTextName("model.language_model.embed_tokens.weight")).toBe("model.embed_tokens.weight");
+    expect(multimodalTextName("vision_tower.vision_model.encoder.layers.0.mlp.fc1.weight")).toBeUndefined();
+    expect(multimodalTextName("multi_modal_projector.mm_soft_emb_norm.weight")).toBeUndefined();
   });
 
   it("refuses unknown architectures by name", () => {
@@ -137,8 +164,10 @@ describe("GGUF", () => {
     const big = new Map(meta);
     big.set("gemma3.block_count", 62).set("gemma3.embedding_length", 5376).set("gemma3.attention.head_count", 32).set("gemma3.attention.key_length", 128);
     expect(configFromGGUF(big, ["token_embd.weight"]).attnScale).toBeCloseTo(168 ** -0.5, 12);
-    big.set("gemma3.rope.scaling.type", "linear");
-    expect(() => configFromGGUF(big, [])).toThrow(/rope scaling/);
+    big.set("gemma3.rope.scaling.type", "linear").set("gemma3.rope.scaling.factor", 8);
+    expect(configFromGGUF(big, []).ropeLinear).toBe(8);
+    big.set("gemma3.rope.scaling.type", "yarn");
+    expect(() => configFromGGUF(big, [])).toThrow(/rope scaling "yarn"/);
   });
 });
 

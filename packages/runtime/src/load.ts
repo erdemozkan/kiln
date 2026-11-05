@@ -15,7 +15,7 @@ import {
   type ModelRef,
 } from "@kiln/loader";
 import { ops, type KvDtype } from "@kiln/kernels";
-import { LlamaModel, configFromGGUF, configFromHF, ggufToHF, type LlamaConfig } from "@kiln/models";
+import { LlamaModel, configFromGGUF, configFromHF, ggufToHF, multimodalTextName, type LlamaConfig } from "@kiln/models";
 import { Tokenizer, type ChatTemplate, type TokenizerJSON } from "@kiln/tokenizers";
 import { Engine } from "./engine";
 import { llamaMatmulShapes, tuneMatmuls } from "./tune";
@@ -128,11 +128,13 @@ async function openSafetensors(ref: ModelRef, endpoint?: string): Promise<{ cfg:
   const cfg = configFromHF(config!, generation);
   // Gemma's RMSNorm scales by (1 + w); folding the 1 in at load keeps one norm kernel for every family.
   const transform = cfg.family === "gemma3" ? (name: string, v: Float32Array) => (name.endsWith("norm.weight") ? addOne(v) : undefined) : undefined;
+  // Multimodal Gemma 3 (4B and up): load the language model's weights under their text names, skip the rest.
+  const rename = config!.model_type === "gemma3" ? multimodalTextName : undefined;
   const files: WeightFile[] = [];
   try {
     for (const name of names) {
       const { source, header } = await openParsed(ref, name, endpoint, readSafetensorsHeader);
-      files.push({ name, source, tensors: header.tensors, transform });
+      files.push({ name, source, tensors: header.tensors, transform, rename });
     }
   } catch (err) {
     // Otherwise the shards already open keep their OPFS locks (and downloads) until the worker dies.

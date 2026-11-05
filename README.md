@@ -244,9 +244,14 @@ and the reply turns to nonsense, so load it with `quant: "q8"` (same tokens as f
 the memory).
 
 `mistral` loads through the same code as `llama` but has not been run (the smallest Mistral is 7B).
-Other architectures are rejected at load: SmolLM3, Granite, Phi-3, Gemma 1/2, multimodal Gemma 3
-(4B and up) and its rope scaling, mixture-of-experts models, Llama 4, and rope scaling other than
-Llama 3's.
+Gemma 3 4B and larger load as text models: the multimodal checkpoint's language model is read
+(`text_config`, weights under `language_model.` or `model.language_model.`, the vision tower skipped),
+with linear rope scaling on the global layers only, from safetensors or GGUF. This has been checked
+against the real 4B config and weight names in tests, but not run end to end yet (an 8.6 GB or
+2.5 GB download). Images are not supported.
+
+Other architectures are rejected at load: SmolLM3, Granite, Phi-3, Gemma 1/2, mixture-of-experts
+models, Llama 4, and rope scaling other than Llama 3's and linear (Gemma 3).
 
 GGUF `gemma3` files load the way llama.cpp writes them: norms already hold Gemma's 1 + w, and the
 sliding layers' rope base (10k) and pattern (every 6th layer global) are not in the metadata. From

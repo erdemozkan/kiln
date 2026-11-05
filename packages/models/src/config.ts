@@ -11,6 +11,11 @@ export interface LlamaConfig {
   rmsEps: number;
   ropeTheta: number;
   ropeScaling?: Llama3RopeScaling;
+  /**
+   * Linear rope scaling: positions divided by this factor (inverse frequencies likewise). For Gemma 3
+   * it applies to the global layers only; the sliding layers' rope is unscaled.
+   */
+  ropeLinear?: number;
   /** GGUF llama checkpoints have Q/K permuted for interleaved (GPT-J style) rotary pairs. */
   ropeInterleaved: boolean;
   tieEmbeddings: boolean;
@@ -56,10 +61,40 @@ const num = (c: HFConfig, k: string, fallback?: number): number => {
 };
 const ids = (v: unknown): number[] => (Array.isArray(v) ? (v as number[]) : typeof v === "number" ? [v] : []);
 
+/** Weights of the multimodal Gemma 3 checkpoints (4B and up) that a text model reads, under their text names. */
+export function multimodalTextName(name: string): string | undefined {
+  // transformers 4.50–4.51 save "language_model.model.layers…", later versions "model.language_model.layers…".
+  if (name.startsWith("language_model.")) return name.slice("language_model.".length);
+  if (name.startsWith("model.language_model.")) return `model.${name.slice("model.language_model.".length)}`;
+  if (name === "lm_head.weight") return name;
+  return undefined; // vision tower and projector
+}
+
+/** Gemma3TextConfig's defaults, for configs that leave fields out (the 4B and larger text_config). */
+const GEMMA3_DEFAULTS: HFConfig = {
+  vocab_size: 262208,
+  hidden_size: 2304,
+  intermediate_size: 9216,
+  num_hidden_layers: 26,
+  num_attention_heads: 8,
+  num_key_value_heads: 4,
+  head_dim: 256,
+  rms_norm_eps: 1e-6,
+  rope_theta: 1000000,
+  rope_local_base_freq: 10000,
+  query_pre_attn_scalar: 256,
+  sliding_window: 4096,
+  sliding_window_pattern: 6,
+};
+
 export function configFromHF(c: HFConfig, generation?: HFConfig): LlamaConfig {
   const type = String(c.model_type);
   if (type === "gemma3") {
-    throw new UnsupportedModelError('model_type "gemma3" is the multimodal Gemma 3; only text-only checkpoints ("gemma3_text": 270M, 1B) are supported');
+    // The multimodal checkpoint: run its language model and ignore the vision tower.
+    const text = c.text_config as HFConfig | undefined;
+    if (!text) throw new UnsupportedModelError('model_type "gemma3" without a text_config');
+    const eos = [...ids(c.eos_token_id), ...ids(text.eos_token_id)];
+    return gemma3({ ...GEMMA3_DEFAULTS, torch_dtype: c.torch_dtype, ...text, eos_token_id: eos, bos_token_id: text.bos_token_id ?? c.bos_token_id }, generation);
   }
   if (!SUPPORTED.includes(type)) {
     throw new UnsupportedModelError(`model_type "${type}" is not supported yet (supported: ${SUPPORTED.join(", ")})`);
@@ -67,7 +102,7 @@ export function configFromHF(c: HFConfig, generation?: HFConfig): LlamaConfig {
   const numHeads = num(c, "num_attention_heads");
   const hiddenSize = num(c, "hidden_size");
   const family = type === "qwen2" ? "qwen2" : type === "qwen3" ? "qwen3" : type === "gemma3_text" ? "gemma3" : "llama";
-  if (family === "gemma3") return gemma3(c, generation);
+  if (family === "gemma3") return gemma3({ ...GEMMA3_DEFAULTS, ...c }, generation);
   return {
     family,
     hiddenSize,
@@ -103,7 +138,11 @@ function gemma3(c: HFConfig, generation?: HFConfig): LlamaConfig {
   if (c.use_bidirectional_attention) throw new UnsupportedModelError("Gemma with bidirectional attention (an embedding model) is not supported");
   const act = String(c.hidden_activation ?? c.hidden_act ?? "gelu_pytorch_tanh");
   if (act !== "gelu_pytorch_tanh") throw new UnsupportedModelError(`Gemma activation "${act}" is not supported (gelu_pytorch_tanh only)`);
-  if (c.rope_scaling) throw new UnsupportedModelError("Gemma 3 with rope_scaling (4B and larger) is not supported yet");
+  const scaling = c.rope_scaling as HFConfig | null | undefined;
+  const scalingType = scaling && (scaling.rope_type ?? scaling.type);
+  if (scaling && scalingType !== "linear" && scalingType !== "default") {
+    throw new UnsupportedModelError(`Gemma 3 with rope_scaling "${String(scalingType)}" is not supported (linear only)`);
+  }
   const numLayers = num(c, "num_hidden_layers");
   const hiddenSize = num(c, "hidden_size");
   const numHeads = num(c, "num_attention_heads");
@@ -124,6 +163,7 @@ function gemma3(c: HFConfig, generation?: HFConfig): LlamaConfig {
     vocabSize: num(c, "vocab_size"),
     rmsEps: num(c, "rms_norm_eps", 1e-6),
     ropeTheta: num(c, "rope_theta", 1000000),
+    ropeLinear: scalingType === "linear" ? num(scaling!, "factor") : undefined,
     ropeLocalTheta: num(c, "rope_local_base_freq", 10000),
     ropeInterleaved: false,
     tieEmbeddings: Boolean(c.tie_word_embeddings ?? true),
@@ -193,8 +233,9 @@ export function configFromGGUF(meta: Map<string, unknown>, tensorNames: readonly
  * metadata), and attention is scaled by head_dim^-0.5, or by (hidden / heads)^-0.5 for the 62-layer 27B.
  */
 function gemma3FromGGUF(meta: Map<string, unknown>, tensorNames: readonly string[], get: (k: string, fallback?: number) => number, tokens: unknown[] | undefined): LlamaConfig {
-  if (meta.has("gemma3.rope.scaling.type") && meta.get("gemma3.rope.scaling.type") !== "none") {
-    throw new UnsupportedModelError("Gemma 3 with rope scaling (4B and larger) is not supported yet");
+  const scaling = meta.get("gemma3.rope.scaling.type");
+  if (scaling !== undefined && scaling !== "none" && scaling !== "linear") {
+    throw new UnsupportedModelError(`Gemma 3 with rope scaling "${String(scaling)}" is not supported (linear only)`);
   }
   for (const k of ["attn_logit_softcapping", "final_logit_softcapping"]) {
     if (meta.get(`gemma3.${k}`)) throw new UnsupportedModelError(`Gemma 3 with ${k} is not supported yet`);
@@ -221,6 +262,7 @@ function gemma3FromGGUF(meta: Map<string, unknown>, tensorNames: readonly string
     vocabSize: get("vocab_size", tokens?.length ?? 0),
     rmsEps: get("attention.layer_norm_rms_epsilon", 1e-6),
     ropeTheta: get("rope.freq_base", 1000000),
+    ropeLinear: scaling === "linear" ? get("rope.scaling.factor") : undefined,
     ropeLocalTheta: 10000,
     ropeInterleaved: false,
     tieEmbeddings: !tensorNames.includes("output.weight"),
@@ -239,12 +281,13 @@ function gemma3FromGGUF(meta: Map<string, unknown>, tensorNames: readonly string
 }
 
 /** RoPE inverse frequencies, with Llama 3 long-context scaling applied when configured. */
-export function ropeInvFreq(cfg: Pick<LlamaConfig, "headDim" | "ropeTheta" | "ropeScaling">): Float32Array {
+export function ropeInvFreq(cfg: Pick<LlamaConfig, "headDim" | "ropeTheta" | "ropeScaling" | "ropeLinear">): Float32Array {
   const half = cfg.headDim / 2;
   const out = new Float32Array(half);
   const s = cfg.ropeScaling;
   for (let i = 0; i < half; i++) {
     let f = 1 / cfg.ropeTheta ** ((2 * i) / cfg.headDim);
+    if (cfg.ropeLinear) f /= cfg.ropeLinear;
     if (s) {
       const lowWave = s.originalMaxPositions / s.lowFreqFactor;
       const highWave = s.originalMaxPositions / s.highFreqFactor;
