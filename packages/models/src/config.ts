@@ -1,6 +1,6 @@
-/** Normalised config for every Llama-shaped decoder (Llama 2/3, Mistral, Qwen2/2.5, Qwen3, SmolLM). */
+/** Normalised config for every Llama-shaped decoder (Llama 2/3, Mistral, Qwen2/2.5, Qwen3, SmolLM, Gemma 3). */
 export interface LlamaConfig {
-  family: "llama" | "qwen2" | "qwen3";
+  family: "llama" | "qwen2" | "qwen3" | "gemma3";
   hiddenSize: number;
   intermediateSize: number;
   numLayers: number;
@@ -19,6 +19,22 @@ export interface LlamaConfig {
   qkNorm: boolean;
   eosTokenIds: number[];
   bosTokenId?: number;
+  /** Gated MLP activation (default silu). */
+  activation?: "silu" | "gelu";
+  /** Embeddings are multiplied by this (Gemma: sqrt(hidden), rounded to the checkpoint's dtype). */
+  embedScale?: number;
+  /**
+   * Gemma: the attention and MLP outputs are normalised before each residual add
+   * (post_attention_layernorm, post_feedforward_layernorm), and the MLP input by pre_feedforward_layernorm.
+   */
+  sandwichNorms?: boolean;
+  /** Attention score scale (default 1 / sqrt(headDim)). */
+  attnScale?: number;
+  /** Keys a sliding-window layer sees, and which layers slide (the others attend to everything). */
+  slidingWindow?: number;
+  slidingLayers?: boolean[];
+  /** RoPE base of the sliding layers, when it differs from `ropeTheta` (Gemma 3: 10k local, 1M global). */
+  ropeLocalTheta?: number;
 }
 
 export interface Llama3RopeScaling {
@@ -30,7 +46,7 @@ export interface Llama3RopeScaling {
 
 export class UnsupportedModelError extends Error {}
 
-const SUPPORTED = ["llama", "mistral", "qwen2", "qwen3"];
+const SUPPORTED = ["llama", "mistral", "qwen2", "qwen3", "gemma3_text"];
 
 type HFConfig = Record<string, unknown>;
 const num = (c: HFConfig, k: string, fallback?: number): number => {
@@ -42,12 +58,16 @@ const ids = (v: unknown): number[] => (Array.isArray(v) ? (v as number[]) : type
 
 export function configFromHF(c: HFConfig, generation?: HFConfig): LlamaConfig {
   const type = String(c.model_type);
+  if (type === "gemma3") {
+    throw new UnsupportedModelError('model_type "gemma3" is the multimodal Gemma 3; only text-only checkpoints ("gemma3_text": 270M, 1B) are supported');
+  }
   if (!SUPPORTED.includes(type)) {
     throw new UnsupportedModelError(`model_type "${type}" is not supported yet (supported: ${SUPPORTED.join(", ")})`);
   }
   const numHeads = num(c, "num_attention_heads");
   const hiddenSize = num(c, "hidden_size");
-  const family = type === "qwen2" ? "qwen2" : type === "qwen3" ? "qwen3" : "llama";
+  const family = type === "qwen2" ? "qwen2" : type === "qwen3" ? "qwen3" : type === "gemma3_text" ? "gemma3" : "llama";
+  if (family === "gemma3") return gemma3(c, generation);
   return {
     family,
     hiddenSize,
@@ -66,6 +86,57 @@ export function configFromHF(c: HFConfig, generation?: HFConfig): LlamaConfig {
     qkNorm: family === "qwen3",
     eosTokenIds: [...new Set([...ids(c.eos_token_id), ...ids(generation?.eos_token_id)])],
     bosTokenId: typeof c.bos_token_id === "number" ? c.bos_token_id : undefined,
+  };
+}
+
+/** Rounds to bfloat16 (round to nearest even), as a bf16 checkpoint's constants are in HF. */
+function bf16(x: number): number {
+  const u = new Uint32Array(new Float32Array([x]).buffer);
+  u[0] = (u[0]! + 0x7fff + ((u[0]! >>> 16) & 1)) & 0xffff0000;
+  return new Float32Array(u.buffer)[0]!;
+}
+
+function gemma3(c: HFConfig, generation?: HFConfig): LlamaConfig {
+  for (const k of ["attn_logit_softcapping", "final_logit_softcapping"]) {
+    if (c[k] != null) throw new UnsupportedModelError(`Gemma 3 with ${k} is not supported yet`);
+  }
+  if (c.use_bidirectional_attention) throw new UnsupportedModelError("Gemma with bidirectional attention (an embedding model) is not supported");
+  const act = String(c.hidden_activation ?? c.hidden_act ?? "gelu_pytorch_tanh");
+  if (act !== "gelu_pytorch_tanh") throw new UnsupportedModelError(`Gemma activation "${act}" is not supported (gelu_pytorch_tanh only)`);
+  if (c.rope_scaling) throw new UnsupportedModelError("Gemma 3 with rope_scaling (4B and larger) is not supported yet");
+  const numLayers = num(c, "num_hidden_layers");
+  const hiddenSize = num(c, "hidden_size");
+  const numHeads = num(c, "num_attention_heads");
+  const headDim = num(c, "head_dim", 256);
+  // Newer configs list layer types; older ones give a period: every Nth layer is global.
+  const types = Array.isArray(c.layer_types) ? (c.layer_types as string[]) : undefined;
+  const period = num(c, "sliding_window_pattern", (c._sliding_window_pattern as number | undefined) ?? 6);
+  const slidingLayers = Array.from({ length: numLayers }, (_, l) => (types ? types[l] === "sliding_attention" : (l + 1) % period !== 0));
+  const dtype = String(c.torch_dtype ?? c.dtype ?? "bfloat16");
+  return {
+    family: "gemma3",
+    hiddenSize,
+    intermediateSize: num(c, "intermediate_size"),
+    numLayers,
+    numHeads,
+    numKvHeads: num(c, "num_key_value_heads", numHeads),
+    headDim,
+    vocabSize: num(c, "vocab_size"),
+    rmsEps: num(c, "rms_norm_eps", 1e-6),
+    ropeTheta: num(c, "rope_theta", 1000000),
+    ropeLocalTheta: num(c, "rope_local_base_freq", 10000),
+    ropeInterleaved: false,
+    tieEmbeddings: Boolean(c.tie_word_embeddings ?? true),
+    attentionBias: Boolean(c.attention_bias ?? false),
+    qkNorm: true,
+    eosTokenIds: [...new Set([...ids(c.eos_token_id), ...ids(generation?.eos_token_id)])],
+    bosTokenId: typeof c.bos_token_id === "number" ? c.bos_token_id : undefined,
+    activation: "gelu",
+    embedScale: dtype === "bfloat16" ? bf16(Math.sqrt(hiddenSize)) : Math.fround(Math.sqrt(hiddenSize)),
+    sandwichNorms: true,
+    attnScale: num(c, "query_pre_attn_scalar", headDim) ** -0.5,
+    slidingWindow: num(c, "sliding_window", 512),
+    slidingLayers,
   };
 }
 

@@ -54,6 +54,8 @@ export interface LinearOptions {
   residual?: Tensor;
   /** W is [gate; up] stacked along N: return silu(x·gateᵀ) * (x·upᵀ), shape [M, N / 2]. */
   silu?: boolean;
+  /** As `silu`, with tanh-approximated GELU (Gemma). */
+  gelu?: boolean;
   /** Force a lanes-per-row variant (kernel checks, autotuning); otherwise the tuned choice. */
   lanes?: MatmulLanes;
   /** f16 dot products (needs shader-f16). Defaults to `setMatmulF16`. */
@@ -87,13 +89,14 @@ export function matmulLanes(): ReadonlyMap<string, MatmulLanes> {
 /** x [M, K] · W[N, K]ᵀ → [M, N], with optional fused RMSNorm, bias, residual add or SiLU-gating. */
 export function linear(ctx: Ctx, x: Tensor, w: Tensor, opts: LinearOptions | Tensor = {}): Tensor {
   const o: LinearOptions = "buf" in opts ? { bias: opts } : opts;
+  const gated = !!(o.silu || o.gelu);
   const K = lastDim(x);
   const M = rowsOf(x);
   const [N, wk] = w.shape as [number, number];
   if (wk !== K) throw new Error(`linear: input has K=${K} but weight is [${w.shape}]`);
   if (K % 32 !== 0) throw new Error(`linear: K must be a multiple of 32 (K=${K})`);
-  if (o.silu && (N % 2 !== 0 || o.residual)) throw new Error("linear: silu needs an even N and no residual");
-  const outN = o.silu ? N / 2 : N;
+  if (gated && (N % 2 !== 0 || o.residual)) throw new Error("linear: a gated matmul needs an even N and no residual");
+  const outN = gated ? N / 2 : N;
   if (o.residual && (rowsOf(o.residual) !== M || lastDim(o.residual) !== outN)) {
     throw new Error(`linear: residual [${o.residual.shape}] does not match output [${M}, ${outN}]`);
   }
@@ -106,7 +109,7 @@ export function linear(ctx: Ctx, x: Tensor, w: Tensor, opts: LinearOptions | Ten
   }
   const y = o.residual ?? ctx.alloc([M, outN]);
   const wdtype = w.dtype === "q4" ? "q4" : "f32";
-  const epi: MatmulEpilogue = o.silu ? "silu" : o.residual ? "add" : "store";
+  const epi: MatmulEpilogue = o.gelu ? "gelu" : o.silu ? "silu" : o.residual ? "add" : "store";
   const lanes = o.lanes ?? tunedLanes.get(lanesKey(wdtype, mt, N, K)) ?? 8;
   const f16 = o.f16 ?? f16Default;
   if (f16 && !ctx.backend.limits.features.has("shader-f16")) throw new Error("linear: f16 math needs the shader-f16 feature");
@@ -119,7 +122,7 @@ export function linear(ctx: Ctx, x: Tensor, w: Tensor, opts: LinearOptions | Ten
   if (o.norm) bufs.push(o.norm.w.buf);
   if (o.bias) bufs.push(o.bias.buf);
   bufs.push(y.buf);
-  ctx.run(spec, bufs, grid, `matmul/${wdtype}/mt${mt} ${N}x${K}${o.norm ? "+norm" : ""}${o.silu ? "+silu" : ""}${o.residual ? "+add" : ""}`);
+  ctx.run(spec, bufs, grid, `matmul/${wdtype}/mt${mt} ${N}x${K}${o.norm ? "+norm" : ""}${gated ? `+${epi}` : ""}${o.residual ? "+add" : ""}`);
   return y;
 }
 
@@ -171,6 +174,10 @@ export interface AttentionShape {
   maxSeq: number;
   /** Cache storage (default f32). */
   kv?: KvDtype;
+  /** Score scale (default 1 / sqrt(D)). */
+  scale?: number;
+  /** Sliding window: each query sees only its last `window` keys (default 0, all keys). */
+  window?: number;
 }
 
 /**
@@ -183,7 +190,7 @@ export function attention(ctx: Ctx, q: Tensor, kc: Buf, vc: Buf, s: AttentionSha
   if (s.D > ATTN_WG || s.D % 4 !== 0) throw new Error(`attention: head dim ${s.D} must be a multiple of 4 and at most ${ATTN_WG}`);
   const out = ctx.alloc([s.T, s.H * s.D]);
   const splits = Math.ceil(s.maxSeq / ATTN_CHUNK);
-  const params = ctx.uniform([u32(s.T), u32(s.H), u32(s.Hkv), u32(s.D), u32(s.maxSeq), f32(1 / Math.sqrt(s.D)), u32(splits), u32(0)]);
+  const params = ctx.uniform([u32(s.T), u32(s.H), u32(s.Hkv), u32(s.D), u32(s.maxSeq), f32(s.scale ?? 1 / Math.sqrt(s.D)), u32(splits), u32(s.window ?? 0)]);
   if (s.T === 1) {
     const ml = ctx.alloc([s.H, splits, 2]);
     const po = ctx.alloc([s.H, splits, s.D]);
@@ -200,10 +207,11 @@ export function attention(ctx: Ctx, q: Tensor, kc: Buf, vc: Buf, s: AttentionSha
   return out;
 }
 
-export function siluMul(ctx: Ctx, gate: Tensor, up: Tensor): Tensor {
+/** act(gate) * up elementwise, SiLU by default. */
+export function siluMul(ctx: Ctx, gate: Tensor, up: Tensor, act: "silu" | "gelu" = "silu"): Tensor {
   const n = numel(gate.shape);
   const o = ctx.alloc(gate.shape);
-  ctx.run(siluMulSpec(), [ctx.uniform([u32(n), u32(0), u32(0), u32(0)]), gate.buf, up.buf, o.buf], grid1d(n));
+  ctx.run(siluMulSpec(act), [ctx.uniform([u32(n), u32(0), u32(0), u32(0)]), gate.buf, up.buf, o.buf], grid1d(n));
   return o;
 }
 
@@ -213,11 +221,12 @@ export function addInPlace(ctx: Ctx, a: Tensor, b: Tensor): void {
   ctx.run(addSpec(), [ctx.uniform([u32(n), u32(numel(b.shape)), u32(0), u32(0)]), a.buf, b.buf], grid1d(n));
 }
 
-export function embed(ctx: Ctx, table: Tensor, tokens: Buf, T: number): Tensor {
+/** Rows of `table` for the token ids, times `scale` (Gemma scales embeddings by sqrt(hidden)). */
+export function embed(ctx: Ctx, table: Tensor, tokens: Buf, T: number, scale = 1): Tensor {
   const D = lastDim(table);
   const o = ctx.alloc([T, D]);
   const spec = embedSpec(table.dtype === "q4" ? "q4" : "f32");
-  ctx.run(spec, [ctx.uniform([u32(T), u32(D), u32(0), u32(0)]), tokens, ...weightBufs(table), o.buf], grid1d(T * D));
+  ctx.run(spec, [ctx.uniform([u32(T), u32(D), f32(scale), u32(0)]), tokens, ...weightBufs(table), o.buf], grid1d(T * D));
   return o;
 }
 

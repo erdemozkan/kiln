@@ -111,6 +111,17 @@ async function main() {
         let ys!: Tensor;
         await run(S0, (ctx) => (ys = ops.linear(ctx, upload(x, [M, K]), W(wgu, [2 * I, K]), { silu: true, lanes })));
         check("matmul+silu", tag, await download(ys.buf, M * I), wantS, 2e-3 * Math.sqrt(K));
+        // Gemma's GELU (tanh) gate, with and without the fused norm.
+        const gated = (gu2: Float32Array) => {
+          const out = new Float32Array(M * I);
+          for (let m = 0; m < M; m++) for (let i = 0; i < I; i++) out[m * I + i] = ref.geluTanh(gu2[m * 2 * I + i]!) * gu2[m * 2 * I + I + i]!;
+          return out;
+        };
+        let yge!: Tensor;
+        await run(S0, (ctx) => (yge = ops.linear(ctx, upload(x, [M, K]), W(wgu, [2 * I, K]), { norm: { w: upload(nw, [K]), eps: 1e-5 }, gelu: true, lanes })));
+        check("matmul+norm+gelu", tag, await download(yge.buf, M * I), gated(gu), 2e-3 * Math.sqrt(K));
+        await run(S0, (ctx) => (yge = ops.linear(ctx, upload(x, [M, K]), W(wgu, [2 * I, K]), { gelu: true, lanes })));
+        check("matmul+gelu", tag, await download(yge.buf, M * I), gated(guPlain), 2e-3 * Math.sqrt(K));
 
         if (lanes <= (be.limits.subgroupMinSize ?? 0)) {
           let yg!: Tensor;
@@ -211,6 +222,27 @@ async function main() {
     ops.setPrefillAttention("tiled");
   }
 
+  // Sliding-window attention with an explicit score scale (Gemma 3: window 512, scale 1/16, D 256).
+  // Windows that start mid-split and mid-tile, are longer than the context, and decode far past them.
+  for (const [T, H, Hkv, D, pos0, maxSeq, window] of [[1, 4, 1, 256, 700, 1024, 512], [1, 4, 1, 256, 100, 1024, 512], [1, 9, 3, 64, 300, 512, 37], [5, 4, 1, 256, 600, 1024, 512], [33, 8, 2, 128, 300, 512, 64], [17, 6, 2, 96, 40, 128, 9], [64, 9, 3, 64, 1000, 2048, 100]] as const) {
+    const q = randn(T * H * D);
+    const kc = randn(maxSeq * Hkv * D);
+    const vc = randn(maxSeq * Hkv * D);
+    const scale = 1 / 16;
+    const want = ref.attentionRef(q, kc, vc, { T, H, Hkv, D, pos0, scale, window });
+    const wantH = ref.attentionRef(q, unpackHalf(packHalf(kc)), unpackHalf(packHalf(vc)), { T, H, Hkv, D, pos0, scale, window });
+    for (const kind of T > 1 ? (["tiled", "rows"] as const) : (["tiled"] as const)) {
+      ops.setPrefillAttention(kind);
+      const tag = `T${T} H${H}/${Hkv} D${D} pos${pos0} win${window}${T > 1 ? ` ${kind}` : ""}`;
+      let o!: Tensor;
+      await run({ ...S0, pos0 }, (ctx) => (o = ops.attention(ctx, upload(q, [T, H * D]), upload(kc, [0]).buf, upload(vc, [0]).buf, { T, H, Hkv, D, maxSeq, scale, window })));
+      check("attention/window", tag, await download(o.buf, q.length), want, 1e-4);
+      await run({ ...S0, pos0 }, (ctx) => (o = ops.attention(ctx, upload(q, [T, H * D]), upload(packHalf(kc), [0]).buf, upload(packHalf(vc), [0]).buf, { T, H, Hkv, D, maxSeq, kv: "f16", scale, window })));
+      check("attention/window/f16", tag, await download(o.buf, q.length), wantH, 1e-4);
+    }
+    ops.setPrefillAttention("tiled");
+  }
+
   {
     const [T, row, pos0, maxSeq] = [2, 8, 3, 8];
     const k = randn(T * row);
@@ -239,6 +271,8 @@ async function main() {
     let o!: Tensor;
     await run(S0, (ctx) => (o = ops.siluMul(ctx, upload(g, [n]), upload(u, [n]))));
     check("silu_mul", `n=${n} (2-D grid)`, await download(o.buf, n), ref.siluMulRef(g, u), 1e-5);
+    await run(S0, (ctx) => (o = ops.siluMul(ctx, upload(g, [n]), upload(u, [n]), "gelu")));
+    check("gelu_mul", `n=${n} (2-D grid)`, await download(o.buf, n), ref.geluMulRef(g, u), 1e-5);
   }
 
   {
@@ -266,6 +300,8 @@ async function main() {
     check("embed/f32", `V${V} D${D}`, await download(o.buf, want.length), want, 0);
     await run(S0, (ctx) => (o = ops.embed(ctx, uploadQ4(table, [V, D]), upload(ids, [4]).buf, ids.length)));
     check("embed/q4", `V${V} D${D}`, await download(o.buf, wantQ.length), wantQ, 1e-6);
+    await run(S0, (ctx) => (o = ops.embed(ctx, uploadQ4(table, [V, D]), upload(ids, [4]).buf, ids.length, 25.25)));
+    check("embed/q4/scaled", `V${V} D${D} ×25.25`, await download(o.buf, wantQ.length), wantQ.map((v) => v * 25.25), 1e-4);
   }
 
   {
@@ -368,7 +404,8 @@ async function main() {
 
     // Per-row grammar masks: row r allows only its own few ids; row 2 is unconstrained.
     const W = 1 + Math.ceil(V / 32);
-    const rowIds = Array.from({ length: R }, (_, r) => [r * 101 + 3, r * 211 + 17, r * 307 + 4000]);
+    // Every id below V: an id past it would set a bit in the next row's mask.
+    const rowIds = Array.from({ length: R }, (_, r) => [r * 101 + 3, r * 211 + 17, r * 157 + 4000]);
     const rowMasks = new Uint32Array(R * W);
     for (const [r, ids] of rowIds.entries()) {
       if (r === 2) continue;

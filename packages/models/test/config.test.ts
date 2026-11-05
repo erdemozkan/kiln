@@ -36,6 +36,40 @@ describe("configFromHF", () => {
     expect(llama.ropeScaling?.factor).toBe(32);
   });
 
+  it("maps Gemma 3 text models (sliding layers, two rope bases, bf16 embedding scale)", () => {
+    const gemma = {
+      model_type: "gemma3_text",
+      hidden_size: 640,
+      intermediate_size: 2048,
+      num_hidden_layers: 18,
+      num_attention_heads: 4,
+      num_key_value_heads: 1,
+      head_dim: 256,
+      vocab_size: 262144,
+      rms_norm_eps: 1e-6,
+      rope_theta: 1000000,
+      rope_local_base_freq: 10000,
+      query_pre_attn_scalar: 256,
+      sliding_window: 512,
+      hidden_activation: "gelu_pytorch_tanh",
+      attn_logit_softcapping: null,
+      final_logit_softcapping: null,
+      rope_scaling: null,
+      torch_dtype: "bfloat16",
+      eos_token_id: 106,
+    };
+    const c = configFromHF({ ...gemma, layer_types: Array.from({ length: 18 }, (_, l) => ((l + 1) % 6 ? "sliding_attention" : "full_attention")) }, { eos_token_id: [1, 106] });
+    expect(c).toMatchObject({ family: "gemma3", qkNorm: true, tieEmbeddings: true, activation: "gelu", sandwichNorms: true, slidingWindow: 512, ropeLocalTheta: 10000, attnScale: 1 / 16 });
+    // sqrt(640) = 25.298… is 25.25 in bf16, which is what HF multiplies by.
+    expect(c.embedScale).toBe(25.25);
+    expect(c.eosTokenIds).toEqual([106, 1]);
+    expect(c.slidingLayers!.map((s) => (s ? "s" : "F")).join("")).toBe("sssssFsssssFsssssF");
+    // Older configs give a period instead of a list.
+    expect(configFromHF({ ...gemma, sliding_window_pattern: 6 }).slidingLayers).toEqual(c.slidingLayers);
+    expect(() => configFromHF({ ...gemma, final_logit_softcapping: 30 })).toThrow(/softcapping/);
+    expect(() => configFromHF({ ...gemma, model_type: "gemma3" })).toThrow(/multimodal/);
+  });
+
   it("refuses unknown architectures by name", () => {
     expect(() => configFromHF({ ...qwen3, model_type: "mamba" })).toThrow(UnsupportedModelError);
   });

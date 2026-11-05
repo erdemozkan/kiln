@@ -44,6 +44,8 @@ export class LlamaModel {
   readonly activations: ActivationPool;
   private readonly kv: { k: Buf; v: Buf }[] = [];
   private readonly invFreq: Tensor;
+  /** RoPE frequencies of sliding-window layers, when their base differs (Gemma 3); else `invFreq`. */
+  private readonly localInvFreq: Tensor;
   /** q/k/v stacked into one `qkv` weight (not for qk-norm models, which normalise q and k separately). */
   private readonly fusedQkv: boolean;
   /** gate/up stacked into one `gate_up` weight, consumed by the SiLU-gated matmul. */
@@ -72,10 +74,16 @@ export class LlamaModel {
         v: backend.alloc(this.maxSeq * row * kvBytes, "storage", `kv/${l}/v`),
       });
     }
-    const freq = ropeInvFreq(cfg);
-    const freqBuf = backend.alloc(freq.byteLength, "storage", "rope/inv_freq");
-    backend.write(freqBuf, 0, freq);
-    this.invFreq = { shape: [freq.length], dtype: "f32", buf: freqBuf };
+    const freqs = (f: Float32Array, label: string): Tensor => {
+      const buf = backend.alloc(f.byteLength, "storage", label);
+      backend.write(buf, 0, f);
+      return { shape: [f.length], dtype: "f32", buf };
+    };
+    this.invFreq = freqs(ropeInvFreq(cfg), "rope/inv_freq");
+    this.localInvFreq =
+      cfg.ropeLocalTheta !== undefined && cfg.ropeLocalTheta !== cfg.ropeTheta
+        ? freqs(ropeInvFreq({ headDim: cfg.headDim, ropeTheta: cfg.ropeLocalTheta }), "rope/inv_freq/local")
+        : this.invFreq;
     this.w("model.embed_tokens.weight");
     const fuse = opts.fuse ?? true;
     this.fusedQkv = fuse && !cfg.qkNorm && this.fuse("self_attn", ["q_proj", "k_proj", "v_proj"], "qkv", cfg.attentionBias);
@@ -214,34 +222,58 @@ export class LlamaModel {
     const tokens = ctx.buffer(T * 4, "tokens");
     const out = ctx.buffer((verify ? T : 1) * 4, "out");
     const D = c.headDim;
-    const attnShape = { T, H: c.numHeads, Hkv: c.numKvHeads, D, maxSeq: this.maxSeq, kv: this.kvDtype };
+    const gelu = c.activation === "gelu";
+    const norm = (t: Tensor, name: string) => ops.rmsnorm(ctx, t, this.w(name), c.rmsEps);
 
-    const x = ops.embed(ctx, this.w("model.embed_tokens.weight"), tokens, T);
+    const x = ops.embed(ctx, this.w("model.embed_tokens.weight"), tokens, T, c.embedScale ?? 1);
     for (let l = 0; l < c.numLayers; l++) {
       const p = `model.layers.${l}`;
       const { k: kc, v: vc } = this.kv[l]!;
+      const sliding = !!c.slidingLayers?.[l];
+      const invFreq = sliding ? this.localInvFreq : this.invFreq;
+      const attnShape = {
+        T,
+        H: c.numHeads,
+        Hkv: c.numKvHeads,
+        D,
+        maxSeq: this.maxSeq,
+        kv: this.kvDtype,
+        scale: c.attnScale,
+        window: sliding ? c.slidingWindow : undefined,
+      };
       const inputNorm = { w: this.w(`${p}.input_layernorm.weight`), eps: c.rmsEps };
       let q: Tensor;
       if (this.fusedQkv) {
         // RMSNorm → one qkv matmul (+bias) → RoPE fused with the cache write.
         const qkv = ops.linear(ctx, x, this.w(`${p}.self_attn.qkv.weight`), { norm: inputNorm, bias: this.bias(`${p}.self_attn.qkv.bias`) });
-        q = ops.ropeKv(ctx, qkv, kc, vc, attnShape, this.invFreq, c.ropeInterleaved);
+        q = ops.ropeKv(ctx, qkv, kc, vc, attnShape, invFreq, c.ropeInterleaved);
       } else {
-        q = this.attentionInputs(ctx, x, l, T);
+        q = this.attentionInputs(ctx, x, l, T, invFreq);
       }
       const a = ops.attention(ctx, q, kc, vc, attnShape);
-      ops.linear(ctx, a, this.w(`${p}.self_attn.o_proj.weight`), { residual: x });
+      if (c.sandwichNorms) {
+        // Gemma: the attention output is normalised before the residual add.
+        const o = ops.linear(ctx, a, this.w(`${p}.self_attn.o_proj.weight`));
+        ops.addInPlace(ctx, x, norm(o, `${p}.post_attention_layernorm.weight`));
+      } else {
+        ops.linear(ctx, a, this.w(`${p}.self_attn.o_proj.weight`), { residual: x });
+      }
 
-      const postNorm = { w: this.w(`${p}.post_attention_layernorm.weight`), eps: c.rmsEps };
+      const mlpNorm = { w: this.w(`${p}.${c.sandwichNorms ? "pre_feedforward_layernorm" : "post_attention_layernorm"}.weight`), eps: c.rmsEps };
       let m: Tensor;
       if (this.fusedMlp) {
-        m = ops.linear(ctx, x, this.w(`${p}.mlp.gate_up.weight`), { norm: postNorm, silu: true });
+        m = ops.linear(ctx, x, this.w(`${p}.mlp.gate_up.weight`), { norm: mlpNorm, silu: !gelu, gelu });
       } else {
-        const h2 = ops.linear(ctx, x, this.w(`${p}.mlp.gate_proj.weight`), { norm: postNorm });
-        const u = ops.linear(ctx, x, this.w(`${p}.mlp.up_proj.weight`), { norm: postNorm });
-        m = ops.siluMul(ctx, h2, u);
+        const h2 = ops.linear(ctx, x, this.w(`${p}.mlp.gate_proj.weight`), { norm: mlpNorm });
+        const u = ops.linear(ctx, x, this.w(`${p}.mlp.up_proj.weight`), { norm: mlpNorm });
+        m = ops.siluMul(ctx, h2, u, gelu ? "gelu" : "silu");
       }
-      ops.linear(ctx, m, this.w(`${p}.mlp.down_proj.weight`), { residual: x });
+      if (c.sandwichNorms) {
+        const d = ops.linear(ctx, m, this.w(`${p}.mlp.down_proj.weight`));
+        ops.addInPlace(ctx, x, norm(d, `${p}.post_feedforward_layernorm.weight`));
+      } else {
+        ops.linear(ctx, m, this.w(`${p}.mlp.down_proj.weight`), { residual: x });
+      }
     }
     const rows = verify ? view(x, [T, c.hiddenSize]) : ops.copyRow(ctx, view(x, [T, c.hiddenSize]));
     const head = this.weights.get("lm_head.weight") ?? this.w("model.embed_tokens.weight");
@@ -272,6 +304,7 @@ export class LlamaModel {
       if (t.scales) this.backend.free(t.scales);
     }
     this.backend.free(this.invFreq.buf);
+    if (this.localInvFreq !== this.invFreq) this.backend.free(this.localInvFreq.buf);
     this.backend.free(this.step);
     this.backend.free(this.history);
     this.backend.free(this.seen);
@@ -287,7 +320,7 @@ export class LlamaModel {
   }
 
   /** Unfused attention inputs (qk-norm models): separate q/k/v, per-head norms, RoPE, cache write. */
-  private attentionInputs(ctx: Ctx, x: Tensor, l: number, T: number): Tensor {
+  private attentionInputs(ctx: Ctx, x: Tensor, l: number, T: number, invFreq: Tensor): Tensor {
     const c = this.cfg;
     const D = c.headDim;
     const p = `model.layers.${l}`;
@@ -301,8 +334,8 @@ export class LlamaModel {
       q = qn;
       k = kn;
     }
-    ops.rope(ctx, q, T, c.numHeads, D, this.invFreq, c.ropeInterleaved);
-    ops.rope(ctx, k, T, c.numKvHeads, D, this.invFreq, c.ropeInterleaved);
+    ops.rope(ctx, q, T, c.numHeads, D, invFreq, c.ropeInterleaved);
+    ops.rope(ctx, k, T, c.numKvHeads, D, invFreq, c.ropeInterleaved);
     ops.kvWrite(ctx, k, v, this.kv[l]!.k, this.kv[l]!.v, T, this.maxSeq, this.kvDtype);
     return q;
   }

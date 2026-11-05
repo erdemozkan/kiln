@@ -126,11 +126,13 @@ async function openSafetensors(ref: ModelRef, endpoint?: string): Promise<{ cfg:
     listing.then((files) => safetensorsFiles(ref, endpoint, files)),
   ]);
   const cfg = configFromHF(config!, generation);
+  // Gemma's RMSNorm scales by (1 + w); folding the 1 in at load keeps one norm kernel for every family.
+  const transform = cfg.family === "gemma3" ? (name: string, v: Float32Array) => (name.endsWith("norm.weight") ? addOne(v) : undefined) : undefined;
   const files: WeightFile[] = [];
   try {
     for (const name of names) {
       const { source, header } = await openParsed(ref, name, endpoint, readSafetensorsHeader);
-      files.push({ name, source, tensors: header.tensors });
+      files.push({ name, source, tensors: header.tensors, transform });
     }
   } catch (err) {
     // Otherwise the shards already open keep their OPFS locks (and downloads) until the worker dies.
@@ -140,6 +142,10 @@ async function openSafetensors(ref: ModelRef, endpoint?: string): Promise<{ cfg:
   const tokenizer = Tokenizer.fromJSON(tokJson!);
   tokenizer.chatTemplate = chatTemplate(tokConfig, templateFile);
   return { cfg, tokenizer, files };
+}
+
+function addOne(v: Float32Array): void {
+  for (let i = 0; i < v.length; i++) v[i]! += 1;
 }
 
 interface TokenizerConfig {

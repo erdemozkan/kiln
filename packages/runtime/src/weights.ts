@@ -17,6 +17,11 @@ export interface WeightFile {
   tensors: TensorEntry[];
   /** Maps the file's tensor names to model names; undefined skips the tensor. */
   rename?: (name: string) => string | undefined;
+  /**
+   * Edits values in place before upload, by model name, for tensors stored as f32 (norms and biases are
+   * never quantized), e.g. Gemma's 1 + w norms.
+   */
+  transform?: (name: string, values: Float32Array) => void;
 }
 
 /** Bytes read per step. Bounds peak CPU memory regardless of model size. */
@@ -44,7 +49,7 @@ export async function loadWeights(
     };
     for (const entry of file.tensors) {
       const name = file.rename ? file.rename(entry.name) : entry.name;
-      if (name) out.set(name, await loadTensor(backend, file.source, entry, name, quant, onBytes));
+      if (name) out.set(name, await loadTensor(backend, file.source, entry, name, quant, onBytes, file.transform));
       else onBytes(entry.byteLength);
     }
   }
@@ -58,6 +63,7 @@ async function loadTensor(
   name: string,
   quant: Quant,
   onBytes: (n: number) => void,
+  transform?: (name: string, values: Float32Array) => void,
 ): Promise<Tensor> {
   const shape = e.shape.length === 1 ? e.shape : [e.shape.slice(0, -1).reduce((a, b) => a * b, 1), e.shape[e.shape.length - 1]!];
   const cols = shape[shape.length - 1]!;
@@ -86,7 +92,9 @@ async function loadTensor(
   for (let r = 0; r < rows; r += rowsPerChunk) {
     const n = Math.min(rowsPerChunk, rows - r);
     const bytes = await src.read(e.offset + r * srcRow, n * srcRow);
-    backend.write(buf, r * cols * 4, toF32(e.type as Exclude<typeof e.type, "Q4_0">, bytes, n * cols));
+    const values = toF32(e.type as Exclude<typeof e.type, "Q4_0">, bytes, n * cols);
+    transform?.(name, values);
+    backend.write(buf, r * cols * 4, values);
     onBytes(n * srcRow);
   }
   return { shape, dtype: "f32", buf };

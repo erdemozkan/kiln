@@ -232,7 +232,10 @@ export class Tokenizer {
         if (tok === undefined) return "";
         if (this.added.has(tok)) {
           if (skipSpecial && this.specialIds.has(id)) return "";
-          return out(utf8.decode() + tok);
+          // Added tokens go through the decoder like any other in HF: Gemma's whitespace tokens ("▁▁")
+          // come out as spaces. Special ones are kept as written.
+          const text = this.scheme.kind === "metaspace" && !this.specialIds.has(id) ? tok.replaceAll(SPACE, " ") : tok;
+          return out(utf8.decode() + text);
         }
         return out(utf8.decode(this.tokenBytes(id), { stream: true }));
       },

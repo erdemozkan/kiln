@@ -47,7 +47,17 @@ export const MM_KC = 256;
 /** Lanes per weight row a matmul variant may use; rows per workgroup = 256 / lanes. */
 export type MatmulLanes = 8 | 16 | 32;
 /** What the matmul does with each output after the dot product. */
-export type MatmulEpilogue = "store" | "add" | "silu";
+export type MatmulEpilogue = "store" | "add" | "silu" | "gelu";
+
+/** Epilogues that read a [gate; up] weight stacked along N and write act(gate) * up. */
+export const isGated = (epi: MatmulEpilogue): boolean => epi === "silu" || epi === "gelu";
+
+/**
+ * GELU with the tanh approximation (PyTorch's gelu "tanh", Gemma's activation), on f32 x. The tanh
+ * argument is clamped: some drivers compute tanh through exp and return NaN past about ±44.
+ */
+const GELU_WGSL = (x: string) => `(0.5 * ${x} * (1.0 + tanh(clamp(0.7978845608 * (${x} + 0.044715 * ${x} * ${x} * ${x}), -15.0, 15.0))))`;
+const actWgsl = (epi: "silu" | "gelu", x: string) => (epi === "gelu" ? GELU_WGSL(x) : `(${x} / (1.0 + exp(-${x})))`);
 
 export interface MatmulVariant {
   wdtype: "f32" | "q4";
@@ -58,8 +68,8 @@ export interface MatmulVariant {
   norm: boolean;
   bias: boolean;
   /**
-   * store: y = acc. add: y += acc (residual). silu: the weight is [gate; up] stacked along N and
-   * y[:, i] = silu(gate_i) * up_i, so a workgroup owns matching gate and up rows.
+   * store: y = acc. add: y += acc (residual). silu / gelu: the weight is [gate; up] stacked along N
+   * and y[:, i] = act(gate_i) * up_i, so a workgroup owns matching gate and up rows.
    */
   epi: MatmulEpilogue;
   /** f16 x tile and 4-wide dot products (needs shader-f16); accumulation stays f32. */
@@ -73,7 +83,7 @@ export interface MatmulVariant {
 }
 
 /** Rows of the output a workgroup produces for this variant. */
-export const matmulRowsPerGroup = (v: Pick<MatmulVariant, "lanes" | "epi">): number => 256 / v.lanes / (v.epi === "silu" ? 2 : 1);
+export const matmulRowsPerGroup = (v: Pick<MatmulVariant, "lanes" | "epi">): number => 256 / v.lanes / (isGated(v.epi) ? 2 : 1);
 
 /**
  * y[m, n] = sum_k x[m, k] * W[n, k], for K a multiple of 32, with an optional RMSNorm prologue and a
@@ -91,7 +101,7 @@ export function matmulSpec(v: MatmulVariant): KernelSpec {
   const kc4 = MM_KC / 4;
   const mt = v.mt;
   const rows = 256 / v.lanes;
-  const silu = v.epi === "silu";
+  const silu = isGated(v.epi);
   const h = !!v.f16;
   const sg = !!v.sg;
   const key = `matmul/${v.wdtype}/mt${mt}/l${v.lanes}${v.norm ? "/norm" : ""}${v.bias ? "/bias" : ""}/${v.epi}${h ? "/f16" : ""}${sg ? "/sg" : ""}`;
@@ -116,7 +126,7 @@ export function matmulSpec(v: MatmulVariant): KernelSpec {
     ? `if (r < HALF && i < p.N / 2u) {
       let g = ${withBias("n", `red[lane * 256u + r * LANES]`)};
       let u = ${withBias("n + p.N / 2u", `red[lane * 256u + (r + HALF) * LANES]`)};
-      y[(m0 + lane) * (p.N / 2u) + i] = g / (1.0 + exp(-g)) * u;
+      y[(m0 + lane) * (p.N / 2u) + i] = ${actWgsl(v.epi as "silu" | "gelu", "g")} * u;
     }`
     : `if (n < p.N) {
       let val = ${withBias("n", `red[lane * 256u + r * LANES]`)};
@@ -339,6 +349,12 @@ ${h
 export const ATTN_WG = 256;
 
 /**
+ * First key a query sees: with a sliding window of `win` keys (0 = none), a query that sees keys
+ * 0…n-1 keeps only the last `win` of them, as Gemma's sliding layers do.
+ */
+const FIRST_KEY_WGSL = /* wgsl */ `fn firstKey(n: u32, win: u32) -> u32 { return select(0u, n - win, win > 0u && n > win); }`;
+
+/**
  * Causal attention with GQA: one 256-thread workgroup per (head, query row).
  * q is cached in workgroup memory. Keys are taken ATTN_WG at a time with an online softmax: each block's
  * scores stay in workgroup memory, the running max and exp-sum rescale the partial output, so no scores
@@ -350,7 +366,8 @@ export function attentionSpec(kv: KvDtype = "f32"): KernelSpec {
   return spec(`attention/online/${kv}`, ["uniform", "read", "read", "read", "read", "rw"], () => /* wgsl */ `
 ${STEP_WGSL}
 ${kv === "f16" ? KV4_FN : ""}
-struct P { T: u32, H: u32, Hkv: u32, D: u32, maxSeq: u32, scale: f32, _a: u32, _b: u32 }
+struct P { T: u32, H: u32, Hkv: u32, D: u32, maxSeq: u32, scale: f32, _a: u32, win: u32 }
+${FIRST_KEY_WGSL}
 @group(0) @binding(0) var<uniform> p: P;
 @group(0) @binding(1) var<storage, read> st: Step;
 @group(0) @binding(2) var<storage, read> q: array<f32>;
@@ -386,7 +403,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
   var m = -3.0e38;
   var l = 0.0;
   var acc = 0.0;
-  for (var b0 = 0u; b0 < n; b0 += WG) {
+  for (var b0 = firstKey(n, p.win); b0 < n; b0 += WG) {
     let bn = min(WG, n - b0);
     // Scores: 8 lanes per key (vec4 slots lane, lane + 8, ...), 32 keys per pass, coalesced cache reads.
     for (var k0 = 0u; k0 < bn; k0 += WG / 8u) {
@@ -474,7 +491,8 @@ export function attentionTiledSpec(kv: KvDtype, D: number): KernelSpec {
   return spec(`attention/tiled/${kv}/D${D}`, ["uniform", "read", "read", "read", "read", "rw"], () => /* wgsl */ `
 ${STEP_WGSL}
 ${kv === "f16" ? KV4_FN : ""}
-struct P { T: u32, H: u32, Hkv: u32, D: u32, maxSeq: u32, scale: f32, _a: u32, _b: u32 }
+struct P { T: u32, H: u32, Hkv: u32, D: u32, maxSeq: u32, scale: f32, _a: u32, win: u32 }
+${FIRST_KEY_WGSL}
 @group(0) @binding(0) var<uniform> p: P;
 @group(0) @binding(1) var<storage, read> st: Step;
 @group(0) @binding(2) var<storage, read> q: array<f32>;
@@ -517,6 +535,9 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
   let sr = li / TPR;
   let sl = li % TPR;
   let sn = min(st.pos0 + (r0 + sr) / G + 1u, p.maxSeq);
+  let slo = firstKey(sn, p.win);
+  // The tile's first row sees the earliest keys (rows are ordered by position).
+  let lo = firstKey(min(st.pos0 + r0 / G + 1u, p.maxSeq), p.win);
   // Output role: row orow, columns 4 * od .. 4 * od + 3.
   let orow = li / D4;
   let od = li % D4;
@@ -525,7 +546,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
   var acc = vec4<f32>(0.0);
   workgroupBarrier();
 
-  for (var b0 = 0u; b0 < nMax; b0 += BK) {
+  for (var b0 = lo; b0 < nMax; b0 += BK) {
     for (var e = li; e < BK * D4; e += 256u) {
       let j = b0 + e / D4;
       var v = vec4<f32>(0.0);
@@ -536,7 +557,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
     if (sr < R) {
       for (var jj = sl; jj < BK; jj += TPR) {
         var d = -3.0e38;
-        if (b0 + jj < sn) {
+        if (b0 + jj < sn && b0 + jj >= slo) {
           d = 0.0;
           for (var c = 0u; c < D4; c++) { d += dot(qs[sr * D4 + c], tile[jj * KP + c]); }
         }
@@ -595,7 +616,8 @@ export function attentionSplitSpec(kv: KvDtype = "f32"): KernelSpec {
   return spec(`attention/split/${kv}`, ["uniform", "read", "read", "read", "read", "rw", "rw"], () => /* wgsl */ `
 ${STEP_WGSL}
 ${kv === "f16" ? KV4_FN : ""}
-struct P { T: u32, H: u32, Hkv: u32, D: u32, maxSeq: u32, scale: f32, S: u32, _b: u32 }
+struct P { T: u32, H: u32, Hkv: u32, D: u32, maxSeq: u32, scale: f32, S: u32, win: u32 }
+${FIRST_KEY_WGSL}
 @group(0) @binding(0) var<uniform> p: P;
 @group(0) @binding(1) var<storage, read> st: Step;
 @group(0) @binding(2) var<storage, read> q: array<f32>;
@@ -617,10 +639,13 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
   let split = wid.z;
   let kvh = h / (p.H / p.Hkv);
   let n = min(st.pos0 + t + 1u, p.maxSeq);
-  let j0 = split * CH;
-  // Splits past the current length do nothing; combine only reads live splits.
-  if (j0 >= n) { return; }
-  let cnt = min(CH, n - j0);
+  // Keys before the sliding window are skipped: splits wholly before it exit, and the first live split
+  // starts at the window's first key. Combine reads the same live splits.
+  let lo = firstKey(n, p.win);
+  let j0s = split * CH;
+  if (j0s >= n || j0s + CH <= lo) { return; }
+  let j0 = max(j0s, lo);
+  let cnt = min(j0s + CH, n) - j0;
   let qo = (t * p.H + h) * p.D;
   let stride = p.Hkv * p.D;
   let ko = kvh * p.D;
@@ -710,7 +735,8 @@ ${kv === "f16"
 export function attentionCombineSpec(): KernelSpec {
   return spec("attention/combine", ["uniform", "read", "read", "read", "rw"], () => /* wgsl */ `
 ${STEP_WGSL}
-struct P { T: u32, H: u32, Hkv: u32, D: u32, maxSeq: u32, scale: f32, S: u32, _b: u32 }
+struct P { T: u32, H: u32, Hkv: u32, D: u32, maxSeq: u32, scale: f32, S: u32, win: u32 }
+${FIRST_KEY_WGSL}
 @group(0) @binding(0) var<uniform> p: P;
 @group(0) @binding(1) var<storage, read> st: Step;
 @group(0) @binding(2) var<storage, read> ml: array<f32>;
@@ -720,23 +746,25 @@ struct P { T: u32, H: u32, Hkv: u32, D: u32, maxSeq: u32, scale: f32, S: u32, _b
 @compute @workgroup_size(64)
 fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) li: u32) {
   let base = (wid.y * p.H + wid.x) * p.S;
-  let live = (min(st.pos0 + wid.y + 1u, p.maxSeq) + ${ATTN_CHUNK - 1}u) / ${ATTN_CHUNK}u;
+  let n = min(st.pos0 + wid.y + 1u, p.maxSeq);
+  let live = (n + ${ATTN_CHUNK - 1}u) / ${ATTN_CHUNK}u;
+  let first = firstKey(n, p.win) / ${ATTN_CHUNK}u;
   var mx = -3.0e38;
-  for (var s = 0u; s < live; s++) { mx = max(mx, ml[(base + s) * 2u]); }
+  for (var s = first; s < live; s++) { mx = max(mx, ml[(base + s) * 2u]); }
   var den = 0.0;
-  for (var s = 0u; s < live; s++) { den += exp(ml[(base + s) * 2u] - mx) * ml[(base + s) * 2u + 1u]; }
+  for (var s = first; s < live; s++) { den += exp(ml[(base + s) * 2u] - mx) * ml[(base + s) * 2u + 1u]; }
   let out = (wid.y * p.H + wid.x) * p.D;
   for (var i = li; i < p.D; i += 64u) {
     var num = 0.0;
-    for (var s = 0u; s < live; s++) { num += exp(ml[(base + s) * 2u] - mx) * po[(base + s) * p.D + i]; }
+    for (var s = first; s < live; s++) { num += exp(ml[(base + s) * 2u] - mx) * po[(base + s) * p.D + i]; }
     o[out + i] = num / den;
   }
 }`);
 }
 
-/** out = silu(gate) * up. */
-export function siluMulSpec(): KernelSpec {
-  return spec("silu_mul", ["uniform", "read", "read", "rw"], () => /* wgsl */ `
+/** out = act(gate) * up, with SiLU (default) or tanh-approximated GELU. */
+export function siluMulSpec(act: "silu" | "gelu" = "silu"): KernelSpec {
+  return spec(`${act}_mul`, ["uniform", "read", "read", "rw"], () => /* wgsl */ `
 struct P { n: u32, _a: u32, _b: u32, _c: u32 }
 @group(0) @binding(0) var<uniform> p: P;
 @group(0) @binding(1) var<storage, read> g: array<f32>;
@@ -748,7 +776,7 @@ fn main(${EW_ARGS}) {
   ${FLAT}
   if (idx >= p.n) { return; }
   let a = g[idx];
-  o[idx] = a / (1.0 + exp(-a)) * u[idx];
+  o[idx] = ${actWgsl(act, "a")} * u[idx];
 }`);
 }
 
@@ -772,7 +800,7 @@ fn main(${EW_ARGS}) {
 export function embedSpec(wdtype: "f32" | "q4"): KernelSpec {
   const q4 = wdtype === "q4";
   return spec(`embed/${wdtype}`, q4 ? ["uniform", "read", "read", "read", "rw"] : ["uniform", "read", "read", "rw"], () => /* wgsl */ `
-struct P { T: u32, D: u32, _a: u32, _b: u32 }
+struct P { T: u32, D: u32, scale: f32, _b: u32 }
 @group(0) @binding(0) var<uniform> p: P;
 @group(0) @binding(1) var<storage, read> tokens: array<u32>;
 ${q4
@@ -789,8 +817,8 @@ fn main(${EW_ARGS}) {
   let e = tokens[idx / p.D] * p.D + idx % p.D;
 ${q4
   ? `  let q = f32((wq[e / 8u] >> (4u * (e % 8u))) & 15u) - 8.0;
-  o[idx] = q * ws[e / 32u];`
-  : `  o[idx] = w[e];`}
+  o[idx] = q * ws[e / 32u] * p.scale;`
+  : `  o[idx] = w[e] * p.scale;`}
 }`);
 }
 

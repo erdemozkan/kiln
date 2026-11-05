@@ -47,6 +47,22 @@ describe("SentencePiece-style BPE", () => {
     expect(tok.encode("hello hello").map((i) => d.push(i)).join("") + d.flush()).toBe("hello hello");
   });
 
+  it("decodes non-special added tokens through the decoder, as Gemma's whitespace runs need", () => {
+    // Gemma: "▁▁" (two spaces) is an added, non-special token, alongside special turn markers.
+    const tok = tiny({
+      added_tokens: [
+        { id: 0, content: "<unk>", special: true },
+        { id: 1, content: "<s>", special: true },
+        { id: 2, content: "</s>", special: true },
+        { id: 277, content: `${S}${S}`, special: false },
+        { id: 278, content: "<eot>", special: true },
+      ],
+    });
+    const ids = [tok.tokenId(`${S}hello`)!, 277, tok.tokenId("h")!, 278];
+    expect(tok.decode(ids)).toBe("hello  h");
+    expect(tok.decode(ids, false)).toBe("hello  h<eot>");
+  });
+
   it("prepends ▁ only at the start with Metaspace prepend_scheme first", () => {
     const tok = tiny({ normalizer: null, pre_tokenizer: { type: "Metaspace", replacement: S, prepend_scheme: "first", split: false } as never });
     const always = tiny();

@@ -47,27 +47,30 @@ export function attentionRef(
   q: Float32Array,
   kc: Float32Array,
   vc: Float32Array,
-  s: { T: number; H: number; Hkv: number; D: number; pos0: number },
+  s: { T: number; H: number; Hkv: number; D: number; pos0: number; scale?: number; window?: number },
 ): Float32Array {
   const { T, H, Hkv, D, pos0 } = s;
+  const scale = s.scale ?? 1 / Math.sqrt(D);
   const out = new Float32Array(T * H * D);
   const group = H / Hkv;
   for (let t = 0; t < T; t++)
     for (let h = 0; h < H; h++) {
       const kvh = Math.floor(h / group);
       const n = pos0 + t + 1;
+      // Keys lo…n-1: all of them, or the last `window` (HF masks q - k >= window).
+      const lo = s.window ? Math.max(0, n - s.window) : 0;
       const scores = new Float64Array(n);
-      for (let j = 0; j < n; j++) {
+      for (let j = lo; j < n; j++) {
         let d = 0;
         for (let i = 0; i < D; i++) d += q[(t * H + h) * D + i]! * kc[(j * Hkv + kvh) * D + i]!;
-        scores[j] = d / Math.sqrt(D);
+        scores[j] = d * scale;
       }
-      const mx = Math.max(...scores);
+      const mx = Math.max(...scores.subarray(lo));
       let sum = 0;
-      for (let j = 0; j < n; j++) sum += scores[j] = Math.exp(scores[j]! - mx);
+      for (let j = lo; j < n; j++) sum += scores[j] = Math.exp(scores[j]! - mx);
       for (let i = 0; i < D; i++) {
         let acc = 0;
-        for (let j = 0; j < n; j++) acc += scores[j]! * vc[(j * Hkv + kvh) * D + i]!;
+        for (let j = lo; j < n; j++) acc += scores[j]! * vc[(j * Hkv + kvh) * D + i]!;
         out[(t * H + h) * D + i] = acc / sum;
       }
     }
@@ -76,6 +79,15 @@ export function attentionRef(
 
 export function siluMulRef(g: Float32Array, u: Float32Array): Float32Array {
   return g.map((a, i) => (a / (1 + Math.exp(-a))) * u[i]!);
+}
+
+/** GELU, tanh approximation (PyTorch `gelu(approximate="tanh")`). */
+export function geluTanh(a: number): number {
+  return 0.5 * a * (1 + Math.tanh(Math.sqrt(2 / Math.PI) * (a + 0.044715 * a ** 3)));
+}
+
+export function geluMulRef(g: Float32Array, u: Float32Array): Float32Array {
+  return g.map((a, i) => geluTanh(a) * u[i]!);
 }
 
 export function argmaxRef(x: Float32Array): number {

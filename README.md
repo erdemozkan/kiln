@@ -25,7 +25,7 @@ const json = llm.chat(messages, { format: { type: "json", schema } }); // or { t
 |---|---|
 | `@kiln/api` | Main-thread client, worker RPC, streaming `TextStream` |
 | `@kiln/runtime` | `Engine`: chunked prefill, pipelined decode, weight streaming |
-| `@kiln/models` | Code-defined architectures (Llama / Mistral / Qwen2 / Qwen3 / SmolLM), HF + GGUF config mapping |
+| `@kiln/models` | Code-defined architectures (Llama / Mistral / Qwen2 / Qwen3 / SmolLM / Gemma 3), HF + GGUF config mapping |
 | `@kiln/tokenizers` | Byte-level and SentencePiece-style BPE from `tokenizer.json` or GGUF metadata, streaming UTF-8 decode, a Jinja interpreter for chat templates |
 | `@kiln/grammar` | JSON / JSON Schema / choice grammars as a byte-level pushdown matcher, token masks over a vocabulary trie |
 | `@kiln/kernels` | WGSL kernels, op wrappers, CPU reference implementations |
@@ -206,8 +206,8 @@ fixed cost.
 
 ## Status
 
-Verified on this GPU: all kernel checks pass (187, including both prefill attention kernels, fused variants, f16 cache paths, grammar masks and
-sampling distributions). SmolLM2-135M-Instruct chats from Hub safetensors (q4, f32) and from a GGUF
+Verified on this GPU: all kernel checks pass (249, including both prefill attention kernels, fused variants, f16 cache paths,
+sliding-window attention, GELU gating, grammar masks and sampling distributions). SmolLM2-135M-Instruct chats from Hub safetensors (q4, f32) and from a GGUF
 Q4_K_M file.
 
 Models run end to end (greedy answers to fixed questions checked by hand; tool calls where noted):
@@ -221,10 +221,20 @@ Models run end to end (greedy answers to fixed questions checked by hand; tool c
 | `qwen2` | Qwen2-0.5B merge, two shards | safetensors | |
 | `qwen2` | DeepSeek-R1-Distill-Qwen-1.5B (reasons, then answers) | GGUF Q4_K_M | 11 tok/s |
 | `qwen3` | Qwen3-0.6B (`toolChoice`) | safetensors | 20–32 tok/s |
+| `gemma3_text` | Gemma 3 1B-it (sliding window: recalls a fact 1,100 tokens back) | safetensors (unsloth mirror) | 12–20 tok/s |
+| `gemma3_text` | Gemma 3 270M-it, with `quant: "f32"` | safetensors | 25–40 tok/s |
+
+Gemma 3 was checked token by token against an independent NumPy forward pass written from
+transformers' `modeling_gemma3`: greedy output matched on every prompt tried, for 1B in q4 and 270M
+in f32. On a 1,138-token prompt, where the fact asked about lies outside the sliding layers' 512-token
+window, 1B in q4 gave the same answer tokens as the reference (then a newline before ending the turn,
+where the reference ended at once). The 270M model does not survive q4: its first answer token wins by 1.4 logits, q4 flips it,
+and the reply turns to nonsense, so load it with `quant: "f32"`.
 
 `mistral` loads through the same code as `llama` but has not been run (the smallest Mistral is 7B).
-Other architectures are rejected at load: SmolLM3, Granite, Phi-3, Gemma, mixture-of-experts
-models, Llama 4, and rope scaling other than Llama 3's.
+Other architectures are rejected at load: SmolLM3, Granite, Phi-3, Gemma 1/2, multimodal Gemma 3
+(4B and up) and its rope scaling, mixture-of-experts models, Llama 4, and rope scaling other than
+Llama 3's. Gemma 3 loads from safetensors only (GGUF `gemma3` is not mapped yet).
 
 Supported:
 
