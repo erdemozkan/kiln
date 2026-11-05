@@ -43,7 +43,15 @@ export interface Frame {
   step(b: number): Frame[][];
   /** Replacements of this frame that consume nothing (an empty one: it may finish here). */
   eps(): Frame[][];
+  /**
+   * True when every plain string byte (`isPlainStringByte`) leaves this frame exactly as it is, and
+   * the frame has no zero-width replacements: an unbounded string body. Masks use it to skip the walk.
+   */
+  readonly loopsOnPlain?: boolean;
 }
+
+/** Bytes a JSON string body takes as themselves: not a quote, a backslash or a control character. */
+export const isPlainStringByte = (b: number): boolean => b >= 0x20 && b !== 0x22 && b !== 0x5c;
 
 /** A match state: frames top first. `null` is the empty stack, the end of a complete match. */
 export class StackNode {
@@ -153,6 +161,9 @@ class Str implements Frame {
     readonly len = 0,
   ) {
     this.key = `s${node.minLength},${node.maxLength}:${phase}:${len}`;
+  }
+  get loopsOnPlain(): boolean {
+    return this.phase === "body" && this.node.minLength === 0 && this.node.maxLength === Infinity;
   }
   private next(phase: Str["phase"], len = this.len): Frame[][] {
     const bounded = this.node.minLength > 0 || this.node.maxLength < Infinity;

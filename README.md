@@ -68,7 +68,10 @@ Key ideas:
 - **Grammars mask tokens on the GPU sampler.** A JSON Schema compiles to a byte-level pushdown matcher.
   Each step walks a prefix tree of every token's bytes from the current state, pruning a subtree at its
   first rejected byte, and caches the resulting bitmask by state, since generation keeps revisiting the
-  same grammar positions. The sampler skips masked ids before top-k / top-p, so truncation applies among
+  same grammar positions. Inside a string with no length bounds, every token of plain bytes (no quote,
+  backslash or control character) is allowed whatever follows, so that state's mask is a precomputed
+  bitmask plus a walk over the few other tokens: 20–29× less CPU per token on string-heavy schemas
+  (0.08 ms on SmolLM2's 49k vocabulary, 0.6 ms on Qwen's 152k). The sampler skips masked ids before top-k / top-p, so truncation applies among
   allowed tokens only. The forward pass needs only the last sampled id, so it is submitted before the
   mask is computed and the CPU work overlaps it.
 - **Speculative decoding by prompt lookup (opt-in, `draftTokens: 7`).** When the last tokens appeared

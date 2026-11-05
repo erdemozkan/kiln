@@ -1,4 +1,4 @@
-import { accepts, push, start, stepAll, type Node, type Stack } from "./matcher";
+import { accepts, isPlainStringByte, push, start, stepAll, type Node, type Stack } from "./matcher";
 
 /**
  * Every token's bytes in a prefix tree, flattened into typed arrays. Tokens that share a prefix share
@@ -15,13 +15,21 @@ export class TokenTrie {
   private readonly tokStart: Int32Array;
   private readonly tokCount: Int32Array;
   private readonly tokIds: Int32Array;
+  /** Tokens made only of plain string bytes, as a mask; and every other token's id and bytes. */
+  readonly plainMask: Uint32Array;
+  readonly special: readonly { id: number; bytes: Uint8Array }[];
 
   /** `tokens[id]` is the token's bytes, or undefined for ids text can never produce (special tokens). */
   constructor(tokens: readonly (Uint8Array | undefined)[]) {
     const children: Map<number, number>[] = [new Map()];
     const ends: number[][] = [[]];
+    this.plainMask = new Uint32Array(Math.ceil(tokens.length / 32));
+    const special: { id: number; bytes: Uint8Array }[] = [];
+    this.special = special;
     tokens.forEach((bytes, id) => {
       if (!bytes?.length) return;
+      if (bytes.every(isPlainStringByte)) this.plainMask[id >>> 5]! |= 1 << (id & 31);
+      else special.push({ id, bytes });
       let n = 0;
       for (const b of bytes) {
         let c = children[n]!.get(b);
@@ -93,6 +101,8 @@ export type MatcherPosition = { readonly __position: unique symbol };
  * u32 words (bit id % 32 of word id / 32).
  */
 export class GrammarMatcher {
+  /** The string-body shortcut in `mask` (on; off only to check it against the full walk). */
+  static fastStrings = true;
   private states: Stack[];
   private readonly cache = new Map<string, Uint32Array>();
 
@@ -151,10 +161,22 @@ export class GrammarMatcher {
       return m;
     }
     m = new Uint32Array(Math.ceil(this.vocabSize / 32));
-    this.trie.collect(this.states, (s, b) => {
-      const next = stepAll(s, b);
-      return next.length ? next : undefined;
-    }, m);
+    if (GrammarMatcher.fastStrings && this.states.length && this.states.every((s) => s?.f.loopsOnPlain)) {
+      // Inside unbounded string bodies: every token of plain bytes leaves each state as it is, so
+      // only the tokens with a quote, backslash or control byte need stepping (a few percent).
+      m.set(this.trie.plainMask.subarray(0, m.length));
+      for (const { id, bytes } of this.trie.special) {
+        if (id >= this.vocabSize) continue;
+        let s: Stack[] = this.states;
+        for (const b of bytes) if (!(s = stepAll(s, b)).length) break;
+        if (s.length) m[id >>> 5]! |= 1 << (id & 31);
+      }
+    } else {
+      this.trie.collect(this.states, (s, b) => {
+        const next = stepAll(s, b);
+        return next.length ? next : undefined;
+      }, m);
+    }
     if (this.complete) for (const id of this.stopIds) if (id < this.vocabSize) m[id >>> 5]! |= 1 << (id & 31);
     if (this.cache.size >= CACHE) this.cache.delete(this.cache.keys().next().value!);
     this.cache.set(key, m);

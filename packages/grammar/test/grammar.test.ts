@@ -143,4 +143,47 @@ describe("token masks", () => {
     });
     expect(allowed(g.mask())).toEqual(want);
   });
+
+  it("the string-body shortcut gives the same masks as the full walk", () => {
+    // Tokens that end, escape or break out of a string, alongside plain text and UTF-8 bytes.
+    const extra = ['"', '",', '", "', '"}', '"]', "\\", '\\"', "\\n", "\\u00", "a\"b", 'x"', "\n", "\t", "é", "日本", "hello world", ' "', ":", '":"'];
+    // Ids 0-255 stay single raw bytes, so feeding a text byte by byte is exact.
+    const toks: (Uint8Array | undefined)[] = [...tokens.slice(0, -1), ...extra.map((t) => utf8.encode(t))];
+    toks.push(undefined);
+    const W = toks.length + 3;
+    const tr = new TokenTrie(toks);
+    const schema: JsonSchema = {
+      type: "object",
+      properties: {
+        name: { type: "string" },
+        short: { type: "string", maxLength: 3 },
+        kind: { enum: ["a", "ab"] },
+        tags: { type: "array", items: { type: "string" } },
+        any: {},
+      },
+      required: ["name", "short", "kind", "tags", "any"],
+    };
+    const texts: [ResponseFormat, string][] = [
+      [json(schema), '{"name": "Ann \\"Lee\\" é 日本", "short": "ab", "kind": "ab", "tags": ["x", "y z"], "any": {"q": ["r", "s\\n"]}}'],
+      [{ type: "json" }, '["a", {"b": "c\\u00e9"}, "d"]'],
+      [{ type: "json", schema: { anyOf: [{ type: "string" }, { type: "string", maxLength: 2 }] } }, '"abc"'],
+    ];
+    let checked = 0;
+    for (const [f, text] of texts) {
+      checked = 0;
+      const fast = new GrammarMatcher(compileFormat(f), tr, toks, W, [toks.length - 1]);
+      const slow = new GrammarMatcher(compileFormat(f), tr, toks, W, [toks.length - 1]);
+      // Byte by byte, so every string phase and every alternative is visited.
+      for (const b of utf8.encode(text)) {
+        GrammarMatcher.fastStrings = false;
+        const want = slow.mask().slice();
+        GrammarMatcher.fastStrings = true;
+        expect(fast.mask(), `${JSON.stringify(text)} after ${checked} bytes`).toEqual(want);
+        expect(fast.accept(b)).toBe(true);
+        expect(slow.accept(b)).toBe(true);
+        checked++;
+      }
+    }
+    expect(checked).toBeGreaterThan(4);
+  });
 });
