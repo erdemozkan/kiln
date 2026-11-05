@@ -74,16 +74,20 @@ Key ideas:
   (0.08 ms on SmolLM2's 49k vocabulary, 0.6 ms on Qwen's 152k). The sampler skips masked ids before top-k / top-p, so truncation applies among
   allowed tokens only. The forward pass needs only the last sampled id, so it is submitted before the
   mask is computed and the CPU work overlaps it.
-- **Speculative decoding by prompt lookup (opt-in, `draftTokens: 7`).** When the last tokens appeared
+- **Speculative decoding by prompt lookup (`draftTokens`, default 7).** When the last tokens appeared
   earlier in the prompt or the output, the tokens that followed are guessed and checked in one forward
   pass that samples every row. The draft stands up to the first token the model chose differently.
   Each row draws the random numbers a single-token step at its position would, so sampling with a
   temperature verifies too. K/V of rejected rows is overwritten by the next pass before anything reads
   it, so nothing is rolled back. A verify pass costs more than a decode step (3.5 steps for up to 8
-  rows on the Intel GPU), so the engine measures both as it goes and only checks a draft that is
-  likely to pay; between passes it decodes as usual, two submits in flight. On SmolLM2-135M (Intel
-  GPU, greedy) it runs 1.8× faster repeating a paragraph, 1.3× renaming a variable in code and 1.2×
-  summarising, and 0.9–1.07× on free-form text. Not combined with grammars or the repetition penalty.
+  rows on the Intel GPU, less on an M3), so the engine measures both as it goes and only checks a
+  draft that is likely to pay; a check that does not pay backs drafting off (8, 16, 32, then 64
+  skipped drafts before the next try). Between passes it decodes as usual, two submits in flight.
+  With JSON or schema output, drafts are cut where the grammar rejects them and each row samples
+  under its own mask. Measured on SmolLM2-135M, output identical in every case: repeating a paragraph
+  2.0× faster on the Intel GPU and 2.2× on an M3; editing code 1.3×; summarising 1.2×; a list schema
+  1.4× on the M3; sampled free text 0.96× at worst. Off with `draftTokens: 0`, and not combined with
+  the repetition penalty.
 - **The prompt prefix is reused, across reloads too.** The engine remembers which tokens' K/V are in
   the cache and only prefills what changed, so a multi-turn chat prefills just the new turn. The
   worker also keeps the last call's K/V in OPFS (`promptCache`, on by default; about 23 KB per token

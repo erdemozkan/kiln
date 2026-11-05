@@ -56,18 +56,45 @@ describe("DraftGate", () => {
     expect(g.worth(1)).toBe(false); // 2 tokens cannot pay for 3.5
   });
 
-  it("stops verifying when drafts are rejected, and tries again later", () => {
+  /** Skipped drafts before the gate tries again. */
+  const skipsUntilTry = (g: DraftGate) => {
+    let n = 0;
+    while (!g.worth(7) && n < 1000) {
+      g.plain(96, 4, true);
+      n++;
+    }
+    return n;
+  };
+
+  it("backs off exponentially while passes lose, and resets when one pays", () => {
+    const g = new DraftGate();
+    g.plain(96, 4, false); // 24 ms a token; a pass costs 83, so it pays from 3 tokens kept
+    g.verified(83, 7, 0);
+    expect(skipsUntilTry(g)).toBe(8);
+    g.verified(83, 7, 1);
+    expect(skipsUntilTry(g)).toBe(16);
+    g.verified(83, 7, 0);
+    expect(skipsUntilTry(g)).toBe(32);
+    for (let i = 0; i < 3; i++) g.verified(83, 7, 0);
+    expect(skipsUntilTry(g)).toBe(64); // capped
+    g.verified(83, 7, 6); // paid: the backoff ends (the kept share, still low, allows a try within 8)
+    expect(skipsUntilTry(g)).toBeLessThanOrEqual(8);
+    g.verified(83, 7, 7);
+    g.verified(83, 7, 7);
+    expect(g.worth(7)).toBe(true);
+  });
+
+  it("retries a draft the estimate turns down, so it can recover", () => {
     const g = new DraftGate();
     g.plain(96, 4, false);
-    for (let i = 0; i < 4; i++) g.verified(83, 7, 0);
-    expect(g.worth(7)).toBe(false);
-    let skips = 0;
-    while (!g.worth(7) && skips < 100) {
+    g.verified(83, 7, 3); // paid, but barely: the kept share is now low
+    for (let i = 0; i < 3; i++) g.verified(83, 7, 3);
+    expect(g.worth(1)).toBe(false);
+    let n = 0;
+    while (!g.worth(1) && n < 100) {
       g.plain(96, 4, true);
-      skips++;
+      n++;
     }
-    // About 8 plain chunks (32 tokens) before the next try.
-    expect(skips).toBeGreaterThan(4);
-    expect(skips).toBeLessThan(16);
+    expect(n).toBe(8);
   });
 });

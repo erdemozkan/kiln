@@ -40,7 +40,7 @@ export interface GenerateOptions {
   /**
    * Speculative decoding by prompt lookup: when the last tokens appeared earlier in the prompt or the
    * output, up to this many of the tokens that followed are guessed and checked in one forward pass
-   * (0 = off, default; 7 fills one 8-row matmul tile; at most 31). Faster when the output repeats its
+   * (default 7, which fills one 8-row matmul tile; 0 = off; at most 31). Faster when the output repeats its
    * input, and a check is only spent when it is likely to pay off on this GPU. Works with `format`:
    * drafts are cut at the first token the grammar rejects and each row samples under its own mask.
    * Sampling draws the same random numbers either way, but the multi-row kernels round differently
@@ -165,7 +165,7 @@ export class Engine {
     const stop = new Set([...this.stopIds, ...(opts.stopTokenIds ?? [])]);
     const t0 = performance.now();
     const grammar = opts.format ? this.matcher(opts.format, [...stop]) : undefined;
-    const draftTokens = sampling.repetitionPenalty !== 1 ? 0 : Math.min(MAX_VERIFY_ROWS - 1, Math.max(0, Math.floor(opts.draftTokens ?? 0)));
+    const draftTokens = sampling.repetitionPenalty !== 1 ? 0 : Math.min(MAX_VERIFY_ROWS - 1, Math.max(0, Math.floor(opts.draftTokens ?? 7)));
     this.busy = true;
     // Reuse the shared prefix, but always prefill at least the last prompt token to get its logits.
     let start = 0;

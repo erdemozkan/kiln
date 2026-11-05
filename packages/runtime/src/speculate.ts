@@ -32,35 +32,48 @@ export function acceptedLength(draft: readonly number[], sampled: ArrayLike<numb
   return n;
 }
 
+/** Skipped drafts before trying again after a pass that did not pay; doubles up to MAX_WAIT. */
+const FIRST_WAIT = 8;
+const MAX_WAIT = 64;
+
 /**
  * Decides, per draft, whether checking it is worth a verify pass on this GPU. A verify pass costs more
  * than a plain decode step (how much depends on the GPU), so it has to keep enough draft tokens to pay
- * for itself. Both costs and the share of draft tokens kept are learned as decoding goes. While drafts
- * do not pay, decoding stays plain, and each skipped draft wins back a little optimism, so a later
- * stretch of repetitive text is still picked up.
+ * for itself. Both costs and the share of draft tokens kept are learned as decoding goes. A pass that
+ * does not pay backs drafting off: the next try waits for 8 skipped drafts, then 16, 32 and 64 while
+ * passes keep losing, and a pass that pays ends the backoff. So text the model does not copy costs a
+ * few probes, and a later stretch of copied text is still picked up.
  */
 export class DraftGate {
   private passMs: number | undefined;
   private tokenMs: number | undefined;
   /** Share of draft tokens kept, smoothed; starts optimistic. */
   private keep = 1;
+  /** Skipped drafts required before the next pass (0: none), and skipped since the last one. */
+  private wait = 0;
+  private skipped = 0;
 
   worth(draftLength: number): boolean {
     // Plain steps are measured first, then one pass, so the comparison has both sides.
     if (this.tokenMs === undefined) return false;
     if (this.passMs === undefined) return true;
+    if (this.skipped < this.wait) return false;
     // A pass yields the model's own token plus the kept draft; plain decoding makes passMs / tokenMs.
-    return 1 + this.keep * draftLength > this.passMs / this.tokenMs;
+    // A draft the estimate turns down is still tried after FIRST_WAIT skips, so it can recover.
+    return this.skipped >= Math.max(this.wait, FIRST_WAIT) || 1 + this.keep * draftLength > this.passMs / this.tokenMs;
   }
 
   verified(ms: number, drafted: number, kept: number): void {
     this.passMs = ema(this.passMs, ms);
     this.keep = ema(this.keep, kept / drafted);
+    this.skipped = 0;
+    const paid = this.tokenMs !== undefined && (1 + kept) * this.tokenMs > ms;
+    this.wait = paid ? 0 : Math.min(MAX_WAIT, Math.max(FIRST_WAIT, 2 * this.wait));
   }
 
   plain(ms: number, tokens: number, skippedDraft: boolean): void {
     this.tokenMs = ema(this.tokenMs, ms / tokens);
-    if (skippedDraft) this.keep += (1 - this.keep) * 0.02;
+    if (skippedDraft) this.skipped++;
   }
 }
 
