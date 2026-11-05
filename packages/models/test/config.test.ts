@@ -93,6 +93,53 @@ describe("GGUF", () => {
     expect(ggufToHF("output.weight")).toBe("lm_head.weight");
     expect(ggufToHF("rope_freqs.weight")).toBeUndefined();
   });
+
+  it("maps gemma3 the way llama.cpp writes it (Gemma 3 270M-it metadata)", () => {
+    const tokens = Array.from({ length: 262144 }, (_, i) => (i === 106 ? "<end_of_turn>" : i === 1 ? "<eos>" : `t${i}`));
+    const meta = new Map<string, unknown>([
+      ["general.architecture", "gemma3"],
+      ["gemma3.embedding_length", 640],
+      ["gemma3.block_count", 18],
+      ["gemma3.feed_forward_length", 2048],
+      ["gemma3.attention.head_count", 4],
+      ["gemma3.attention.head_count_kv", 1],
+      ["gemma3.attention.key_length", 256],
+      ["gemma3.attention.layer_norm_rms_epsilon", 1e-6],
+      ["gemma3.rope.freq_base", 1000000],
+      ["gemma3.attention.sliding_window", 512],
+      ["tokenizer.ggml.tokens", tokens],
+      ["tokenizer.ggml.eos_token_id", 1],
+      ["tokenizer.ggml.bos_token_id", 2],
+    ]);
+    const c = configFromGGUF(meta, ["token_embd.weight", "blk.0.attn_q.weight", "blk.0.attn_q_norm.weight"]);
+    expect(c).toMatchObject({
+      family: "gemma3",
+      headDim: 256,
+      vocabSize: 262144,
+      ropeInterleaved: false,
+      ropeTheta: 1000000,
+      ropeLocalTheta: 10000,
+      tieEmbeddings: true,
+      qkNorm: true,
+      activation: "gelu",
+      sandwichNorms: true,
+      embedScale: 25.25,
+      attnScale: 1 / 16,
+      slidingWindow: 512,
+      eosTokenIds: [1, 106],
+    });
+    expect(c.slidingLayers!.map((s) => (s ? "s" : "F")).join("")).toBe("sssssFsssssFsssssF");
+    expect(ggufToHF("blk.2.ffn_norm.weight", "gemma3")).toBe("model.layers.2.pre_feedforward_layernorm.weight");
+    expect(ggufToHF("blk.2.post_attention_norm.weight", "gemma3")).toBe("model.layers.2.post_attention_layernorm.weight");
+    expect(ggufToHF("blk.2.post_ffw_norm.weight", "gemma3")).toBe("model.layers.2.post_feedforward_layernorm.weight");
+    expect(ggufToHF("blk.2.ffn_norm.weight")).toBe("model.layers.2.post_attention_layernorm.weight");
+    // The 62-layer 27B scales by hidden / heads, not head_dim.
+    const big = new Map(meta);
+    big.set("gemma3.block_count", 62).set("gemma3.embedding_length", 5376).set("gemma3.attention.head_count", 32).set("gemma3.attention.key_length", 128);
+    expect(configFromGGUF(big, ["token_embd.weight"]).attnScale).toBeCloseTo(168 ** -0.5, 12);
+    big.set("gemma3.rope.scaling.type", "linear");
+    expect(() => configFromGGUF(big, [])).toThrow(/rope scaling/);
+  });
 });
 
 describe("helpers", () => {

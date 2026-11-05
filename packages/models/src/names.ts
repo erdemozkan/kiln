@@ -19,12 +19,20 @@ const GLOBAL: Record<string, string> = {
   "output.weight": "lm_head.weight",
 };
 
+/** Gemma's sandwich norms: llama.cpp's ffn_norm is the norm before the MLP, not after attention. */
+const GEMMA3_BLOCK: Record<string, string> = {
+  ...BLOCK,
+  post_attention_norm: "post_attention_layernorm",
+  ffn_norm: "pre_feedforward_layernorm",
+  post_ffw_norm: "post_feedforward_layernorm",
+};
+
 /** Returns undefined for tensors the model does not use (e.g. rope_freqs). */
-export function ggufToHF(name: string): string | undefined {
+export function ggufToHF(name: string, arch = "llama"): string | undefined {
   if (GLOBAL[name]) return GLOBAL[name];
   const m = name.match(/^blk\.(\d+)\.(\w+)\.(weight|bias)$/);
   if (!m) return undefined;
-  const mapped = BLOCK[m[2]!];
+  const mapped = (arch === "gemma3" ? GEMMA3_BLOCK : BLOCK)[m[2]!];
   return mapped ? `model.layers.${m[1]}.${mapped}.${m[3]}` : undefined;
 }
 

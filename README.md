@@ -233,7 +233,7 @@ Models run end to end (greedy answers to fixed questions checked by hand; tool c
 | `qwen2` | DeepSeek-R1-Distill-Qwen-1.5B (reasons, then answers) | GGUF Q4_K_M | 11 tok/s |
 | `qwen3` | Qwen3-0.6B (`toolChoice`) | safetensors | 20–32 tok/s |
 | `gemma3_text` | Gemma 3 1B-it (sliding window: recalls a fact 1,100 tokens back) | safetensors (unsloth mirror) | 12–20 tok/s |
-| `gemma3_text` | Gemma 3 270M-it, with `quant: "q8"` or `"f32"` | safetensors | 25–40 tok/s |
+| `gemma3_text` | Gemma 3 270M-it, with `quant: "q8"` or `"f32"` | safetensors, GGUF Q8_0 | 25–42 tok/s |
 
 Gemma 3 was checked token by token against an independent NumPy forward pass written from
 transformers' `modeling_gemma3`: greedy output matched on every prompt tried, for 1B in q4 and q8 and 270M
@@ -246,7 +246,12 @@ the memory).
 `mistral` loads through the same code as `llama` but has not been run (the smallest Mistral is 7B).
 Other architectures are rejected at load: SmolLM3, Granite, Phi-3, Gemma 1/2, multimodal Gemma 3
 (4B and up) and its rope scaling, mixture-of-experts models, Llama 4, and rope scaling other than
-Llama 3's. Gemma 3 loads from safetensors only (GGUF `gemma3` is not mapped yet).
+Llama 3's.
+
+GGUF `gemma3` files load the way llama.cpp writes them: norms already hold Gemma's 1 + w, and the
+sliding layers' rope base (10k) and pattern (every 6th layer global) are not in the metadata. From
+`gemma-3-270m-it-Q8_0.gguf` the tokenizer gives the same ids as `tokenizer.json` on every test string,
+and greedy output matched the reference on the short prompts and the 1,138-token one.
 
 Supported:
 

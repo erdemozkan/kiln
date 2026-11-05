@@ -155,8 +155,8 @@ function ropeScalingFromHF(s: HFConfig | null | undefined): Llama3RopeScaling | 
 
 export function configFromGGUF(meta: Map<string, unknown>, tensorNames: readonly string[]): LlamaConfig {
   const arch = String(meta.get("general.architecture"));
-  if (!["llama", "qwen2", "qwen3"].includes(arch)) {
-    throw new UnsupportedModelError(`GGUF architecture "${arch}" is not supported yet (llama, qwen2, qwen3)`);
+  if (!["llama", "qwen2", "qwen3", "gemma3"].includes(arch)) {
+    throw new UnsupportedModelError(`GGUF architecture "${arch}" is not supported yet (llama, qwen2, qwen3, gemma3)`);
   }
   const get = (k: string, fallback?: number): number => {
     const v = meta.get(`${arch}.${k}`) ?? fallback;
@@ -166,6 +166,7 @@ export function configFromGGUF(meta: Map<string, unknown>, tensorNames: readonly
   const numHeads = get("attention.head_count");
   const hiddenSize = get("embedding_length");
   const tokens = meta.get("tokenizer.ggml.tokens") as unknown[] | undefined;
+  if (arch === "gemma3") return gemma3FromGGUF(meta, tensorNames, get, tokens);
   return {
     family: arch as LlamaConfig["family"],
     hiddenSize,
@@ -183,6 +184,57 @@ export function configFromGGUF(meta: Map<string, unknown>, tensorNames: readonly
     qkNorm: tensorNames.includes("blk.0.attn_q_norm.weight"),
     eosTokenIds: ids(meta.get("tokenizer.ggml.eos_token_id")),
     bosTokenId: meta.has("tokenizer.ggml.bos_token_id") ? Number(meta.get("tokenizer.ggml.bos_token_id")) : undefined,
+  };
+}
+
+/**
+ * GGUF gemma3, as llama.cpp writes and reads it: norm weights are stored with Gemma's 1 + w already
+ * applied, the sliding layers' rope base is 10k and every 6th layer is global (neither is in the
+ * metadata), and attention is scaled by head_dim^-0.5, or by (hidden / heads)^-0.5 for the 62-layer 27B.
+ */
+function gemma3FromGGUF(meta: Map<string, unknown>, tensorNames: readonly string[], get: (k: string, fallback?: number) => number, tokens: unknown[] | undefined): LlamaConfig {
+  if (meta.has("gemma3.rope.scaling.type") && meta.get("gemma3.rope.scaling.type") !== "none") {
+    throw new UnsupportedModelError("Gemma 3 with rope scaling (4B and larger) is not supported yet");
+  }
+  for (const k of ["attn_logit_softcapping", "final_logit_softcapping"]) {
+    if (meta.get(`gemma3.${k}`)) throw new UnsupportedModelError(`Gemma 3 with ${k} is not supported yet`);
+  }
+  const numLayers = get("block_count");
+  const hiddenSize = get("embedding_length");
+  const numHeads = get("attention.head_count");
+  const headDim = get("attention.key_length", 256);
+  const pattern = meta.get("gemma3.attention.sliding_window_pattern");
+  const slidingLayers = Array.from({ length: numLayers }, (_, l) =>
+    Array.isArray(pattern) ? Boolean(pattern[l]) : (l + 1) % (typeof pattern === "number" ? pattern : 6) !== 0,
+  );
+  const eos = ids(meta.get("tokenizer.ggml.eos_token_id"));
+  // Chat turns end with <end_of_turn>; some files name <eos> as the end-of-sequence token instead.
+  const eot = tokens?.indexOf("<end_of_turn>") ?? -1;
+  return {
+    family: "gemma3",
+    hiddenSize,
+    intermediateSize: get("feed_forward_length"),
+    numLayers,
+    numHeads,
+    numKvHeads: get("attention.head_count_kv", numHeads),
+    headDim,
+    vocabSize: get("vocab_size", tokens?.length ?? 0),
+    rmsEps: get("attention.layer_norm_rms_epsilon", 1e-6),
+    ropeTheta: get("rope.freq_base", 1000000),
+    ropeLocalTheta: 10000,
+    ropeInterleaved: false,
+    tieEmbeddings: !tensorNames.includes("output.weight"),
+    attentionBias: false,
+    qkNorm: true,
+    eosTokenIds: [...new Set([...eos, ...(eot >= 0 ? [eot] : [])])],
+    bosTokenId: meta.has("tokenizer.ggml.bos_token_id") ? Number(meta.get("tokenizer.ggml.bos_token_id")) : undefined,
+    activation: "gelu",
+    // As transformers computes it for the bf16 checkpoints these files come from (llama.cpp skips the rounding).
+    embedScale: bf16(Math.sqrt(hiddenSize)),
+    sandwichNorms: true,
+    attnScale: (numLayers === 62 ? hiddenSize / numHeads : headDim) ** -0.5,
+    slidingWindow: get("attention.sliding_window", 512),
+    slidingLayers,
   };
 }
 
