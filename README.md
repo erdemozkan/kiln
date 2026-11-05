@@ -224,6 +224,13 @@ Supported:
   (the tests compare against Python output). Models without a template fall back to built-in
   chatml / Llama 3 formats, and so do templates using Jinja the interpreter lacks (`{% filter %}`,
   `{% include %}`, …), with a warning.
+- Tool calling: `chat(messages, { tools })` passes OpenAI-style function specs to the template the way
+  transformers does (`tools` and `documents` are None when absent), and messages can carry
+  `tool_calls` and the `tool` role. The test fixture's tool and document cases for SmolLM3,
+  Qwen2.5/3, Mistral v0.3 and Granite 3.3 render byte-for-byte like jinja2. `parseToolCalls` reads
+  the `<tool_call>{…}</tool_call>` replies of Qwen and SmolLM3; on Qwen2.5-0.5B a call, its result
+  and the final answer made a full round trip. Templates that never read `tools` (SmolLM2) and the
+  built-in formats refuse tools rather than drop them.
 - Generation: temperature, top-k, top-p and HF-style repetition penalty, all on the GPU; prefix KV
   reuse; f16 or f32 KV cache; speculative decoding by prompt lookup. With drafts, 10 of 10 test
   prompts (greedy and sampled) gave the same text as plain decoding. The verify pass uses the 8-row
@@ -246,12 +253,14 @@ Known limits, roughly in roadmap order:
 - Matmul needs K to be a multiple of 32; attention needs head dim ≤ 256 and a multiple of 4.
 - Prefill attention does not split keys across workgroups, so a short prompt (few tiles) far into a long
   context runs on few workgroups.
-- The KV cache is contiguous: one sequence, no paging, and the reused prefix lives only in memory.
-- Constrained decoding runs one step per submit (each mask depends on the token before it). No regex
-  or GBNF grammars, and `minimum`/`maximum`/`format` are not enforced.
+- The KV cache is contiguous: one sequence, no paging, and one reusable prefix (the last prompt).
+- Constrained decoding waits for the CPU's mask between forward passes (drafts let one pass check
+  several tokens). No regex or GBNF grammars, and `minimum`/`maximum`/`format` are not enforced.
+  Tool calls are not constrained to the tool schemas.
 - K-quants are re-quantized to q4 on load (a second rounding) instead of being run natively.
-- Unigram tokenizers (T5, XLM-R, some SentencePiece models) are not supported. Chat templates get `messages`, `bos_token`,
-  `eos_token`, `add_generation_prompt` and `enable_thinking`, but no `tools` or `documents` yet.
+- Unigram tokenizers (T5, XLM-R, some SentencePiece models) are not supported. Tool calls in formats whose
+  markers are special tokens (Mistral's `[TOOL_CALLS]`, Granite's `<|tool_call|>`) are dropped when
+  decoding, so `parseToolCalls` only reads the `<tool_call>` format.
 - Single storage binding per tensor: very large f32 embeddings can exceed `maxStorageBufferBindingSize`
   (use q4).
 - WebGPU only; WASM fallback, WebNN and Node/Dawn backends come later.

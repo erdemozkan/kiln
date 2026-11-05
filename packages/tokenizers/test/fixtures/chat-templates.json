@@ -61,6 +61,97 @@
     "role": "user",
     "content": "Bye"
    }
+  ],
+  "tool-call": [
+   {
+    "role": "user",
+    "content": "What's the weather in Paris?"
+   },
+   {
+    "role": "assistant",
+    "content": "",
+    "tool_calls": [
+     {
+      "id": "call12345",
+      "type": "function",
+      "function": {
+       "name": "get_weather",
+       "arguments": {
+        "city": "Paris"
+       }
+      }
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "tool_call_id": "call12345",
+    "name": "get_weather",
+    "content": "{\"temperature\": 18, \"unit\": \"celsius\"}"
+   }
+  ],
+  "tool-parallel": [
+   {
+    "role": "system",
+    "content": "You are terse."
+   },
+   {
+    "role": "user",
+    "content": "Weather and time in Rome?"
+   },
+   {
+    "role": "assistant",
+    "content": "",
+    "tool_calls": [
+     {
+      "id": "callA1234",
+      "type": "function",
+      "function": {
+       "name": "get_weather",
+       "arguments": {
+        "city": "Rome",
+        "unit": "celsius"
+       }
+      }
+     },
+     {
+      "id": "callB5678",
+      "type": "function",
+      "function": {
+       "name": "get_time",
+       "arguments": {
+        "city": "Rome"
+       }
+      }
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "tool_call_id": "callA1234",
+    "name": "get_weather",
+    "content": "{\"temperature\": 24}"
+   },
+   {
+    "role": "tool",
+    "tool_call_id": "callB5678",
+    "name": "get_time",
+    "content": "14:05"
+   },
+   {
+    "role": "assistant",
+    "content": "24 °C and 14:05."
+   },
+   {
+    "role": "user",
+    "content": "Thanks!"
+   }
+  ],
+  "museum": [
+   {
+    "role": "user",
+    "content": "When does the museum open, and what does it cost?"
+   }
   ]
  },
  "templates": [
@@ -213,6 +304,172 @@
       "enable_thinking": false
      },
      "text": "<|im_start|>system\n## Metadata\n\nKnowledge Cutoff Date: June 2025\nToday Date: 26 Jul 2024\nReasoning Mode: /no_think\n\n## Custom Instructions\n\nYou are a helpful AI assistant named SmolLM, trained by Hugging Face.\n\n<|im_start|>user\nHello<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n<think>\nThe user greets me.\n</think>\n\nHi!<|im_end|>\n<|im_start|>user\nBye<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n"
+    },
+    {
+     "messages": "single",
+     "vars": {
+      "add_generation_prompt": true,
+      "bos_token": "<s>",
+      "eos_token": "</s>",
+      "tools": [
+       {
+        "type": "function",
+        "function": {
+         "name": "get_weather",
+         "description": "Get the current weather in a city.",
+         "parameters": {
+          "type": "object",
+          "properties": {
+           "city": {
+            "type": "string",
+            "description": "City name, e.g. Paris"
+           },
+           "unit": {
+            "type": "string",
+            "enum": [
+             "celsius",
+             "fahrenheit"
+            ]
+           }
+          },
+          "required": [
+           "city"
+          ]
+         }
+        }
+       },
+       {
+        "type": "function",
+        "function": {
+         "name": "get_time",
+         "description": "Get the local time in a city.",
+         "parameters": {
+          "type": "object",
+          "properties": {
+           "city": {
+            "type": "string"
+           }
+          },
+          "required": [
+           "city"
+          ]
+         }
+        }
+       }
+      ]
+     },
+     "text": "<|im_start|>system\n## Metadata\n\nKnowledge Cutoff Date: June 2025\nToday Date: 26 Jul 2024\nReasoning Mode: /think\n\n## Custom Instructions\n\nYou are a helpful AI assistant named SmolLM, trained by Hugging Face. Your role as an assistant involves thoroughly exploring questions through a systematic thinking process before providing the final precise and accurate solutions. This requires engaging in a comprehensive cycle of analysis, summarizing, exploration, reassessment, reflection, backtracking, and iteration to develop well-considered thinking process. Please structure your response into two main sections: Thought and Solution using the specified format: <think> Thought section </think> Solution section. In the Thought section, detail your reasoning process in steps. Each step should include detailed considerations such as analysing questions, summarizing relevant findings, brainstorming new ideas, verifying the accuracy of the current steps, refining any errors, and revisiting previous steps. In the Solution section, based on various attempts, explorations, and reflections from the Thought section, systematically present the final solution that you deem correct. The Solution section should be logical, accurate, and concise and detail necessary steps needed to reach the conclusion.\n\n### Tools\n\nYou may call one or more functions to assist with the user query.\nYou are provided with function signatures within <tools></tools> XML tags:\n\n<tools>\n{'type': 'function', 'function': {'name': 'get_weather', 'description': 'Get the current weather in a city.', 'parameters': {'type': 'object', 'properties': {'city': {'type': 'string', 'description': 'City name, e.g. Paris'}, 'unit': {'type': 'string', 'enum': ['celsius', 'fahrenheit']}}, 'required': ['city']}}}\n{'type': 'function', 'function': {'name': 'get_time', 'description': 'Get the local time in a city.', 'parameters': {'type': 'object', 'properties': {'city': {'type': 'string'}}, 'required': ['city']}}}\n</tools>\n\nFor each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n<tool_call>\n{\"name\": <function-name>, \"arguments\": <args-json-object>}\n</tool_call>\n\n<|im_end|>\n<|im_start|>user\nHi there!<|im_end|>\n<|im_start|>assistant\n"
+    },
+    {
+     "messages": "tool-call",
+     "vars": {
+      "add_generation_prompt": true,
+      "bos_token": "<s>",
+      "eos_token": "</s>",
+      "tools": [
+       {
+        "type": "function",
+        "function": {
+         "name": "get_weather",
+         "description": "Get the current weather in a city.",
+         "parameters": {
+          "type": "object",
+          "properties": {
+           "city": {
+            "type": "string",
+            "description": "City name, e.g. Paris"
+           },
+           "unit": {
+            "type": "string",
+            "enum": [
+             "celsius",
+             "fahrenheit"
+            ]
+           }
+          },
+          "required": [
+           "city"
+          ]
+         }
+        }
+       },
+       {
+        "type": "function",
+        "function": {
+         "name": "get_time",
+         "description": "Get the local time in a city.",
+         "parameters": {
+          "type": "object",
+          "properties": {
+           "city": {
+            "type": "string"
+           }
+          },
+          "required": [
+           "city"
+          ]
+         }
+        }
+       }
+      ]
+     },
+     "text": "<|im_start|>system\n## Metadata\n\nKnowledge Cutoff Date: June 2025\nToday Date: 26 Jul 2024\nReasoning Mode: /think\n\n## Custom Instructions\n\nYou are a helpful AI assistant named SmolLM, trained by Hugging Face. Your role as an assistant involves thoroughly exploring questions through a systematic thinking process before providing the final precise and accurate solutions. This requires engaging in a comprehensive cycle of analysis, summarizing, exploration, reassessment, reflection, backtracking, and iteration to develop well-considered thinking process. Please structure your response into two main sections: Thought and Solution using the specified format: <think> Thought section </think> Solution section. In the Thought section, detail your reasoning process in steps. Each step should include detailed considerations such as analysing questions, summarizing relevant findings, brainstorming new ideas, verifying the accuracy of the current steps, refining any errors, and revisiting previous steps. In the Solution section, based on various attempts, explorations, and reflections from the Thought section, systematically present the final solution that you deem correct. The Solution section should be logical, accurate, and concise and detail necessary steps needed to reach the conclusion.\n\n### Tools\n\nYou may call one or more functions to assist with the user query.\nYou are provided with function signatures within <tools></tools> XML tags:\n\n<tools>\n{'type': 'function', 'function': {'name': 'get_weather', 'description': 'Get the current weather in a city.', 'parameters': {'type': 'object', 'properties': {'city': {'type': 'string', 'description': 'City name, e.g. Paris'}, 'unit': {'type': 'string', 'enum': ['celsius', 'fahrenheit']}}, 'required': ['city']}}}\n{'type': 'function', 'function': {'name': 'get_time', 'description': 'Get the local time in a city.', 'parameters': {'type': 'object', 'properties': {'city': {'type': 'string'}}, 'required': ['city']}}}\n</tools>\n\nFor each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n<tool_call>\n{\"name\": <function-name>, \"arguments\": <args-json-object>}\n</tool_call>\n\n<|im_end|>\n<|im_start|>user\nWhat's the weather in Paris?<|im_end|>\n<|im_start|>assistant\n<|im_end|>\n<|im_start|>user\n{\"temperature\": 18, \"unit\": \"celsius\"}<|im_end|>\n<|im_start|>assistant\n"
+    },
+    {
+     "messages": "tool-parallel",
+     "vars": {
+      "add_generation_prompt": true,
+      "bos_token": "<s>",
+      "eos_token": "</s>",
+      "tools": [
+       {
+        "type": "function",
+        "function": {
+         "name": "get_weather",
+         "description": "Get the current weather in a city.",
+         "parameters": {
+          "type": "object",
+          "properties": {
+           "city": {
+            "type": "string",
+            "description": "City name, e.g. Paris"
+           },
+           "unit": {
+            "type": "string",
+            "enum": [
+             "celsius",
+             "fahrenheit"
+            ]
+           }
+          },
+          "required": [
+           "city"
+          ]
+         }
+        }
+       },
+       {
+        "type": "function",
+        "function": {
+         "name": "get_time",
+         "description": "Get the local time in a city.",
+         "parameters": {
+          "type": "object",
+          "properties": {
+           "city": {
+            "type": "string"
+           }
+          },
+          "required": [
+           "city"
+          ]
+         }
+        }
+       }
+      ],
+      "enable_thinking": false
+     },
+     "text": "<|im_start|>system\n## Metadata\n\nKnowledge Cutoff Date: June 2025\nToday Date: 26 Jul 2024\nReasoning Mode: /no_think\n\n## Custom Instructions\n\nYou are terse.\n\n### Tools\n\nYou may call one or more functions to assist with the user query.\nYou are provided with function signatures within <tools></tools> XML tags:\n\n<tools>\n{'type': 'function', 'function': {'name': 'get_weather', 'description': 'Get the current weather in a city.', 'parameters': {'type': 'object', 'properties': {'city': {'type': 'string', 'description': 'City name, e.g. Paris'}, 'unit': {'type': 'string', 'enum': ['celsius', 'fahrenheit']}}, 'required': ['city']}}}\n{'type': 'function', 'function': {'name': 'get_time', 'description': 'Get the local time in a city.', 'parameters': {'type': 'object', 'properties': {'city': {'type': 'string'}}, 'required': ['city']}}}\n</tools>\n\nFor each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n<tool_call>\n{\"name\": <function-name>, \"arguments\": <args-json-object>}\n</tool_call>\n\n<|im_end|>\n<|im_start|>user\nWeather and time in Rome?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n<|im_end|>\n<|im_start|>user\n{\"temperature\": 24}<|im_end|>\n<|im_start|>user\n14:05<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n24 °C and 14:05.<|im_end|>\n<|im_start|>user\nThanks!<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n"
     }
    ]
   },
@@ -264,6 +521,226 @@
       "eos_token": "<|im_end|>"
      },
      "text": "<|im_start|>system\nYou are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>\n<|im_start|>user\nHello<|im_end|>\n<|im_start|>assistant\n<think>\nThe user greets me.\n</think>\n\nHi!<|im_end|>\n<|im_start|>user\nBye<|im_end|>\n<|im_start|>assistant\n"
+    },
+    {
+     "messages": "single",
+     "vars": {
+      "add_generation_prompt": true,
+      "bos_token": "<s>",
+      "eos_token": "<|im_end|>",
+      "tools": [
+       {
+        "type": "function",
+        "function": {
+         "name": "get_weather",
+         "description": "Get the current weather in a city.",
+         "parameters": {
+          "type": "object",
+          "properties": {
+           "city": {
+            "type": "string",
+            "description": "City name, e.g. Paris"
+           },
+           "unit": {
+            "type": "string",
+            "enum": [
+             "celsius",
+             "fahrenheit"
+            ]
+           }
+          },
+          "required": [
+           "city"
+          ]
+         }
+        }
+       },
+       {
+        "type": "function",
+        "function": {
+         "name": "get_time",
+         "description": "Get the local time in a city.",
+         "parameters": {
+          "type": "object",
+          "properties": {
+           "city": {
+            "type": "string"
+           }
+          },
+          "required": [
+           "city"
+          ]
+         }
+        }
+       }
+      ]
+     },
+     "text": "<|im_start|>system\nYou are Qwen, created by Alibaba Cloud. You are a helpful assistant.\n\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Get the current weather in a city.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name, e.g. Paris\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}\n{\"type\": \"function\", \"function\": {\"name\": \"get_time\", \"description\": \"Get the local time in a city.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}}, \"required\": [\"city\"]}}}\n</tools>\n\nFor each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n<tool_call>\n{\"name\": <function-name>, \"arguments\": <args-json-object>}\n</tool_call><|im_end|>\n<|im_start|>user\nHi there!<|im_end|>\n<|im_start|>assistant\n"
+    },
+    {
+     "messages": "system",
+     "vars": {
+      "add_generation_prompt": true,
+      "bos_token": "<s>",
+      "eos_token": "<|im_end|>",
+      "tools": [
+       {
+        "type": "function",
+        "function": {
+         "name": "get_weather",
+         "description": "Get the current weather in a city.",
+         "parameters": {
+          "type": "object",
+          "properties": {
+           "city": {
+            "type": "string",
+            "description": "City name, e.g. Paris"
+           },
+           "unit": {
+            "type": "string",
+            "enum": [
+             "celsius",
+             "fahrenheit"
+            ]
+           }
+          },
+          "required": [
+           "city"
+          ]
+         }
+        }
+       },
+       {
+        "type": "function",
+        "function": {
+         "name": "get_time",
+         "description": "Get the local time in a city.",
+         "parameters": {
+          "type": "object",
+          "properties": {
+           "city": {
+            "type": "string"
+           }
+          },
+          "required": [
+           "city"
+          ]
+         }
+        }
+       }
+      ]
+     },
+     "text": "<|im_start|>system\nYou are terse.\n\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Get the current weather in a city.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name, e.g. Paris\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}\n{\"type\": \"function\", \"function\": {\"name\": \"get_time\", \"description\": \"Get the local time in a city.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}}, \"required\": [\"city\"]}}}\n</tools>\n\nFor each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n<tool_call>\n{\"name\": <function-name>, \"arguments\": <args-json-object>}\n</tool_call><|im_end|>\n<|im_start|>user\nWhat is 2+2?<|im_end|>\n<|im_start|>assistant\n"
+    },
+    {
+     "messages": "tool-call",
+     "vars": {
+      "add_generation_prompt": true,
+      "bos_token": "<s>",
+      "eos_token": "<|im_end|>",
+      "tools": [
+       {
+        "type": "function",
+        "function": {
+         "name": "get_weather",
+         "description": "Get the current weather in a city.",
+         "parameters": {
+          "type": "object",
+          "properties": {
+           "city": {
+            "type": "string",
+            "description": "City name, e.g. Paris"
+           },
+           "unit": {
+            "type": "string",
+            "enum": [
+             "celsius",
+             "fahrenheit"
+            ]
+           }
+          },
+          "required": [
+           "city"
+          ]
+         }
+        }
+       },
+       {
+        "type": "function",
+        "function": {
+         "name": "get_time",
+         "description": "Get the local time in a city.",
+         "parameters": {
+          "type": "object",
+          "properties": {
+           "city": {
+            "type": "string"
+           }
+          },
+          "required": [
+           "city"
+          ]
+         }
+        }
+       }
+      ]
+     },
+     "text": "<|im_start|>system\nYou are Qwen, created by Alibaba Cloud. You are a helpful assistant.\n\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Get the current weather in a city.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name, e.g. Paris\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}\n{\"type\": \"function\", \"function\": {\"name\": \"get_time\", \"description\": \"Get the local time in a city.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}}, \"required\": [\"city\"]}}}\n</tools>\n\nFor each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n<tool_call>\n{\"name\": <function-name>, \"arguments\": <args-json-object>}\n</tool_call><|im_end|>\n<|im_start|>user\nWhat's the weather in Paris?<|im_end|>\n<|im_start|>assistant\n<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\"}}\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\n{\"temperature\": 18, \"unit\": \"celsius\"}\n</tool_response><|im_end|>\n<|im_start|>assistant\n"
+    },
+    {
+     "messages": "tool-parallel",
+     "vars": {
+      "add_generation_prompt": true,
+      "bos_token": "<s>",
+      "eos_token": "<|im_end|>",
+      "tools": [
+       {
+        "type": "function",
+        "function": {
+         "name": "get_weather",
+         "description": "Get the current weather in a city.",
+         "parameters": {
+          "type": "object",
+          "properties": {
+           "city": {
+            "type": "string",
+            "description": "City name, e.g. Paris"
+           },
+           "unit": {
+            "type": "string",
+            "enum": [
+             "celsius",
+             "fahrenheit"
+            ]
+           }
+          },
+          "required": [
+           "city"
+          ]
+         }
+        }
+       },
+       {
+        "type": "function",
+        "function": {
+         "name": "get_time",
+         "description": "Get the local time in a city.",
+         "parameters": {
+          "type": "object",
+          "properties": {
+           "city": {
+            "type": "string"
+           }
+          },
+          "required": [
+           "city"
+          ]
+         }
+        }
+       }
+      ]
+     },
+     "text": "<|im_start|>system\nYou are terse.\n\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Get the current weather in a city.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name, e.g. Paris\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}\n{\"type\": \"function\", \"function\": {\"name\": \"get_time\", \"description\": \"Get the local time in a city.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}}, \"required\": [\"city\"]}}}\n</tools>\n\nFor each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n<tool_call>\n{\"name\": <function-name>, \"arguments\": <args-json-object>}\n</tool_call><|im_end|>\n<|im_start|>user\nWeather and time in Rome?<|im_end|>\n<|im_start|>assistant\n<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Rome\", \"unit\": \"celsius\"}}\n</tool_call>\n<tool_call>\n{\"name\": \"get_time\", \"arguments\": {\"city\": \"Rome\"}}\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\n{\"temperature\": 24}\n</tool_response>\n<tool_response>\n14:05\n</tool_response><|im_end|>\n<|im_start|>assistant\n24 °C and 14:05.<|im_end|>\n<|im_start|>user\nThanks!<|im_end|>\n<|im_start|>assistant\n"
     }
    ]
   },
@@ -365,6 +842,172 @@
       "enable_thinking": false
      },
      "text": "<|im_start|>user\nHello<|im_end|>\n<|im_start|>assistant\nHi!<|im_end|>\n<|im_start|>user\nBye<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+    },
+    {
+     "messages": "single",
+     "vars": {
+      "add_generation_prompt": true,
+      "bos_token": "<s>",
+      "eos_token": "<|im_end|>",
+      "tools": [
+       {
+        "type": "function",
+        "function": {
+         "name": "get_weather",
+         "description": "Get the current weather in a city.",
+         "parameters": {
+          "type": "object",
+          "properties": {
+           "city": {
+            "type": "string",
+            "description": "City name, e.g. Paris"
+           },
+           "unit": {
+            "type": "string",
+            "enum": [
+             "celsius",
+             "fahrenheit"
+            ]
+           }
+          },
+          "required": [
+           "city"
+          ]
+         }
+        }
+       },
+       {
+        "type": "function",
+        "function": {
+         "name": "get_time",
+         "description": "Get the local time in a city.",
+         "parameters": {
+          "type": "object",
+          "properties": {
+           "city": {
+            "type": "string"
+           }
+          },
+          "required": [
+           "city"
+          ]
+         }
+        }
+       }
+      ]
+     },
+     "text": "<|im_start|>system\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Get the current weather in a city.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name, e.g. Paris\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}\n{\"type\": \"function\", \"function\": {\"name\": \"get_time\", \"description\": \"Get the local time in a city.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}}, \"required\": [\"city\"]}}}\n</tools>\n\nFor each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n<tool_call>\n{\"name\": <function-name>, \"arguments\": <args-json-object>}\n</tool_call><|im_end|>\n<|im_start|>user\nHi there!<|im_end|>\n<|im_start|>assistant\n"
+    },
+    {
+     "messages": "tool-call",
+     "vars": {
+      "add_generation_prompt": true,
+      "bos_token": "<s>",
+      "eos_token": "<|im_end|>",
+      "tools": [
+       {
+        "type": "function",
+        "function": {
+         "name": "get_weather",
+         "description": "Get the current weather in a city.",
+         "parameters": {
+          "type": "object",
+          "properties": {
+           "city": {
+            "type": "string",
+            "description": "City name, e.g. Paris"
+           },
+           "unit": {
+            "type": "string",
+            "enum": [
+             "celsius",
+             "fahrenheit"
+            ]
+           }
+          },
+          "required": [
+           "city"
+          ]
+         }
+        }
+       },
+       {
+        "type": "function",
+        "function": {
+         "name": "get_time",
+         "description": "Get the local time in a city.",
+         "parameters": {
+          "type": "object",
+          "properties": {
+           "city": {
+            "type": "string"
+           }
+          },
+          "required": [
+           "city"
+          ]
+         }
+        }
+       }
+      ]
+     },
+     "text": "<|im_start|>system\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Get the current weather in a city.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name, e.g. Paris\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}\n{\"type\": \"function\", \"function\": {\"name\": \"get_time\", \"description\": \"Get the local time in a city.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}}, \"required\": [\"city\"]}}}\n</tools>\n\nFor each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n<tool_call>\n{\"name\": <function-name>, \"arguments\": <args-json-object>}\n</tool_call><|im_end|>\n<|im_start|>user\nWhat's the weather in Paris?<|im_end|>\n<|im_start|>assistant\n<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\"}}\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\n{\"temperature\": 18, \"unit\": \"celsius\"}\n</tool_response><|im_end|>\n<|im_start|>assistant\n"
+    },
+    {
+     "messages": "tool-parallel",
+     "vars": {
+      "add_generation_prompt": true,
+      "bos_token": "<s>",
+      "eos_token": "<|im_end|>",
+      "tools": [
+       {
+        "type": "function",
+        "function": {
+         "name": "get_weather",
+         "description": "Get the current weather in a city.",
+         "parameters": {
+          "type": "object",
+          "properties": {
+           "city": {
+            "type": "string",
+            "description": "City name, e.g. Paris"
+           },
+           "unit": {
+            "type": "string",
+            "enum": [
+             "celsius",
+             "fahrenheit"
+            ]
+           }
+          },
+          "required": [
+           "city"
+          ]
+         }
+        }
+       },
+       {
+        "type": "function",
+        "function": {
+         "name": "get_time",
+         "description": "Get the local time in a city.",
+         "parameters": {
+          "type": "object",
+          "properties": {
+           "city": {
+            "type": "string"
+           }
+          },
+          "required": [
+           "city"
+          ]
+         }
+        }
+       }
+      ],
+      "enable_thinking": false
+     },
+     "text": "<|im_start|>system\nYou are terse.\n\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Get the current weather in a city.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name, e.g. Paris\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}\n{\"type\": \"function\", \"function\": {\"name\": \"get_time\", \"description\": \"Get the local time in a city.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}}, \"required\": [\"city\"]}}}\n</tools>\n\nFor each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n<tool_call>\n{\"name\": <function-name>, \"arguments\": <args-json-object>}\n</tool_call><|im_end|>\n<|im_start|>user\nWeather and time in Rome?<|im_end|>\n<|im_start|>assistant\n<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Rome\", \"unit\": \"celsius\"}}\n</tool_call>\n<tool_call>\n{\"name\": \"get_time\", \"arguments\": {\"city\": \"Rome\"}}\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\n{\"temperature\": 24}\n</tool_response>\n<tool_response>\n14:05\n</tool_response><|im_end|>\n<|im_start|>assistant\n24 °C and 14:05.<|im_end|>\n<|im_start|>user\nThanks!<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
     }
    ]
   },
@@ -518,6 +1161,171 @@
       "eos_token": "</s>"
      },
      "text": "<s>[INST] Hello[/INST] <think>\nThe user greets me.\n</think>\n\nHi!</s>[INST] Bye[/INST]"
+    },
+    {
+     "messages": "single",
+     "vars": {
+      "add_generation_prompt": true,
+      "bos_token": "<s>",
+      "eos_token": "</s>",
+      "tools": [
+       {
+        "type": "function",
+        "function": {
+         "name": "get_weather",
+         "description": "Get the current weather in a city.",
+         "parameters": {
+          "type": "object",
+          "properties": {
+           "city": {
+            "type": "string",
+            "description": "City name, e.g. Paris"
+           },
+           "unit": {
+            "type": "string",
+            "enum": [
+             "celsius",
+             "fahrenheit"
+            ]
+           }
+          },
+          "required": [
+           "city"
+          ]
+         }
+        }
+       },
+       {
+        "type": "function",
+        "function": {
+         "name": "get_time",
+         "description": "Get the local time in a city.",
+         "parameters": {
+          "type": "object",
+          "properties": {
+           "city": {
+            "type": "string"
+           }
+          },
+          "required": [
+           "city"
+          ]
+         }
+        }
+       }
+      ]
+     },
+     "text": "<s>[AVAILABLE_TOOLS] [{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Get the current weather in a city.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name, e.g. Paris\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"get_time\", \"description\": \"Get the local time in a city.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}}, \"required\": [\"city\"]}}}][/AVAILABLE_TOOLS][INST] Hi there![/INST]"
+    },
+    {
+     "messages": "tool-call",
+     "vars": {
+      "add_generation_prompt": true,
+      "bos_token": "<s>",
+      "eos_token": "</s>",
+      "tools": [
+       {
+        "type": "function",
+        "function": {
+         "name": "get_weather",
+         "description": "Get the current weather in a city.",
+         "parameters": {
+          "type": "object",
+          "properties": {
+           "city": {
+            "type": "string",
+            "description": "City name, e.g. Paris"
+           },
+           "unit": {
+            "type": "string",
+            "enum": [
+             "celsius",
+             "fahrenheit"
+            ]
+           }
+          },
+          "required": [
+           "city"
+          ]
+         }
+        }
+       },
+       {
+        "type": "function",
+        "function": {
+         "name": "get_time",
+         "description": "Get the local time in a city.",
+         "parameters": {
+          "type": "object",
+          "properties": {
+           "city": {
+            "type": "string"
+           }
+          },
+          "required": [
+           "city"
+          ]
+         }
+        }
+       }
+      ]
+     },
+     "text": "<s>[AVAILABLE_TOOLS] [{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Get the current weather in a city.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name, e.g. Paris\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"get_time\", \"description\": \"Get the local time in a city.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}}, \"required\": [\"city\"]}}}][/AVAILABLE_TOOLS][INST] What's the weather in Paris?[/INST][TOOL_CALLS] [{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\"}, \"id\": \"call12345\"}]</s>[TOOL_RESULTS] {\"content\": {\"temperature\": 18, \"unit\": \"celsius\"}, \"call_id\": \"call12345\"}[/TOOL_RESULTS]"
+    },
+    {
+     "messages": "tool-parallel",
+     "vars": {
+      "add_generation_prompt": true,
+      "bos_token": "<s>",
+      "eos_token": "</s>",
+      "tools": [
+       {
+        "type": "function",
+        "function": {
+         "name": "get_weather",
+         "description": "Get the current weather in a city.",
+         "parameters": {
+          "type": "object",
+          "properties": {
+           "city": {
+            "type": "string",
+            "description": "City name, e.g. Paris"
+           },
+           "unit": {
+            "type": "string",
+            "enum": [
+             "celsius",
+             "fahrenheit"
+            ]
+           }
+          },
+          "required": [
+           "city"
+          ]
+         }
+        }
+       },
+       {
+        "type": "function",
+        "function": {
+         "name": "get_time",
+         "description": "Get the local time in a city.",
+         "parameters": {
+          "type": "object",
+          "properties": {
+           "city": {
+            "type": "string"
+           }
+          },
+          "required": [
+           "city"
+          ]
+         }
+        }
+       }
+      ]
+     },
+     "text": "<s>[INST] Weather and time in Rome?[/INST][TOOL_CALLS] [{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Rome\", \"unit\": \"celsius\"}, \"id\": \"callA1234\"}, {\"name\": \"get_time\", \"arguments\": {\"city\": \"Rome\"}, \"id\": \"callB5678\"}]</s>[TOOL_RESULTS] {\"content\": {\"temperature\": 24}, \"call_id\": \"callA1234\"}[/TOOL_RESULTS][TOOL_RESULTS] {\"content\": 14:05, \"call_id\": \"callB5678\"}[/TOOL_RESULTS] 24 °C and 14:05.</s>[AVAILABLE_TOOLS] [{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Get the current weather in a city.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name, e.g. Paris\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"get_time\", \"description\": \"Get the local time in a city.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}}, \"required\": [\"city\"]}}}][/AVAILABLE_TOOLS][INST] You are terse.\n\nThanks![/INST]"
     }
    ]
   },
@@ -620,6 +1428,259 @@
       "eos_token": "<|end_of_text|>"
      },
      "text": "<|start_of_role|>system<|end_of_role|>Knowledge Cutoff Date: April 2024.\nToday's Date: 26 Jul 2024.\nYou are Granite, developed by IBM. You are a helpful AI assistant.<|end_of_text|>\n<|start_of_role|>user<|end_of_role|>Hello<|end_of_text|>\n<|start_of_role|>assistant<|end_of_role|><think>\nThe user greets me.\n</think>\n\nHi!<|end_of_text|>\n<|start_of_role|>user<|end_of_role|>Bye<|end_of_text|>\n<|start_of_role|>assistant<|end_of_role|>"
+    },
+    {
+     "messages": "single",
+     "vars": {
+      "add_generation_prompt": true,
+      "bos_token": "<|end_of_text|>",
+      "eos_token": "<|end_of_text|>",
+      "tools": [
+       {
+        "type": "function",
+        "function": {
+         "name": "get_weather",
+         "description": "Get the current weather in a city.",
+         "parameters": {
+          "type": "object",
+          "properties": {
+           "city": {
+            "type": "string",
+            "description": "City name, e.g. Paris"
+           },
+           "unit": {
+            "type": "string",
+            "enum": [
+             "celsius",
+             "fahrenheit"
+            ]
+           }
+          },
+          "required": [
+           "city"
+          ]
+         }
+        }
+       },
+       {
+        "type": "function",
+        "function": {
+         "name": "get_time",
+         "description": "Get the local time in a city.",
+         "parameters": {
+          "type": "object",
+          "properties": {
+           "city": {
+            "type": "string"
+           }
+          },
+          "required": [
+           "city"
+          ]
+         }
+        }
+       }
+      ]
+     },
+     "text": "<|start_of_role|>system<|end_of_role|>Knowledge Cutoff Date: April 2024.\nToday's Date: 26 Jul 2024.\nYou are Granite, developed by IBM. You are a helpful assistant with access to the following tools. When a tool is required to answer the user's query, respond only with <|tool_call|> followed by a JSON list of tools used. If a tool does not exist in the provided list of tools, notify the user that you do not have the ability to fulfill the request.<|end_of_text|>\n<|start_of_role|>available_tools<|end_of_role|>[\n    {\n        \"type\": \"function\",\n        \"function\": {\n            \"name\": \"get_weather\",\n            \"description\": \"Get the current weather in a city.\",\n            \"parameters\": {\n                \"type\": \"object\",\n                \"properties\": {\n                    \"city\": {\n                        \"type\": \"string\",\n                        \"description\": \"City name, e.g. Paris\"\n                    },\n                    \"unit\": {\n                        \"type\": \"string\",\n                        \"enum\": [\n                            \"celsius\",\n                            \"fahrenheit\"\n                        ]\n                    }\n                },\n                \"required\": [\n                    \"city\"\n                ]\n            }\n        }\n    },\n    {\n        \"type\": \"function\",\n        \"function\": {\n            \"name\": \"get_time\",\n            \"description\": \"Get the local time in a city.\",\n            \"parameters\": {\n                \"type\": \"object\",\n                \"properties\": {\n                    \"city\": {\n                        \"type\": \"string\"\n                    }\n                },\n                \"required\": [\n                    \"city\"\n                ]\n            }\n        }\n    }\n]<|end_of_text|>\n<|start_of_role|>user<|end_of_role|>Hi there!<|end_of_text|>\n<|start_of_role|>assistant<|end_of_role|>"
+    },
+    {
+     "messages": "tool-call",
+     "vars": {
+      "add_generation_prompt": true,
+      "bos_token": "<|end_of_text|>",
+      "eos_token": "<|end_of_text|>",
+      "tools": [
+       {
+        "type": "function",
+        "function": {
+         "name": "get_weather",
+         "description": "Get the current weather in a city.",
+         "parameters": {
+          "type": "object",
+          "properties": {
+           "city": {
+            "type": "string",
+            "description": "City name, e.g. Paris"
+           },
+           "unit": {
+            "type": "string",
+            "enum": [
+             "celsius",
+             "fahrenheit"
+            ]
+           }
+          },
+          "required": [
+           "city"
+          ]
+         }
+        }
+       },
+       {
+        "type": "function",
+        "function": {
+         "name": "get_time",
+         "description": "Get the local time in a city.",
+         "parameters": {
+          "type": "object",
+          "properties": {
+           "city": {
+            "type": "string"
+           }
+          },
+          "required": [
+           "city"
+          ]
+         }
+        }
+       }
+      ]
+     },
+     "text": "<|start_of_role|>system<|end_of_role|>Knowledge Cutoff Date: April 2024.\nToday's Date: 26 Jul 2024.\nYou are Granite, developed by IBM. You are a helpful assistant with access to the following tools. When a tool is required to answer the user's query, respond only with <|tool_call|> followed by a JSON list of tools used. If a tool does not exist in the provided list of tools, notify the user that you do not have the ability to fulfill the request.<|end_of_text|>\n<|start_of_role|>available_tools<|end_of_role|>[\n    {\n        \"type\": \"function\",\n        \"function\": {\n            \"name\": \"get_weather\",\n            \"description\": \"Get the current weather in a city.\",\n            \"parameters\": {\n                \"type\": \"object\",\n                \"properties\": {\n                    \"city\": {\n                        \"type\": \"string\",\n                        \"description\": \"City name, e.g. Paris\"\n                    },\n                    \"unit\": {\n                        \"type\": \"string\",\n                        \"enum\": [\n                            \"celsius\",\n                            \"fahrenheit\"\n                        ]\n                    }\n                },\n                \"required\": [\n                    \"city\"\n                ]\n            }\n        }\n    },\n    {\n        \"type\": \"function\",\n        \"function\": {\n            \"name\": \"get_time\",\n            \"description\": \"Get the local time in a city.\",\n            \"parameters\": {\n                \"type\": \"object\",\n                \"properties\": {\n                    \"city\": {\n                        \"type\": \"string\"\n                    }\n                },\n                \"required\": [\n                    \"city\"\n                ]\n            }\n        }\n    }\n]<|end_of_text|>\n<|start_of_role|>user<|end_of_role|>What's the weather in Paris?<|end_of_text|>\n<|start_of_role|>assistant<|end_of_role|><|end_of_text|>\n<|start_of_role|>tool<|end_of_role|>{\"temperature\": 18, \"unit\": \"celsius\"}<|end_of_text|>\n<|start_of_role|>assistant<|end_of_role|>"
+    },
+    {
+     "messages": "tool-parallel",
+     "vars": {
+      "add_generation_prompt": true,
+      "bos_token": "<|end_of_text|>",
+      "eos_token": "<|end_of_text|>",
+      "tools": [
+       {
+        "type": "function",
+        "function": {
+         "name": "get_weather",
+         "description": "Get the current weather in a city.",
+         "parameters": {
+          "type": "object",
+          "properties": {
+           "city": {
+            "type": "string",
+            "description": "City name, e.g. Paris"
+           },
+           "unit": {
+            "type": "string",
+            "enum": [
+             "celsius",
+             "fahrenheit"
+            ]
+           }
+          },
+          "required": [
+           "city"
+          ]
+         }
+        }
+       },
+       {
+        "type": "function",
+        "function": {
+         "name": "get_time",
+         "description": "Get the local time in a city.",
+         "parameters": {
+          "type": "object",
+          "properties": {
+           "city": {
+            "type": "string"
+           }
+          },
+          "required": [
+           "city"
+          ]
+         }
+        }
+       }
+      ]
+     },
+     "text": "<|start_of_role|>system<|end_of_role|>You are terse.<|end_of_text|>\n<|start_of_role|>available_tools<|end_of_role|>[\n    {\n        \"type\": \"function\",\n        \"function\": {\n            \"name\": \"get_weather\",\n            \"description\": \"Get the current weather in a city.\",\n            \"parameters\": {\n                \"type\": \"object\",\n                \"properties\": {\n                    \"city\": {\n                        \"type\": \"string\",\n                        \"description\": \"City name, e.g. Paris\"\n                    },\n                    \"unit\": {\n                        \"type\": \"string\",\n                        \"enum\": [\n                            \"celsius\",\n                            \"fahrenheit\"\n                        ]\n                    }\n                },\n                \"required\": [\n                    \"city\"\n                ]\n            }\n        }\n    },\n    {\n        \"type\": \"function\",\n        \"function\": {\n            \"name\": \"get_time\",\n            \"description\": \"Get the local time in a city.\",\n            \"parameters\": {\n                \"type\": \"object\",\n                \"properties\": {\n                    \"city\": {\n                        \"type\": \"string\"\n                    }\n                },\n                \"required\": [\n                    \"city\"\n                ]\n            }\n        }\n    }\n]<|end_of_text|>\n<|start_of_role|>user<|end_of_role|>Weather and time in Rome?<|end_of_text|>\n<|start_of_role|>assistant<|end_of_role|><|end_of_text|>\n<|start_of_role|>tool<|end_of_role|>{\"temperature\": 24}<|end_of_text|>\n<|start_of_role|>tool<|end_of_role|>14:05<|end_of_text|>\n<|start_of_role|>assistant<|end_of_role|>24 °C and 14:05.<|end_of_text|>\n<|start_of_role|>user<|end_of_role|>Thanks!<|end_of_text|>\n<|start_of_role|>assistant<|end_of_role|>"
+    },
+    {
+     "messages": "museum",
+     "vars": {
+      "add_generation_prompt": true,
+      "bos_token": "<|end_of_text|>",
+      "eos_token": "<|end_of_text|>",
+      "documents": [
+       {
+        "doc_id": 1,
+        "title": "Opening hours",
+        "text": "The museum opens at 9am and closes at 5pm."
+       },
+       {
+        "doc_id": 2,
+        "title": "Tickets",
+        "text": "Tickets cost 12 euros; under-18s go free."
+       }
+      ]
+     },
+     "text": "<|start_of_role|>system<|end_of_role|>Knowledge Cutoff Date: April 2024.\nToday's Date: 26 Jul 2024.\nYou are Granite, developed by IBM. Write the response to the user's input by strictly aligning with the facts in the provided documents. If the information needed to answer the question is not available in the documents, inform the user that the question cannot be answered based on the available data.<|end_of_text|>\n<|start_of_role|>document {\"document_id\": \"1\"}<|end_of_role|>\nThe museum opens at 9am and closes at 5pm.<|end_of_text|>\n<|start_of_role|>document {\"document_id\": \"2\"}<|end_of_role|>\nTickets cost 12 euros; under-18s go free.<|end_of_text|>\n<|start_of_role|>user<|end_of_role|>When does the museum open, and what does it cost?<|end_of_text|>\n<|start_of_role|>assistant<|end_of_role|>"
+    },
+    {
+     "messages": "museum",
+     "vars": {
+      "add_generation_prompt": true,
+      "bos_token": "<|end_of_text|>",
+      "eos_token": "<|end_of_text|>",
+      "tools": [
+       {
+        "type": "function",
+        "function": {
+         "name": "get_weather",
+         "description": "Get the current weather in a city.",
+         "parameters": {
+          "type": "object",
+          "properties": {
+           "city": {
+            "type": "string",
+            "description": "City name, e.g. Paris"
+           },
+           "unit": {
+            "type": "string",
+            "enum": [
+             "celsius",
+             "fahrenheit"
+            ]
+           }
+          },
+          "required": [
+           "city"
+          ]
+         }
+        }
+       },
+       {
+        "type": "function",
+        "function": {
+         "name": "get_time",
+         "description": "Get the local time in a city.",
+         "parameters": {
+          "type": "object",
+          "properties": {
+           "city": {
+            "type": "string"
+           }
+          },
+          "required": [
+           "city"
+          ]
+         }
+        }
+       }
+      ],
+      "documents": [
+       {
+        "doc_id": 1,
+        "title": "Opening hours",
+        "text": "The museum opens at 9am and closes at 5pm."
+       },
+       {
+        "doc_id": 2,
+        "title": "Tickets",
+        "text": "Tickets cost 12 euros; under-18s go free."
+       }
+      ]
+     },
+     "text": "<|start_of_role|>system<|end_of_role|>Knowledge Cutoff Date: April 2024.\nToday's Date: 26 Jul 2024.\nYou are Granite, developed by IBM. You are a helpful assistant with access to the following tools. When a tool is required to answer the user's query, respond only with <|tool_call|> followed by a JSON list of tools used. If a tool does not exist in the provided list of tools, notify the user that you do not have the ability to fulfill the request.\nWrite the response to the user's input by strictly aligning with the facts in the provided documents. If the information needed to answer the question is not available in the documents, inform the user that the question cannot be answered based on the available data.<|end_of_text|>\n<|start_of_role|>available_tools<|end_of_role|>[\n    {\n        \"type\": \"function\",\n        \"function\": {\n            \"name\": \"get_weather\",\n            \"description\": \"Get the current weather in a city.\",\n            \"parameters\": {\n                \"type\": \"object\",\n                \"properties\": {\n                    \"city\": {\n                        \"type\": \"string\",\n                        \"description\": \"City name, e.g. Paris\"\n                    },\n                    \"unit\": {\n                        \"type\": \"string\",\n                        \"enum\": [\n                            \"celsius\",\n                            \"fahrenheit\"\n                        ]\n                    }\n                },\n                \"required\": [\n                    \"city\"\n                ]\n            }\n        }\n    },\n    {\n        \"type\": \"function\",\n        \"function\": {\n            \"name\": \"get_time\",\n            \"description\": \"Get the local time in a city.\",\n            \"parameters\": {\n                \"type\": \"object\",\n                \"properties\": {\n                    \"city\": {\n                        \"type\": \"string\"\n                    }\n                },\n                \"required\": [\n                    \"city\"\n                ]\n            }\n        }\n    }\n]<|end_of_text|>\n<|start_of_role|>document {\"document_id\": \"1\"}<|end_of_role|>\nThe museum opens at 9am and closes at 5pm.<|end_of_text|>\n<|start_of_role|>document {\"document_id\": \"2\"}<|end_of_role|>\nTickets cost 12 euros; under-18s go free.<|end_of_text|>\n<|start_of_role|>user<|end_of_role|>When does the museum open, and what does it cost?<|end_of_text|>\n<|start_of_role|>assistant<|end_of_role|>"
     }
    ]
   }

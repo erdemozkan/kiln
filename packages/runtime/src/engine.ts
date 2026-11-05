@@ -1,7 +1,7 @@
 import type { Backend, Buf, Dispatch } from "@kiln/core";
 import { GrammarMatcher, TokenTrie, compileFormat, type ResponseFormat } from "@kiln/grammar";
 import { LlamaModel, MAX_VERIFY_ROWS, type ForwardPlan } from "@kiln/models";
-import { detectChatFormat, type ChatFormat, type ChatMessage, type Tokenizer } from "@kiln/tokenizers";
+import { detectChatFormat, type ChatDocument, type ChatFormat, type ChatMessage, type Tokenizer, type ToolSpec } from "@kiln/tokenizers";
 import { SubmitPacer } from "./pace";
 import { DraftGate, acceptedLength, lookupDraft } from "./speculate";
 
@@ -31,6 +31,14 @@ export interface GenerateOptions {
   reuseCache?: boolean;
   /** Qwen3 reasoning toggle; ignored by other families. */
   enableThinking?: boolean;
+  /**
+   * Functions the model may call (`chat` only), passed to the model's chat template as transformers
+   * does. Calls come back as text in the template's format; `parseToolCalls` reads the
+   * `<tool_call>` one. Built-in fallback formats reject tools.
+   */
+  tools?: ToolSpec[];
+  /** Documents to ground the answer in (`chat` only), for templates that read `documents`. */
+  documents?: ChatDocument[];
   /**
    * Constrain the output: `{ type: "json" }` for any JSON value, `{ type: "json", schema }` for a JSON
    * Schema (properties in declared order), `{ type: "choice", choices }` for one of a set of strings.
@@ -129,7 +137,11 @@ export class Engine {
     if (!this.chatFormat) throw new Error("this model has no supported chat format; use complete() instead");
     // Only reasoning models know <think>; injecting it elsewhere derails them.
     const thinks = this.tokenizer.tokenId("<think>") !== undefined;
-    const prompt = this.chatFormat.render(messages, { enableThinking: thinks ? opts.enableThinking : undefined });
+    const prompt = this.chatFormat.render(messages, {
+      enableThinking: thinks ? opts.enableThinking : undefined,
+      tools: opts.tools,
+      documents: opts.documents,
+    });
     yield* this.complete(prompt, opts);
   }
 
