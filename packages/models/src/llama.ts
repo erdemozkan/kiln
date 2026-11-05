@@ -7,6 +7,11 @@ export interface ForwardPlan {
   readonly T: number;
   /** The forward pass; the last dispatch samples, so it can be submitted separately from the rest. */
   readonly dispatches: readonly Dispatch[];
+  /**
+   * The layers only, without the output head and sampling: for prefill chunks before the last, whose
+   * logits nobody reads (the head is a vocabulary-sized matmul). Same as `dispatches` for verify plans.
+   */
+  readonly body: readonly Dispatch[];
   /** u32 [T] token ids, written before each replay. */
   readonly tokens: Buf;
   /** u32 [1] sampled token for row `step.lastRow`; u32 [T], one per row, for a verify plan. */
@@ -281,7 +286,11 @@ export class LlamaModel {
     if (verify) ops.sampleRows(ctx, logits, out, this.seen, this.allowedRows);
     else ops.sample(ctx, logits, out, this.seen, this.allowed);
 
-    return { T, dispatches: ctx.dispatches, tokens, out, destroy: () => ctx.destroy() };
+    const dispatches = ctx.dispatches;
+    // Non-verify plans end copy_row → head matmul → sample.
+    const body = verify ? dispatches : dispatches.slice(0, dispatches.length - 3);
+    if (!verify && dispatches[body.length]!.label !== "copy_row") throw new Error("buildPlan: unexpected head layout");
+    return { T, dispatches, body, tokens, out, destroy: () => ctx.destroy() };
   }
 
   /**

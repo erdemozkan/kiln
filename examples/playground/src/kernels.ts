@@ -89,6 +89,45 @@ async function main() {
     check("matmul/q8", `M${M} N${N} K${K}`, await download(yq.buf, M * N), ref.matmulRef(x, dequantQ8(quantizeQ8(w)), M, N, K), 1e-3 * Math.sqrt(K));
   }
 
+  // Prefill GEMM (64 rows and up): every weight format and epilogue, with ragged M and N edges.
+  for (const [M, N, K] of [[64, 64, 32], [77, 70, 96], [128, 1000, 640], [200, 33, 256]] as const) {
+    for (const wd of ["f32", "q4", "q8"] as const) {
+      const x = randn(M * K);
+      const w = randn(N * K);
+      const deq = asStored(wd, w);
+      const tag = `${wd} M${M} N${N} K${K}`;
+      const plain = ref.matmulRef(x, deq, M, N, K);
+      let y!: Tensor;
+      await run(S0, (ctx) => (y = ops.linear(ctx, upload(x, [M, K]), uploadW(wd, w, [N, K]))));
+      check("gemm", tag, await download(y.buf, M * N), plain, 1e-3 * Math.sqrt(K));
+      const res = randn(M * N);
+      const bias = randn(N);
+      const rt = upload(res, [M, N]);
+      await run(S0, (ctx) => ops.linear(ctx, upload(x, [M, K]), uploadW(wd, w, [N, K]), { residual: rt, bias: upload(bias, [N]) }));
+      check("gemm+bias+add", tag, await download(rt.buf, M * N), res.map((r, j) => r + plain[j]! + bias[j % N]!), 1e-3 * Math.sqrt(K));
+      if (N % 2 === 0) {
+        const I = N / 2;
+        for (const act of ["silu", "gelu"] as const) {
+          const want = new Float32Array(M * I);
+          for (let m = 0; m < M; m++) for (let i = 0; i < I; i++) {
+            const g = plain[m * N + i]!;
+            want[m * I + i] = (act === "gelu" ? ref.geluTanh(g) : g / (1 + Math.exp(-g))) * plain[m * N + I + i]!;
+          }
+          await run(S0, (ctx) => (y = ops.linear(ctx, upload(x, [M, K]), uploadW(wd, w, [N, K]), { [act]: true })));
+          check(`gemm+${act}`, tag, await download(y.buf, M * I), want, 2e-3 * Math.sqrt(K));
+          const gb = randn(N);
+          const wantB = new Float32Array(M * I);
+          for (let m = 0; m < M; m++) for (let i = 0; i < I; i++) {
+            const g = plain[m * N + i]! + gb[i]!;
+            wantB[m * I + i] = (act === "gelu" ? ref.geluTanh(g) : g / (1 + Math.exp(-g))) * (plain[m * N + I + i]! + gb[I + i]!);
+          }
+          await run(S0, (ctx) => (y = ops.linear(ctx, upload(x, [M, K]), uploadW(wd, w, [N, K]), { [act]: true, bias: upload(gb, [N]) })));
+          check(`gemm+bias+${act}`, tag, await download(y.buf, M * I), wantB, 2e-3 * Math.sqrt(K));
+        }
+      }
+    }
+  }
+
   // Fused matmul variants: every lanes setting, with norm prologue, SiLU gating, residual add and bias.
   for (const lanes of [8, 16, 32] as const) {
     for (const [M, I, K] of [[1, 40, 96], [5, 24, 256], [19, 70, 576]] as const) {

@@ -233,7 +233,8 @@ export class Engine {
         tokens.set(promptIds.slice(pos, pos + n));
         this.backend.write(plan.tokens, 0, tokens);
         this.model.setStep({ pos0: pos, lastRow: n - 1, seed, temperature, ...sampling });
-        prefillUnits += this.submit(plan.dispatches, T);
+        // Only the last chunk's logits are read; earlier chunks skip the output head.
+        prefillUnits += this.submit(pos + n < promptIds.length ? plan.body : plan.dispatches, T);
         pos += n;
         out = plan.out;
       }

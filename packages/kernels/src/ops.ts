@@ -14,6 +14,8 @@ import {
   attentionTiledSpec,
   copyRowSpec,
   embedSpec,
+  gemmSpec,
+  GEMM_TILE,
   kvWriteSpec,
   matmulRowsPerGroup,
   matmulSpec,
@@ -75,6 +77,13 @@ export function setMatmulF16(on: boolean): void {
   f16Default = on;
 }
 
+/** Rows of x from which prefill matmuls use the tiled GEMM rather than the 8-row kernel. */
+let gemmMinRows = 64;
+/** Use the tiled GEMM for matmuls with at least this many rows (Infinity turns it off). */
+export function setGemmMinRows(rows: number): void {
+  gemmMinRows = rows;
+}
+
 let subgroupsDefault = false;
 /** Use subgroup reductions in matmuls from now on, where the device supports them. */
 export function setSubgroups(on: boolean): void {
@@ -114,9 +123,19 @@ export function linear(ctx: Ctx, x: Tensor, w: Tensor, opts: LinearOptions | Ten
   }
   const y = o.residual ?? ctx.alloc([M, outN]);
   const wdtype = weightDType(w);
+  const f16 = o.f16 ?? f16Default;
+  if (M >= gemmMinRows && !o.lanes && !o.f16) {
+    const epi: MatmulEpilogue = o.gelu ? "gelu" : o.silu ? "silu" : o.residual ? "add" : "store";
+    const groups = Math.ceil(outN / (gated ? GEMM_TILE / 2 : GEMM_TILE));
+    const grid: Grid = [Math.min(groups, MM_SLICE), Math.ceil(M / GEMM_TILE), Math.ceil(groups / MM_SLICE)];
+    const bufs = [ctx.uniform([u32(M), u32(N), u32(K), u32(0)]), x.buf, ...weightBufs(w)];
+    if (o.bias) bufs.push(o.bias.buf);
+    bufs.push(y.buf);
+    ctx.run(gemmSpec({ wdtype, bias: !!o.bias, epi }), bufs, grid, `gemm/${wdtype} ${N}x${K}${gated ? `+${epi}` : ""}${o.residual ? "+add" : ""}`);
+    return y;
+  }
   const epi: MatmulEpilogue = o.gelu ? "gelu" : o.silu ? "silu" : o.residual ? "add" : "store";
   const lanes = o.lanes ?? tunedLanes.get(lanesKey(wdtype, mt, N, K)) ?? 8;
-  const f16 = o.f16 ?? f16Default;
   if (f16 && !ctx.backend.limits.features.has("shader-f16")) throw new Error("linear: f16 math needs the shader-f16 feature");
   // The butterfly needs each row's lanes inside one subgroup.
   const sg = (o.subgroups ?? subgroupsDefault) && lanes <= (ctx.backend.limits.subgroupMinSize ?? 0);

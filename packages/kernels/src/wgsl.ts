@@ -260,6 +260,157 @@ ${sg
 }`);
 }
 
+/** Tokens and weight rows per GEMM workgroup tile. */
+export const GEMM_TILE = 64;
+
+export interface GemmVariant {
+  wdtype: WeightDType;
+  bias: boolean;
+  epi: MatmulEpilogue;
+}
+
+/**
+ * Prefill matmul, y[m, n] = sum_k x[m, k] * W[n, k], as a tiled GEMM: a 256-thread workgroup owns a
+ * 64-token × 64-row output tile and each thread a 4 × 4 block of it. K is walked one 32-element block
+ * at a time; the x tile and the dequantized weight tile are staged in workgroup memory, transposed so
+ * each k step is two vec4 reads per thread for 16 multiply-adds (the GEMV-style kernel above does 4).
+ *
+ * For gated epilogues the tile's 64 rows are 32 gate rows and the 32 matching up rows, stored so each
+ * thread's four columns are gate i, gate i + 1, up i, up i + 1 and it can write act(gate) * up itself.
+ */
+export function gemmSpec(v: GemmVariant): KernelSpec {
+  const gated = isGated(v.epi);
+  const key = `gemm/${v.wdtype}${v.bias ? "/bias" : ""}/${v.epi}`;
+  const quant = v.wdtype !== "f32";
+  const bindings: BindingKind[] = quant ? ["uniform", "read", "read", "read"] : ["uniform", "read", "read"];
+  let b = bindings.length;
+  const decl: string[] = [];
+  if (v.bias) {
+    decl.push(`@group(0) @binding(${b++}) var<storage, read> bias: array<f32>;`);
+    bindings.push("read");
+  }
+  decl.push(`@group(0) @binding(${b}) var<storage, read_write> y: array<f32>;`);
+  bindings.push("rw");
+  // Weight tile loads by threads 128…255: thread j takes the 4 rows of one tile column group and one
+  // word of their block (neighbouring threads, neighbouring words), and writes whole vec4s (one per k):
+  // threads writing components of one shared vec4 race on some drivers.
+  const loadW =
+    v.wdtype === "q4"
+      ? `  if (li >= 128u && li < 192u) {
+    let j = li - 128u;
+    let g = j / 4u;
+    let wi = j % 4u;
+    var vals: array<vec4<f32>, 8>;
+    for (var c = 0u; c < 4u; c++) {
+      let row = slotRow(g * 4u + c);
+      if (row < p.N) {
+        let word = wq[(row * blocks + kb) * 4u + wi];
+        let d = ws[row * blocks + kb];
+        for (var e = 0u; e < 8u; e++) { vals[e][c] = (f32((word >> (4u * e)) & 15u) - 8.0) * d; }
+      }
+    }
+    for (var e = 0u; e < 8u; e++) { wt[(wi * 8u + e) * 16u + g] = vals[e]; }
+  }`
+      : `  if (li >= 128u) {
+    let j = li - 128u;
+    let g = j / 8u;
+    let q = j % 8u;
+    var r4: array<vec4<f32>, 4>;
+    for (var c = 0u; c < 4u; c++) {
+      let row = slotRow(g * 4u + c);
+      if (row < p.N) {
+${v.wdtype === "q8"
+  ? `        let word = wq[(row * blocks + kb) * 8u + q];
+        r4[c] = vec4<f32>(bitcast<vec4<i32>>(vec4<u32>(word << 24u, word << 16u, word << 8u, word)) >> vec4<u32>(24u)) * ws[row * blocks + kb];`
+  : `        r4[c] = w[(row * blocks + kb) * 8u + q];`}
+      }
+    }
+    for (var e = 0u; e < 4u; e++) { wt[(q * 4u + e) * 16u + g] = vec4<f32>(r4[0][e], r4[1][e], r4[2][e], r4[3][e]); }
+  }`;
+  const withBias = (row: string, val: string) => (v.bias ? `(${val} + bias[${row}])` : val);
+  const store = gated
+    ? `  let half = p.N / 2u;
+  for (var i = 0u; i < 4u; i++) {
+    let m = m0 + tm * 4u + i;
+    if (m >= p.M) { break; }
+    for (var j = 0u; j < 2u; j++) {
+      let col = grp * 32u + tn * 2u + j;
+      if (col < half) {
+        let g = ${withBias("col", "acc[i][j]")};
+        let u = ${withBias("half + col", "acc[i][j + 2u]")};
+        y[m * half + col] = ${actWgsl(v.epi as "silu" | "gelu", "g")} * u;
+      }
+    }
+  }`
+    : `  for (var i = 0u; i < 4u; i++) {
+    let m = m0 + tm * 4u + i;
+    if (m >= p.M) { break; }
+    for (var j = 0u; j < 4u; j++) {
+      let n = grp * 64u + tn * 4u + j;
+      if (n < p.N) { y[m * p.N + n] ${v.epi === "add" ? "+=" : "="} ${withBias("n", "acc[i][j]")}; }
+    }
+  }`;
+  return spec(key, bindings, () => /* wgsl */ `
+struct P { M: u32, N: u32, K: u32, _p: u32 }
+@group(0) @binding(0) var<uniform> p: P;
+@group(0) @binding(1) var<storage, read> x: array<vec4<f32>>;
+${quant
+  ? `@group(0) @binding(2) var<storage, read> wq: array<u32>;
+@group(0) @binding(3) var<storage, read> ws: array<f32>;`
+  : `@group(0) @binding(2) var<storage, read> w: array<vec4<f32>>;`}
+${decl.join("\n")}
+// [32 k][64 tokens] and [32 k][64 weight rows], as vec4 along the token / row axis.
+var<workgroup> xt: array<vec4<f32>, 512>;
+var<workgroup> wt: array<vec4<f32>, 512>;
+var<private> grp: u32;
+
+/** Weight row staged in column s (0…63) of the tile. */
+fn slotRow(s: u32) -> u32 {
+${gated
+  ? `  // Thread t's four columns are gate rows 2t, 2t + 1 and up rows 2t, 2t + 1 of the group's 32.
+  let i = (s / 4u) * 2u + s % 2u;
+  return select(grp * 32u + i, p.N / 2u + grp * 32u + i, s % 4u >= 2u);`
+  : `  return grp * 64u + s;`}
+}
+
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) li: u32) {
+  grp = wid.x + wid.z * ${MM_SLICE}u;
+  let m0 = wid.y * 64u;
+  let tn = li % 16u;
+  let tm = li / 16u;
+  let blocks = p.K / 32u;
+  let xs4 = p.K / 4u;
+  var acc: array<vec4<f32>, 4>;
+  for (var kb = 0u; kb < blocks; kb++) {
+    // x tile by threads 0…127: thread j takes tokens 4g…4g+3 (g = j / 8) at vec4 q = j % 8 of the block,
+    // so 8 neighbouring threads read one row's 128 contiguous bytes.
+    if (li < 128u) {
+      let g = li / 8u;
+      let q = li % 8u;
+      var r4: array<vec4<f32>, 4>;
+      for (var c = 0u; c < 4u; c++) {
+        let m = m0 + g * 4u + c;
+        r4[c] = select(vec4<f32>(0.0), x[min(m, p.M - 1u) * xs4 + kb * 8u + q], m < p.M);
+      }
+      for (var e = 0u; e < 4u; e++) { xt[(q * 4u + e) * 16u + g] = vec4<f32>(r4[0][e], r4[1][e], r4[2][e], r4[3][e]); }
+    }
+${loadW}
+    workgroupBarrier();
+    for (var k = 0u; k < 32u; k++) {
+      let a = xt[k * 16u + tm];
+      let bv = wt[k * 16u + tn];
+      acc[0] += a.x * bv;
+      acc[1] += a.y * bv;
+      acc[2] += a.z * bv;
+      acc[3] += a.w * bv;
+    }
+    workgroupBarrier();
+  }
+${store}
+}`);
+}
+
 /** y = x * rsqrt(mean(x^2) + eps) * w, one workgroup per row. */
 export function rmsnormSpec(): KernelSpec {
   return spec("rmsnorm", ["uniform", "read", "read", "rw"], () => /* wgsl */ `
@@ -466,12 +617,13 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
 }
 
 /** Query rows and keys per workgroup tile in tiled prefill attention, sized to fit workgroup memory. */
-export function attentionTile(D: number): { R: number; BK: number } {
-  const bytes = (R: number, BK: number) => 16 * R * (D / 4) + 16 * BK * (D / 4 + 1) + 4 * R * BK;
+export function attentionTile(D: number): { R: number; BK: number; TPP: number } {
+  const tpp = (R: number, BK: number) => Math.max(1, Math.floor(256 / (R * BK)));
+  const bytes = (R: number, BK: number) => 16 * R * (D / 4) + 16 * BK * (D / 4 + 1) + 4 * R * BK + (tpp(R, BK) > 1 ? 1024 : 0);
   const BK = Math.min(64, Math.floor(2048 / D));
   let R = Math.min(32, Math.floor(1024 / D));
   while (R > 1 && bytes(R, BK) > 16384 - 256) R = Math.floor(R / 2);
-  return { R, BK };
+  return { R, BK, TPP: tpp(R, BK) };
 }
 
 /**
@@ -480,12 +632,15 @@ export function attentionTile(D: number): { R: number; BK: number } {
  * keys is staged once in workgroup memory and used by all R rows, then its values likewise, so the cache
  * is read once per tile instead of once per (head, token).
  *
- * Scores: TPR threads per row, each scoring every TPR-th key of the block. Values: thread (row, d4) owns
+ * Scores: TPR threads per row, each scoring every TPR-th key of the block. With large heads the tile has
+ * few (row, key) pairs (32 for D = 256), so each dot product is split across TPP threads instead and
+ * their partial sums added in workgroup memory. Values: thread (row, d4) owns
  * four output columns as a vec4 and folds the online softmax into its pass over the block (block max,
  * rescale, exp, exp-sum), so the row statistics live in registers and need no extra barrier.
  */
 export function attentionTiledSpec(kv: KvDtype, D: number): KernelSpec {
-  const { R, BK } = attentionTile(D);
+  const { R, BK, TPP: TPP_ } = attentionTile(D);
+  const split = TPP_ > 1;
   const D4 = D / 4;
   const KP = D4 + 1; // padded row stride (vec4) of the key/value tile, so rows start in different banks
   const TPR = Math.floor(256 / R);
@@ -513,6 +668,8 @@ const TPR = ${TPR}u;
 var<workgroup> qs: array<vec4<f32>, ${R * D4}>;
 var<workgroup> tile: array<vec4<f32>, ${BK * KP}>;
 var<workgroup> sc: array<f32, ${R * BK}>;
+${split ? `var<workgroup> part: array<f32, 256>;
+const TPP = ${TPP_}u;` : ""}
 
 fn K4(i: u32) -> vec4<f32> { return ${load.k}; }
 fn V4(i: u32) -> vec4<f32> { return ${load.v}; }
@@ -559,7 +716,31 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
       tile[(e / D4) * KP + e % D4] = v;
     }
     workgroupBarrier();
-    if (sr < R) {
+${split
+  ? `    {
+      // Thread li adds every TPP-th vec4 of pair li / TPP's dot product.
+      let pr = li / TPP;
+      var d = 0.0;
+      if (pr < R * BK) {
+        let rr = pr / BK;
+        let jj = pr % BK;
+        for (var c = li % TPP; c < D4; c += TPP) { d += dot(qs[rr * D4 + c], tile[jj * KP + c]); }
+      }
+      part[li] = d;
+    }
+    workgroupBarrier();
+    if (li < R * BK) {
+      let rr = li / BK;
+      let jj = li % BK;
+      let n = min(st.pos0 + (r0 + rr) / G + 1u, p.maxSeq);
+      var d = -3.0e38;
+      if (b0 + jj < n && b0 + jj >= firstKey(n, p.win)) {
+        d = 0.0;
+        for (var t = 0u; t < TPP; t++) { d += part[li * TPP + t]; }
+      }
+      sc[li] = d;
+    }`
+  : `    if (sr < R) {
       for (var jj = sl; jj < BK; jj += TPR) {
         var d = -3.0e38;
         if (b0 + jj < sn && b0 + jj >= slo) {
@@ -568,7 +749,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
         }
         sc[sr * BK + jj] = d;
       }
-    }
+    }`}
     workgroupBarrier();
     for (var e = li; e < BK * D4; e += 256u) {
       let j = b0 + e / D4;

@@ -168,6 +168,17 @@ How it got there, each step measured in one session with identical greedy output
   vec4 of output and folding the softmax into the value pass fixed that. Same session, attention / whole
   prefill: 64 tokens at 1024 165 → 72 ms / 329 → 234 ms, 128 at 1536 500 → 209 ms / 808 → 522 ms,
   16 at 1024 45 → 26 ms. Greedy output unchanged. The per-row kernel remains as `setPrefillAttention("rows")`.
+- **Prefill GEMM and large-head attention** (measured on Gemma 3 270M, q8: hidden 640, head dim 256,
+  262k vocabulary). Prefill matmuls of 64 rows and up use a tiled GEMM: a 64-token × 64-row output tile
+  per workgroup and a 4 × 4 block per thread, so each k step is two workgroup-memory vec4 reads for 16
+  multiply-adds instead of one per 4 (matmuls in a 128-token chunk 274 → 186 ms). Tiled attention had
+  only 4 rows × 8 keys per tile at head dim 256, and each of those 32 dot products ran serially on one
+  thread while 224 waited; splitting each across 8 threads took attention in a 128-token chunk at
+  position 1024 from 331 to 105 ms. Prefill chunks before the last also skip the output head and
+  sampling, whose logits nobody reads. A 1,138-token prompt: 5.1–5.2 → 2.4–2.5 s, with the same
+  answer tokens as before and as the NumPy reference. On SmolLM2-135M (head dim 64, untouched
+  attention) a 250-token prompt prefills in 516 against 670 ms with the GEMM off, with the same 40
+  greedy tokens. The GEMM computes in f32 even with `f16Math`.
 - **Autotuner:** on this GPU it picks 16 lanes per row for the 576×576 projections and 8 elsewhere; gains
   here are within noise. It exists for GPUs with more cores, where small N leaves most of them idle.
 - **Measured and not adopted:** f16 dot products in the matmul (`f16Math: true`) ran at 64–66 tok/s
@@ -206,7 +217,7 @@ fixed cost.
 
 ## Status
 
-Verified on this GPU: all kernel checks pass (320, including q4 and q8 weights in every matmul variant, both prefill attention kernels, fused variants, f16 cache paths,
+Verified on this GPU: all kernel checks pass (380, including q4 and q8 weights in every matmul variant and the prefill GEMM, both prefill attention kernels, fused variants, f16 cache paths,
 sliding-window attention, GELU gating, grammar masks and sampling distributions). SmolLM2-135M-Instruct chats from Hub safetensors (q4, f32) and from a GGUF
 Q4_K_M file.
 
@@ -228,7 +239,7 @@ Gemma 3 was checked token by token against an independent NumPy forward pass wri
 transformers' `modeling_gemma3`: greedy output matched on every prompt tried, for 1B in q4 and q8 and 270M
 in q8 and f32. On a 1,138-token prompt, where the fact asked about lies outside the sliding layers' 512-token
 window, 1B in q4 gave the same answer tokens as the reference (then a newline before ending the turn,
-where the reference ended at once). The 270M model does not survive q4: its first answer token wins by 1.4 logits, q4 flips it,
+where the reference ended at once), and 270M in q8 matched the reference exactly. The 270M model does not survive q4: its first answer token wins by 1.4 logits, q4 flips it,
 and the reply turns to nonsense, so load it with `quant: "q8"` (same tokens as f32 at a quarter of
 the memory).
 
