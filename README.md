@@ -233,6 +233,16 @@ How it got there, each step measured in one session with identical greedy output
   re-reading K/V per tile was not the cost. Gemma 3 4B, 1,518-token prompt: 86.2 against 91.6 s,
   same tokens. Tiles size themselves to the device's workgroup memory, which is now requested in
   full.
+- **Fused q/k/v for qk-norm models, and gated prefill without the gated GEMM** (Gemma 3 4B Q4_0).
+  Gemma and Qwen3 normalise each q and k head, so their q/k/v ran as three matmuls followed by an
+  input norm, two head norms, two RoPE passes and a cache write. They now stack q/k/v like the
+  other models and finish in one kernel (head norms, RoPE, cache write, ring slots included):
+  dispatches per decode step 616 → 378. Measuring that change separately (`fuse: { qkv, mlp }`)
+  showed the fused gate/up GEMM, whose tiles pair 32 gate rows with 32 up rows, costing 7% of a
+  prefill; prefill now runs a plain GEMM over [gate | up] and an elementwise act(gate) · up, and the
+  decode GEMV keeps its gated epilogue. 1,138-token prompt 64.3 → 60.2 s, decode step 178 → 174 ms,
+  same tokens; Gemma 3 1B still matches the NumPy reference in q8 and q4 on that prompt, its
+  640-slot rings wrapping almost twice.
 - **Decode GEMV:** the general matmul gives each lane half of a q4 word per step (4 bytes shared by two
   lanes, 4 multiply-adds), and ran at 6.5–8.5 GB/s. One-token matmuls now use a kernel where each lane
   takes whole 32-element blocks: one 16-byte load and 32 multiply-adds for q4, 4 lanes per row,
@@ -299,7 +309,7 @@ cost.
 
 ## Status
 
-Verified on this GPU: all kernel checks pass (505, including q4 and q8 weights in every matmul variant, the decode GEMV and the prefill GEMM, both prefill attention kernels, fused variants, f16 cache paths,
+Verified on this GPU: all kernel checks pass (529, including q4 and q8 weights in every matmul variant, the decode GEMV and the prefill GEMM, both prefill attention kernels, fused variants, f16 cache paths,
 sliding-window attention, GELU gating, grammar masks and sampling distributions). SmolLM2-135M-Instruct chats from Hub safetensors (q4, f32) and from a GGUF
 Q4_K_M file.
 

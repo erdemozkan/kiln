@@ -39,7 +39,7 @@ export interface LoadOptions {
    */
   subgroups?: boolean;
   /** Fuse q/k/v and gate/up weights into single matmuls (default true). */
-  fuse?: boolean;
+  fuse?: boolean | { qkv?: boolean; mlp?: boolean };
   revision?: string;
   /** Hub endpoint, for mirrors or a local server. */
   endpoint?: string;

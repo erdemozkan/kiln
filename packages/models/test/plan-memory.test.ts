@@ -75,7 +75,9 @@ describe("plan memory", () => {
       const plans = [1, 16, 64, 128].map((T) => model.buildPlan(T));
       const total = actBytes();
       // With a size-keyed free list per plan and a [T, H, maxSeq] score buffer this was 19.3 / 21.3 MiB.
-      expect(total).toBeLessThan((fuse ? 2 : 4) * 2 ** 20);
+      // Prefill holds the [T, 2I] gate/up product before the gated activation either way (fused: one
+      // GEMM's output, unfused: gate and up), 1.5 MiB at T = 128.
+      expect(total).toBeLessThan(4 * 2 ** 20);
       expect(model.memory.activations).toBe(total);
       for (const p of plans) p.destroy();
       model.destroy();

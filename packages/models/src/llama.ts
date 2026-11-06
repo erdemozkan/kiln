@@ -24,8 +24,11 @@ export interface LlamaOptions {
   maxSeq?: number;
   /** KV cache storage: f16 (default) halves the cache and the attention reads; f32 for exactness. */
   kvDtype?: KvDtype;
-  /** Stack q/k/v and gate/up into single matmuls (default true). False keeps the unfused graph. */
-  fuse?: boolean;
+  /**
+   * Stack q/k/v and gate/up into single matmuls (default true). False keeps the unfused graph; an
+   * object chooses each (missing parts default to true).
+   */
+  fuse?: boolean | { qkv?: boolean; mlp?: boolean };
 }
 
 export class MissingWeightError extends Error {}
@@ -94,7 +97,7 @@ export class LlamaModel {
   private readonly invFreq: Tensor;
   /** RoPE frequencies of sliding-window layers, when their base differs (Gemma 3); else `invFreq`. */
   private readonly localInvFreq: Tensor;
-  /** q/k/v stacked into one `qkv` weight (not for qk-norm models, which normalise q and k separately). */
+  /** q/k/v stacked into one `qkv` weight; qk-norm models normalise its q and k heads in `qkNormRopeKv`. */
   private readonly fusedQkv: boolean;
   /** gate/up stacked into one `gate_up` weight, consumed by the SiLU-gated matmul. */
   private readonly fusedMlp: boolean;
@@ -135,9 +138,9 @@ export class LlamaModel {
         ? freqs(ropeInvFreq({ headDim: cfg.headDim, ropeTheta: cfg.ropeLocalTheta }), "rope/inv_freq/local")
         : this.invFreq;
     this.w("model.embed_tokens.weight");
-    const fuse = opts.fuse ?? true;
-    this.fusedQkv = fuse && !cfg.qkNorm && this.fuse("self_attn", ["q_proj", "k_proj", "v_proj"], "qkv", cfg.attentionBias);
-    this.fusedMlp = fuse && this.fuse("mlp", ["gate_proj", "up_proj"], "gate_up", false);
+    const fuse = typeof opts.fuse === "object" ? { qkv: true, mlp: true, ...opts.fuse } : { qkv: opts.fuse ?? true, mlp: opts.fuse ?? true };
+    this.fusedQkv = fuse.qkv && this.fuse("self_attn", ["q_proj", "k_proj", "v_proj"], "qkv", cfg.attentionBias);
+    this.fusedMlp = fuse.mlp && this.fuse("mlp", ["gate_proj", "up_proj"], "gate_up", false);
   }
 
   /**
@@ -327,7 +330,9 @@ export class LlamaModel {
       if (this.fusedQkv) {
         // RMSNorm → one qkv matmul (+bias) → RoPE fused with the cache write.
         const qkv = ops.linear(ctx, x, this.w(`${p}.self_attn.qkv.weight`), { norm: inputNorm, bias: this.bias(`${p}.self_attn.qkv.bias`) });
-        q = ops.ropeKv(ctx, qkv, kc, vc, attnShape, invFreq, c.ropeInterleaved);
+        q = c.qkNorm
+          ? ops.qkNormRopeKv(ctx, qkv, this.w(`${p}.self_attn.q_norm.weight`), this.w(`${p}.self_attn.k_norm.weight`), c.rmsEps, kc, vc, attnShape, invFreq, c.ropeInterleaved)
+          : ops.ropeKv(ctx, qkv, kc, vc, attnShape, invFreq, c.ropeInterleaved);
       } else {
         q = this.attentionInputs(ctx, x, l, T, invFreq);
       }

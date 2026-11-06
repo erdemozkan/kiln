@@ -269,6 +269,48 @@ async function main() {
     check("rope_kv/f16", `v cache ${tag}`, unpackHalf(await words(vc16.buf, wantV.length / 2)), wantV, 2e-3);
   }
 
+  // Per-head q/k norm + RoPE + cache write after a stacked qkv matmul (Qwen3, Gemma 3), including a
+  // ring cache that wraps (positions 13…15 of 14 slots land in 13, 0, 1).
+  for (const [T, H, Hkv, D, pos0, maxSeq, slots, interleaved] of [[3, 4, 2, 64, 5, 12, 12, false], [3, 4, 2, 64, 5, 12, 12, true], [2, 8, 4, 256, 9, 32, 32, false], [3, 2, 1, 256, 13, 64, 14, false]] as const) {
+    const W = (H + 2 * Hkv) * D;
+    const qkv = randn(T * W);
+    const qw = Float32Array.from(randn(D), (x) => 1 + x);
+    const kw = Float32Array.from(randn(D), (x) => 1 + x);
+    const eps = 1e-6;
+    const inv = Float32Array.from({ length: D / 2 }, (_, i) => 1 / 10000 ** ((2 * i) / D));
+    const q = new Float32Array(T * H * D);
+    const k = new Float32Array(T * Hkv * D);
+    const v = new Float32Array(T * Hkv * D);
+    for (let t = 0; t < T; t++) {
+      q.set(qkv.subarray(t * W, t * W + H * D), t * H * D);
+      k.set(qkv.subarray(t * W + H * D, t * W + (H + Hkv) * D), t * Hkv * D);
+      v.set(qkv.subarray(t * W + (H + Hkv) * D, (t + 1) * W), t * Hkv * D);
+    }
+    const wantQ = ref.ropeRef(ref.rmsnormRef(q, qw, D, eps), T, H, D, pos0, inv, interleaved);
+    const kr = ref.ropeRef(ref.rmsnormRef(k, kw, D, eps), T, Hkv, D, pos0, inv, interleaved);
+    const row = Hkv * D;
+    const wantK = new Float32Array(slots * row);
+    const wantV = new Float32Array(slots * row);
+    for (let t = 0; t < T; t++) {
+      wantK.set(kr.subarray(t * row, (t + 1) * row), ((pos0 + t) % slots) * row);
+      wantV.set(v.subarray(t * row, (t + 1) * row), ((pos0 + t) % slots) * row);
+    }
+    const tag = `T${T} H${H}/${Hkv} D${D} pos${pos0} slots${slots} ${interleaved ? "interleaved" : "rotate-half"}`;
+    const shape = { T, H, Hkv, D, maxSeq, slots };
+    for (const kv of ["f32", "f16"] as const) {
+      const kc = upload(kv === "f16" ? new Uint32Array((slots * row) / 2) : new Float32Array(slots * row), [0]);
+      const vc = upload(kv === "f16" ? new Uint32Array((slots * row) / 2) : new Float32Array(slots * row), [0]);
+      let qo!: Tensor;
+      await run({ ...S0, pos0 }, (ctx) => (qo = ops.qkNormRopeKv(ctx, upload(qkv, [T, W]), upload(qw, [D]), upload(kw, [D]), eps, kc.buf, vc.buf, { ...shape, kv }, upload(inv, [D / 2]), interleaved)));
+      const cache = async (b: Buf) => (kv === "f16" ? unpackHalf(new Uint32Array(await be.readback(b, 0, slots * row * 2))) : await download(b, slots * row));
+      // Normalised values reach about 10 (weights 1 + N(0, 1)), so f32 rounding alone is ~1e-4.
+      const tol = kv === "f16" ? 2e-2 : 5e-4;
+      check(`qknorm_rope_kv/${kv}`, `q ${tag}`, await download(qo.buf, q.length), wantQ, 5e-4);
+      check(`qknorm_rope_kv/${kv}`, `k cache ${tag}`, await cache(kc.buf), wantK, tol);
+      check(`qknorm_rope_kv/${kv}`, `v cache ${tag}`, await cache(vc.buf), wantV, kv === "f16" ? 2e-3 : 0);
+    }
+  }
+
   {
     const [R, D] = [5, 300];
     const x = randn(R * D);

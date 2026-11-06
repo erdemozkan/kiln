@@ -1198,6 +1198,25 @@ fn main(${EW_ARGS}) {
 }`);
 }
 
+/** y[r, i] = act(x[r, i]) * x[r, I + i]: a gated activation over [gate | up] rows of width 2I. */
+export function gatedActSpec(act: "silu" | "gelu"): KernelSpec {
+  return spec(`gated_${act}`, ["uniform", "read", "rw"], () => /* wgsl */ `
+struct P { n: u32, I: u32, _b: u32, _c: u32 }
+@group(0) @binding(0) var<uniform> p: P;
+@group(0) @binding(1) var<storage, read> x: array<f32>;
+@group(0) @binding(2) var<storage, read_write> y: array<f32>;
+
+@compute @workgroup_size(${EW})
+fn main(${EW_ARGS}) {
+  ${FLAT}
+  if (idx >= p.n) { return; }
+  let r = idx / p.I;
+  let i = idx % p.I;
+  let a = x[r * 2u * p.I + i];
+  y[idx] = ${actWgsl(act, "a")} * x[r * 2u * p.I + p.I + i];
+}`);
+}
+
 /** a += b, with b broadcast over rows when `cols` < n (bias add). */
 export function addSpec(): KernelSpec {
   return spec("add", ["uniform", "rw", "read"], () => /* wgsl */ `
@@ -1432,6 +1451,91 @@ fn main() {
   st.n = st.n + 1u;
   st.pos0 = st.pos0 + st.lastRow + 1u;
   st.lastRow = 0u;
+}`);
+}
+
+/**
+ * Per-head RMSNorm on q and k (Qwen3, Gemma 3), RoPE and the cache write, fused: reads qkv rows
+ * [T, (H + 2·Hkv)·D] from one stacked matmul, writes the normalised, rotated q to qo [T, H·D] and the
+ * normalised, rotated k plus v into the caches at slot (step.pos0 + t) % cap. One workgroup per
+ * (head of q, k or v, token), one thread per element (D ≤ 256).
+ */
+export function qkNormRopeKvSpec(interleaved: boolean, kv: KvDtype = "f32"): KernelSpec {
+  const h = kv === "f16";
+  return spec(`qknorm_rope_kv/${interleaved ? "interleaved" : "half"}/${kv}`, ["uniform", "read", "read", "read", "read", "read", "rw", "rw", "rw"], () => /* wgsl */ `
+${STEP_WGSL}
+struct P { T: u32, H: u32, Hkv: u32, D: u32, maxSeq: u32, cap: u32, eps: f32, _c: u32 }
+@group(0) @binding(0) var<uniform> p: P;
+@group(0) @binding(1) var<storage, read> st: Step;
+@group(0) @binding(2) var<storage, read> invFreq: array<f32>;
+@group(0) @binding(3) var<storage, read> qkv: array<f32>;
+@group(0) @binding(4) var<storage, read> qw: array<f32>;
+@group(0) @binding(5) var<storage, read> kw: array<f32>;
+@group(0) @binding(6) var<storage, read_write> qo: array<f32>;
+@group(0) @binding(7) var<storage, read_write> kc: array<${h ? "u32" : "f32"}>;
+@group(0) @binding(8) var<storage, read_write> vc: array<${h ? "u32" : "f32"}>;
+var<workgroup> row: array<f32, 256>;
+var<workgroup> red: array<f32, 256>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) i: u32) {
+  let hh = wid.x;
+  let t = wid.y;
+  let D = p.D;
+  let base = (t * (p.H + 2u * p.Hkv) + hh) * D;
+  let pos = st.pos0 + t;
+  let kn = p.Hkv * D;
+  let slot = (pos % p.cap) * kn;
+  // Writes are guarded rather than returned from: pos comes from storage, and a barrier follows.
+  let live = pos < p.maxSeq;
+  let x = select(0.0, qkv[base + min(i, D - 1u)], i < D);
+  if (hh >= p.H + p.Hkv) {
+    // v: copied into the cache as is.
+    let c = (hh - p.H - p.Hkv) * D + i;
+${h
+  ? `    if (live && i < D && i % 2u == 0u) { vc[(slot + c) / 2u] = pack2x16float(vec2<f32>(x, qkv[base + i + 1u])); }`
+  : `    if (live && i < D) { vc[slot + c] = x; }`}
+    return;
+  }
+  // RMSNorm over the head.
+  red[i] = x * x;
+  workgroupBarrier();
+  for (var s = 128u; s > 0u; s >>= 1u) {
+    if (i < s) { red[i] += red[i + s]; }
+    workgroupBarrier();
+  }
+  let inv = inverseSqrt(red[0] / f32(D) + p.eps);
+  let isQ = hh < p.H;
+  let w = select(kw[min(i, D - 1u)], qw[min(i, D - 1u)], isQ);
+  row[i] = x * inv * w;
+  workgroupBarrier();
+  // RoPE from the normalised row.
+  var out = 0.0;
+  if (i < D) {
+${interleaved
+  ? `    let j = i / 2u;
+    let a = row[2u * j];
+    let b = row[2u * j + 1u];
+    let first = (i % 2u) == 0u;`
+  : `    let hd = D / 2u;
+    let j = i % hd;
+    let a = row[j];
+    let b = row[j + hd];
+    let first = i < hd;`}
+    let ang = f32(pos) * invFreq[j];
+    out = select(b * cos(ang) + a * sin(ang), a * cos(ang) - b * sin(ang), first);
+  }
+  if (isQ) {
+    if (i < D) { qo[(t * p.H + hh) * D + i] = out; }
+    return;
+  }
+  let c = (hh - p.H) * D + i;
+${h
+  ? `  workgroupBarrier();
+  red[i] = out;
+  workgroupBarrier();
+  if (live && i < D && i % 2u == 0u) { kc[(slot + c) / 2u] = pack2x16float(vec2<f32>(red[i], red[i + 1u])); }`
+  : `  if (live && i < D) { kc[slot + c] = out; }`}
 }`);
 }
 

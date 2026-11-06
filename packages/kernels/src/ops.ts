@@ -14,6 +14,7 @@ import {
   attentionTiledSpec,
   copyRowSpec,
   embedSpec,
+  gatedActSpec,
   gemmSpec,
   GEMM_TILE,
   gemvLayout,
@@ -23,6 +24,7 @@ import {
   matmulRowsPerGroup,
   matmulSpec,
   rmsnormSpec,
+  qkNormRopeKvSpec,
   ropeKvSpec,
   ropeSpec,
   sampleSpec,
@@ -133,6 +135,14 @@ export function linear(ctx: Ctx, x: Tensor, w: Tensor, opts: LinearOptions | Ten
   const y = o.residual ?? ctx.alloc([M, outN]);
   const wdtype = weightDType(w);
   const f16 = o.f16 ?? f16Default;
+  if (M >= gemmMinRows && !o.lanes && !o.f16 && gated) {
+    // The GEMM's gated epilogue pairs 32 gate rows with 32 up rows per tile and ran 7% slower over a
+    // Gemma 3 4B prefill than a plain GEMM over [gate | up] followed by this elementwise pass.
+    const gu = linear(ctx, x, w, { bias: o.bias });
+    const act = o.gelu ? "gelu" : "silu";
+    ctx.run(gatedActSpec(act), [ctx.uniform([u32(M * outN), u32(outN), u32(0), u32(0)]), gu.buf, y.buf], grid1d(M * outN), `gated_${act} ${outN}`);
+    return y;
+  }
   if (M >= gemmMinRows && !o.lanes && !o.f16) {
     const epi: MatmulEpilogue = o.gelu ? "gelu" : o.silu ? "silu" : o.residual ? "add" : "store";
     const groups = Math.ceil(outN / (gated ? GEMM_TILE / 2 : GEMM_TILE));
@@ -193,6 +203,18 @@ export function ropeKv(ctx: Ctx, qkv: Tensor, kc: Buf, vc: Buf, s: AttentionShap
   const W = (s.H + 2 * s.Hkv) * s.D;
   const params = ctx.uniform([u32(s.T), u32(s.H), u32(s.Hkv), u32(s.D), u32(s.maxSeq), u32(cacheSlots(s)), u32(0), u32(0)]);
   ctx.run(ropeKvSpec(interleaved, s.kv), [params, ctx.step, invFreq.buf, qkv.buf, q.buf, kc, vc], grid1d((s.T * W) / 2));
+  return q;
+}
+
+/**
+ * Per-head q/k RMSNorm, RoPE and the cache write on the output of a stacked qkv matmul (qk-norm
+ * models): qkv [T, (H + 2·Hkv)·D] → normalised, rotated q [T, H·D]; k and v land in kc / vc.
+ */
+export function qkNormRopeKv(ctx: Ctx, qkv: Tensor, qNorm: Tensor, kNorm: Tensor, eps: number, kc: Buf, vc: Buf, s: AttentionShape, invFreq: Tensor, interleaved: boolean): Tensor {
+  if (s.D > 256 || s.D % 4 !== 0) throw new Error(`qkNormRopeKv: head dim ${s.D} must be a multiple of 4 and at most 256`);
+  const q = ctx.alloc([s.T, s.H * s.D]);
+  const params = ctx.uniform([u32(s.T), u32(s.H), u32(s.Hkv), u32(s.D), u32(s.maxSeq), u32(cacheSlots(s)), f32(eps), u32(0)]);
+  ctx.run(qkNormRopeKvSpec(interleaved, s.kv), [params, ctx.step, invFreq.buf, qkv.buf, qNorm.buf, kNorm.buf, q.buf, kc, vc], [s.H + 2 * s.Hkv, s.T, 1]);
   return q;
 }
 
