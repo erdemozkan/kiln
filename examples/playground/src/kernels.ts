@@ -131,7 +131,7 @@ async function main() {
 
   // Decode GEMV (one token): every weight format, prologue and epilogue; K past one staged chunk
   // (2048) and ragged in the last one, N ragged against the 64 rows of a workgroup.
-  for (const [N, K] of [[70, 96], [1000, 640], [66, 2304], [130, 4128]] as const) {
+  for (const [N, K] of [[70, 96], [1000, 640], [66, 2304], [130, 4128], [16400, 128]] as const) {
     for (const wd of ["f32", "q4", "q8"] as const) {
       const x = randn(K);
       const w = randn(N * K);

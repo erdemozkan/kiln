@@ -260,30 +260,48 @@ ${sg
 }`);
 }
 
-/** Lanes per weight row in the decode GEMV, and 32-element blocks of x staged per step. */
-export const GEMV_LANES = 4;
+/** 32-element blocks of x the decode GEMV stages per step. */
 export const GEMV_KB = 64;
+
+/** Decode GEMV layout: lanes per row group and weight rows per thread (sharing each staged x block). */
+export interface GemvLayout {
+  lanes: 4 | 8;
+  rows: 1 | 2 | 4;
+}
+
+/**
+ * Measured on Gemma 3 4B and SmolLM2 (Intel Gen9): several rows per thread pay off on large
+ * matrices (gate/up and the head 1.1x, down 1.15x) but cost 10-40% on small ones, which have too few
+ * workgroups (1024 rows) or too few blocks per lane (K = 576) for 8 lanes.
+ */
+export const gemvLayout = (outN: number, K: number): GemvLayout =>
+  outN >= 8192 ? { lanes: 8, rows: 4 } : K >= 4096 ? { lanes: 8, rows: 2 } : { lanes: 4, rows: 1 };
 
 export interface GemvVariant {
   wdtype: WeightDType;
   norm: boolean;
   bias: boolean;
   epi: MatmulEpilogue;
+  layout: GemvLayout;
 }
 
 /** Output rows a GEMV workgroup produces. */
-export const gemvRowsPerGroup = (epi: MatmulEpilogue): number => 256 / GEMV_LANES / (isGated(epi) ? 2 : 1);
+export const gemvRowsPerGroup = (epi: MatmulEpilogue, l: GemvLayout): number => ((256 / l.lanes) * l.rows) / (isGated(epi) ? 2 : 1);
 
 /**
  * Decode matmul (one token), y[n] = sum_k x[k] * W[n, k], with the same prologue and epilogues as
  * `matmulSpec`. Each lane takes whole 32-element blocks: one 16-byte load for a q4 block (two for q8,
  * eight vec4 for f32) and 32 multiply-adds, where the general kernel loads 4 bytes for 4. Neighbouring
  * lanes take neighbouring blocks, so a row's lanes read one contiguous run. The x chunk is staged
- * transposed (slot j of block b at j * KB + b), so those lanes read consecutive vec4s of it.
+ * transposed (slot j of block b at j * KB + b), so those lanes read consecutive vec4s of it, and each
+ * thread applies the x block it read to `rows` weight rows: with one row per thread, x reads from
+ * workgroup memory were 8x the weight bytes. Gated epilogues give a thread gate rows and the matching
+ * up rows; with one row per thread, the first half of the row groups take gate rows and the second
+ * half the matching up rows.
  */
 export function gemvSpec(v: GemvVariant): KernelSpec {
   const gated = isGated(v.epi);
-  const key = `gemv/${v.wdtype}${v.norm ? "/norm" : ""}${v.bias ? "/bias" : ""}/${v.epi}`;
+  const key = `gemv/${v.wdtype}${v.norm ? "/norm" : ""}${v.bias ? "/bias" : ""}/${v.epi}/l${v.layout.lanes}r${v.layout.rows}`;
   const quant = v.wdtype !== "f32";
   const bindings: BindingKind[] = quant ? ["uniform", "read", "read", "read"] : ["uniform", "read", "read"];
   let b = bindings.length;
@@ -298,32 +316,58 @@ export function gemvSpec(v: GemvVariant): KernelSpec {
   }
   decl.push(`@group(0) @binding(${b}) var<storage, read_write> y: array<f32>;`);
   bindings.push("rw");
-  const rows = 256 / GEMV_LANES;
+  const R = v.layout.rows;
+  const LANES = v.layout.lanes;
+  const groups = 256 / LANES;
+  // Gated with one row per thread: row group gi pairs with gi + groups / 2.
+  const split = gated && R === 1;
   const withBias = (row: string, val: string) => (v.bias ? `(${val} + bias[${row}])` : val);
-  // The dot product of one block with x, from slots j = 0..7 of the staged chunk.
-  const xs = (j: number) => `xt[${j}u * KB + bi]`;
-  const block =
+  // The dot product of one block (index blk) with the x block in registers x0…x7.
+  const blockDot = (blk: string) =>
     v.wdtype === "q4"
-      ? `let q = wq[blk];
-        let d = dot(${xs(0)}, dq4(q.x)) + dot(${xs(1)}, dq4(q.x >> 16u)) + dot(${xs(2)}, dq4(q.y)) + dot(${xs(3)}, dq4(q.y >> 16u))
-          + dot(${xs(4)}, dq4(q.z)) + dot(${xs(5)}, dq4(q.z >> 16u)) + dot(${xs(6)}, dq4(q.w)) + dot(${xs(7)}, dq4(q.w >> 16u));
-        acc += d * ws[blk];`
+      ? `let q = wq[${blk}];
+          acc += (dot(x0, dq4(q.x)) + dot(x1, dq4(q.x >> 16u)) + dot(x2, dq4(q.y)) + dot(x3, dq4(q.y >> 16u))
+            + dot(x4, dq4(q.z)) + dot(x5, dq4(q.z >> 16u)) + dot(x6, dq4(q.w)) + dot(x7, dq4(q.w >> 16u))) * ws[${blk}];`
       : quant
-        ? `let q0 = wq[blk * 2u];
-        let q1 = wq[blk * 2u + 1u];
-        let d = dot(${xs(0)}, dq8(q0.x)) + dot(${xs(1)}, dq8(q0.y)) + dot(${xs(2)}, dq8(q0.z)) + dot(${xs(3)}, dq8(q0.w))
-          + dot(${xs(4)}, dq8(q1.x)) + dot(${xs(5)}, dq8(q1.y)) + dot(${xs(6)}, dq8(q1.z)) + dot(${xs(7)}, dq8(q1.w));
-        acc += d * ws[blk];`
-        : `for (var j = 0u; j < 8u; j++) { acc += dot(xt[j * KB + bi], w[blk * 8u + j]); }`;
-  const store = gated
-    ? `if (r < HALF && i < p.N / 2u) {
-    let g = ${withBias("n", "red[li]")};
-    let u = ${withBias("n + p.N / 2u", "red[li + HALF * LANES]")};
-    y[i] = ${actWgsl(v.epi as "silu" | "gelu", "g")} * u;
-  }`
-    : `if (live) {
-    y[n] ${v.epi === "add" ? "+=" : "="} ${withBias("n", "red[li]")};
-  }`;
+        ? `let q0 = wq[${blk} * 2u];
+          let q1 = wq[${blk} * 2u + 1u];
+          acc += (dot(x0, dq8(q0.x)) + dot(x1, dq8(q0.y)) + dot(x2, dq8(q0.z)) + dot(x3, dq8(q0.w))
+            + dot(x4, dq8(q1.x)) + dot(x5, dq8(q1.y)) + dot(x6, dq8(q1.z)) + dot(x7, dq8(q1.w))) * ws[${blk}];`
+        : `let o = ${blk} * 8u;
+          acc += dot(x0, w[o]) + dot(x1, w[o + 1u]) + dot(x2, w[o + 2u]) + dot(x3, w[o + 3u])
+            + dot(x4, w[o + 4u]) + dot(x5, w[o + 5u]) + dot(x6, w[o + 6u]) + dot(x7, w[o + 7u]);`;
+  const rowsCode = Array.from({ length: R }, (_, r) => `
+        if (ok${r}) {
+          var acc = acc${r};
+          ${blockDot(`(row${r} * blocks + c0 + bi)`)}
+          acc${r} = acc;
+        }`).join("");
+  const rowDecl = split
+    ? `  let half = p.N / 2u;
+  let i0 = grp * ${groups / 2}u + gi % ${groups / 2}u;
+  let row0 = select(i0, half + i0, gi >= ${groups / 2}u);
+  let ok0 = i0 < half;`
+    : gated
+    ? `  let half = p.N / 2u;
+  let i0 = grp * ${(groups * R) / 2}u + gi * ${R / 2}u;
+${Array.from({ length: R }, (_, r) => `  let row${r} = ${r < R / 2 ? "" : "half + "}i0 + ${r % (R / 2)}u;
+  let ok${r} = i0 + ${r % (R / 2)}u < half;`).join("\n")}`
+    : `  let n0 = grp * ${groups * R}u + gi * ${R}u;
+${Array.from({ length: R }, (_, r) => `  let row${r} = n0 + ${r}u;
+  let ok${r} = row${r} < p.N;`).join("\n")}`;
+  const store = split
+    ? `    if (gi < ${groups / 2}u && ok0) {
+      let g = ${withBias("row0", "red[li]")};
+      let u = ${withBias("half + i0", `red[li + ${(groups / 2) * LANES}u]`)};
+      y[i0] = ${actWgsl(v.epi as "silu" | "gelu", "g")} * u;
+    }`
+    : gated
+    ? Array.from({ length: R / 2 }, (_, j) => `    if (ok${j}) {
+      let g = ${withBias(`row${j}`, `red[${j * 256}u + li]`)};
+      let u = ${withBias(`row${j + R / 2}`, `red[${(j + R / 2) * 256}u + li]`)};
+      y[i0 + ${j}u] = ${actWgsl(v.epi as "silu" | "gelu", "g")} * u;
+    }`).join("\n")
+    : Array.from({ length: R }, (_, r) => `    if (ok${r}) { y[row${r}] ${v.epi === "add" ? "+=" : "="} ${withBias(`row${r}`, `red[${r * 256}u + li]`)}; }`).join("\n");
   return spec(key, bindings, () => /* wgsl */ `
 struct P { M: u32, N: u32, K: u32, eps: f32 }
 @group(0) @binding(0) var<uniform> p: P;
@@ -333,11 +377,10 @@ ${quant
 @group(0) @binding(3) var<storage, read> ws: array<f32>;`
   : `@group(0) @binding(2) var<storage, read> w: array<vec4<f32>>;`}
 ${decl.join("\n")}
-const LANES = ${GEMV_LANES}u;
+const LANES = ${LANES}u;
 const KB = ${GEMV_KB}u;
-const HALF = ${rows / 2}u;
 var<workgroup> xt: array<vec4<f32>, ${GEMV_KB * 8}>;
-var<workgroup> red: array<f32, 256>;
+var<workgroup> red: array<f32, ${256 * R}>;
 
 fn dq4(w: u32) -> vec4<f32> { return vec4<f32>(vec4<u32>(w, w >> 4u, w >> 8u, w >> 12u) & vec4<u32>(15u)) - 8.0; }
 fn dq8(w: u32) -> vec4<f32> { return vec4<f32>(bitcast<vec4<i32>>(vec4<u32>(w << 24u, w << 16u, w << 8u, w)) >> vec4<u32>(24u)); }
@@ -345,14 +388,9 @@ fn dq8(w: u32) -> vec4<f32> { return vec4<f32>(bitcast<vec4<i32>>(vec4<u32>(w <<
 @compute @workgroup_size(256)
 fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) li: u32) {
   let lane = li % LANES;
-  let r = li / LANES;
+  let gi = li / LANES;
   let grp = wid.x + wid.z * ${MM_SLICE}u;
-${gated
-  ? `  let i = grp * HALF + r % HALF;
-  let n = select(i, p.N / 2u + i, r >= HALF);
-  let live = i < p.N / 2u;`
-  : `  let n = grp * ${rows}u + r;
-  let live = n < p.N;`}
+${rowDecl}
   let blocks = p.K / 32u;
   let xs4 = p.K / 4u;
 ${v.norm
@@ -368,7 +406,7 @@ ${v.norm
   let inv = inverseSqrt(red[0] / f32(p.K) + p.eps);
   workgroupBarrier();`
   : ""}
-  var acc = 0.0;
+${Array.from({ length: R }, (_, r) => `  var acc${r} = 0.0;`).join("\n")}
   for (var c0 = 0u; c0 < blocks; c0 += KB) {
     for (var e = li; e < KB * 8u; e += 256u) {
       let c = c0 * 8u + e;
@@ -376,23 +414,23 @@ ${v.norm
       xt[(e % 8u) * KB + e / 8u] = ${v.norm ? "xv * inv * nw[min(c, xs4 - 1u)]" : "xv"};
     }
     workgroupBarrier();
-    if (live) {
-      let nb = min(KB, blocks - c0);
-      for (var bi = lane; bi < nb; bi += LANES) {
-        let blk = n * blocks + c0 + bi;
-        ${block}
-      }
+    let nb = min(KB, blocks - c0);
+    for (var bi = lane; bi < nb; bi += LANES) {
+      let x0 = xt[bi]; let x1 = xt[KB + bi]; let x2 = xt[2u * KB + bi]; let x3 = xt[3u * KB + bi];
+      let x4 = xt[4u * KB + bi]; let x5 = xt[5u * KB + bi]; let x6 = xt[6u * KB + bi]; let x7 = xt[7u * KB + bi];${rowsCode}
     }
     workgroupBarrier();
   }
-  red[li] = acc;
+${Array.from({ length: R }, (_, r) => `  red[${r * 256}u + li] = acc${r};`).join("\n")}
   workgroupBarrier();
   for (var s = LANES / 2u; s > 0u; s >>= 1u) {
-    if (lane < s) { red[li] += red[li + s]; }
+    if (lane < s) {
+${Array.from({ length: R }, (_, r) => `      red[${r * 256}u + li] += red[${r * 256}u + li + s];`).join("\n")}
+    }
     workgroupBarrier();
   }
   if (lane == 0u) {
-  ${store}
+${store}
   }
 }`);
 }

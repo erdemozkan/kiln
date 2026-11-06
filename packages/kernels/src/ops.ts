@@ -16,6 +16,7 @@ import {
   embedSpec,
   gemmSpec,
   GEMM_TILE,
+  gemvLayout,
   gemvRowsPerGroup,
   gemvSpec,
   kvWriteSpec,
@@ -144,13 +145,14 @@ export function linear(ctx: Ctx, x: Tensor, w: Tensor, opts: LinearOptions | Ten
   }
   const epi: MatmulEpilogue = o.gelu ? "gelu" : o.silu ? "silu" : o.residual ? "add" : "store";
   if (M === 1 && gemvOn && !o.lanes && !f16 && !(o.subgroups ?? subgroupsDefault)) {
-    const groups = Math.ceil(outN / gemvRowsPerGroup(epi));
+    const layout = gemvLayout(outN, K);
+    const groups = Math.ceil(outN / gemvRowsPerGroup(epi, layout));
     const grid: Grid = [Math.min(groups, MM_SLICE), 1, Math.ceil(groups / MM_SLICE)];
     const bufs = [ctx.uniform([u32(M), u32(N), u32(K), f32(o.norm?.eps ?? 0)]), x.buf, ...weightBufs(w)];
     if (o.norm) bufs.push(o.norm.w.buf);
     if (o.bias) bufs.push(o.bias.buf);
     bufs.push(y.buf);
-    ctx.run(gemvSpec({ wdtype, norm: !!o.norm, bias: !!o.bias, epi }), bufs, grid, `gemv/${wdtype} ${N}x${K}${o.norm ? "+norm" : ""}${gated ? `+${epi}` : ""}${o.residual ? "+add" : ""}`);
+    ctx.run(gemvSpec({ wdtype, norm: !!o.norm, bias: !!o.bias, epi, layout }), bufs, grid, `gemv/${wdtype} ${N}x${K}${o.norm ? "+norm" : ""}${gated ? `+${epi}` : ""}${o.residual ? "+add" : ""}`);
     return y;
   }
   const lanes = o.lanes ?? tunedLanes.get(lanesKey(wdtype, mt, N, K)) ?? 8;

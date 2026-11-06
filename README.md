@@ -221,6 +221,14 @@ How it got there, each step measured in one session with identical greedy output
   at one step per submit with the page in the background. Greedy output is unchanged on both models,
   and Gemma 1B q4 and q8 still match the NumPy reference token for token. `setGemv(false)` restores
   the general kernel, which forced `lanes`, `f16Math` and subgroups still use.
+- **GEMV rows per thread** (Gemma 3 4B Q4_0, decode step at position 256): this GPU reads about 22
+  GB/s in a plain streaming kernel, and the GEMV reached 11-15. With one row per thread, each lane
+  read 128 bytes of x from workgroup memory per 16-byte weight block. Large matrices now give each
+  thread 4 rows (8,192 output rows and up) or 2 rows (K of 4,096 and up) on the x block it read,
+  with 8 lanes per row group: step 190.6 → 177-180 ms (gate/up 75.5 → 72, down 43.8 → 36, head 28.0
+  → 24.7). Small matrices keep 4 lanes and one row, since several rows per thread made SmolLM2's
+  (K = 576) and 4B's 1024-row k/v projections 10-40% slower. Same answer tokens on the 1,138-token
+  prompt, SmolLM2's step unchanged.
 - **Autotuner:** on this GPU it picks 16 lanes per row for the 576×576 projections and 8 elsewhere; gains
   here are within noise. It exists for GPUs with more cores, where small N leaves most of them idle.
   It tunes the general kernel, so with the GEMV it only matters for prefill and forced variants.
@@ -261,7 +269,7 @@ cost.
 
 ## Status
 
-Verified on this GPU: all kernel checks pass (466, including q4 and q8 weights in every matmul variant, the decode GEMV and the prefill GEMM, both prefill attention kernels, fused variants, f16 cache paths,
+Verified on this GPU: all kernel checks pass (487, including q4 and q8 weights in every matmul variant, the decode GEMV and the prefill GEMM, both prefill attention kernels, fused variants, f16 cache paths,
 sliding-window attention, GELU gating, grammar masks and sampling distributions). SmolLM2-135M-Instruct chats from Hub safetensors (q4, f32) and from a GGUF
 Q4_K_M file.
 
