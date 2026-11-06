@@ -1,5 +1,5 @@
 import { byteSize, packUniform, q4ScaleBytes, roundUp, u32, type Backend, type Buf, type Tensor } from "@kiln/core";
-import { convertSpec, grid1d, MAX_X, type GpuConvertType } from "@kiln/kernels";
+import { convertSpec, GPU_CONVERT_TYPES, grid1d, MAX_X, type GpuConvertType } from "@kiln/kernels";
 import { quantizeQ4, quantizeQ8, repackQ4_0, repackQ8_0, rowBytes, toF32, type ByteSource, type TensorEntry } from "@kiln/loader";
 import { isQuantizable } from "@kiln/models";
 
@@ -35,9 +35,10 @@ const CHUNK = 8 * 2 ** 20;
 let gpuConvert = true;
 
 /**
- * Converts GGUF Q4_0 and Q6_K blocks to q4 on the GPU (default true): raw blocks are uploaded and a
- * kernel writes the planes, which takes the conversion off the CPU, where it was most of a cached
- * load. False converts on the CPU; the planes are the same bits either way.
+ * Converts weights to q4 on the GPU (default true) from F32/F16/BF16 safetensors and GGUF
+ * Q8_0/Q4_0/Q4_K/Q5_K/Q6_K: raw blocks are uploaded and a kernel writes the planes, which takes the
+ * conversion off the CPU, where it was most of a cached load. False converts on the CPU; the planes
+ * are the same bits either way.
  */
 export function setGpuConvert(on: boolean): void {
   gpuConvert = on;
@@ -136,7 +137,7 @@ async function loadTensor(
     const perRow = byteSize([cols], dtype);
     const buf = backend.alloc(rows * perRow, "storage", name);
     const scales = backend.alloc(q4ScaleBytes(shape), "storage", `${name}/scales`);
-    const onGpu = gpu && dtype === "q4" && (e.type === "Q4_0" || e.type === "Q6_K") && grid1d((rowsPerChunk * cols) / 32)[1] <= MAX_X;
+    const onGpu = gpu && dtype === "q4" && GPU_CONVERT_TYPES.has(e.type) && grid1d((rowsPerChunk * cols) / 32)[1] <= MAX_X;
     for (let r = 0; r < rows; r += rowsPerChunk) {
       const n = Math.min(rowsPerChunk, rows - r);
       const bytes = await src.read(e.offset + r * srcRow, n * srcRow);

@@ -605,14 +605,36 @@ async function main() {
     }
   }
 
-  // Load-time conversion of GGUF blocks on the GPU, bit for bit against the CPU converters, over two 8 MB chunks
+  // Load-time conversion to q4 on the GPU, bit for bit against the CPU converters, over two 8 MB chunks
   // each so the second chunk's offsets are exercised. Scales cover negative, subnormal and zero f16.
-  for (const [type, rows, cols] of [["Q4_0", 4000, 4128], ["Q6_K", 4500, 2560]] as [SrcType, number, number][]) {
+  // Float sources mix random values with blocks on a small integer grid, whose codes land exactly on
+  // the x / d + 8.5 ties, and all-zero blocks.
+  const convertCases: [SrcType, number, number][] = [
+    ["Q4_0", 4000, 4128], ["Q6_K", 4500, 2560], ["Q4_K", 3000, 2560], ["Q5_K", 3000, 2560],
+    ["Q8_0", 3000, 2560], ["F16", 1700, 2560], ["BF16", 1700, 2560], ["F32", 900, 2560],
+  ];
+  for (const [type, rows, cols] of convertCases) {
     const bytes = new Uint8Array(rows * rowBytes(type, cols));
     for (let i = 0; i < bytes.length; i++) bytes[i] = (rand() * 128 + 128) & 255;
-    const [blk, dAt] = type === "Q4_0" ? [18, 0] : [210, 208];
-    for (let b = 0, o = dAt; o < bytes.length; b++, o += blk) {
-      const h = b % 97 === 0 ? (b % 2 ? 0x8003 : 0) : toHalf((rand() * 0.02) * (b % 13 === 0 ? 1e-3 : 1)) | (b % 3 ? 0 : 0x8000);
+    const float = type === "F16" || type === "BF16" || type === "F32";
+    if (float) {
+      const vals = new Float32Array(rows * cols);
+      for (let b = 0; b < vals.length / 32; b++) {
+        const grid = b % 3 === 0;
+        // Power-of-two grid steps keep the grid exact in f16 and bf16.
+        const s = grid ? 2 ** -(5 + (b % 6)) : (b % 7 === 0 ? 1e-3 : 1) * (0.01 + rand() * 0.05);
+        for (let l = 0; l < 32; l++) vals[b * 32 + l] = b % 101 === 0 ? 0 : grid ? s * (Math.floor(rand() * 33) - 16) : (rand() - 0.5) * s;
+      }
+      if (type === "F32") bytes.set(new Uint8Array(vals.buffer));
+      else {
+        const dv = new DataView(bytes.buffer);
+        for (let i = 0; i < vals.length; i++) dv.setUint16(i * 2, type === "F16" ? toHalf(vals[i]!) : new Uint32Array(Float32Array.of(vals[i]!).buffer)[0]! >>> 16, true);
+      }
+    }
+    const scaleAt: Partial<Record<SrcType, [number, number[]]>> = { Q4_0: [18, [0]], Q6_K: [210, [208]], Q8_0: [34, [0]], Q4_K: [144, [0, 2]], Q5_K: [176, [0, 2]] };
+    const [blk, dAts] = scaleAt[type] ?? [0, []];
+    for (const dAt of dAts) for (let b = 0, o = dAt; o < bytes.length; b++, o += blk) {
+      const h = b % 97 === 0 ? (b % 2 ? 0x8003 : 0) : toHalf((rand() * 0.02) * (b % 13 === 0 ? 1e-3 : 1)) | (b % 3 || dAt === 2 ? 0 : 0x8000);
       bytes[o] = h & 255;
       bytes[o + 1] = h >> 8;
     }

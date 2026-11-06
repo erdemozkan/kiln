@@ -96,9 +96,12 @@ Key ideas:
   the Intel GPU, with the same reply. The file is keyed by model, revision, weight format and f16
   math, written after the reply goes out, and a half-written file is ignored.
 - **1× memory while loading.** Weights stream row-chunk by row-chunk from the network into GPU buffers,
-  quantized to q4 or q8 on the way if requested. Nothing holds the whole model in CPU memory. GGUF
-  Q4_0 and Q6_K blocks are uploaded raw and converted to q4 by a compute kernel, bit for bit what the
-  CPU converter gives (`setGpuConvert(false)` keeps it on the CPU).
+  quantized to q4 or q8 on the way if requested. Nothing holds the whole model in CPU memory. For q4,
+  F32/F16/BF16 tensors and GGUF Q8_0, Q4_0, Q4_K, Q5_K and Q6_K blocks are uploaded raw and converted
+  by a compute kernel, bit for bit what the CPU converter gives: the rounding at x / d + 8.5 is decided
+  by an exact comparison, not the GPU's division (`setGpuConvert(false)` keeps it on the CPU). On the
+  Intel Mac, cached SmolLM2-360M loads went from 8.3 to 3.5 s (BF16 safetensors) and from 6.6 to 4.3 s
+  (Q4_K_M GGUF), with the same replies.
 - **Why a reply ended.** `stats.stopReason` is `"stop"` (an end-of-turn or stop token),
   `"maxTokens"`, `"context"` (the reply filled the context before maxTokens), `"format"` (the
   structured value is complete) or `"abort"` (the signal fired or the caller stopped reading), the
@@ -309,7 +312,7 @@ cost.
 
 ## Status
 
-Verified on this GPU: all kernel checks pass (529, including q4 and q8 weights in every matmul variant, the decode GEMV and the prefill GEMM, both prefill attention kernels, fused variants, f16 cache paths,
+Verified on this GPU: all kernel checks pass (535, including q4 and q8 weights in every matmul variant, the decode GEMV and the prefill GEMM, both prefill attention kernels, fused variants, f16 cache paths,
 sliding-window attention, GELU gating, grammar masks and sampling distributions). SmolLM2-135M-Instruct chats from Hub safetensors (q4, f32) and from a GGUF
 Q4_K_M file.
 
