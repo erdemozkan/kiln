@@ -5,6 +5,7 @@ export type WireGenerateOptions = Omit<GenerateOptions, "signal">;
 
 export interface WireLoadOptions {
   quant?: Quant;
+  /** Context length in tokens (default: the model's, up to 8192 tokens and 512 MiB of KV cache). */
   maxSeq?: number;
   revision?: string;
   endpoint?: string;
@@ -23,7 +24,10 @@ export interface ModelInfo {
   layers: number;
   hiddenSize: number;
   vocabSize: number;
+  /** Context length this load allocated, in tokens. */
   maxSeq: number;
+  /** Longest context the model was trained for, if its files say; pass a larger `maxSeq` to use more. */
+  contextLength?: number;
   chatFormat: string | undefined;
   backendFeatures: string[];
   /** Tokens of K/V restored from the prompt cache at load (0 if none). */

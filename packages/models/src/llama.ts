@@ -20,7 +20,7 @@ export interface ForwardPlan {
 }
 
 export interface LlamaOptions {
-  /** KV cache length in tokens. */
+  /** KV cache length in tokens (default `defaultMaxSeq`). */
   maxSeq?: number;
   /** KV cache storage: f16 (default) halves the cache and the attention reads; f32 for exactness. */
   kvDtype?: KvDtype;
@@ -29,6 +29,24 @@ export interface LlamaOptions {
 }
 
 export class MissingWeightError extends Error {}
+
+/** KV cache memory the default context may take, and the longest default context. */
+export const KV_BUDGET_BYTES = 512 * 2 ** 20;
+export const MAX_DEFAULT_SEQ = 8192;
+
+/** KV cache bytes per token: keys and values of every layer. */
+export const kvBytesPerToken = (cfg: LlamaConfig, kvDtype: KvDtype = "f16"): number =>
+  cfg.numLayers * 2 * cfg.numKvHeads * cfg.headDim * (kvDtype === "f16" ? 2 : 4);
+
+/**
+ * Default context length: the model's trained context, at most MAX_DEFAULT_SEQ tokens, and no more
+ * than fits KV_BUDGET_BYTES of cache (in multiples of 256, never under 2048 unless the model's own
+ * context is shorter). Gemma 3 4B (136 KB per token in f16) gets 3840, SmolLM2 and Gemma 3 1B 8192.
+ */
+export function defaultMaxSeq(cfg: LlamaConfig, kvDtype: KvDtype = "f16"): number {
+  const fits = Math.floor(KV_BUDGET_BYTES / kvBytesPerToken(cfg, kvDtype) / 256) * 256;
+  return Math.min(cfg.contextLength ?? 2048, MAX_DEFAULT_SEQ, Math.max(fits, 2048));
+}
 
 /** Most rows a verify plan can have (the last token plus a draft of up to 31). */
 export const MAX_VERIFY_ROWS = 32;
@@ -62,8 +80,8 @@ export class LlamaModel {
     private readonly weights: Map<string, Tensor>,
     opts: LlamaOptions = {},
   ) {
-    this.maxSeq = opts.maxSeq ?? 2048;
     this.kvDtype = opts.kvDtype ?? "f16";
+    this.maxSeq = opts.maxSeq ?? defaultMaxSeq(cfg, this.kvDtype);
     const kvBytes = this.kvDtype === "f16" ? 2 : 4;
     this.step = backend.alloc(32, "storage", "step");
     this.history = backend.alloc(this.maxSeq * 4, "storage", "history");

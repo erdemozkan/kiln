@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { UnsupportedModelError, configFromGGUF, configFromHF, ggufToHF, isQuantizable, multimodalTextName, ropeInvFreq } from "../src";
+import { UnsupportedModelError, configFromGGUF, configFromHF, defaultMaxSeq, ggufToHF, isQuantizable, kvBytesPerToken, multimodalTextName, ropeInvFreq } from "../src";
 
 const qwen3 = {
   model_type: "qwen3",
@@ -85,6 +85,11 @@ describe("configFromHF", () => {
     expect(c).toMatchObject({ family: "gemma3", numHeads: 8, numKvHeads: 4, headDim: 256, vocabSize: 262208, slidingWindow: 1024, ropeLinear: 8, ropeTheta: 1e6, ropeLocalTheta: 10000, attnScale: 1 / 16, eosTokenIds: [1, 106] });
     expect(c.embedScale).toBe(50.5); // sqrt(2560) = 50.596 in bf16
     expect(c.slidingLayers!.filter((s) => !s)).toHaveLength(5);
+    // The trained context comes from Gemma3TextConfig's default; the KV budget caps the default context.
+    expect(c.contextLength).toBe(131072);
+    expect(kvBytesPerToken(c)).toBe(34 * 2 * 4 * 256 * 2);
+    expect(defaultMaxSeq(c)).toBe(3840);
+    expect(defaultMaxSeq(c, "f32")).toBe(2048); // 1920 fits; never under 2048
     const global = ropeInvFreq(c);
     const local = ropeInvFreq({ headDim: 256, ropeTheta: 10000 });
     expect(global[1]).toBeCloseTo(1e6 ** (-2 / 256) / 8, 7);
@@ -95,6 +100,11 @@ describe("configFromHF", () => {
     expect(multimodalTextName("model.language_model.embed_tokens.weight")).toBe("model.embed_tokens.weight");
     expect(multimodalTextName("vision_tower.vision_model.encoder.layers.0.mlp.fc1.weight")).toBeUndefined();
     expect(multimodalTextName("multi_modal_projector.mm_soft_emb_norm.weight")).toBeUndefined();
+  });
+
+  it("reads the trained context length", () => {
+    expect(configFromHF({ ...qwen3, max_position_embeddings: 40960 }).contextLength).toBe(40960);
+    expect(configFromHF(qwen3).contextLength).toBeUndefined();
   });
 
   it("refuses unknown architectures by name", () => {
@@ -116,6 +126,12 @@ describe("GGUF", () => {
     ]);
     const c = configFromGGUF(meta, ["token_embd.weight", "blk.0.attn_q.weight"]);
     expect(c).toMatchObject({ headDim: 64, ropeInterleaved: true, tieEmbeddings: true, eosTokenIds: [2] });
+    // No context_length: the old 2048 default. With one, the smaller of it and 8192.
+    expect(c.contextLength).toBeUndefined();
+    expect(defaultMaxSeq(c)).toBe(2048);
+    expect(defaultMaxSeq(configFromGGUF(new Map([...meta, ["llama.context_length", 8192]]), []))).toBe(8192);
+    expect(defaultMaxSeq(configFromGGUF(new Map([...meta, ["llama.context_length", 1024]]), []))).toBe(1024);
+    expect(defaultMaxSeq(configFromGGUF(new Map([...meta, ["llama.context_length", 131072]]), []))).toBe(8192);
     expect(ggufToHF("blk.3.ffn_down.weight")).toBe("model.layers.3.mlp.down_proj.weight");
     expect(ggufToHF("output.weight")).toBe("lm_head.weight");
     expect(ggufToHF("rope_freqs.weight")).toBeUndefined();

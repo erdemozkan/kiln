@@ -49,6 +49,7 @@ scope.onmessage = async (e: MessageEvent<Request>) => {
             hiddenSize: cfg.hiddenSize,
             vocabSize: cfg.vocabSize,
             maxSeq: engine.model.maxSeq,
+            contextLength: cfg.contextLength,
             chatFormat: engine.chatFormat?.name,
             backendFeatures: [...engine.backend.limits.features],
             restoredTokens: savedTokens.length,

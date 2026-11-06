@@ -185,7 +185,11 @@ export class Engine {
     if (this.busy) throw new Error("Engine is already generating; await or abort the previous call");
     if (promptIds.length === 0) throw new Error("prompt is empty");
     const maxSeq = this.model.maxSeq;
-    if (promptIds.length >= maxSeq) throw new Error(`prompt has ${promptIds.length} tokens but the context is ${maxSeq}`);
+    if (promptIds.length >= maxSeq) {
+      const trained = this.model.cfg.contextLength;
+      const hint = trained && trained > maxSeq ? `; load with a larger maxSeq (this model was trained for ${trained})` : "";
+      throw new Error(`prompt has ${promptIds.length} tokens but the context is ${maxSeq}${hint}`);
+    }
     const maxTokens = Math.min(opts.maxTokens ?? 512, maxSeq - promptIds.length);
     const temperature = opts.temperature ?? 0.7;
     const seed = opts.seed ?? (Math.random() * 2 ** 32) >>> 0;

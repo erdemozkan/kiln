@@ -40,7 +40,11 @@ export interface LlamaConfig {
   slidingLayers?: boolean[];
   /** RoPE base of the sliding layers, when it differs from `ropeTheta` (Gemma 3: 10k local, 1M global). */
   ropeLocalTheta?: number;
+  /** Longest context the model was trained for (max_position_embeddings / GGUF context_length), if stated. */
+  contextLength?: number;
 }
+
+const optNum = (v: unknown): number | undefined => (typeof v === "number" && v > 0 ? v : typeof v === "bigint" && v > 0n ? Number(v) : undefined);
 
 export interface Llama3RopeScaling {
   factor: number;
@@ -84,6 +88,7 @@ const GEMMA3_DEFAULTS: HFConfig = {
   rope_local_base_freq: 10000,
   query_pre_attn_scalar: 256,
   sliding_window: 4096,
+  max_position_embeddings: 131072,
   sliding_window_pattern: 6,
 };
 
@@ -121,6 +126,7 @@ export function configFromHF(c: HFConfig, generation?: HFConfig): LlamaConfig {
     qkNorm: family === "qwen3",
     eosTokenIds: [...new Set([...ids(c.eos_token_id), ...ids(generation?.eos_token_id)])],
     bosTokenId: typeof c.bos_token_id === "number" ? c.bos_token_id : undefined,
+    contextLength: optNum(c.max_position_embeddings),
   };
 }
 
@@ -177,6 +183,7 @@ function gemma3(c: HFConfig, generation?: HFConfig): LlamaConfig {
     attnScale: num(c, "query_pre_attn_scalar", headDim) ** -0.5,
     slidingWindow: num(c, "sliding_window", 512),
     slidingLayers,
+    contextLength: optNum(c.max_position_embeddings),
   };
 }
 
@@ -224,6 +231,7 @@ export function configFromGGUF(meta: Map<string, unknown>, tensorNames: readonly
     qkNorm: tensorNames.includes("blk.0.attn_q_norm.weight"),
     eosTokenIds: ids(meta.get("tokenizer.ggml.eos_token_id")),
     bosTokenId: meta.has("tokenizer.ggml.bos_token_id") ? Number(meta.get("tokenizer.ggml.bos_token_id")) : undefined,
+    contextLength: optNum(meta.get(`${arch}.context_length`)),
   };
 }
 
@@ -277,6 +285,7 @@ function gemma3FromGGUF(meta: Map<string, unknown>, tensorNames: readonly string
     attnScale: (numLayers === 62 ? hiddenSize / numHeads : headDim) ** -0.5,
     slidingWindow: get("attention.sliding_window", 512),
     slidingLayers,
+    contextLength: optNum(meta.get("gemma3.context_length")),
   };
 }
 

@@ -99,6 +99,13 @@ Key ideas:
   quantized to q4 or q8 on the way if requested. Nothing holds the whole model in CPU memory. GGUF
   Q4_0 and Q6_K blocks are uploaded raw and converted to q4 by a compute kernel, bit for bit what the
   CPU converter gives (`setGpuConvert(false)` keeps it on the CPU).
+- **Context sized to the model.** The default `maxSeq` is the model's trained context
+  (`max_position_embeddings`, GGUF `context_length`), at most 8192 tokens and 512 MiB of KV cache:
+  SmolLM2 and Gemma 3 1B get 8192, Gemma 3 4B (136 KB of f16 cache per token) 3840, where it was
+  2048 for every model. `info.contextLength` tells an app how far a larger `maxSeq` can go, and a
+  prompt that does not fit says so. On Gemma 3 4B a 2,997-token prompt now answers the long-range
+  question, and the decode step is unchanged (attention 4.0 ms at position 256 with 3840 slots, 4.8
+  with 2048).
 - **The download is the cache.** In a worker, `CachedHttpSource` writes the download into OPFS and serves
   reads from it as bytes land. Interrupted downloads resume from the last flushed byte recorded in the
   metadata (not the file size, which can include writes lost when a worker is killed), and a cached

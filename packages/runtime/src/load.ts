@@ -24,7 +24,10 @@ import { loadWeights, type LoadProgress, type Quant, type WeightFile } from "./w
 export interface LoadOptions {
   /** Weight storage on the GPU: "q4" (default), "q8" or "f32". See `Quant`. */
   quant?: Quant;
-  /** KV cache length. Default 2048. */
+  /**
+   * KV cache length in tokens. Default: the model's trained context, at most 8192 tokens and 512 MiB
+   * of cache (see `defaultMaxSeq`).
+   */
   maxSeq?: number;
   /** KV cache storage, f16 (default) or f32. */
   kvDtype?: KvDtype;
