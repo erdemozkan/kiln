@@ -249,6 +249,7 @@ Models run end to end (greedy answers to fixed questions checked by hand; tool c
 | `qwen3` | Qwen3-0.6B (`toolChoice`) | safetensors | 20–32 tok/s |
 | `gemma3_text` | Gemma 3 1B-it (sliding window: recalls a fact 1,100 tokens back) | safetensors (unsloth mirror) | 12–20 tok/s |
 | `gemma3_text` | Gemma 3 270M-it, with `quant: "q8"` or `"f32"` | safetensors, GGUF Q8_0 | 25–42 tok/s |
+| `gemma3` | Gemma 3 4B-it, text only (recalls a fact 1,100 tokens back) | GGUF Q4_0 (2.4 GB) | 197 ms GPU per step (about 5 tok/s) |
 
 Gemma 3 was checked token by token against an independent NumPy forward pass written from
 transformers' `modeling_gemma3`: greedy output matched on every prompt tried, for 1B in q4 and q8 and 270M
@@ -261,9 +262,12 @@ the memory).
 `mistral` loads through the same code as `llama` but has not been run (the smallest Mistral is 7B).
 Gemma 3 4B and larger load as text models: the multimodal checkpoint's language model is read
 (`text_config`, weights under `language_model.` or `model.language_model.`, the vision tower skipped),
-with linear rope scaling on the global layers only, from safetensors or GGUF. This has been checked
-against the real 4B config and weight names in tests, but not run end to end yet (an 8.6 GB or
-2.5 GB download). Images are not supported.
+with linear rope scaling on the global layers only, from safetensors or GGUF. 4B from
+`gemma-3-4b-it-Q4_0.gguf` answers "The capital of France is Paris." and, on the 1,138-token prompt,
+"BLUE HERON", which needs the global layers since the fact lies outside the 1,024-token sliding
+window. There is no token-level reference for 4B (the NumPy pass would need the 8.6 GB checkpoint);
+its greedy tokens on both prompts are the same as 1B's. The 2.4 GB file is cached whole (three
+segments) and the next load reads it from the cache. Images are not supported.
 
 Other architectures are rejected at load: SmolLM3, Granite, Phi-3, Gemma 1/2, mixture-of-experts
 models, Llama 4, and rope scaling other than Llama 3's and linear (Gemma 3).
