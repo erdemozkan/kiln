@@ -205,6 +205,12 @@ How it got there, each step measured in one session with identical greedy output
   answer tokens as before and as the NumPy reference. On SmolLM2-135M (head dim 64, untouched
   attention) a 250-token prompt prefills in 516 against 670 ms with the GEMM off, with the same 40
   greedy tokens. The GEMM computes in f32 even with `f16Math`.
+- **GEMM with 8 × 4 per thread** (Gemma 3 4B Q4_0, 128-token chunk at position 1024, GPU time per
+  layer). The GEMM now runs 128 threads per 64 × 64 tile with an 8 × 4 block each, three vec4 reads
+  for 32 multiply-adds per k step: matmuls 350 → 198 ms per layer (gate/up 179 → 106, down 100 → 56,
+  qkv 50 → 22), about 120 GFLOP/s. In a sweep of tile and block shapes, 64 × 128 tiles, 8 × 8 or
+  16 × 4 blocks, and 256 threads were all slower. The 1,138-token prompt prefills in 65.6 against
+  106 s, with the same answer tokens ("BLUE HERON"). Attention is now about 20% of a prefill chunk.
 - **Decode GEMV:** the general matmul gives each lane half of a q4 word per step (4 bytes shared by two
   lanes, 4 multiply-adds), and ran at 6.5–8.5 GB/s. One-token matmuls now use a kernel where each lane
   takes whole 32-element blocks: one 16-byte load and 32 multiply-adds for q4, 4 lanes per row,

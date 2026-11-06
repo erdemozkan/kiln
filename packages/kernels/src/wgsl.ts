@@ -407,10 +407,11 @@ export interface GemmVariant {
 }
 
 /**
- * Prefill matmul, y[m, n] = sum_k x[m, k] * W[n, k], as a tiled GEMM: a 256-thread workgroup owns a
- * 64-token × 64-row output tile and each thread a 4 × 4 block of it. K is walked one 32-element block
+ * Prefill matmul, y[m, n] = sum_k x[m, k] * W[n, k], as a tiled GEMM: a 128-thread workgroup owns a
+ * 64-token × 64-row output tile and each thread an 8 × 4 block of it. K is walked one 32-element block
  * at a time; the x tile and the dequantized weight tile are staged in workgroup memory, transposed so
- * each k step is two vec4 reads per thread for 16 multiply-adds (the GEMV-style kernel above does 4).
+ * each k step is three vec4 reads per thread for 32 multiply-adds. On Intel Gen9 this is 1.9x the
+ * 256-thread 4 × 4 version, and larger blocks or tiles were slower (register pressure).
  *
  * For gated epilogues the tile's 64 rows are 32 gate rows and the 32 matching up rows, stored so each
  * thread's four columns are gate i, gate i + 1, up i, up i + 1 and it can write act(gate) * up itself.
@@ -428,13 +429,13 @@ export function gemmSpec(v: GemmVariant): KernelSpec {
   }
   decl.push(`@group(0) @binding(${b}) var<storage, read_write> y: array<f32>;`);
   bindings.push("rw");
-  // Weight tile loads by threads 128…255: thread j takes the 4 rows of one tile column group and one
+  // Weight tile loads (after the x tile, by the same threads): thread j takes the 4 rows of one tile column group and one
   // word of their block (neighbouring threads, neighbouring words), and writes whole vec4s (one per k):
   // threads writing components of one shared vec4 race on some drivers.
   const loadW =
     v.wdtype === "q4"
-      ? `  if (li >= 128u && li < 192u) {
-    let j = li - 128u;
+      ? `  if (li < 64u) {
+    let j = li;
     let g = j / 4u;
     let wi = j % 4u;
     var vals: array<vec4<f32>, 8>;
@@ -448,8 +449,8 @@ export function gemmSpec(v: GemmVariant): KernelSpec {
     }
     for (var e = 0u; e < 8u; e++) { wt[(wi * 8u + e) * 16u + g] = vals[e]; }
   }`
-      : `  if (li >= 128u) {
-    let j = li - 128u;
+      : `  {
+    let j = li;
     let g = j / 8u;
     let q = j % 8u;
     var r4: array<vec4<f32>, 4>;
@@ -467,8 +468,8 @@ ${v.wdtype === "q8"
   const withBias = (row: string, val: string) => (v.bias ? `(${val} + bias[${row}])` : val);
   const store = gated
     ? `  let half = p.N / 2u;
-  for (var i = 0u; i < 4u; i++) {
-    let m = m0 + tm * 4u + i;
+  for (var i = 0u; i < 8u; i++) {
+    let m = m0 + tm * 8u + i;
     if (m >= p.M) { break; }
     for (var j = 0u; j < 2u; j++) {
       let col = grp * 32u + tn * 2u + j;
@@ -479,8 +480,8 @@ ${v.wdtype === "q8"
       }
     }
   }`
-    : `  for (var i = 0u; i < 4u; i++) {
-    let m = m0 + tm * 4u + i;
+    : `  for (var i = 0u; i < 8u; i++) {
+    let m = m0 + tm * 8u + i;
     if (m >= p.M) { break; }
     for (var j = 0u; j < 4u; j++) {
       let n = grp * 64u + tn * 4u + j;
@@ -510,7 +511,7 @@ ${gated
   : `  return grp * 64u + s;`}
 }
 
-@compute @workgroup_size(256)
+@compute @workgroup_size(128)
 fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) li: u32) {
   grp = wid.x + wid.z * ${MM_SLICE}u;
   let m0 = wid.y * 64u;
@@ -518,11 +519,11 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
   let tm = li / 16u;
   let blocks = p.K / 32u;
   let xs4 = p.K / 4u;
-  var acc: array<vec4<f32>, 4>;
+  var acc: array<vec4<f32>, 8>;
   for (var kb = 0u; kb < blocks; kb++) {
-    // x tile by threads 0…127: thread j takes tokens 4g…4g+3 (g = j / 8) at vec4 q = j % 8 of the block,
-    // so 8 neighbouring threads read one row's 128 contiguous bytes.
-    if (li < 128u) {
+    // x tile: thread j takes tokens 4g…4g+3 (g = j / 8) at vec4 q = j % 8 of the block, so 8
+    // neighbouring threads read one row's 128 contiguous bytes.
+    {
       let g = li / 8u;
       let q = li % 8u;
       var r4: array<vec4<f32>, 4>;
@@ -535,12 +536,17 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
 ${loadW}
     workgroupBarrier();
     for (var k = 0u; k < 32u; k++) {
-      let a = xt[k * 16u + tm];
+      let a0 = xt[k * 16u + tm * 2u];
+      let a1 = xt[k * 16u + tm * 2u + 1u];
       let bv = wt[k * 16u + tn];
-      acc[0] += a.x * bv;
-      acc[1] += a.y * bv;
-      acc[2] += a.z * bv;
-      acc[3] += a.w * bv;
+      acc[0] += a0.x * bv;
+      acc[1] += a0.y * bv;
+      acc[2] += a0.z * bv;
+      acc[3] += a0.w * bv;
+      acc[4] += a1.x * bv;
+      acc[5] += a1.y * bv;
+      acc[6] += a1.z * bv;
+      acc[7] += a1.w * bv;
     }
     workgroupBarrier();
   }
