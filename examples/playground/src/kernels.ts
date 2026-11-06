@@ -1,7 +1,8 @@
 import { createWebGPUBackend, type WebGPUBackend } from "@kiln/backend-webgpu";
 import { Ctx, packStep, type Buf, type StepParams, type Tensor } from "@kiln/core";
 import { ops, ref } from "@kiln/kernels";
-import { dequantQ4, dequantQ8, f16ToF32, quantizeQ4, quantizeQ8 } from "@kiln/loader";
+import { dequantQ4, dequantQ8, f16ToF32, MemorySource, quantizeQ4, quantizeQ8, rowBytes, type SrcType } from "@kiln/loader";
+import { loadWeights, setGpuConvert } from "@kiln/runtime";
 
 interface Result {
   kernel: string;
@@ -514,6 +515,37 @@ async function main() {
       const same = got.every((id, r) => id === want[r]) && got.every((id, r) => r === 2 || rowIds[r]!.includes(id));
       results.push({ kernel: "sample/rows", case: `${R} rows, per-row masks, ${name}`, error: same ? 0 : 1, tol: 0, pass: same, note: `${got.join(",")} vs ${want.join(",")}` });
     }
+  }
+
+  // Load-time conversion of GGUF blocks on the GPU, bit for bit against the CPU converters, over two 8 MB chunks
+  // each so the second chunk's offsets are exercised. Scales cover negative, subnormal and zero f16.
+  for (const [type, rows, cols] of [["Q4_0", 4000, 4128], ["Q6_K", 4500, 2560]] as [SrcType, number, number][]) {
+    const bytes = new Uint8Array(rows * rowBytes(type, cols));
+    for (let i = 0; i < bytes.length; i++) bytes[i] = (rand() * 128 + 128) & 255;
+    const [blk, dAt] = type === "Q4_0" ? [18, 0] : [210, 208];
+    for (let b = 0, o = dAt; o < bytes.length; b++, o += blk) {
+      const h = b % 97 === 0 ? (b % 2 ? 0x8003 : 0) : toHalf((rand() * 0.02) * (b % 13 === 0 ? 1e-3 : 1)) | (b % 3 ? 0 : 0x8000);
+      bytes[o] = h & 255;
+      bytes[o + 1] = h >> 8;
+    }
+    const files = [{ name: "check", source: new MemorySource(bytes, "check"), tensors: [{ name: "w.weight", shape: [rows, cols], type, offset: 0, byteLength: bytes.length }] }];
+    const planes = async (gpu: boolean) => {
+      setGpuConvert(gpu);
+      const t = (await loadWeights(be, files, "q4")).get("w.weight")!;
+      return [new Uint32Array(await be.readback(t.buf, 0, t.buf.size)), new Float32Array(await be.readback(t.scales!, 0, t.scales!.size))] as const;
+    };
+    const [gn, gs] = await planes(true);
+    const [cn, cs] = await planes(false);
+    setGpuConvert(true);
+    let codes = 0;
+    for (let e = 0; e < cn.length * 8; e++) {
+      const a = (gn[e >> 3]! >>> ((e & 7) * 4)) & 15;
+      const c = (cn[e >> 3]! >>> ((e & 7) * 4)) & 15;
+      if (a !== c) codes++;
+    }
+    const scaleDiffs = gs.reduce((n, v, i) => n + (Object.is(v, cs[i]) ? 0 : 1), 0);
+    const pass = scaleDiffs === 0 && codes === 0 && gn.length === cn.length;
+    results.push({ kernel: `convert/${type}`, case: `${rows}x${cols}, 2 chunks`, error: codes, tol: 0, pass, note: `${codes} of ${cn.length * 8} codes differ, ${scaleDiffs} scales` });
   }
 
   render(results, be);

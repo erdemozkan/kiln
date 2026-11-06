@@ -96,7 +96,9 @@ Key ideas:
   the Intel GPU, with the same reply. The file is keyed by model, revision, weight format and f16
   math, written after the reply goes out, and a half-written file is ignored.
 - **1× memory while loading.** Weights stream row-chunk by row-chunk from the network into GPU buffers,
-  quantized to q4 or q8 on the way if requested. Nothing holds the whole model in CPU memory.
+  quantized to q4 or q8 on the way if requested. Nothing holds the whole model in CPU memory. GGUF
+  Q4_0 and Q6_K blocks are uploaded raw and converted to q4 by a compute kernel, bit for bit what the
+  CPU converter gives (`setGpuConvert(false)` keeps it on the CPU).
 - **The download is the cache.** In a worker, `CachedHttpSource` writes the download into OPFS and serves
   reads from it as bytes land. Interrupted downloads resume from the last flushed byte recorded in the
   metadata (not the file size, which can include writes lost when a worker is killed), and a cached
@@ -253,7 +255,7 @@ cost.
 
 ## Status
 
-Verified on this GPU: all kernel checks pass (464, including q4 and q8 weights in every matmul variant, the decode GEMV and the prefill GEMM, both prefill attention kernels, fused variants, f16 cache paths,
+Verified on this GPU: all kernel checks pass (466, including q4 and q8 weights in every matmul variant, the decode GEMV and the prefill GEMM, both prefill attention kernels, fused variants, f16 cache paths,
 sliding-window attention, GELU gating, grammar masks and sampling distributions). SmolLM2-135M-Instruct chats from Hub safetensors (q4, f32) and from a GGUF
 Q4_K_M file.
 
@@ -288,9 +290,8 @@ with linear rope scaling on the global layers only, from safetensors or GGUF. 4B
 "BLUE HERON", which needs the global layers since the fact lies outside the 1,024-token sliding
 window. There is no token-level reference for 4B (the NumPy pass would need the 8.6 GB checkpoint);
 its greedy tokens on both prompts are the same as 1B's. The 2.4 GB file is cached whole (three
-segments) and the next load reads it from the cache in 21-40 s on the test Mac (Iris Plus 650): about
-6 s of reading and the rest converting blocks on the CPU, mostly the Q6_K embedding re-quantized to
-q4. Images are not supported.
+segments) and the next load reads it from the cache in about 10 s on the test Mac (Iris Plus 650), 6 s
+of it reading; converting on the CPU instead takes about 24 s. Images are not supported.
 
 Other architectures are rejected at load: SmolLM3, Granite, Phi-3, Gemma 1/2, mixture-of-experts
 models, Llama 4, and rope scaling other than Llama 3's and linear (Gemma 3).

@@ -11,7 +11,8 @@
     "@kiln/backend-webgpu": "*",
     "@kiln/core": "*",
     "@kiln/kernels": "*",
-    "@kiln/loader": "*"
+    "@kiln/loader": "*",
+    "@kiln/runtime": "*"
   },
   "devDependencies": {
     "vite": "7.3.7"

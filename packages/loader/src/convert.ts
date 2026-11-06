@@ -189,7 +189,10 @@ export interface Q4Planes {
   scales: Float32Array;
 }
 
-/** Same rounding as llama.cpp Q4_0: scale from the signed max magnitude, q = clamp(round(x/d) + 8). */
+/**
+ * llama.cpp's Q4_0 rule: d = (signed max magnitude) / -8, q = clamp(floor(x / d + 8.5)), with the
+ * division done exactly rather than as a multiply by 1 / d.
+ */
 export function quantizeQ4(x: Float32Array): Q4Planes {
   if (x.length % 32 !== 0) throw new Error(`quantizeQ4: length ${x.length} is not a multiple of 32`);
   const nibbles = new Uint32Array(x.length / 8);
@@ -207,13 +210,18 @@ export function quantizeQ4(x: Float32Array): Q4Planes {
     let max = -lo > hi ? lo : hi;
     if (-lo === hi && hi !== 0) for (let j = 0; j < 32; j++) if (x[o + j] === hi || x[o + j] === lo) { max = x[o + j]!; break; }
     const d = max / -8;
-    const id = d ? 1 / d : 0;
     scales[b] = d;
+    if (!d) {
+      nibbles.fill(0x88888888, b * 4, b * 4 + 4);
+      continue;
+    }
     for (let w = 0; w < 4; w++) {
       let word = 0;
       for (let k = 7; k >= 0; k--) {
-        // Truncation equals floor here: anything below 0 clamps to 0 either way.
-        const v = x[o + w * 8 + k]! * id + 8.5;
+        // x / d in double is exact enough that floor never lands on the wrong side of an integer (a
+        // multiply by 1 / d does on ties, which block-quantized sources hit often). Truncation equals
+        // floor here: anything below 0 clamps to 0 either way.
+        const v = x[o + w * 8 + k]! / d + 8.5;
         word = (word << 4) | (v >= 15 ? 15 : v > 0 ? v | 0 : 0);
       }
       nibbles[b * 4 + w] = word;
