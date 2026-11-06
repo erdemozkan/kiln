@@ -5,6 +5,8 @@
   "license": "MIT",
   "author": "Erdem Ozkan",
   "repository": { "type": "git", "url": "git+https://github.com/erdemozkan/kiln.git" },
+  "homepage": "https://github.com/erdemozkan/kiln#readme",
+  "bugs": { "url": "https://github.com/erdemozkan/kiln/issues" },
   "keywords": ["webgpu", "llm", "inference", "gguf", "safetensors", "browser", "transformer"],
   "type": "module",
   "sideEffects": false,
