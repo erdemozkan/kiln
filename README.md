@@ -119,6 +119,27 @@ npm run typecheck
 npm run dev       # playground at http://localhost:5173, kernel check at /kernels.html, profiler at /bench.html
 ```
 
+### Package and demo builds
+
+```bash
+npm run build:package      # packages/kiln-webgpu/dist: one ES module, its worker, bundled .d.ts
+npm run build:playground   # examples/playground/dist: static demo, works from any path
+```
+
+`kiln-webgpu` is the published form: the workspace packages bundled into one ES module plus the model
+worker as its own file, resolved with `new URL(…, import.meta.url)` so it works under Vite, webpack 5
+and other bundlers that understand that pattern. Its declarations are the workspace's, with `@kiln/*`
+imports rewritten to relative paths, so they type-check without the workspace (checked with
+`skipLibCheck: false` in a fresh Vite app installed from the `npm pack` tarball, which then loaded
+SmolLM2, chatted and produced schema-constrained JSON). It has not been published; to do so:
+
+```bash
+npm publish -w kiln-webgpu
+```
+
+The playground build uses relative URLs, so it can be served from a subpath such as a GitHub Pages
+project site; served from `/kiln/`, it loads and chats and its kernel-check page passes.
+
 The kernel-check page runs every WGSL kernel against `@kiln/kernels` reference code on the current GPU.
 The bench page reports GPU time per step and per kernel (matmuls are labelled with their shape) plus
 end-to-end decode speed. The dev server reloads the page whenever a source file changes, which aborts a
@@ -341,3 +362,7 @@ Known limits, roughly in roadmap order:
 - Single storage binding per tensor: very large f32 embeddings can exceed `maxStorageBufferBindingSize`
   (use q4 or q8).
 - WebGPU only; WASM fallback, WebNN and Node/Dawn backends come later.
+
+## License
+
+MIT, see [LICENSE](LICENSE).

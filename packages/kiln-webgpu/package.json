@@ -1,0 +1,31 @@
+{
+  "name": "kiln-webgpu",
+  "version": "0.1.0",
+  "description": "Run LLMs in the browser on WebGPU, straight from Hugging Face safetensors or GGUF files",
+  "license": "MIT",
+  "author": "Erdem Ozkan",
+  "repository": { "type": "git", "url": "git+https://github.com/erdemozkan/kiln.git" },
+  "keywords": ["webgpu", "llm", "inference", "gguf", "safetensors", "browser", "transformer"],
+  "type": "module",
+  "sideEffects": false,
+  "exports": {
+    ".": {
+      "types": "./dist/types/kiln-webgpu/src/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "types": "./dist/types/kiln-webgpu/src/index.d.ts",
+  "files": ["dist", "README.md", "LICENSE"],
+  "scripts": {
+    "build": "vite build && tsc -p tsconfig.build.json && node scripts/fix-dts.mjs && cp ../../LICENSE LICENSE",
+    "prepack": "npm run build"
+  },
+  "dependencies": {
+    "@webgpu/types": "^0.1.40"
+  },
+  "devDependencies": {
+    "@kiln/api": "*",
+    "@kiln/loader": "*",
+    "vite": "7.3.7"
+  }
+}

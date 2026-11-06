@@ -1,6 +1,7 @@
 {
   "name": "kiln",
   "private": true,
+  "license": "MIT",
   "type": "module",
   "workspaces": [
     "packages/*",
@@ -10,7 +11,8 @@
     "typecheck": "tsc -p tsconfig.json",
     "test": "vitest run",
     "dev": "npm run dev -w @kiln/playground",
-    "build:playground": "npm run build -w @kiln/playground"
+    "build:playground": "npm run build -w @kiln/playground",
+    "build:package": "npm run build -w kiln-webgpu"
   },
   "devDependencies": {
     "@webgpu/types": "0.1.40",

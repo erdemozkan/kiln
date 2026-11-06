@@ -3,3 +3,4 @@ dist/
 dist-share/
 .DS_Store
 *.log
+packages/kiln-webgpu/LICENSE

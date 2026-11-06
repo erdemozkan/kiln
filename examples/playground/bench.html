@@ -4,12 +4,12 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Kiln bench</title>
-    <link rel="stylesheet" href="/src/style.css" />
+    <link rel="stylesheet" href="./src/style.css" />
   </head>
   <body>
     <main>
       <h1>Kiln bench</h1>
-      <p class="sub">GPU time per step and per kernel, plus end-to-end decode speed. <a href="/">Playground</a> · <a href="/kernels.html">Kernel check</a></p>
+      <p class="sub">GPU time per step and per kernel, plus end-to-end decode speed. <a href="./">Playground</a> · <a href="kernels.html">Kernel check</a></p>
       <div class="row">
         <input id="model" type="text" value="HuggingFaceTB/SmolLM2-135M-Instruct" aria-label="Model id" />
         <select id="quant" aria-label="Weight format">
@@ -21,6 +21,6 @@
       </div>
       <div id="out"></div>
     </main>
-    <script type="module" src="/src/bench.ts"></script>
+    <script type="module" src="./src/bench.ts"></script>
   </body>
 </html>
