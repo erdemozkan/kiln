@@ -17,7 +17,8 @@ prompt lookup) on by default, also under a grammar.
 
 **Loading.** Weights stream into GPU buffers without holding the model in CPU memory. The download is
 the cache: files land in OPFS as 1 GiB segments, interrupted downloads resume, dropped connections
-retry, and `listCache` / `clearCache` manage it. Conversion to q4 runs on the GPU for F32/F16/BF16 safetensors and every GGUF block type Kiln reads. The
+retry, and `listCache` / `clearCache` manage it. `load` asks the browser to keep the cache
+(`navigator.storage.persist()`); `info.persistent` gives the answer. Conversion to q4 runs on the GPU for F32/F16/BF16 safetensors and every GGUF block type Kiln reads. The
 last prompt's K/V survives page reloads.
 
 **Context.** The default context is the model's trained context, up to 8192 tokens and 512 MiB of

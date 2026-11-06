@@ -9,6 +9,23 @@ export interface LoadOptions extends WireLoadOptions {
   onProgress?: (p: LoadProgress) => void;
   /** Supply your own worker (e.g. a bundler-specific URL). Defaults to Kiln's module worker. */
   worker?: Worker;
+  /**
+   * Ask the browser to keep the weight cache (`navigator.storage.persist()`, default true), so a
+   * multi-GB download is not evicted when the disk runs low. Chrome and Safari decide on their own;
+   * Firefox may ask the user. `info.persistent` holds the answer once the browser gives it.
+   */
+  persist?: boolean;
+}
+
+/** True if site storage is (now) persistent, undefined where the browser cannot say. */
+async function requestPersistence(): Promise<boolean | undefined> {
+  const storage = globalThis.navigator?.storage;
+  if (!storage?.persist) return undefined;
+  try {
+    return (await storage.persisted()) || (await storage.persist());
+  } catch {
+    return undefined;
+  }
 }
 
 export interface GenerateOptions extends WireGenerateOptions {
@@ -42,7 +59,8 @@ export class KilnModel {
   static async load(model: string, opts: LoadOptions = {}): Promise<KilnModel> {
     const worker = opts.worker ?? new Worker(new URL("./worker.ts", import.meta.url), { type: "module", name: "kiln" });
     const m = new KilnModel(worker, undefined as unknown as ModelInfo);
-    const { onProgress, worker: _w, ...wire } = opts;
+    const { onProgress, worker: _w, persist = true, ...wire } = opts;
+    const persistent = persist ? requestPersistence() : Promise.resolve(undefined);
     m.info = await new Promise<ModelInfo>((resolve, reject) => {
       m.send({ type: "load", model, opts: wire }, (msg) => {
         if (msg.type === "progress") onProgress?.(msg.progress);
@@ -51,6 +69,8 @@ export class KilnModel {
         return msg.type === "loaded" || msg.type === "error";
       });
     });
+    // Not awaited: a permission prompt the user ignores must not hold up the load.
+    void persistent.then((v) => (m.info.persistent = v));
     return m;
   }
 

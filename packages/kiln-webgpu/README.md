@@ -32,6 +32,8 @@ value is complete) or `"abort"`.
 
 Weights are cached in the browser (OPFS) as they download, so later loads skip the network, and an
 interrupted download resumes. `listCache()` reports what is cached and `clearCache()` deletes it.
+`load` asks the browser to keep the cache (`navigator.storage.persist()`) so it survives low disk
+space; `llm.info.persistent` says whether it agreed, and `load(id, { persist: false })` skips asking.
 
 ## Models
 

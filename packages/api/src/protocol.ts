@@ -32,6 +32,8 @@ export interface ModelInfo {
   backendFeatures: string[];
   /** Tokens of K/V restored from the prompt cache at load (0 if none). */
   restoredTokens: number;
+  /** Whether the browser agreed to keep cached weights (see `LoadOptions.persist`); set by the client once the browser answers. */
+  persistent?: boolean;
 }
 
 export type Request =
