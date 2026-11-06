@@ -288,7 +288,9 @@ with linear rope scaling on the global layers only, from safetensors or GGUF. 4B
 "BLUE HERON", which needs the global layers since the fact lies outside the 1,024-token sliding
 window. There is no token-level reference for 4B (the NumPy pass would need the 8.6 GB checkpoint);
 its greedy tokens on both prompts are the same as 1B's. The 2.4 GB file is cached whole (three
-segments) and the next load reads it from the cache. Images are not supported.
+segments) and the next load reads it from the cache in 21-40 s on the test Mac (Iris Plus 650): about
+6 s of reading and the rest converting blocks on the CPU, mostly the Q6_K embedding re-quantized to
+q4. Images are not supported.
 
 Other architectures are rejected at load: SmolLM3, Granite, Phi-3, Gemma 1/2, mixture-of-experts
 models, Llama 4, and rope scaling other than Llama 3's and linear (Gemma 3).

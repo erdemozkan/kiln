@@ -115,6 +115,36 @@ describe("conversion", () => {
     expect([...y.subarray(16)]).toEqual(Array.from({ length: 16 }, (_, j) => 7 - j));
   });
 
+  it("repacks many Q4_0 blocks element for element", () => {
+    const blocks = 37;
+    const src = Uint8Array.from({ length: blocks * 18 }, (_, i) => (i * 97 + 13) & 255);
+    for (let b = 0; b < blocks; b++) new DataView(src.buffer).setUint16(b * 18, 0x3c00 + b, true);
+    const p = repackQ4_0(src, blocks * 32);
+    for (let e = 0; e < blocks * 32; e++) {
+      const b = e >> 5;
+      const j = e & 31;
+      const byte = src[b * 18 + 2 + (j & 15)]!;
+      expect((p.nibbles[e >> 3]! >>> ((e & 7) * 4)) & 15).toBe(j < 16 ? byte & 15 : byte >> 4);
+    }
+    expect(p.scales[1]).toBe(f16ToF32(src.subarray(18, 20))[0]);
+  });
+
+  it("q4 picks llama.cpp's codes, including the clamped block maximum", () => {
+    const x = Float32Array.from({ length: 128 }, (_, i) => Math.cos(i * 1.3) * (i % 7) - (i === 40 ? 9 : 0));
+    // A tie between +3 and -3 in the last block: the first (-3) sets the scale's sign.
+    x.subarray(96).fill(0.5);
+    x[100] = -3;
+    x[110] = 3;
+    const p = quantizeQ4(x);
+    for (let e = 0; e < x.length; e++) {
+      const blk = x.subarray(e & ~31, (e & ~31) + 32);
+      const max = blk.reduce((m, v) => (Math.abs(v) > Math.abs(m) ? v : m), 0);
+      if (e === 100) expect(p.scales[3]).toBe(Math.fround(3 / 8));
+      const want = Math.min(15, Math.max(0, Math.floor(x[e]! * (-8 / max) + 8.5)));
+      expect((p.nibbles[e >> 3]! >>> ((e & 7) * 4)) & 15).toBe(want);
+    }
+  });
+
   it("q8 round-trips within half a step, with 4 int8 per word in element order", () => {
     const x = Float32Array.from({ length: 128 }, (_, i) => Math.sin(i * 0.7) * (1 + (i % 32) / 8));
     const p = quantizeQ8(x);

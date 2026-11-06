@@ -29,11 +29,11 @@ export function bf16ToF32(bytes: Uint8Array): Float32Array {
 
 export function dequantQ8_0(bytes: Uint8Array, n: number): Float32Array {
   const out = new Float32Array(n);
-  const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const q = new Int8Array(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   for (let b = 0; b < n / 32; b++) {
     const o = b * 34;
-    const d = f16Table[dv.getUint16(o, true)]!;
-    for (let j = 0; j < 32; j++) out[b * 32 + j] = dv.getInt8(o + 2 + j) * d;
+    const d = f16Table[bytes[o]! | (bytes[o + 1]! << 8)]!;
+    for (let j = 0; j < 32; j++) out[b * 32 + j] = q[o + 2 + j]! * d;
   }
   return out;
 }
@@ -159,26 +159,24 @@ export function dequantQ5_K(bytes: Uint8Array, n: number): Float32Array {
 /** Q6_K: 256 elements as 4 low bits (ql) + 2 high bits (qh), 16 int8 scales, one f16 d; x = d·sc·(q − 32). */
 export function dequantQ6_K(bytes: Uint8Array, n: number): Float32Array {
   const out = new Float32Array(n);
-  const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const i8 = new Int8Array(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   for (let b = 0; b < n / 256; b++) {
     const o = b * 210;
-    const d = f16Table[dv.getUint16(o + 208, true)]!;
+    const d = f16Table[bytes[o + 208]! | (bytes[o + 209]! << 8)]!;
     let ql = o;
     let qh = o + 128;
     let sc = o + 192;
     let y = b * 256;
     for (let half = 0; half < 2; half++, ql += 64, qh += 32, sc += 8, y += 128) {
       for (let l = 0; l < 32; l++) {
-        const is = l >> 4;
+        const is = sc + (l >> 4);
         const h = bytes[qh + l]!;
-        const q1 = ((bytes[ql + l]! & 15) | ((h & 3) << 4)) - 32;
-        const q2 = ((bytes[ql + l + 32]! & 15) | (((h >> 2) & 3) << 4)) - 32;
-        const q3 = ((bytes[ql + l]! >> 4) | (((h >> 4) & 3) << 4)) - 32;
-        const q4 = ((bytes[ql + l + 32]! >> 4) | (((h >> 6) & 3) << 4)) - 32;
-        out[y + l] = d * dv.getInt8(sc + is) * q1;
-        out[y + l + 32] = d * dv.getInt8(sc + is + 2) * q2;
-        out[y + l + 64] = d * dv.getInt8(sc + is + 4) * q3;
-        out[y + l + 96] = d * dv.getInt8(sc + is + 6) * q4;
+        const a = bytes[ql + l]!;
+        const c = bytes[ql + l + 32]!;
+        out[y + l] = d * i8[is]! * (((a & 15) | ((h & 3) << 4)) - 32);
+        out[y + l + 32] = d * i8[is + 2]! * (((c & 15) | (((h >> 2) & 3) << 4)) - 32);
+        out[y + l + 64] = d * i8[is + 4]! * (((a >> 4) | (((h >> 4) & 3) << 4)) - 32);
+        out[y + l + 96] = d * i8[is + 6]! * (((c >> 4) | (((h >> 6) & 3) << 4)) - 32);
       }
     }
   }
@@ -197,22 +195,28 @@ export function quantizeQ4(x: Float32Array): Q4Planes {
   const nibbles = new Uint32Array(x.length / 8);
   const scales = new Float32Array(x.length / 32);
   for (let b = 0; b < scales.length; b++) {
-    let amax = 0;
-    let max = 0;
+    const o = b * 32;
+    let hi = 0;
+    let lo = 0;
     for (let j = 0; j < 32; j++) {
-      const v = x[b * 32 + j]!;
-      if (Math.abs(v) > amax) {
-        amax = Math.abs(v);
-        max = v;
-      }
+      const v = x[o + j]!;
+      if (v > hi) hi = v;
+      if (v < lo) lo = v;
     }
+    // The signed value of largest magnitude; on a tie, the first one, as llama.cpp picks it.
+    let max = -lo > hi ? lo : hi;
+    if (-lo === hi && hi !== 0) for (let j = 0; j < 32; j++) if (x[o + j] === hi || x[o + j] === lo) { max = x[o + j]!; break; }
     const d = max / -8;
     const id = d ? 1 / d : 0;
     scales[b] = d;
-    for (let j = 0; j < 32; j++) {
-      const q = Math.min(15, Math.max(0, Math.floor(x[b * 32 + j]! * id + 8.5)));
-      const e = b * 32 + j;
-      nibbles[e >> 3] |= q << ((e & 7) * 4);
+    for (let w = 0; w < 4; w++) {
+      let word = 0;
+      for (let k = 7; k >= 0; k--) {
+        // Truncation equals floor here: anything below 0 clamps to 0 either way.
+        const v = x[o + w * 8 + k]! * id + 8.5;
+        word = (word << 4) | (v >= 15 ? 15 : v > 0 ? v | 0 : 0);
+      }
+      nibbles[b * 4 + w] = word;
     }
   }
   return { nibbles, scales };
@@ -222,15 +226,20 @@ export function quantizeQ4(x: Float32Array): Q4Planes {
 export function repackQ4_0(bytes: Uint8Array, n: number): Q4Planes {
   const nibbles = new Uint32Array(n / 8);
   const scales = new Float32Array(n / 32);
-  const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   for (let b = 0; b < n / 32; b++) {
     const o = b * 18;
-    scales[b] = f16Table[dv.getUint16(o, true)]!;
-    for (let j = 0; j < 16; j++) {
-      const byte = bytes[o + 2 + j]!;
-      for (const [e, q] of [[b * 32 + j, byte & 15], [b * 32 + j + 16, byte >> 4]] as const) {
-        nibbles[e >> 3] |= q << ((e & 7) * 4);
+    scales[b] = f16Table[bytes[o]! | (bytes[o + 1]! << 8)]!;
+    // Words 0-1 take the low nibbles of bytes 0-7 and 8-15 (elements 0-15), words 2-3 the high ones.
+    for (let h = 0; h < 2; h++) {
+      let lo = 0;
+      let hi = 0;
+      for (let k = 7; k >= 0; k--) {
+        const byte = bytes[o + 2 + h * 8 + k]!;
+        lo = (lo << 4) | (byte & 15);
+        hi = (hi << 4) | (byte >> 4);
       }
+      nibbles[b * 4 + h] = lo;
+      nibbles[b * 4 + 2 + h] = hi;
     }
   }
   return { nibbles, scales };
