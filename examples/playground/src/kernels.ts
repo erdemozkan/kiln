@@ -611,7 +611,7 @@ async function main() {
   // the x / d + 8.5 ties, and all-zero blocks.
   const convertCases: [SrcType, number, number][] = [
     ["Q4_0", 4000, 4128], ["Q6_K", 4500, 2560], ["Q4_K", 3000, 2560], ["Q5_K", 3000, 2560],
-    ["Q8_0", 3000, 2560], ["F16", 1700, 2560], ["BF16", 1700, 2560], ["F32", 900, 2560],
+    ["Q8_0", 3000, 2560], ["Q4_1", 3000, 2560], ["Q5_0", 3000, 2560], ["Q5_1", 3000, 2560], ["F16", 1700, 2560], ["BF16", 1700, 2560], ["F32", 900, 2560],
   ];
   for (const [type, rows, cols] of convertCases) {
     const bytes = new Uint8Array(rows * rowBytes(type, cols));
@@ -631,7 +631,7 @@ async function main() {
         for (let i = 0; i < vals.length; i++) dv.setUint16(i * 2, type === "F16" ? toHalf(vals[i]!) : new Uint32Array(Float32Array.of(vals[i]!).buffer)[0]! >>> 16, true);
       }
     }
-    const scaleAt: Partial<Record<SrcType, [number, number[]]>> = { Q4_0: [18, [0]], Q6_K: [210, [208]], Q8_0: [34, [0]], Q4_K: [144, [0, 2]], Q5_K: [176, [0, 2]] };
+    const scaleAt: Partial<Record<SrcType, [number, number[]]>> = { Q4_0: [18, [0]], Q6_K: [210, [208]], Q8_0: [34, [0]], Q4_1: [20, [0, 2]], Q5_0: [22, [0]], Q5_1: [24, [0, 2]], Q4_K: [144, [0, 2]], Q5_K: [176, [0, 2]] };
     const [blk, dAts] = scaleAt[type] ?? [0, []];
     for (const dAt of dAts) for (let b = 0, o = dAt; o < bytes.length; b++, o += blk) {
       const h = b % 97 === 0 ? (b % 2 ? 0x8003 : 0) : toHalf((rand() * 0.02) * (b % 13 === 0 ? 1e-3 : 1)) | (b % 3 || dAt === 2 ? 0 : 0x8000);

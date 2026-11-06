@@ -35,8 +35,8 @@ const CHUNK = 8 * 2 ** 20;
 let gpuConvert = true;
 
 /**
- * Converts weights to q4 on the GPU (default true) from F32/F16/BF16 safetensors and GGUF
- * Q8_0/Q4_0/Q4_K/Q5_K/Q6_K: raw blocks are uploaded and a kernel writes the planes, which takes the
+ * Converts weights to q4 on the GPU (default true) from F32/F16/BF16 safetensors and every GGUF
+ * block type Kiln reads: raw blocks are uploaded and a kernel writes the planes, which takes the
  * conversion off the CPU, where it was most of a cached load. False converts on the CPU; the planes
  * are the same bits either way.
  */

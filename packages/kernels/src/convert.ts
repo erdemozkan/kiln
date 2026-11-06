@@ -1,9 +1,9 @@
 import type { KernelSpec } from "@kiln/core";
 
 /** Source types the GPU converts to Kiln's q4 planes at load time. */
-export type GpuConvertType = "F32" | "F16" | "BF16" | "Q8_0" | "Q4_0" | "Q4_K" | "Q5_K" | "Q6_K";
+export type GpuConvertType = "F32" | "F16" | "BF16" | "Q8_0" | "Q4_0" | "Q4_1" | "Q5_0" | "Q5_1" | "Q4_K" | "Q5_K" | "Q6_K";
 
-export const GPU_CONVERT_TYPES: ReadonlySet<string> = new Set<GpuConvertType>(["F32", "F16", "BF16", "Q8_0", "Q4_0", "Q4_K", "Q5_K", "Q6_K"]);
+export const GPU_CONVERT_TYPES: ReadonlySet<string> = new Set<GpuConvertType>(["F32", "F16", "BF16", "Q8_0", "Q4_0", "Q4_1", "Q5_0", "Q5_1", "Q4_K", "Q5_K", "Q6_K"]);
 
 /** Decodes element l of block i into x[l] (as the CPU's toF32 computes it, bit for bit). */
 const DECODE: Partial<Record<GpuConvertType, string>> = {
@@ -11,6 +11,10 @@ const DECODE: Partial<Record<GpuConvertType, string>> = {
   F16: `x[l] = f16Bits((src[i * 16u + l / 2u] >> ((l & 1u) * 16u)) & 0xffffu);`,
   BF16: `x[l] = bitcast<f32>(((src[i * 16u + l / 2u] >> ((l & 1u) * 16u)) & 0xffffu) << 16u);`,
   Q8_0: `x[l] = f32(i32(rd(i * 34u + 2u + l) << 24u) >> 24u) * d;`,
+  // Low nibbles are elements 0–15, high 16–31; Q5's fifth bit of element l is bit l of qh.
+  Q4_1: `x[l] = f32((rd(o + 4u + (l & 15u)) >> ((l >> 4u) * 4u)) & 15u) * d + m;`,
+  Q5_0: `x[l] = f32(i32(((rd(o + 6u + (l & 15u)) >> ((l >> 4u) * 4u)) & 15u) | (((qh >> l) & 1u) << 4u)) - 16) * d;`,
+  Q5_1: `x[l] = f32(((rd(o + 8u + (l & 15u)) >> ((l >> 4u) * 4u)) & 15u) | (((qh >> l) & 1u) << 4u)) * d + m;`,
   // Both products are exact in f32 (f16 times an integer of at most 11 bits), so the one rounding
   // of the difference matches the CPU's double arithmetic.
   Q4_K: `x[l] = d * f32(sm.x * ((rd(o + 16u + (j / 2u) * 32u + l) >> ((j & 1u) * 4u)) & 15u)) - dmin * f32(sm.y);`,
@@ -20,6 +24,9 @@ const DECODE: Partial<Record<GpuConvertType, string>> = {
 /** Per-block setup before the decode loop. */
 const SETUP: Partial<Record<GpuConvertType, string>> = {
   Q8_0: `let d = f16At(i * 34u);`,
+  Q4_1: `let o = i * 20u; let d = f16At(o); let m = f16At(o + 2u);`,
+  Q5_0: `let o = i * 22u; let d = f16At(o); let qh = rd(o + 2u) | (rd(o + 3u) << 8u) | (rd(o + 4u) << 16u) | (rd(o + 5u) << 24u);`,
+  Q5_1: `let o = i * 24u; let d = f16At(o); let m = f16At(o + 2u); let qh = rd(o + 4u) | (rd(o + 5u) << 8u) | (rd(o + 6u) << 16u) | (rd(o + 7u) << 24u);`,
   Q4_K: `let o = (i / 8u) * 144u; let j = i % 8u; let d = f16At(o); let dmin = f16At(o + 2u); let sm = scaleMin(j, o + 4u);`,
   Q5_K: `let o = (i / 8u) * 176u; let j = i % 8u; let d = f16At(o); let dmin = f16At(o + 2u); let sm = scaleMin(j, o + 4u);`,
 };
