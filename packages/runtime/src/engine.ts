@@ -80,7 +80,15 @@ export interface GenerateStats {
   submits?: number;
   /** Speculative decoding (draftTokens): forward passes, draft tokens proposed and draft tokens kept. */
   speculation?: { passes: number; drafted: number; accepted: number };
+  /**
+   * Why generation ended: "stop" (an end-of-turn or stop token), "maxTokens", "context" (the reply
+   * filled the context before maxTokens), "format" (the structured value is complete) or "abort"
+   * (the signal fired, or the caller stopped reading).
+   */
+  stopReason?: StopReason;
 }
+
+export type StopReason = "stop" | "maxTokens" | "context" | "format" | "abort";
 
 /** K/V cache contents for a token prefix, from `Engine.exportCache` (see `LlamaModel.readKv`). */
 export interface CacheSnapshot {
@@ -192,7 +200,10 @@ export class Engine {
       const hint = trained && trained > maxSeq ? `; load with a larger maxSeq (this model was trained for ${trained})` : "";
       throw new Error(`prompt has ${promptIds.length} tokens but the context is ${maxSeq}${hint}`);
     }
-    const maxTokens = Math.min(opts.maxTokens ?? 512, maxSeq - promptIds.length);
+    const requested = opts.maxTokens ?? 512;
+    const maxTokens = Math.min(requested, maxSeq - promptIds.length);
+    /** Set when a stop token ends the reply (as opposed to the caller ending it). */
+    const ended = { stop: false };
     const temperature = opts.temperature ?? 0.7;
     const seed = opts.seed ?? (Math.random() * 2 ** 32) >>> 0;
     const sampling = { topK: opts.topK ?? 0, topP: opts.topP ?? 1, repetitionPenalty: opts.repetitionPenalty ?? 1 };
@@ -250,7 +261,7 @@ export class Engine {
 
       if (draftTokens > 0) {
         spoken = [...promptIds];
-        yield* this.decodeSpeculative(out, spoken, { draftTokens, maxTokens, stop, signal: opts.signal, seed, temperature, sampling, stats, t0, grammar, prefillUnits });
+        yield* this.decodeSpeculative(out, spoken, { draftTokens, maxTokens, stop, signal: opts.signal, seed, temperature, sampling, stats, t0, grammar, prefillUnits, ended });
         return;
       }
 
@@ -315,6 +326,7 @@ export class Engine {
         }
         for (const id of ids) {
           if (stop.has(id) || opts.signal?.aborted) {
+            ended.stop = stop.has(id);
             done = true;
             break;
           }
@@ -334,6 +346,15 @@ export class Engine {
       // Verify passes write up to MAX_VERIFY_ROWS positions past the kept ones; plain decode none.
       this.written = failed ? this.model.maxSeq : this.cached.length + (spoken ? MAX_VERIFY_ROWS : 0);
       stats.submits = this.submits;
+      stats.stopReason = opts.signal?.aborted
+        ? "abort"
+        : grammar?.finished
+          ? "format"
+          : stats.generatedTokens >= maxTokens
+            ? maxTokens < requested ? "context" : "maxTokens"
+            : ended.stop
+              ? "stop"
+              : "abort";
       this.lastStats = stats;
       this.busy = false;
     }
@@ -369,6 +390,7 @@ export class Engine {
       t0: number;
       grammar: GrammarMatcher | undefined;
       prefillUnits: number;
+      ended: { stop: boolean };
     },
   ): AsyncGenerator<number> {
     const { stats, grammar } = o;
@@ -407,7 +429,10 @@ export class Engine {
     /** Records and yields ids; false once generation is over. */
     const speak = function* (ids: Iterable<number>): Generator<number, boolean> {
       for (const id of ids) {
-        if (o.stop.has(id) || o.signal?.aborted) return false;
+        if (o.stop.has(id) || o.signal?.aborted) {
+          o.ended.stop = o.stop.has(id);
+          return false;
+        }
         if (grammar && !grammar.accept(id)) throw new Error(`grammar: sampled token ${id} is not allowed (mask out of sync)`);
         spoken.push(id);
         stats.generatedTokens++;

@@ -99,6 +99,10 @@ Key ideas:
   quantized to q4 or q8 on the way if requested. Nothing holds the whole model in CPU memory. GGUF
   Q4_0 and Q6_K blocks are uploaded raw and converted to q4 by a compute kernel, bit for bit what the
   CPU converter gives (`setGpuConvert(false)` keeps it on the CPU).
+- **Why a reply ended.** `stats.stopReason` is `"stop"` (an end-of-turn or stop token),
+  `"maxTokens"`, `"context"` (the reply filled the context before maxTokens), `"format"` (the
+  structured value is complete) or `"abort"` (the signal fired or the caller stopped reading), the
+  same with and without draft tokens.
 - **Context sized to the model.** The default `maxSeq` is the model's trained context
   (`max_position_embeddings`, GGUF `context_length`), at most 8192 tokens and 512 MiB of KV cache,
   where it was 2048 for every model. `info.contextLength` tells an app how far a larger `maxSeq` can
@@ -305,7 +309,7 @@ Models run end to end (greedy answers to fixed questions checked by hand; tool c
 | `qwen3` | Qwen3-0.6B (`toolChoice`) | safetensors | 20–32 tok/s |
 | `gemma3_text` | Gemma 3 1B-it (sliding window: recalls a fact 1,100 tokens back) | safetensors (unsloth mirror) | 12–20 tok/s |
 | `gemma3_text` | Gemma 3 270M-it, with `quant: "q8"` or `"f32"` | safetensors, GGUF Q8_0 | 25–42 tok/s |
-| `gemma3` | Gemma 3 4B-it, text only (recalls a fact 1,100 tokens back) | GGUF Q4_0 (2.4 GB) | 197 ms GPU per step (about 5 tok/s) |
+| `gemma3` | Gemma 3 4B-it, text only (recalls a fact 1,100 and 3,000 tokens back) | GGUF Q4_0 (2.4 GB) | 177–180 ms GPU per step (about 5.5 tok/s); 24.6 tok/s on an M3 |
 
 Gemma 3 was checked token by token against an independent NumPy forward pass written from
 transformers' `modeling_gemma3`: greedy output matched on every prompt tried, for 1B in q4 and q8 and 270M

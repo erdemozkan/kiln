@@ -26,6 +26,10 @@ const schema = { type: "object", properties: { city: { type: "string" }, populat
 const json = llm.chat(messages, { format: { type: "json", schema } }); // or { type: "json" }, { type: "choice", choices: ["yes", "no"] }
 ```
 
+Each stream's `stats` resolve when it ends, with token counts, timings and `stopReason`: `"stop"`
+(end of turn), `"maxTokens"`, `"context"` (the reply filled the context), `"format"` (the structured
+value is complete) or `"abort"`.
+
 Weights are cached in the browser (OPFS) as they download, so later loads skip the network, and an
 interrupted download resumes. `listCache()` reports what is cached and `clearCache()` deletes it.
 
