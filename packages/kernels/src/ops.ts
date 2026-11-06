@@ -191,16 +191,17 @@ export function rope(ctx: Ctx, x: Tensor, T: number, H: number, D: number, invFr
 export function ropeKv(ctx: Ctx, qkv: Tensor, kc: Buf, vc: Buf, s: AttentionShape, invFreq: Tensor, interleaved: boolean): Tensor {
   const q = ctx.alloc([s.T, s.H * s.D]);
   const W = (s.H + 2 * s.Hkv) * s.D;
-  const params = ctx.uniform([u32(s.T), u32(s.H), u32(s.Hkv), u32(s.D), u32(s.maxSeq), u32(0), u32(0), u32(0)]);
+  const params = ctx.uniform([u32(s.T), u32(s.H), u32(s.Hkv), u32(s.D), u32(s.maxSeq), u32(cacheSlots(s)), u32(0), u32(0)]);
   ctx.run(ropeKvSpec(interleaved, s.kv), [params, ctx.step, invFreq.buf, qkv.buf, q.buf, kc, vc], grid1d((s.T * W) / 2));
   return q;
 }
 
-export function kvWrite(ctx: Ctx, k: Tensor, v: Tensor, kc: Buf, vc: Buf, T: number, maxSeq: number, kv: KvDtype = "f32"): void {
+/** Writes k/v into the caches at positions pos0…; `slots` < maxSeq makes the cache a ring (slot = position % slots). */
+export function kvWrite(ctx: Ctx, k: Tensor, v: Tensor, kc: Buf, vc: Buf, T: number, maxSeq: number, kv: KvDtype = "f32", slots = maxSeq): void {
   const row = numel(k.shape) / T;
   if (kv === "f16" && row % 2 !== 0) throw new Error(`kvWrite: f16 cache needs an even row (row=${row})`);
   const threads = kv === "f16" ? (T * row) / 2 : T * row;
-  ctx.run(kvWriteSpec(kv), [ctx.uniform([u32(T), u32(row), u32(maxSeq), u32(0)]), ctx.step, k.buf, v.buf, kc, vc], grid1d(threads));
+  ctx.run(kvWriteSpec(kv), [ctx.uniform([u32(T), u32(row), u32(maxSeq), u32(slots)]), ctx.step, k.buf, v.buf, kc, vc], grid1d(threads));
 }
 
 export type PrefillAttention = "tiled" | "rows";
@@ -222,7 +223,14 @@ export interface AttentionShape {
   scale?: number;
   /** Sliding window: each query sees only its last `window` keys (default 0, all keys). */
   window?: number;
+  /**
+   * Cache slots (default maxSeq). Fewer makes the cache a ring, position j in slot j % slots: enough
+   * for a sliding layer when slots ≥ window + T - 1 and slots ≥ ATTN_WG (see `ringSlots`).
+   */
+  slots?: number;
 }
+
+export const cacheSlots = (s: Pick<AttentionShape, "maxSeq" | "slots">): number => s.slots ?? s.maxSeq;
 
 /**
  * Causal GQA attention over the cache. q [T, H * D] → [T, H * D].
@@ -234,7 +242,14 @@ export function attention(ctx: Ctx, q: Tensor, kc: Buf, vc: Buf, s: AttentionSha
   if (s.D > ATTN_WG || s.D % 4 !== 0) throw new Error(`attention: head dim ${s.D} must be a multiple of 4 and at most ${ATTN_WG}`);
   const out = ctx.alloc([s.T, s.H * s.D]);
   const splits = Math.ceil(s.maxSeq / ATTN_CHUNK);
-  const params = ctx.uniform([u32(s.T), u32(s.H), u32(s.Hkv), u32(s.D), u32(s.maxSeq), f32(s.scale ?? 1 / Math.sqrt(s.D)), u32(splits), u32(s.window ?? 0)]);
+  const slots = cacheSlots(s);
+  if (slots < s.maxSeq && (!s.window || slots < s.window + s.T - 1 || slots < ATTN_WG)) {
+    throw new Error(`attention: a ${slots}-slot ring cannot hold a ${s.window ?? 0}-key window for ${s.T} rows`);
+  }
+  const params = ctx.uniform([
+    u32(s.T), u32(s.H), u32(s.Hkv), u32(s.D), u32(s.maxSeq), f32(s.scale ?? 1 / Math.sqrt(s.D)), u32(splits), u32(s.window ?? 0),
+    u32(slots), u32(0), u32(0), u32(0),
+  ]);
   if (s.T === 1) {
     const ml = ctx.alloc([s.H, splits, 2]);
     const po = ctx.alloc([s.H, splits, s.D]);

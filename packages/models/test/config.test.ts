@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { UnsupportedModelError, configFromGGUF, configFromHF, defaultMaxSeq, ggufToHF, isQuantizable, kvBytesPerToken, multimodalTextName, ropeInvFreq } from "../src";
+import { UnsupportedModelError, configFromGGUF, configFromHF, defaultMaxSeq, ggufToHF, isQuantizable, kvCacheBytes, multimodalTextName, ringSlots, ropeInvFreq } from "../src";
 
 const qwen3 = {
   model_type: "qwen3",
@@ -85,11 +85,15 @@ describe("configFromHF", () => {
     expect(c).toMatchObject({ family: "gemma3", numHeads: 8, numKvHeads: 4, headDim: 256, vocabSize: 262208, slidingWindow: 1024, ropeLinear: 8, ropeTheta: 1e6, ropeLocalTheta: 10000, attnScale: 1 / 16, eosTokenIds: [1, 106] });
     expect(c.embedScale).toBe(50.5); // sqrt(2560) = 50.596 in bf16
     expect(c.slidingLayers!.filter((s) => !s)).toHaveLength(5);
-    // The trained context comes from Gemma3TextConfig's default; the KV budget caps the default context.
+    // The trained context comes from Gemma3TextConfig's default. Sliding layers keep a ring of
+    // window + 128 slots, so 8192 tokens take 305 MB (1.1 GB with a full cache per layer).
     expect(c.contextLength).toBe(131072);
-    expect(kvBytesPerToken(c)).toBe(34 * 2 * 4 * 256 * 2);
-    expect(defaultMaxSeq(c)).toBe(3840);
-    expect(defaultMaxSeq(c, "f32")).toBe(2048); // 1920 fits; never under 2048
+    expect(ringSlots(c, 8192, 0)).toBe(1152);
+    expect(ringSlots(c, 8192, 5)).toBe(8192);
+    expect(ringSlots(c, 1000, 0)).toBe(1000);
+    expect(kvCacheBytes(c, 8192)).toBe(2 * (5 * 8192 + 29 * 1152) * 4 * 256 * 2);
+    expect(defaultMaxSeq(c)).toBe(8192);
+    expect(defaultMaxSeq(c, "f32")).toBe(6400);
     const global = ropeInvFreq(c);
     const local = ropeInvFreq({ headDim: 256, ropeTheta: 10000 });
     expect(global[1]).toBeCloseTo(1e6 ** (-2 / 256) / 8, 7);

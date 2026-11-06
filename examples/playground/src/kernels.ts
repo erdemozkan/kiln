@@ -329,6 +329,52 @@ async function main() {
     ops.setPrefillAttention("tiled");
   }
 
+  // Ring caches (sliding layers keep window + slack slots, key j in slot j % slots): filled from the
+  // same keys as a full cache at positions far past the ring size, they must give the same output.
+  for (const [T, H, Hkv, D, pos0, maxSeq, window, slots] of [[1, 4, 1, 256, 1700, 2048, 512, 640], [1, 9, 3, 64, 3001, 4096, 300, 428], [64, 4, 1, 256, 1500, 2048, 512, 640], [33, 8, 2, 128, 900, 2048, 256, 384], [5, 9, 3, 64, 3000, 4096, 300, 428]] as const) {
+    const q = randn(T * H * D);
+    const row = Hkv * D;
+    const kc = randn(maxSeq * row);
+    const vc = randn(maxSeq * row);
+    const scale = 1 / 16;
+    const ring = (c: Float32Array) => {
+      const r = new Float32Array(slots * row);
+      for (let j = pos0 + T - slots; j < pos0 + T; j++) r.set(c.subarray(j * row, (j + 1) * row), (j % slots) * row);
+      return r;
+    };
+    const want = ref.attentionRef(q, kc, vc, { T, H, Hkv, D, pos0, scale, window });
+    const wantH = ref.attentionRef(q, unpackHalf(packHalf(kc)), unpackHalf(packHalf(vc)), { T, H, Hkv, D, pos0, scale, window });
+    for (const kind of T > 1 ? (["tiled", "rows"] as const) : (["tiled"] as const)) {
+      ops.setPrefillAttention(kind);
+      const tag = `T${T} H${H}/${Hkv} D${D} pos${pos0} win${window} ring${slots}${T > 1 ? ` ${kind}` : ""}`;
+      const shape = { T, H, Hkv, D, maxSeq, scale, window, slots };
+      let o!: Tensor;
+      await run({ ...S0, pos0 }, (ctx) => (o = ops.attention(ctx, upload(q, [T, H * D]), upload(ring(kc), [0]).buf, upload(ring(vc), [0]).buf, shape)));
+      check("attention/ring", tag, await download(o.buf, q.length), want, 1e-4);
+      await run({ ...S0, pos0 }, (ctx) => (o = ops.attention(ctx, upload(q, [T, H * D]), upload(packHalf(ring(kc)), [0]).buf, upload(packHalf(ring(vc)), [0]).buf, { ...shape, kv: "f16" })));
+      check("attention/ring/f16", tag, await download(o.buf, q.length), wantH, 1e-4);
+    }
+    ops.setPrefillAttention("tiled");
+  }
+
+  {
+    // A write that wraps around a ring: positions 14…18 of a 16-slot cache land in slots 14, 15, 0, 1, 2.
+    const [T, row, pos0, maxSeq, slots] = [5, 8, 14, 64, 16];
+    const k = randn(T * row);
+    const v = randn(T * row);
+    const kc = upload(new Float32Array(slots * row), [slots, row]);
+    const vc = upload(new Float32Array(slots * row), [slots, row]);
+    await run({ ...S0, pos0 }, (ctx) => ops.kvWrite(ctx, upload(k, [T, row]), upload(v, [T, row]), kc.buf, vc.buf, T, maxSeq, "f32", slots));
+    const wantK = new Float32Array(slots * row);
+    const wantV = new Float32Array(slots * row);
+    for (let t = 0; t < T; t++) {
+      wantK.set(k.subarray(t * row, (t + 1) * row), ((pos0 + t) % slots) * row);
+      wantV.set(v.subarray(t * row, (t + 1) * row), ((pos0 + t) % slots) * row);
+    }
+    check("kv_write/ring", "k", await download(kc.buf, wantK.length), wantK, 0);
+    check("kv_write/ring", "v", await download(vc.buf, wantV.length), wantV, 0);
+  }
+
   {
     const [T, row, pos0, maxSeq] = [2, 8, 3, 8];
     const k = randn(T * row);

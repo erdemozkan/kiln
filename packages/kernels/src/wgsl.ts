@@ -648,12 +648,12 @@ fn main(${EW_ARGS}) {
 }`);
 }
 
-/** Writes k/v rows [T, rowSize] into the caches at positions pos0..pos0+T. */
+/** Writes k/v rows [T, rowSize] into the caches at positions pos0..pos0+T (slot = position % cap). */
 export function kvWriteSpec(kv: KvDtype = "f32"): KernelSpec {
   const h = kv === "f16";
   return spec(`kv_write/${kv}`, ["uniform", "read", "read", "read", "rw", "rw"], () => /* wgsl */ `
 ${STEP_WGSL}
-struct P { T: u32, row: u32, maxSeq: u32, _p: u32 }
+struct P { T: u32, row: u32, maxSeq: u32, cap: u32 }
 @group(0) @binding(0) var<uniform> p: P;
 @group(0) @binding(1) var<storage, read> st: Step;
 @group(0) @binding(2) var<storage, read> k: array<f32>;
@@ -670,13 +670,13 @@ ${h
   if (e >= p.T * p.row) { return; }
   let t = e / p.row;
   if (st.pos0 + t >= p.maxSeq) { return; }
-  let dst = ((st.pos0 + t) * p.row + e % p.row) / 2u;
+  let dst = (((st.pos0 + t) % p.cap) * p.row + e % p.row) / 2u;
   kc[dst] = pack2x16float(vec2<f32>(k[e], k[e + 1u]));
   vc[dst] = pack2x16float(vec2<f32>(v[e], v[e + 1u]));`
   : `  if (idx >= p.T * p.row) { return; }
   let t = idx / p.row;
   if (st.pos0 + t >= p.maxSeq) { return; }
-  let dst = (st.pos0 + t) * p.row + idx % p.row;
+  let dst = ((st.pos0 + t) % p.cap) * p.row + idx % p.row;
   kc[dst] = k[idx];
   vc[dst] = v[idx];`}
 }`);
@@ -689,7 +689,15 @@ export const ATTN_WG = 256;
  * First key a query sees: with a sliding window of `win` keys (0 = none), a query that sees keys
  * 0…n-1 keeps only the last `win` of them, as Gemma's sliding layers do.
  */
-const FIRST_KEY_WGSL = /* wgsl */ `fn firstKey(n: u32, win: u32) -> u32 { return select(0u, n - win, win > 0u && n > win); }`;
+const FIRST_KEY_WGSL = /* wgsl */ `fn firstKey(n: u32, win: u32) -> u32 { return select(0u, n - win, win > 0u && n > win); }
+// Cache slot of a key, given base = (first key of a run) % cap and an offset into the run of at most cap.
+fn wrap(s: u32) -> u32 { return select(s, s - p.cap, s >= p.cap); }`;
+
+/**
+ * Attention parameters. A layer's cache holds cap slots and key j lives in slot j % cap: cap is
+ * maxSeq for full layers, and window + slack for sliding layers, whose cache is a ring.
+ */
+const ATTN_P = (third: string) => `struct P { T: u32, H: u32, Hkv: u32, D: u32, maxSeq: u32, scale: f32, ${third}: u32, win: u32, cap: u32, _x: u32, _y: u32, _z: u32 }`;
 
 /**
  * Causal attention with GQA: one 256-thread workgroup per (head, query row).
@@ -703,7 +711,7 @@ export function attentionSpec(kv: KvDtype = "f32"): KernelSpec {
   return spec(`attention/online/${kv}`, ["uniform", "read", "read", "read", "read", "rw"], () => /* wgsl */ `
 ${STEP_WGSL}
 ${kv === "f16" ? KV4_FN : ""}
-struct P { T: u32, H: u32, Hkv: u32, D: u32, maxSeq: u32, scale: f32, _a: u32, win: u32 }
+${ATTN_P("_a")}
 ${FIRST_KEY_WGSL}
 @group(0) @binding(0) var<uniform> p: P;
 @group(0) @binding(1) var<storage, read> st: Step;
@@ -742,12 +750,13 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
   var acc = 0.0;
   for (var b0 = firstKey(n, p.win); b0 < n; b0 += WG) {
     let bn = min(WG, n - b0);
+    let sb = b0 % p.cap;
     // Scores: 8 lanes per key (vec4 slots lane, lane + 8, ...), 32 keys per pass, coalesced cache reads.
     for (var k0 = 0u; k0 < bn; k0 += WG / 8u) {
       let jj = k0 + key;
       var d = 0.0;
       if (jj < bn) {
-        let kb = ((b0 + jj) * stride + ko) / 4u;
+        let kb = (wrap(sb + jj) * stride + ko) / 4u;
         for (var c = lane; c < d4; c += 8u) { d += dot(qs[c], ${r.k4("kb + c")}); }
       }
       red[li] = d;
@@ -782,7 +791,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
     m = mNew;
     acc *= corr;
     if (g < groups) {
-      for (var jj = g; jj < bn; jj += groups) { acc += ss[jj] * ${r.v1("(b0 + jj) * stride + ko + i")}; }
+      for (var jj = g; jj < bn; jj += groups) { acc += ss[jj] * ${r.v1("wrap(sb + jj) * stride + ko + i")}; }
     }
     workgroupBarrier();
   }
@@ -832,7 +841,7 @@ export function attentionTiledSpec(kv: KvDtype, D: number): KernelSpec {
   return spec(`attention/tiled/${kv}/D${D}`, ["uniform", "read", "read", "read", "read", "rw"], () => /* wgsl */ `
 ${STEP_WGSL}
 ${kv === "f16" ? KV4_FN : ""}
-struct P { T: u32, H: u32, Hkv: u32, D: u32, maxSeq: u32, scale: f32, _a: u32, win: u32 }
+${ATTN_P("_a")}
 ${FIRST_KEY_WGSL}
 @group(0) @binding(0) var<uniform> p: P;
 @group(0) @binding(1) var<storage, read> st: Step;
@@ -890,10 +899,11 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
   workgroupBarrier();
 
   for (var b0 = lo; b0 < nMax; b0 += BK) {
+    let sb = b0 % p.cap;
     for (var e = li; e < BK * D4; e += 256u) {
       let j = b0 + e / D4;
       var v = vec4<f32>(0.0);
-      if (j < nMax) { v = K4(j * stride4 + ko4 + e % D4); }
+      if (j < nMax) { v = K4(wrap(sb + e / D4) * stride4 + ko4 + e % D4); }
       tile[(e / D4) * KP + e % D4] = v;
     }
     workgroupBarrier();
@@ -935,7 +945,7 @@ ${split
     for (var e = li; e < BK * D4; e += 256u) {
       let j = b0 + e / D4;
       var v = vec4<f32>(0.0);
-      if (j < nMax) { v = V4(j * stride4 + ko4 + e % D4); }
+      if (j < nMax) { v = V4(wrap(sb + e / D4) * stride4 + ko4 + e % D4); }
       tile[(e / D4) * KP + e % D4] = v;
     }
     workgroupBarrier();
@@ -983,7 +993,7 @@ export function attentionSplitSpec(kv: KvDtype = "f32"): KernelSpec {
   return spec(`attention/split/${kv}`, ["uniform", "read", "read", "read", "read", "rw", "rw"], () => /* wgsl */ `
 ${STEP_WGSL}
 ${kv === "f16" ? KV4_FN : ""}
-struct P { T: u32, H: u32, Hkv: u32, D: u32, maxSeq: u32, scale: f32, S: u32, win: u32 }
+${ATTN_P("S")}
 ${FIRST_KEY_WGSL}
 @group(0) @binding(0) var<uniform> p: P;
 @group(0) @binding(1) var<storage, read> st: Step;
@@ -1013,6 +1023,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
   if (j0s >= n || j0s + CH <= lo) { return; }
   let j0 = max(j0s, lo);
   let cnt = min(j0s + CH, n) - j0;
+  let sb = j0 % p.cap;
   let qo = (t * p.H + h) * p.D;
   let stride = p.Hkv * p.D;
   let ko = kvh * p.D;
@@ -1030,7 +1041,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
     let j = k0 + key;
     var d = 0.0;
     if (j < cnt) {
-      let kb = ((j0 + j) * stride + ko) / 4u;
+      let kb = (wrap(sb + j) * stride + ko) / 4u;
       for (var c = lane; c < d4; c += 8u) { d += dot(qs[c], ${r.k4("kb + c")}); }
     }
     part[li] = d;
@@ -1070,11 +1081,11 @@ ${kv === "f16"
   let groups = max(1u, 64u / pairs);
   let g = select(0u, li / pairs, pairs < 64u);
   let vs = stride / 2u;
-  let vo = (j0 * stride + ko) / 2u;
+  let vo = ko / 2u;
   for (var pi = li % pairs; pi < pairs; pi += 64u) {
     var acc = vec2<f32>(0.0);
     if (g < groups) {
-      for (var j = g; j < cnt; j += groups) { acc += sc[j] * unpack2x16float(vc[vo + j * vs + pi]); }
+      for (var j = g; j < cnt; j += groups) { acc += sc[j] * unpack2x16float(vc[vo + wrap(sb + j) * vs + pi]); }
     }
     if (pairs < 64u) {
       vpart[li] = acc;
@@ -1092,7 +1103,7 @@ ${kv === "f16"
   }`
   : `  for (var i = li; i < p.D; i += 64u) {
     var acc = 0.0;
-    for (var j = 0u; j < cnt; j++) { acc += sc[j] * ${r.v1("(j0 + j) * stride + ko + i")}; }
+    for (var j = 0u; j < cnt; j++) { acc += sc[j] * ${r.v1("wrap(sb + j) * stride + ko + i")}; }
     po[row * p.D + i] = acc;
   }`}
 }`);
@@ -1102,7 +1113,7 @@ ${kv === "f16"
 export function attentionCombineSpec(): KernelSpec {
   return spec("attention/combine", ["uniform", "read", "read", "read", "rw"], () => /* wgsl */ `
 ${STEP_WGSL}
-struct P { T: u32, H: u32, Hkv: u32, D: u32, maxSeq: u32, scale: f32, S: u32, win: u32 }
+${ATTN_P("S")}
 ${FIRST_KEY_WGSL}
 @group(0) @binding(0) var<uniform> p: P;
 @group(0) @binding(1) var<storage, read> st: Step;
@@ -1386,14 +1397,15 @@ fn main() {
 
 /**
  * Rotary embedding fused with the KV-cache write. Reads fused qkv rows [T, (H + 2·Hkv)·D], writes the
- * rotated q to qo [T, H·D] and the rotated k plus v straight into the caches at step.pos0 + t.
+ * rotated q to qo [T, H·D] and the rotated k plus v straight into the caches at step.pos0 + t (slot
+ * (step.pos0 + t) % cap).
  * One thread per output element; each reads its rotation partner, so nothing is updated in place.
  */
 export function ropeKvSpec(interleaved: boolean, kv: KvDtype = "f32"): KernelSpec {
   const h = kv === "f16";
   return spec(`rope_kv/${interleaved ? "interleaved" : "half"}/${kv}`, ["uniform", "read", "read", "read", "rw", "rw", "rw"], () => /* wgsl */ `
 ${STEP_WGSL}
-struct P { T: u32, H: u32, Hkv: u32, D: u32, maxSeq: u32, _a: u32, _b: u32, _c: u32 }
+struct P { T: u32, H: u32, Hkv: u32, D: u32, maxSeq: u32, cap: u32, _b: u32, _c: u32 }
 @group(0) @binding(0) var<uniform> p: P;
 @group(0) @binding(1) var<storage, read> st: Step;
 @group(0) @binding(2) var<storage, read> invFreq: array<f32>;
@@ -1446,7 +1458,7 @@ fn main(${EW_ARGS}) {
     return;
   }
   if (pos >= p.maxSeq) { return; }
-  let dst = pos * kn + (c - qn) % kn;
+  let dst = (pos % p.cap) * kn + (c - qn) % kn;
 ${h
   ? `  let packed = pack2x16float(pair);
   if (c < qn + kn) { kc[dst / 2u] = packed; } else { vc[dst / 2u] = packed; }`

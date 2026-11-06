@@ -122,6 +122,8 @@ export class Engine {
   private submits = 0;
   /** Token bytes in a prefix tree, built on the first constrained call. */
   private trie: { trie: TokenTrie; tokens: (Uint8Array | undefined)[] } | undefined;
+  /** Upper bound on the cache positions written so far (for ring caches, see `minReuseStart`). */
+  private written = 0;
 
   constructor(
     readonly backend: Backend,
@@ -207,6 +209,9 @@ export class Engine {
     if (opts.reuseCache ?? true) {
       const prev = this.cached;
       while (start < prev.length && start < promptIds.length - 1 && prev[start] === promptIds[start]) start++;
+      // Ring caches (sliding layers) keep only the last window + slack positions written; resuming
+      // further back would read overwritten keys, so the prompt is prefilled from the start instead.
+      if (start < this.model.minReuseStart(this.written)) start = 0;
     }
     this.cached = [];
     const stats: GenerateStats = { promptTokens: promptIds.length, cachedTokens: start, generatedTokens: 0, prefillMs: 0, decodeMs: 0, ttftMs: 0 };
@@ -326,6 +331,8 @@ export class Engine {
       // including steps still in flight, which run before anything submitted later. This also holds
       // when the consumer stops iterating early.
       if (!failed) this.cached = spoken ? spoken.slice(0, -1) : [...promptIds, ...readIds.slice(0, Math.max(0, queued - 1))];
+      // Verify passes write up to MAX_VERIFY_ROWS positions past the kept ones; plain decode none.
+      this.written = failed ? this.model.maxSeq : this.cached.length + (spoken ? MAX_VERIFY_ROWS : 0);
       stats.submits = this.submits;
       this.lastStats = stats;
       this.busy = false;
@@ -562,9 +569,10 @@ export class Engine {
   importCache(s: CacheSnapshot): boolean {
     const m = this.model;
     if (this.busy || s.kvDtype !== m.kvDtype || s.layers !== m.cfg.numLayers || s.rowBytes !== m.kvRowBytes || s.tokens.length >= m.maxSeq) return false;
-    if (s.data.length !== s.layers * 2 * s.tokens.length * s.rowBytes) return false;
+    if (s.data.length !== m.kvSnapshotBytes(s.tokens.length)) return false;
     m.writeKv(s.tokens.length, s.data);
     this.cached = [...s.tokens];
+    this.written = s.tokens.length;
     return true;
   }
 

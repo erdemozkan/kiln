@@ -100,12 +100,16 @@ Key ideas:
   Q4_0 and Q6_K blocks are uploaded raw and converted to q4 by a compute kernel, bit for bit what the
   CPU converter gives (`setGpuConvert(false)` keeps it on the CPU).
 - **Context sized to the model.** The default `maxSeq` is the model's trained context
-  (`max_position_embeddings`, GGUF `context_length`), at most 8192 tokens and 512 MiB of KV cache:
-  SmolLM2 and Gemma 3 1B get 8192, Gemma 3 4B (136 KB of f16 cache per token) 3840, where it was
-  2048 for every model. `info.contextLength` tells an app how far a larger `maxSeq` can go, and a
-  prompt that does not fit says so. On Gemma 3 4B a 2,997-token prompt now answers the long-range
-  question, and the decode step is unchanged (attention 4.0 ms at position 256 with 3840 slots, 4.8
-  with 2048).
+  (`max_position_embeddings`, GGUF `context_length`), at most 8192 tokens and 512 MiB of KV cache,
+  where it was 2048 for every model. `info.contextLength` tells an app how far a larger `maxSeq` can
+  go, and a prompt that does not fit says so. Sliding-window layers (Gemma 3: 29 of 34 in 4B, window
+  1024) keep a ring of window + 128 slots, key j in slot j % slots, instead of a row per position:
+  Gemma 3 4B gets 8192 tokens in 290 MB, where a full cache per layer held 3840 tokens in 510 MB.
+  Same greedy tokens as the full cache on a 1,518-token prompt (the ring wraps after 1,152), same
+  prefill time, and the decode step does not grow with the slots (attention 4.0 ms at position 256
+  with 3840, 4.8 with 2048). Reusing a cached prefix stays exact across the ring: a second question
+  on the same 1,500 tokens reused 1,494 of them (6.6 s against 88.9 s) with the same tokens as a
+  fresh prefill, and a prefix too far behind the ring's oldest key is prefilled from the start.
 - **The download is the cache.** In a worker, `CachedHttpSource` writes the download into OPFS and serves
   reads from it as bytes land. Interrupted downloads resume from the last flushed byte recorded in the
   metadata (not the file size, which can include writes lost when a worker is killed), and a cached
@@ -284,7 +288,7 @@ cost.
 
 ## Status
 
-Verified on this GPU: all kernel checks pass (487, including q4 and q8 weights in every matmul variant, the decode GEMV and the prefill GEMM, both prefill attention kernels, fused variants, f16 cache paths,
+Verified on this GPU: all kernel checks pass (505, including q4 and q8 weights in every matmul variant, the decode GEMV and the prefill GEMM, both prefill attention kernels, fused variants, f16 cache paths,
 sliding-window attention, GELU gating, grammar masks and sampling distributions). SmolLM2-135M-Instruct chats from Hub safetensors (q4, f32) and from a GGUF
 Q4_K_M file.
 

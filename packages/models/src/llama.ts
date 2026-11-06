@@ -1,5 +1,5 @@
 import { ActivationPool, Ctx, byteSize, isBlockQuant, packStep, q4ScaleBytes, view, type Backend, type Buf, type Dispatch, type StepParams, type Tensor } from "@kiln/core";
-import { ops, type KvDtype } from "@kiln/kernels";
+import { ATTN_WG, ops, type KvDtype } from "@kiln/kernels";
 import { ropeInvFreq, type LlamaConfig } from "./config";
 
 /** A recorded forward pass for a fixed number of tokens. */
@@ -34,18 +34,41 @@ export class MissingWeightError extends Error {}
 export const KV_BUDGET_BYTES = 512 * 2 ** 20;
 export const MAX_DEFAULT_SEQ = 8192;
 
-/** KV cache bytes per token: keys and values of every layer. */
-export const kvBytesPerToken = (cfg: LlamaConfig, kvDtype: KvDtype = "f16"): number =>
-  cfg.numLayers * 2 * cfg.numKvHeads * cfg.headDim * (kvDtype === "f16" ? 2 : 4);
+/**
+ * Rows a sliding layer's ring holds beyond its window: keys written ahead of the oldest one a query
+ * still needs, up to the largest prefill chunk (128) or verify pass (MAX_VERIFY_ROWS).
+ */
+export const RING_SLACK = 128;
+
+/**
+ * Cache slots of layer l: maxSeq for full layers; for sliding layers a ring of window + RING_SLACK
+ * slots (at least ATTN_WG, which the attention kernels' key runs need), when that is smaller.
+ */
+export function ringSlots(cfg: LlamaConfig, maxSeq: number, l: number): number {
+  const win = cfg.slidingLayers?.[l] ? cfg.slidingWindow : undefined;
+  return win ? Math.min(maxSeq, Math.max(ATTN_WG, win + RING_SLACK)) : maxSeq;
+}
+
+/** KV cache bytes of a model at a context length: keys and values of every layer, rings included. */
+export function kvCacheBytes(cfg: LlamaConfig, maxSeq: number, kvDtype: KvDtype = "f16"): number {
+  const row = cfg.numKvHeads * cfg.headDim * (kvDtype === "f16" ? 2 : 4);
+  let slots = 0;
+  for (let l = 0; l < cfg.numLayers; l++) slots += ringSlots(cfg, maxSeq, l);
+  return 2 * slots * row;
+}
 
 /**
  * Default context length: the model's trained context, at most MAX_DEFAULT_SEQ tokens, and no more
  * than fits KV_BUDGET_BYTES of cache (in multiples of 256, never under 2048 unless the model's own
- * context is shorter). Gemma 3 4B (136 KB per token in f16) gets 3840, SmolLM2 and Gemma 3 1B 8192.
+ * context is shorter). Sliding layers count as their rings: Gemma 3 4B takes 305 MB at 8192 tokens,
+ * where a full cache per layer would take 1.1 GB.
  */
 export function defaultMaxSeq(cfg: LlamaConfig, kvDtype: KvDtype = "f16"): number {
-  const fits = Math.floor(KV_BUDGET_BYTES / kvBytesPerToken(cfg, kvDtype) / 256) * 256;
-  return Math.min(cfg.contextLength ?? 2048, MAX_DEFAULT_SEQ, Math.max(fits, 2048));
+  const top = Math.min(cfg.contextLength ?? 2048, MAX_DEFAULT_SEQ);
+  const floor = Math.min(top, 2048);
+  let n = top;
+  while (n - 256 >= floor && kvCacheBytes(cfg, n, kvDtype) > KV_BUDGET_BYTES) n = Math.ceil(n / 256) * 256 - 256;
+  return n;
 }
 
 /** Most rows a verify plan can have (the last token plus a draft of up to 31). */
@@ -66,6 +89,8 @@ export class LlamaModel {
   /** Intermediates of every plan, shared: plans run one after another on the queue. */
   readonly activations: ActivationPool;
   private readonly kv: { k: Buf; v: Buf }[] = [];
+  /** Cache slots per layer: maxSeq, or a ring for sliding layers (see `ringSlots`). */
+  readonly slots: number[] = [];
   private readonly invFreq: Tensor;
   /** RoPE frequencies of sliding-window layers, when their base differs (Gemma 3); else `invFreq`. */
   private readonly localInvFreq: Tensor;
@@ -92,9 +117,11 @@ export class LlamaModel {
     this.activations = new ActivationPool(backend);
     const row = cfg.numKvHeads * cfg.headDim;
     for (let l = 0; l < cfg.numLayers; l++) {
+      const slots = ringSlots(cfg, this.maxSeq, l);
+      this.slots.push(slots);
       this.kv.push({
-        k: backend.alloc(this.maxSeq * row * kvBytes, "storage", `kv/${l}/k`),
-        v: backend.alloc(this.maxSeq * row * kvBytes, "storage", `kv/${l}/v`),
+        k: backend.alloc(slots * row * kvBytes, "storage", `kv/${l}/k`),
+        v: backend.alloc(slots * row * kvBytes, "storage", `kv/${l}/v`),
       });
     }
     const freqs = (f: Float32Array, label: string): Tensor => {
@@ -167,27 +194,57 @@ export class LlamaModel {
     return this.cfg.numKvHeads * this.cfg.headDim * (this.kvDtype === "f16" ? 2 : 4);
   }
 
+  /** Bytes `readKv(n)` returns: each layer's first min(n, slots) K rows and as many V rows. */
+  kvSnapshotBytes(n: number): number {
+    return this.slots.reduce((t, slots) => t + 2 * Math.min(n, slots) * this.kvRowBytes, 0);
+  }
+
   /**
    * Copies the K/V of positions 0…n-1 out of every layer's cache: layer 0's K rows, then its V rows,
-   * then layer 1's, and so on. The copies are queued at once, so they read the cache as it stands
-   * when this is called, even if more work is submitted before they resolve.
+   * then layer 1's, and so on. A ring layer gives its first min(n, slots) slots, which hold the last
+   * positions at slot = position % slots, the layout `writeKv` restores. The copies are queued at
+   * once, so they read the cache as it stands when this is called, even if more work is submitted
+   * before they resolve.
    */
   async readKv(n: number): Promise<Uint8Array> {
-    const bytes = n * this.kvRowBytes;
-    const parts = this.kv.flatMap(({ k, v }) => [this.backend.readback(k, 0, bytes), this.backend.readback(v, 0, bytes)]);
-    const out = new Uint8Array(parts.length * bytes);
-    for (const [i, p] of (await Promise.all(parts)).entries()) out.set(new Uint8Array(p), i * bytes);
+    const parts = this.kv.flatMap(({ k, v }, l) => {
+      const bytes = Math.min(n, this.slots[l]!) * this.kvRowBytes;
+      return [this.backend.readback(k, 0, bytes), this.backend.readback(v, 0, bytes)];
+    });
+    const out = new Uint8Array(this.kvSnapshotBytes(n));
+    let at = 0;
+    for (const p of await Promise.all(parts)) {
+      out.set(new Uint8Array(p), at);
+      at += p.byteLength;
+    }
     return out;
   }
 
   /** Writes K/V for positions 0…n-1 back into every layer's cache, in `readKv`'s layout. */
   writeKv(n: number, data: Uint8Array): void {
-    const bytes = n * this.kvRowBytes;
-    if (n > this.maxSeq || data.length !== this.kv.length * 2 * bytes) throw new Error(`writeKv: ${data.length} bytes do not hold ${n} positions`);
+    if (n > this.maxSeq || data.length !== this.kvSnapshotBytes(n)) throw new Error(`writeKv: ${data.length} bytes do not hold ${n} positions`);
+    let at = 0;
     for (const [l, { k, v }] of this.kv.entries()) {
-      this.backend.write(k, 0, data.subarray(2 * l * bytes, (2 * l + 1) * bytes));
-      this.backend.write(v, 0, data.subarray((2 * l + 1) * bytes, (2 * l + 2) * bytes));
+      const bytes = Math.min(n, this.slots[l]!) * this.kvRowBytes;
+      this.backend.write(k, 0, data.subarray(at, at + bytes));
+      this.backend.write(v, 0, data.subarray(at + bytes, at + 2 * bytes));
+      at += 2 * bytes;
     }
+  }
+
+  /**
+   * Earliest position a call may resume prefill from when the cache was last written up to `written`
+   * positions: a ring has overwritten the keys before written - slots, and the first position
+   * prefilled needs the window before it. 0 when no layer is a ring or nothing was overwritten.
+   */
+  minReuseStart(written: number): number {
+    let min = 0;
+    for (let l = 0; l < this.slots.length; l++) {
+      const slots = this.slots[l]!;
+      if (slots >= this.maxSeq || written <= slots) continue;
+      min = Math.max(min, written - slots + (this.cfg.slidingWindow ?? 0) - 1);
+    }
+    return min;
   }
 
   /** Marks the ids the repetition penalty starts from (the prompt); generated ids are added on the GPU. */
@@ -263,6 +320,7 @@ export class LlamaModel {
         kv: this.kvDtype,
         scale: c.attnScale,
         window: sliding ? c.slidingWindow : undefined,
+        slots: this.slots[l],
       };
       const inputNorm = { w: this.w(`${p}.input_layernorm.weight`), eps: c.rmsEps };
       let q: Tensor;
@@ -363,7 +421,7 @@ export class LlamaModel {
     }
     ops.rope(ctx, q, T, c.numHeads, D, invFreq, c.ropeInterleaved);
     ops.rope(ctx, k, T, c.numKvHeads, D, invFreq, c.ropeInterleaved);
-    ops.kvWrite(ctx, k, v, this.kv[l]!.k, this.kv[l]!.v, T, this.maxSeq, this.kvDtype);
+    ops.kvWrite(ctx, k, v, this.kv[l]!.k, this.kv[l]!.v, T, this.maxSeq, this.kvDtype, this.slots[l]);
     return q;
   }
 
