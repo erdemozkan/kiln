@@ -101,9 +101,12 @@ Key ideas:
   reads from it as bytes land. Interrupted downloads resume from the last flushed byte recorded in the
   metadata (not the file size, which can include writes lost when a worker is killed), and a cached
   file whose header no longer parses, or whose bytes fail to read back, is downloaded again in place.
-  When the store stops taking bytes (a full disk, or the 2000 MiB per-file limit of Chrome's
-  in-memory storage), the rest of the file is read over HTTP instead of failing the load, and the
-  next load resumes from the cached part.
+  Each file is stored as 1 GiB segments, because Chrome's in-memory storage (embedded browsers,
+  incognito) fails writes past 2000 MiB in one file while holding more in total; files cached by
+  earlier versions as one piece over 1 GiB are downloaded again. When the store stops taking bytes
+  (a full disk), the rest of the file is read over HTTP instead of failing the load, and the next
+  load resumes from the cached part. `listCache()` reports what is cached, and the playground shows
+  it next to a Clear cache button.
 
 ## Develop
 

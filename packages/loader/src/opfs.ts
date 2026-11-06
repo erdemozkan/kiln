@@ -14,6 +14,69 @@ type SyncFileHandle = FileSystemFileHandle & { createSyncAccessHandle(): Promise
 const DIR = "kiln-cache";
 /** Bytes written between flushes; the resume point only advances past flushed bytes. */
 const FLUSH_EVERY = 32 * 2 ** 20;
+/**
+ * Largest single OPFS file. Some stores cap one file (Chrome's in-memory storage, used by embedded
+ * browsers and incognito, fails writes at 2000 MiB) while holding more in total, so a cached file is
+ * kept as segments of this size: `name`, `name.part1`, `name.part2`, ...
+ */
+const SEGMENT = 2 ** 30;
+
+const partName = (name: string, i: number) => (i === 0 ? name : `${name}.part${i}`);
+
+/** One logical file over segment files of `seg` bytes each (the last may be shorter). */
+class Segments implements SyncHandle {
+  constructor(
+    private readonly parts: SyncHandle[],
+    private readonly seg: number,
+  ) {}
+
+  /** Splits [at, at + n) by segment; stops and returns the first count that is not the full piece. */
+  private each(at: number, n: number, op: (p: SyncHandle, from: number, len: number, off: number) => number): number {
+    let done = 0;
+    while (done < n) {
+      const i = Math.floor((at + done) / this.seg);
+      const off = at + done - i * this.seg;
+      const len = Math.min(n - done, this.seg - off);
+      const p = this.parts[i];
+      if (!p) return done;
+      const got = op(p, done, len, off);
+      if (got !== len) return got;
+      done += len;
+    }
+    return done;
+  }
+
+  read(buffer: Uint8Array, { at }: { at: number }): number {
+    return this.each(at, buffer.length, (p, from, len, off) => p.read(buffer.subarray(from, from + len), { at: off }));
+  }
+
+  write(buffer: Uint8Array, { at }: { at: number }): number {
+    return this.each(at, buffer.length, (p, from, len, off) => p.write(buffer.subarray(from, from + len), { at: off }));
+  }
+
+  /** Bytes up to the first segment that is not full: a later segment's bytes have no defined place. */
+  getSize(): number {
+    let total = 0;
+    for (const p of this.parts) {
+      const n = p.getSize();
+      total += Math.min(n, this.seg);
+      if (n < this.seg) break;
+    }
+    return total;
+  }
+
+  truncate(size: number): void {
+    this.parts.forEach((p, i) => p.truncate(Math.max(0, Math.min(this.seg, size - i * this.seg))));
+  }
+
+  flush(): void {
+    for (const p of this.parts) p.flush();
+  }
+
+  close(): void {
+    for (const p of this.parts) p.close();
+  }
+}
 
 /** True inside a dedicated worker with OPFS sync access (the only place the cached source works). */
 export function opfsAvailable(): boolean {
@@ -48,20 +111,33 @@ export class CachedHttpSource implements ByteSource {
    * `key` should pin the revision (e.g. repo@commit/file) so a new upload never reuses stale bytes.
    * `fresh` discards whatever is cached and downloads from the start.
    */
-  static async open(url: string, key: string, { fresh = false } = {}): Promise<ByteSource> {
+  static async open(
+    url: string,
+    key: string,
+    { fresh = false, segment = SEGMENT }: { fresh?: boolean; segment?: number } = {},
+  ): Promise<ByteSource> {
     if (!opfsAvailable()) return new HttpSource(url);
     const root = await navigator.storage.getDirectory();
     const dir = await root.getDirectoryHandle(DIR, { create: true });
     const fileName = encodeURIComponent(key);
     const meta = fresh ? undefined : await readMeta(dir, fileName);
-    const file = (await dir.getFileHandle(fileName, { create: true })) as SyncFileHandle;
-    const handle = await file.createSyncAccessHandle().catch((err: unknown) => {
+    const total = meta?.size ?? (await new HttpSource(url).size());
+    const parts: SyncHandle[] = [];
+    try {
+      for (let i = 0; i < Math.max(1, Math.ceil(total / segment)); i++) {
+        const file = (await dir.getFileHandle(partName(fileName, i), { create: true })) as SyncFileHandle;
+        parts.push(await file.createSyncAccessHandle());
+      }
+    } catch (err) {
+      for (const p of parts) p.close();
       if ((err as { name?: string }).name === "NoModificationAllowedError") {
         throw new Error(`${key} is already open in another tab or worker; close it and try again`);
       }
       throw err;
-    });
-    const total = meta?.size ?? (await new HttpSource(url).size());
+    }
+    // A file cached before segments existed is one oversized segment; its bytes are re-downloaded.
+    if (parts[0]!.getSize() > segment) parts[0]!.truncate(0);
+    const handle = new Segments(parts, segment);
     const src = new CachedHttpSource(key, handle, total, (m) => writeMeta(dir, fileName, m));
     const onDisk = Math.min(handle.getSize(), total);
     if (meta?.complete && onDisk === total) {
@@ -289,12 +365,60 @@ export async function writeCacheFile(name: string, parts: readonly Uint8Array[])
   }
 }
 
-/** Deletes one cached file and its metadata. Silently keeps a file another tab or worker has open. */
+/** Deletes one cached file, its segments and its metadata. Silently keeps a file another tab or worker has open. */
 export async function evictCached(key: string): Promise<void> {
   const root = await navigator.storage.getDirectory();
   const dir = await root.getDirectoryHandle(DIR, { create: true });
   const name = encodeURIComponent(key);
   for (const n of [name, `${name}.meta.json`]) await dir.removeEntry(n).catch(() => undefined);
+  for (let i = 1; ; i++) {
+    const gone = await dir.removeEntry(partName(name, i)).then(
+      () => true,
+      (err: unknown) => (err as { name?: string }).name !== "NotFoundError",
+    );
+    if (!gone) break;
+  }
+}
+
+/** One cached model file, as `listCache` reports it. */
+export interface CachedFile {
+  /** The cache key (repo@revision/file). */
+  key: string;
+  /** Bytes on disk, all segments together. */
+  bytes: number;
+  /** Full size of the file, from its metadata (undefined for a small JSON or tuning entry). */
+  size?: number;
+  complete: boolean;
+}
+
+/** Lists the cache directory: model files with their segments summed, plus small entries. Works outside workers. */
+export async function listCache(): Promise<CachedFile[]> {
+  let dir: FileSystemDirectoryHandle;
+  try {
+    dir = await (await navigator.storage.getDirectory()).getDirectoryHandle(DIR);
+  } catch {
+    return [];
+  }
+  const sizes = new Map<string, number>();
+  const metas = new Map<string, Meta>();
+  for await (const [n, h] of (dir as unknown as { entries(): AsyncIterable<[string, FileSystemHandle]> }).entries()) {
+    if (h.kind !== "file") continue;
+    const file = await (h as FileSystemFileHandle).getFile();
+    if (n.endsWith(".meta.json")) {
+      try {
+        metas.set(n.slice(0, -".meta.json".length), JSON.parse(await file.text()) as Meta);
+      } catch {
+        // An unreadable watermark only means the file is listed as incomplete.
+      }
+      continue;
+    }
+    const base = n.replace(/\.part\d+$/, "");
+    sizes.set(base, (sizes.get(base) ?? 0) + file.size);
+  }
+  return [...sizes].map(([n, bytes]) => {
+    const meta = metas.get(n);
+    return { key: decodeURIComponent(n), bytes, size: meta?.size, complete: meta ? meta.complete : true };
+  });
 }
 
 /** Deletes every cached model file. */

@@ -1,4 +1,5 @@
 import { load, type ChatMessage, type KilnModel, type ResponseFormat } from "@kiln/api";
+import { clearCache, listCache } from "@kiln/loader";
 
 const $ = <T extends HTMLElement>(id: string) => document.getElementById(id) as T;
 const modelInput = $<HTMLInputElement>("model");
@@ -29,6 +30,37 @@ function format(): ResponseFormat | undefined {
 let model: KilnModel | undefined;
 let abort: AbortController | undefined;
 const history: ChatMessage[] = [];
+
+const cacheInfo = $("cache");
+const clearBtn = $<HTMLButtonElement>("clear-cache");
+const gib = (n: number) => `${(n / 2 ** 30).toFixed(2)} GiB`;
+
+/** Shows what the model cache holds; the hover lists each file. */
+async function showCache(): Promise<void> {
+  const files = (await listCache()).filter((f) => f.size !== undefined);
+  const bytes = files.reduce((a, f) => a + f.bytes, 0);
+  const partial = files.filter((f) => !f.complete).length;
+  cacheInfo.textContent = files.length
+    ? `Cache: ${gib(bytes)} in ${files.length} file${files.length > 1 ? "s" : ""}${partial ? ` (${partial} partial, resumes on next load)` : ""}`
+    : "Cache: empty";
+  cacheInfo.title = files.map((f) => `${f.key}: ${gib(f.bytes)} of ${gib(f.size!)}`).join("\n");
+}
+void showCache();
+
+clearBtn.onclick = async () => {
+  clearBtn.disabled = loadBtn.disabled = true;
+  try {
+    // A loaded model keeps its cache files open, and open files cannot be deleted.
+    await model?.unload();
+    model = undefined;
+    prompt.disabled = send.disabled = true;
+    status.textContent = "Not loaded.";
+    await clearCache();
+  } finally {
+    clearBtn.disabled = loadBtn.disabled = false;
+    await showCache();
+  }
+};
 
 function bubble(role: string): HTMLElement {
   const el = document.createElement("div");
@@ -66,6 +98,7 @@ loadBtn.onclick = async () => {
     status.textContent = String(err instanceof Error ? err.message : err);
   } finally {
     loadBtn.disabled = false;
+    void showCache();
   }
 };
 

@@ -180,6 +180,52 @@ describe("CachedHttpSource", () => {
     warn.mockRestore();
   });
 
+  describe("segments", () => {
+    const seg = { segment: 100 };
+    const sizes = () => [NAME, `${NAME}.part1`, `${NAME}.part2`].map((n) => files.get(n)?.bytes.length);
+
+    it("stores a file larger than one segment across segment files", async () => {
+      const src = await CachedHttpSource.open("u", KEY, seg);
+      expect(await src.read(90, 120)).toEqual(BODY.subarray(90, 210)); // spans three segments
+      expect(await readAll(src)).toEqual(BODY);
+      expect(sizes()).toEqual([100, 100, 100]);
+      expect(getMeta()).toMatchObject({ complete: true, flushed: BODY.length });
+      requests.length = 0;
+      expect(await readAll(await CachedHttpSource.open("u", KEY, seg))).toEqual(BODY);
+      expect(requests).toEqual([]);
+    });
+
+    it("resumes inside a later segment and drops unconfirmed bytes in every segment", async () => {
+      files.set(NAME, { bytes: BODY.slice(0, 100) });
+      files.set(`${NAME}.part1`, { bytes: BODY.slice(100, 200) });
+      files.set(`${NAME}.part2`, { bytes: new Uint8Array(100) }); // garbage past the watermark
+      setMeta({ size: BODY.length, complete: false, flushed: 150 });
+      const src = await CachedHttpSource.open("u", KEY, seg);
+      expect(requests.at(-1)).toBe("bytes=150-");
+      expect(await readAll(src)).toEqual(BODY);
+      expect(sizes()).toEqual([100, 100, 100]);
+    });
+
+    it("does not count bytes after a short segment as cached", async () => {
+      // A hole: segment 0 is short, so segment 1's bytes cannot be placed and are cut.
+      files.set(NAME, { bytes: BODY.slice(0, 60) });
+      files.set(`${NAME}.part1`, { bytes: BODY.slice(100, 200) });
+      setMeta({ size: BODY.length, complete: false, flushed: 200 });
+      const src = await CachedHttpSource.open("u", KEY, seg);
+      expect(requests.at(-1)).toBe("bytes=60-");
+      expect(await readAll(src)).toEqual(BODY);
+    });
+
+    it("re-downloads a file cached as one oversized segment", async () => {
+      files.set(NAME, { bytes: BODY.slice() });
+      setMeta({ size: BODY.length, complete: true, flushed: BODY.length });
+      const src = await CachedHttpSource.open("u", KEY, seg);
+      expect(requests.at(-1)).toBe("bytes=0-");
+      expect(await readAll(src)).toEqual(BODY);
+      expect(sizes()).toEqual([100, 100, 100]);
+    });
+  });
+
   it("closing twice is harmless", async () => {
     const src = await CachedHttpSource.open("u", KEY);
     await readAll(src);
