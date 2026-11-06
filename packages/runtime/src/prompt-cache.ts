@@ -1,8 +1,11 @@
 import { readCacheFile, writeCacheFile } from "@kiln/loader";
 import type { CacheSnapshot } from "./engine";
 
-/** Bump when the K/V layout or anything that changes cached values (kernels, RoPE) changes. */
-const VERSION = 1;
+/**
+ * Bump when the K/V layout or anything that changes cached values (kernels, RoPE) changes.
+ * 2: sliding layers store min(n, slots) ring rows, so the data length is in the header.
+ */
+const VERSION = 2;
 const MAGIC = 0x6b6c6e31; // "kln1"
 
 /**
@@ -15,7 +18,7 @@ export function promptCacheName(model: string, o: { revision?: string; quant?: s
 
 /** Layout: magic, header length (u32 LE each), JSON header, then the K/V bytes. */
 export async function savePromptCache(name: string, s: CacheSnapshot): Promise<boolean> {
-  const header = new TextEncoder().encode(JSON.stringify({ tokens: s.tokens, kvDtype: s.kvDtype, layers: s.layers, rowBytes: s.rowBytes }));
+  const header = new TextEncoder().encode(JSON.stringify({ tokens: s.tokens, kvDtype: s.kvDtype, layers: s.layers, rowBytes: s.rowBytes, bytes: s.data.length }));
   const head = new Uint8Array(8);
   const dv = new DataView(head.buffer);
   dv.setUint32(0, MAGIC, true);
@@ -32,9 +35,11 @@ export async function loadPromptCache(name: string): Promise<CacheSnapshot | und
   const len = dv.getUint32(4, true);
   if (8 + len > bytes.length) return undefined;
   try {
-    const h = JSON.parse(new TextDecoder().decode(bytes.subarray(8, 8 + len))) as Omit<CacheSnapshot, "data">;
+    const { bytes: size, ...h } = JSON.parse(new TextDecoder().decode(bytes.subarray(8, 8 + len))) as Omit<CacheSnapshot, "data"> & { bytes: number };
     const data = bytes.subarray(8 + len);
-    if (!Array.isArray(h.tokens) || data.length !== h.layers * 2 * h.tokens.length * h.rowBytes) return undefined;
+    // The header records the data length, which a write cut short does not reach. Whether the data
+    // fits the model (layers, ring sizes) is for Engine.importCache to decide.
+    if (!Array.isArray(h.tokens) || data.length !== size) return undefined;
     return { ...h, data };
   } catch {
     return undefined;

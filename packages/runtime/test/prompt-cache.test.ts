@@ -51,6 +51,13 @@ describe("prompt cache", () => {
     expect(await loadPromptCache(name)).toEqual(snap);
   });
 
+  it("round-trips a snapshot whose layers hold different row counts (ring caches)", async () => {
+    const name = promptCacheName("org/ring", {});
+    const ring = { ...snap, tokens: [1, 2, 3, 4, 5], data: Uint8Array.from({ length: 2 * 4 * (5 + 2) }, (_, i) => i) };
+    await savePromptCache(name, ring);
+    expect(await loadPromptCache(name)).toEqual(ring);
+  });
+
   it("keys on everything that changes the cached values", () => {
     const base = promptCacheName("org/model", {});
     expect(promptCacheName("org/model", { revision: "main", quant: "q4" })).toBe(base);
