@@ -19,16 +19,17 @@ export interface MatmulShape {
   silu?: boolean;
 }
 
-/** The matmuls a Llama forward pass runs, for decode (mt 1) and prefill (mt 8). */
+/**
+ * The matmuls of a Llama forward pass that use the tunable kernel: prefill chunks below the GEMM's
+ * 64 rows (mt 8). One-token decode uses the GEMV, which has no lanes to tune.
+ */
 export function llamaMatmulShapes(cfg: LlamaConfig, wdtype: WeightDType): MatmulShape[] {
   const { hiddenSize: Hd, intermediateSize: I, numHeads: H, numKvHeads: Hkv, headDim: D } = cfg;
   const out: MatmulShape[] = [];
-  for (const mt of [1, 8] as const) {
-    if (cfg.qkNorm) out.push({ wdtype, mt, N: H * D, K: Hd }, { wdtype, mt, N: Hkv * D, K: Hd });
-    else out.push({ wdtype, mt, N: (H + 2 * Hkv) * D, K: Hd, norm: true });
-    out.push({ wdtype, mt, N: Hd, K: H * D }, { wdtype, mt, N: 2 * I, K: Hd, norm: true, silu: true }, { wdtype, mt, N: Hd, K: I });
-  }
-  out.push({ wdtype, mt: 1, N: cfg.vocabSize, K: Hd, norm: true });
+  const mt = 8;
+  if (cfg.qkNorm) out.push({ wdtype, mt, N: H * D, K: Hd }, { wdtype, mt, N: Hkv * D, K: Hd });
+  else out.push({ wdtype, mt, N: (H + 2 * Hkv) * D, K: Hd, norm: true });
+  out.push({ wdtype, mt, N: Hd, K: H * D }, { wdtype, mt, N: 2 * I, K: Hd, norm: true, silu: true }, { wdtype, mt, N: Hd, K: I });
   return out;
 }
 

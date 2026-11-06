@@ -182,8 +182,19 @@ How it got there, each step measured in one session with identical greedy output
   answer tokens as before and as the NumPy reference. On SmolLM2-135M (head dim 64, untouched
   attention) a 250-token prompt prefills in 516 against 670 ms with the GEMM off, with the same 40
   greedy tokens. The GEMM computes in f32 even with `f16Math`.
+- **Decode GEMV:** the general matmul gives each lane half of a q4 word per step (4 bytes shared by two
+  lanes, 4 multiply-adds), and ran at 6.5–8.5 GB/s. One-token matmuls now use a kernel where each lane
+  takes whole 32-element blocks: one 16-byte load and 32 multiply-adds for q4, 4 lanes per row,
+  neighbouring lanes on neighbouring blocks, and the x chunk staged transposed so those lanes read
+  consecutive vec4s of it. Gemma 3 1B q4, decode step at position 256 (GPU time): 99.1 → 55.9 ms
+  (gate/up 40.5 → 20.1, the 262144×1152 head 28.0 → 14.8, down 17.1 → 10.1). SmolLM2-135M q4,
+  alternating runs: 20.0 → 14.1 ms at position 256 and 25.2 → 19.9 ms at 1536, about 40 → 60 tok/s
+  at one step per submit with the page in the background. Greedy output is unchanged on both models,
+  and Gemma 1B q4 and q8 still match the NumPy reference token for token. `setGemv(false)` restores
+  the general kernel, which forced `lanes`, `f16Math` and subgroups still use.
 - **Autotuner:** on this GPU it picks 16 lanes per row for the 576×576 projections and 8 elsewhere; gains
   here are within noise. It exists for GPUs with more cores, where small N leaves most of them idle.
+  It tunes the general kernel, so with the GEMV it only matters for prefill and forced variants.
 - **Measured and not adopted:** f16 dot products in the matmul (`f16Math: true`) ran at 64–66 tok/s
   against 70–71 with f32 here, with the same greedy tokens. Memory and latency bound the matmuls on this
   GPU, not arithmetic. The option stays for GPUs where it helps.
@@ -214,13 +225,14 @@ On the M3, chaining steps barely matters (302 → 307 tok/s): submit and readbac
 whereas the Intel GPU gains 50% from it. The grammar costs more relative to the step (241 against
 302 tok/s), because a 3.4 ms step leaves little to hide the mask computation behind.
 
-Where the remaining time goes at position 256 on the Intel GPU: the 49152×576 LM head, gate/up and the projections run
-at about half the GPU's copy bandwidth (13.8 GB/s), and each of the 214 dispatches has about 11 µs of
-fixed cost.
+Where the remaining time goes at position 256 on the Intel GPU: the tables above predate the decode
+GEMV, which took the step from 20.0 to 14.1 ms; the matmuls now read at 11–15 GB/s, close to the GPU's
+copy bandwidth (13.8 GB/s, read plus write), and each of the 214 dispatches has about 11 µs of fixed
+cost.
 
 ## Status
 
-Verified on this GPU: all kernel checks pass (380, including q4 and q8 weights in every matmul variant and the prefill GEMM, both prefill attention kernels, fused variants, f16 cache paths,
+Verified on this GPU: all kernel checks pass (464, including q4 and q8 weights in every matmul variant, the decode GEMV and the prefill GEMM, both prefill attention kernels, fused variants, f16 cache paths,
 sliding-window attention, GELU gating, grammar masks and sampling distributions). SmolLM2-135M-Instruct chats from Hub safetensors (q4, f32) and from a GGUF
 Q4_K_M file.
 

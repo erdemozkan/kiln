@@ -16,6 +16,8 @@ import {
   embedSpec,
   gemmSpec,
   GEMM_TILE,
+  gemvRowsPerGroup,
+  gemvSpec,
   kvWriteSpec,
   matmulRowsPerGroup,
   matmulSpec,
@@ -84,6 +86,12 @@ export function setGemmMinRows(rows: number): void {
   gemmMinRows = rows;
 }
 
+let gemvOn = true;
+/** Use the block-per-lane GEMV for one-token matmuls (default), or the general kernel. */
+export function setGemv(on: boolean): void {
+  gemvOn = on;
+}
+
 let subgroupsDefault = false;
 /** Use subgroup reductions in matmuls from now on, where the device supports them. */
 export function setSubgroups(on: boolean): void {
@@ -135,6 +143,16 @@ export function linear(ctx: Ctx, x: Tensor, w: Tensor, opts: LinearOptions | Ten
     return y;
   }
   const epi: MatmulEpilogue = o.gelu ? "gelu" : o.silu ? "silu" : o.residual ? "add" : "store";
+  if (M === 1 && gemvOn && !o.lanes && !f16 && !(o.subgroups ?? subgroupsDefault)) {
+    const groups = Math.ceil(outN / gemvRowsPerGroup(epi));
+    const grid: Grid = [Math.min(groups, MM_SLICE), 1, Math.ceil(groups / MM_SLICE)];
+    const bufs = [ctx.uniform([u32(M), u32(N), u32(K), f32(o.norm?.eps ?? 0)]), x.buf, ...weightBufs(w)];
+    if (o.norm) bufs.push(o.norm.w.buf);
+    if (o.bias) bufs.push(o.bias.buf);
+    bufs.push(y.buf);
+    ctx.run(gemvSpec({ wdtype, norm: !!o.norm, bias: !!o.bias, epi }), bufs, grid, `gemv/${wdtype} ${N}x${K}${o.norm ? "+norm" : ""}${gated ? `+${epi}` : ""}${o.residual ? "+add" : ""}`);
+    return y;
+  }
   const lanes = o.lanes ?? tunedLanes.get(lanesKey(wdtype, mt, N, K)) ?? 8;
   if (f16 && !ctx.backend.limits.features.has("shader-f16")) throw new Error("linear: f16 math needs the shader-f16 feature");
   // The butterfly needs each row's lanes inside one subgroup.

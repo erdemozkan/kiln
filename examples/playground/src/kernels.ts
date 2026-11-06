@@ -128,6 +128,41 @@ async function main() {
     }
   }
 
+  // Decode GEMV (one token): every weight format, prologue and epilogue; K past one staged chunk
+  // (2048) and ragged in the last one, N ragged against the 64 rows of a workgroup.
+  for (const [N, K] of [[70, 96], [1000, 640], [66, 2304], [130, 4128]] as const) {
+    for (const wd of ["f32", "q4", "q8"] as const) {
+      const x = randn(K);
+      const w = randn(N * K);
+      const nw = randn(K);
+      const deq = asStored(wd, w);
+      const tag = `${wd} N${N} K${K}`;
+      const tol = 1e-3 * Math.sqrt(K);
+      const plain = ref.matmulRef(x, deq, 1, N, K);
+      const normed = ref.matmulRef(ref.rmsnormRef(x, nw, K, 1e-5), deq, 1, N, K);
+      const norm = () => ({ w: upload(nw, [K]), eps: 1e-5 });
+      let y!: Tensor;
+      await run(S0, (ctx) => (y = ops.linear(ctx, upload(x, [1, K]), uploadW(wd, w, [N, K]))));
+      check("gemv", tag, await download(y.buf, N), plain, tol);
+      await run(S0, (ctx) => (y = ops.linear(ctx, upload(x, [1, K]), uploadW(wd, w, [N, K]), { norm: norm() })));
+      check("gemv+norm", tag, await download(y.buf, N), normed, tol);
+      const res = randn(N);
+      const bias = randn(N);
+      const rt = upload(res, [1, N]);
+      await run(S0, (ctx) => ops.linear(ctx, upload(x, [1, K]), uploadW(wd, w, [N, K]), { residual: rt, bias: upload(bias, [N]) }));
+      check("gemv+bias+add", tag, await download(rt.buf, N), res.map((r, j) => r + plain[j]! + bias[j]!), tol);
+      const I = N / 2;
+      for (const act of ["silu", "gelu"] as const) {
+        const f = (g: number) => (act === "gelu" ? ref.geluTanh(g) : g / (1 + Math.exp(-g)));
+        const gb = randn(N);
+        await run(S0, (ctx) => (y = ops.linear(ctx, upload(x, [1, K]), uploadW(wd, w, [N, K]), { [act]: true, norm: norm() })));
+        check(`gemv+norm+${act}`, tag, await download(y.buf, I), Float32Array.from({ length: I }, (_, i) => f(normed[i]!) * normed[I + i]!), 2 * tol);
+        await run(S0, (ctx) => (y = ops.linear(ctx, upload(x, [1, K]), uploadW(wd, w, [N, K]), { [act]: true, bias: upload(gb, [N]) })));
+        check(`gemv+bias+${act}`, tag, await download(y.buf, I), Float32Array.from({ length: I }, (_, i) => f(plain[i]! + gb[i]!) * (plain[I + i]! + gb[I + i]!)), 2 * tol);
+      }
+    }
+  }
+
   // Fused matmul variants: every lanes setting, with norm prologue, SiLU gating, residual add and bias.
   for (const lanes of [8, 16, 32] as const) {
     for (const [M, I, K] of [[1, 40, 96], [5, 24, 256], [19, 70, 576]] as const) {
