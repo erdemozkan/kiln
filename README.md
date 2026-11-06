@@ -262,6 +262,14 @@ On the M3, chaining steps barely matters (302 → 307 tok/s): submit and readbac
 whereas the Intel GPU gains 50% from it. The grammar costs more relative to the step (241 against
 302 tok/s), because a 3.4 ms step leaves little to hide the mask computation behind.
 
+Gemma 3 4B Q4_0 on the M3 (commit 04c4c1a, one run, 520 kernel checks passing with the subgroup
+variants): loads from the cache in 2.4 s (about 10 s on the Intel GPU), prefills a 2,005-token prompt
+in 11.2 s (about 179 tok/s, against about 17 on the Intel GPU), decodes at 24.6 tok/s (about 5.5),
+and answers the long-range question correctly. The rows-per-thread GEMV (5afb94c) was A/B tested
+there in alternating runs: identical output, SmolLM2 faster in every pair (378 against 336 tok/s,
+best of three), Gemma 4B faster in two of three pairs. The machine was swapping heavily, which
+halved the 4B numbers partway through, so only adjacent runs compare.
+
 Where the remaining time goes at position 256 on the Intel GPU: the tables above predate the decode
 GEMV, which took the step from 20.0 to 14.1 ms; the matmuls now read at 11–15 GB/s, close to the GPU's
 copy bandwidth (13.8 GB/s, read plus write), and each of the 214 dispatches has about 11 µs of fixed
