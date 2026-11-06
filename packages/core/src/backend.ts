@@ -44,6 +44,8 @@ export interface DeviceLimits {
   readonly features: ReadonlySet<string>;
   /** Smallest subgroup size the device may use (0 without the `subgroups` feature). */
   readonly subgroupMinSize?: number;
+  /** Workgroup memory a kernel may use, in bytes (WebGPU guarantees 16384). */
+  readonly maxWorkgroupStorage?: number;
 }
 
 export type BufUsage = "storage" | "uniform";

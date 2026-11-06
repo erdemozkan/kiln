@@ -258,8 +258,8 @@ export function attention(ctx: Ctx, q: Tensor, kc: Buf, vc: Buf, s: AttentionSha
     return out;
   }
   if (prefillAttention === "tiled") {
-    const { R } = attentionTile(s.D);
-    ctx.run(attentionTiledSpec(s.kv ?? "f32", s.D), [params, ctx.step, q.buf, kc, vc, out.buf], [s.Hkv, Math.ceil((s.T * (s.H / s.Hkv)) / R), 1]);
+    const tile = attentionTile(s.D, ctx.backend.limits.maxWorkgroupStorage);
+    ctx.run(attentionTiledSpec(s.kv ?? "f32", s.D, tile), [params, ctx.step, q.buf, kc, vc, out.buf], [s.Hkv, Math.ceil((s.T * (s.H / s.Hkv)) / tile.R), 1]);
     return out;
   }
   ctx.run(attentionSpec(s.kv), [params, ctx.step, q.buf, kc, vc, out.buf], [s.H, s.T, 1]);

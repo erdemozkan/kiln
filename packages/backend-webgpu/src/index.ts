@@ -57,6 +57,7 @@ export async function createWebGPUBackend(opts: WebGPUOptions = {}): Promise<Web
       maxBufferSize: adapter.limits.maxBufferSize,
       maxStorageBufferBindingSize: adapter.limits.maxStorageBufferBindingSize,
       maxStorageBuffersPerShaderStage: adapter.limits.maxStorageBuffersPerShaderStage,
+      maxComputeWorkgroupStorageSize: adapter.limits.maxComputeWorkgroupStorageSize,
     },
   });
   const info = (adapter as GPUAdapter & { info?: GPUAdapterInfo & { subgroupMinSize?: number } }).info;
@@ -86,6 +87,7 @@ export class WebGPUBackend implements Backend {
       maxComputeWorkgroupsPerDimension: device.limits.maxComputeWorkgroupsPerDimension,
       features: new Set(device.features as unknown as Iterable<string>),
       subgroupMinSize,
+      maxWorkgroupStorage: device.limits.maxComputeWorkgroupStorageSize,
     };
     device.lost.then((info) => {
       this.lostReason = `${info.reason}: ${info.message}`;

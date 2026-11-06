@@ -226,6 +226,13 @@ How it got there, each step measured in one session with identical greedy output
   qkv 50 → 22), about 120 GFLOP/s. In a sweep of tile and block shapes, 64 × 128 tiles, 8 × 8 or
   16 × 4 blocks, and 256 threads were all slower. The 1,138-token prompt prefills in 65.6 against
   106 s, with the same answer tokens ("BLUE HERON"). Attention is now about 20% of a prefill chunk.
+- **Attention tiles for head dim 256.** Tiled prefill attention held 4 query rows and 8 keys per
+  tile at head dim 256, one output vec4 per thread. Threads can now own several output rows (each
+  with its own running max and sum), and Gemma's heads take 8 rows of 4 keys: 29-31 against 35-42 ms
+  for a 128-token chunk at position 1024. Larger tiles (16 or 32 rows, 8 or 16 keys) were slower, so
+  re-reading K/V per tile was not the cost. Gemma 3 4B, 1,518-token prompt: 86.2 against 91.6 s,
+  same tokens. Tiles size themselves to the device's workgroup memory, which is now requested in
+  full.
 - **Decode GEMV:** the general matmul gives each lane half of a q4 word per step (4 bytes shared by two
   lanes, 4 multiply-adds), and ran at 6.5–8.5 GB/s. One-token matmuls now use a kernel where each lane
   takes whole 32-element blocks: one 16-byte load and 32 multiply-adds for q4, 4 lanes per row,

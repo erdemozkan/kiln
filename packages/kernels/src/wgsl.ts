@@ -806,13 +806,42 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
 }`);
 }
 
-/** Query rows and keys per workgroup tile in tiled prefill attention, sized to fit workgroup memory. */
-export function attentionTile(D: number): { R: number; BK: number; TPP: number } {
+export interface AttentionTile {
+  /** Query rows per tile. */
+  R: number;
+  /** Keys per block. */
+  BK: number;
+  /** Threads per (row, key) dot product. */
+  TPP: number;
+}
+
+let tileOverride: { R: number; BK: number } | undefined;
+/** Forces the tiled attention's rows and keys per tile (for measurements); undefined restores the rule. */
+export function setAttentionTile(t: { R: number; BK: number } | undefined): void {
+  tileOverride = t;
+}
+
+/** Workgroup memory the tiled attention needs for a tile of R rows and BK keys. */
+export function attentionTileBytes(D: number, R: number, BK: number): number {
+  const tpp = Math.max(1, Math.floor(256 / (R * BK)));
+  return 16 * R * (D / 4) + 16 * BK * (D / 4 + 1) + 4 * R * BK + (tpp > 1 ? 1024 : 0);
+}
+
+/**
+ * Query rows and keys per workgroup tile in tiled prefill attention, sized to fit workgroup memory.
+ * Head dim 256 (Gemma 3) takes 8 rows of 4 keys, two output rows per thread: on Gemma 3 4B's shapes
+ * (128-token chunk at position 1024, Intel Gen9) 29-31 ms against 35-42 for 4 rows of 8 keys, where
+ * more rows (16, 32) or more keys per block (8, 16) were slower and fewer keys (2) too.
+ */
+export function attentionTile(D: number, wgBytes = 16384): AttentionTile {
   const tpp = (R: number, BK: number) => Math.max(1, Math.floor(256 / (R * BK)));
-  const bytes = (R: number, BK: number) => 16 * R * (D / 4) + 16 * BK * (D / 4 + 1) + 4 * R * BK + (tpp(R, BK) > 1 ? 1024 : 0);
-  const BK = Math.min(64, Math.floor(2048 / D));
-  let R = Math.min(32, Math.floor(1024 / D));
-  while (R > 1 && bytes(R, BK) > 16384 - 256) R = Math.floor(R / 2);
+  if (tileOverride) {
+    if (attentionTileBytes(D, tileOverride.R, tileOverride.BK) > wgBytes - 256) throw new Error(`attention tile ${tileOverride.R}x${tileOverride.BK} does not fit ${wgBytes} bytes of workgroup memory`);
+    return { ...tileOverride, TPP: tpp(tileOverride.R, tileOverride.BK) };
+  }
+  const BK = D >= 256 ? 4 : Math.min(64, Math.floor(2048 / D));
+  let R = D >= 256 ? 8 : Math.min(32, Math.floor(1024 / D));
+  while (R > 1 && attentionTileBytes(D, R, BK) > wgBytes - 256) R = Math.floor(R / 2);
   return { R, BK, TPP: tpp(R, BK) };
 }
 
@@ -828,8 +857,10 @@ export function attentionTile(D: number): { R: number; BK: number; TPP: number }
  * four output columns as a vec4 and folds the online softmax into its pass over the block (block max,
  * rescale, exp, exp-sum), so the row statistics live in registers and need no extra barrier.
  */
-export function attentionTiledSpec(kv: KvDtype, D: number): KernelSpec {
-  const { R, BK, TPP: TPP_ } = attentionTile(D);
+export function attentionTiledSpec(kv: KvDtype, D: number, tile: AttentionTile = attentionTile(D)): KernelSpec {
+  const { R, BK, TPP: TPP_ } = tile;
+  // Output slots (row, vec4 column) per thread: one while R * D / 4 fits 256 threads, more beyond.
+  const ORR = Math.ceil((R * (D / 4)) / 256);
   const split = TPP_ > 1;
   const D4 = D / 4;
   const KP = D4 + 1; // padded row stride (vec4) of the key/value tile, so rows start in different banks
@@ -838,7 +869,7 @@ export function attentionTiledSpec(kv: KvDtype, D: number): KernelSpec {
     kv === "f16"
       ? { kDecl: "array<vec2<u32>>", vDecl: "array<vec2<u32>>", k: "kv4(kc[i])", v: "kv4(vc[i])" }
       : { kDecl: "array<vec4<f32>>", vDecl: "array<vec4<f32>>", k: "kc[i]", v: "vc[i]" };
-  return spec(`attention/tiled/${kv}/D${D}`, ["uniform", "read", "read", "read", "read", "rw"], () => /* wgsl */ `
+  return spec(`attention/tiled/${kv}/D${D}/R${R}/BK${BK}`, ["uniform", "read", "read", "read", "read", "rw"], () => /* wgsl */ `
 ${STEP_WGSL}
 ${kv === "f16" ? KV4_FN : ""}
 ${ATTN_P("_a")}
@@ -890,12 +921,12 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
   let slo = firstKey(sn, p.win);
   // The tile's first row sees the earliest keys (rows are ordered by position).
   let lo = firstKey(min(st.pos0 + r0 / G + 1u, p.maxSeq), p.win);
-  // Output role: row orow, columns 4 * od .. 4 * od + 3.
-  let orow = li / D4;
-  let od = li % D4;
-  var m = -3.0e38;
-  var l = 0.0;
-  var acc = vec4<f32>(0.0);
+  // Output role: slots e = li + 256 k, each row e / D4, columns 4 * (e % D4) .. + 3, with its own
+  // running max and exp-sum.
+  var m: array<f32, ${ORR}>;
+  var l: array<f32, ${ORR}>;
+  var acc: array<vec4<f32>, ${ORR}>;
+  for (var k = 0u; k < ${ORR}u; k++) { m[k] = -3.0e38; }
   workgroupBarrier();
 
   for (var b0 = lo; b0 < nMax; b0 += BK) {
@@ -949,32 +980,41 @@ ${split
       tile[(e / D4) * KP + e % D4] = v;
     }
     workgroupBarrier();
-    if (orow < R) {
-      var mx = m;
-      for (var jj = 0u; jj < BK; jj++) { mx = max(mx, sc[orow * BK + jj]); }
-      let corr = exp(m - mx);
-      m = mx;
-      var bl = 0.0;
-      var ba = vec4<f32>(0.0);
-      for (var jj = 0u; jj < BK; jj++) {
-        let e = exp(sc[orow * BK + jj] - mx);
-        bl += e;
-        ba += e * tile[jj * KP + od];
+    for (var k = 0u; k < ${ORR}u; k++) {
+      let slot = li + k * 256u;
+      if (slot < R * D4) {
+        let orow = slot / D4;
+        let od = slot % D4;
+        var mx = m[k];
+        for (var jj = 0u; jj < BK; jj++) { mx = max(mx, sc[orow * BK + jj]); }
+        let corr = exp(m[k] - mx);
+        m[k] = mx;
+        var bl = 0.0;
+        var ba = vec4<f32>(0.0);
+        for (var jj = 0u; jj < BK; jj++) {
+          let e = exp(sc[orow * BK + jj] - mx);
+          bl += e;
+          ba += e * tile[jj * KP + od];
+        }
+        l[k] = l[k] * corr + bl;
+        acc[k] = acc[k] * corr + ba;
       }
-      l = l * corr + bl;
-      acc = acc * corr + ba;
     }
     workgroupBarrier();
   }
 
-  let rho = r0 + orow;
-  if (orow < R && rho < rows) {
-    let ob = ((rho / G) * p.H + kvh * G + rho % G) * D + od * 4u;
-    let v = acc / l;
-    o[ob] = v.x;
-    o[ob + 1u] = v.y;
-    o[ob + 2u] = v.z;
-    o[ob + 3u] = v.w;
+  for (var k = 0u; k < ${ORR}u; k++) {
+    let slot = li + k * 256u;
+    let orow = slot / D4;
+    let rho = r0 + orow;
+    if (slot < R * D4 && rho < rows) {
+      let ob = ((rho / G) * p.H + kvh * G + rho % G) * D + (slot % D4) * 4u;
+      let v = acc[k] / l[k];
+      o[ob] = v.x;
+      o[ob + 1u] = v.y;
+      o[ob + 2u] = v.z;
+      o[ob + 3u] = v.w;
+    }
   }
 }`);
 }
