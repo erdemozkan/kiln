@@ -105,6 +105,7 @@ export class CachedHttpSource implements ByteSource {
     private readonly handle: SyncHandle,
     private readonly total: number,
     private readonly saveMeta: (meta: Meta) => Promise<void>,
+    private readonly retryMs: number,
   ) {}
 
   /**
@@ -114,7 +115,7 @@ export class CachedHttpSource implements ByteSource {
   static async open(
     url: string,
     key: string,
-    { fresh = false, segment = SEGMENT }: { fresh?: boolean; segment?: number } = {},
+    { fresh = false, segment = SEGMENT, retryMs = 1000 }: { fresh?: boolean; segment?: number; retryMs?: number } = {},
   ): Promise<ByteSource> {
     if (!opfsAvailable()) return new HttpSource(url);
     const root = await navigator.storage.getDirectory();
@@ -138,7 +139,7 @@ export class CachedHttpSource implements ByteSource {
     // A file cached before segments existed is one oversized segment; its bytes are re-downloaded.
     if (parts[0]!.getSize() > segment) parts[0]!.truncate(0);
     const handle = new Segments(parts, segment);
-    const src = new CachedHttpSource(key, handle, total, (m) => writeMeta(dir, fileName, m));
+    const src = new CachedHttpSource(key, handle, total, (m) => writeMeta(dir, fileName, m), retryMs);
     const onDisk = Math.min(handle.getSize(), total);
     if (meta?.complete && onDisk === total) {
       src.have = total;
@@ -202,45 +203,78 @@ export class CachedHttpSource implements ByteSource {
     return this.have;
   }
 
+  /**
+   * Downloads the rest of the file. A dropped connection or a server error (5xx, 429) is retried from
+   * the bytes already written, after 1, 2, 4, ... seconds; the count resets whenever a retry makes
+   * progress, so a slow, flaky link still finishes. Other failures end the download.
+   */
   private async download(url: string): Promise<void> {
-    try {
-      const res = await fetch(url, { headers: { Range: `bytes=${this.have}-` } });
-      if (res.status === 200 && this.have > 0) this.have = 0; // server ignored Range: restart
-      else if (res.status !== 206 && res.status !== 200) throw new Error(`${url}: HTTP ${res.status}`);
-      const total = parseContentRangeTotal(res.headers.get("Content-Range"));
-      if (total !== undefined && total !== this.total) throw new Error(`${url}: size changed (${this.total} → ${total})`);
-      const reader = res.body!.getReader();
-      let flushed = this.have;
-      for (;;) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        // Same failure reporting as reads: a short or wrapped count means the bytes did not land.
-        const n = this.handle.write(value, { at: this.have });
-        if (n !== value.byteLength) {
-          await reader.cancel().catch(() => undefined);
-          await this.stopCaching(url, `cache write of ${value.byteLength} bytes at ${this.have} returned ${n}`);
-          return;
+    let failures = 0;
+    for (;;) {
+      const before = this.have;
+      try {
+        if ((await this.fetchRest(url)) !== "retry") break;
+      } catch (err) {
+        const e = err instanceof Error ? err : new Error(String(err));
+        if (!(e instanceof RetryableError) && e.name !== "TypeError") {
+          this.failure = e;
+          break;
         }
-        this.have += value.byteLength;
-        // The last chunk wakes readers only after completion is recorded: the final reader's caller
-        // may close the handle right away, and then the file would never be marked complete.
-        if (this.have >= this.total) continue;
-        this.wake();
-        if (this.have - flushed >= FLUSH_EVERY) {
-          // Data first, then the watermark, so the metadata never points past durable bytes.
-          this.handle.flush();
-          flushed = this.have;
-          await this.saveMeta({ size: this.total, complete: false, flushed });
+        if (this.have > before) failures = 0;
+        if (++failures > MAX_RETRIES || this.closed) {
+          this.failure = e;
+          break;
         }
+        console.warn(`[kiln] ${this.name}: ${e.message}; retrying from byte ${this.have}`);
+        await new Promise((r) => setTimeout(r, this.retryMs * 2 ** (failures - 1)));
+        if (this.closed) break;
+        continue;
       }
-      if (this.have !== this.total) throw new Error(`${url}: download ended at ${this.have} of ${this.total} bytes`);
-      this.handle.flush();
-      this.complete = true;
-      await this.saveMeta({ size: this.total, complete: true, flushed: this.total });
-    } catch (err) {
-      this.failure = err instanceof Error ? err : new Error(String(err));
     }
     this.wake();
+  }
+
+  /** One request for the bytes after `have`. Returns once the file is complete or caching stopped. */
+  private async fetchRest(url: string): Promise<"done" | "retry"> {
+    const res = await fetch(url, { headers: { Range: `bytes=${this.have}-` } });
+    if (res.status === 200 && this.have > 0) this.have = 0; // server ignored Range: restart
+    else if (res.status >= 500 || res.status === 429) throw new RetryableError(`${url}: HTTP ${res.status}`);
+    else if (res.status !== 206 && res.status !== 200) throw new Error(`${url}: HTTP ${res.status}`);
+    const total = parseContentRangeTotal(res.headers.get("Content-Range"));
+    if (total !== undefined && total !== this.total) throw new Error(`${url}: size changed (${this.total} → ${total})`);
+    const reader = res.body!.getReader();
+    let flushed = this.have;
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (this.closed) {
+        await reader.cancel().catch(() => undefined);
+        return "done";
+      }
+      // Same failure reporting as reads: a short or wrapped count means the bytes did not land.
+      const n = this.handle.write(value, { at: this.have });
+      if (n !== value.byteLength) {
+        await reader.cancel().catch(() => undefined);
+        await this.stopCaching(url, `cache write of ${value.byteLength} bytes at ${this.have} returned ${n}`);
+        return "done";
+      }
+      this.have += value.byteLength;
+      // The last chunk wakes readers only after completion is recorded: the final reader's caller
+      // may close the handle right away, and then the file would never be marked complete.
+      if (this.have >= this.total) continue;
+      this.wake();
+      if (this.have - flushed >= FLUSH_EVERY) {
+        // Data first, then the watermark, so the metadata never points past durable bytes.
+        this.handle.flush();
+        flushed = this.have;
+        await this.saveMeta({ size: this.total, complete: false, flushed });
+      }
+    }
+    if (this.have !== this.total) throw new RetryableError(`${url}: download ended at ${this.have} of ${this.total} bytes`);
+    this.handle.flush();
+    this.complete = true;
+    await this.saveMeta({ size: this.total, complete: true, flushed: this.total });
+    return "done";
   }
 
   /**
@@ -266,6 +300,12 @@ export class CachedHttpSource implements ByteSource {
     for (const r of w) r();
   }
 }
+
+/** A download failure worth retrying: a server error or a body that ended early. */
+class RetryableError extends Error {}
+
+/** Consecutive failed attempts (without progress) before a download gives up. */
+const MAX_RETRIES = 5;
 
 /** The cached bytes are inconsistent with their metadata; opening with `fresh` downloads them again. */
 export class CorruptCacheError extends Error {

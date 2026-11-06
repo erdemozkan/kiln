@@ -226,6 +226,42 @@ describe("CachedHttpSource", () => {
     });
   });
 
+  it("retries a dropped connection and a server error from the bytes already written", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    let calls = 0;
+    vi.stubGlobal("fetch", async (url: string, init?: { headers?: Record<string, string> }) => {
+      calls++;
+      const res = await fakeFetch(url, init);
+      if (calls === 3) return { ...res, status: 503 };
+      if (calls !== 2) return res;
+      // The first download request dies after two chunks, the way a dropped connection does.
+      const reader = res.body.getReader();
+      let n = 0;
+      return {
+        ...res,
+        body: { getReader: () => ({ read: async () => (n++ < 2 ? reader.read() : Promise.reject(new TypeError("network error"))), cancel: reader.cancel }) },
+      };
+    });
+    const src = await CachedHttpSource.open("u", KEY, { retryMs: 1 });
+    expect(await readAll(src)).toEqual(BODY);
+    expect(requests).toEqual(["bytes=0-0", "bytes=0-", "bytes=128-", "bytes=128-"]);
+    expect(getMeta()).toMatchObject({ complete: true });
+    warn.mockRestore();
+  });
+
+  it("gives up after repeated failures without progress", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    vi.stubGlobal("fetch", async (url: string, init?: { headers?: Record<string, string> }) => {
+      const res = await fakeFetch(url, init);
+      return init?.headers?.Range === "bytes=0-0" ? res : { ...res, status: 502 };
+    });
+    const src = await CachedHttpSource.open("u", KEY, { retryMs: 1 });
+    await expect(src.read(0, 8)).rejects.toThrow(/HTTP 502/);
+    expect(requests.length).toBe(1 + 6);
+    src.close?.();
+    warn.mockRestore();
+  });
+
   it("closing twice is harmless", async () => {
     const src = await CachedHttpSource.open("u", KEY);
     await readAll(src);
