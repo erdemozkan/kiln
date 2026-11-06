@@ -157,6 +157,15 @@ describe("conversion", () => {
     expect((one.bytes[0]! >> 8) & 0xff).toBe(64); // round(63.5)
   });
 
+  it("q8 rounds exact ties away from zero", () => {
+    // amax 127/128 makes d = 1/128 exactly, so x = (k + 0.5) / 128 is a tie.
+    const x = new Float32Array(32);
+    x.set([127, 2.5, -2.5, 0.5, -0.5, 126.5, 3.4999].map((v) => v / 128));
+    const p = quantizeQ8(x);
+    expect(p.scales[0]).toBe(1 / 128);
+    expect([...new Int8Array(p.bytes.buffer).subarray(0, 7)]).toEqual([127, 3, -3, 1, -1, 127, 3]);
+  });
+
   it("repacks GGUF Q8_0 blocks exactly", () => {
     const blocks = new Uint8Array(68);
     const dv = new DataView(blocks.buffer);

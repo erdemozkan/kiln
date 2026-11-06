@@ -1,6 +1,6 @@
 import { createWebGPUBackend, type WebGPUBackend } from "@kiln/backend-webgpu";
 import { Ctx, packStep, type Buf, type StepParams, type Tensor } from "@kiln/core";
-import { ops, ref } from "@kiln/kernels";
+import { gpuConverts, ops, ref } from "@kiln/kernels";
 import { dequantQ4, dequantQ8, f16ToF32, MemorySource, quantizeQ4, quantizeQ8, rowBytes, type SrcType } from "@kiln/loader";
 import { loadWeights, setGpuConvert } from "@kiln/runtime";
 
@@ -605,7 +605,7 @@ async function main() {
     }
   }
 
-  // Load-time conversion to q4 on the GPU, bit for bit against the CPU converters, over two 8 MB chunks
+  // Load-time conversion to q4 and q8 on the GPU, bit for bit against the CPU converters, over two 8 MB chunks
   // each so the second chunk's offsets are exercised. Scales cover negative, subnormal and zero f16.
   // Float sources mix random values with blocks on a small integer grid, whose codes land exactly on
   // the x / d + 8.5 ties, and all-zero blocks.
@@ -622,8 +622,13 @@ async function main() {
       for (let b = 0; b < vals.length / 32; b++) {
         const grid = b % 3 === 0;
         // Power-of-two grid steps keep the grid exact in f16 and bf16.
-        const s = grid ? 2 ** -(5 + (b % 6)) : (b % 7 === 0 ? 1e-3 : 1) * (0.01 + rand() * 0.05);
+        const s = grid || b % 3 === 1 ? 2 ** -(5 + (b % 6)) : (b % 7 === 0 ? 1e-3 : 1) * (0.01 + rand() * 0.05);
         for (let l = 0; l < 32; l++) vals[b * 32 + l] = b % 101 === 0 ? 0 : grid ? s * (Math.floor(rand() * 33) - 16) : (rand() - 0.5) * s;
+        // q8 ties: amax 127·s makes d = s exactly, and half-steps of s land on x / d = k + 0.5.
+        if (b % 3 === 1) {
+          for (let l = 0; l < 32; l++) vals[b * 32 + l] = (s * (Math.floor(rand() * 509) - 254)) / 2;
+          vals[b * 32 + (b % 32)] = (b % 2 ? -127 : 127) * s;
+        }
       }
       if (type === "F32") bytes.set(new Uint8Array(vals.buffer));
       else {
@@ -639,23 +644,27 @@ async function main() {
       bytes[o + 1] = h >> 8;
     }
     const files = [{ name: "check", source: new MemorySource(bytes, "check"), tensors: [{ name: "w.weight", shape: [rows, cols], type, offset: 0, byteLength: bytes.length }] }];
-    const planes = async (gpu: boolean) => {
-      setGpuConvert(gpu);
-      const t = (await loadWeights(be, files, "q4")).get("w.weight")!;
-      return [new Uint32Array(await be.readback(t.buf, 0, t.buf.size)), new Float32Array(await be.readback(t.scales!, 0, t.scales!.size))] as const;
-    };
-    const [gn, gs] = await planes(true);
-    const [cn, cs] = await planes(false);
-    setGpuConvert(true);
-    let codes = 0;
-    for (let e = 0; e < cn.length * 8; e++) {
-      const a = (gn[e >> 3]! >>> ((e & 7) * 4)) & 15;
-      const c = (cn[e >> 3]! >>> ((e & 7) * 4)) & 15;
-      if (a !== c) codes++;
+    for (const out of ["q4", "q8"] as const) {
+      if (!gpuConverts(type, out)) continue;
+      const planes = async (gpu: boolean) => {
+        setGpuConvert(gpu);
+        const t = (await loadWeights(be, files, out)).get("w.weight")!;
+        return [new Uint32Array(await be.readback(t.buf, 0, t.buf.size)), new Float32Array(await be.readback(t.scales!, 0, t.scales!.size))] as const;
+      };
+      const [gn, gs] = await planes(true);
+      const [cn, cs] = await planes(false);
+      setGpuConvert(true);
+      // Codes compared as whole words: 8 nibbles (q4) or 4 bytes (q8) each.
+      const per = out === "q4" ? 8 : 4;
+      let codes = 0;
+      for (let w = 0; w < cn.length; w++) {
+        if (gn[w] === cn[w]) continue;
+        for (let e = 0; e < per; e++) if (((gn[w]! >>> (e * (32 / per))) ^ (cn[w]! >>> (e * (32 / per)))) & (per === 8 ? 15 : 255)) codes++;
+      }
+      const scaleDiffs = gs.reduce((n, v, i) => n + (Object.is(v, cs[i]) ? 0 : 1), 0);
+      const pass = scaleDiffs === 0 && codes === 0 && gn.length === cn.length;
+      results.push({ kernel: `convert/${type}/${out}`, case: `${rows}x${cols}, 2 chunks`, error: codes, tol: 0, pass, note: `${codes} of ${cn.length * per} codes differ, ${scaleDiffs} scales` });
     }
-    const scaleDiffs = gs.reduce((n, v, i) => n + (Object.is(v, cs[i]) ? 0 : 1), 0);
-    const pass = scaleDiffs === 0 && codes === 0 && gn.length === cn.length;
-    results.push({ kernel: `convert/${type}`, case: `${rows}x${cols}, 2 chunks`, error: codes, tol: 0, pass, note: `${codes} of ${cn.length * 8} codes differ, ${scaleDiffs} scales` });
   }
 
   render(results, be);

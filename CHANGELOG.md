@@ -18,7 +18,8 @@ prompt lookup) on by default, also under a grammar.
 **Loading.** Weights stream into GPU buffers without holding the model in CPU memory. The download is
 the cache: files land in OPFS as 1 GiB segments, interrupted downloads resume, dropped connections
 retry, and `listCache` / `clearCache` manage it. `load` asks the browser to keep the cache
-(`navigator.storage.persist()`); `info.persistent` gives the answer. Conversion to q4 runs on the GPU for F32/F16/BF16 safetensors and every GGUF block type Kiln reads. The
+(`navigator.storage.persist()`); `info.persistent` gives the answer. Conversion to q4 and q8 runs on the GPU for F32/F16/BF16 safetensors and every GGUF block type
+Kiln reads, with the CPU converter's exact bits. The
 last prompt's K/V survives page reloads.
 
 **Context.** The default context is the model's trained context, up to 8192 tokens and 512 MiB of
@@ -31,6 +32,6 @@ load in 2.4 s. Decode uses a block-per-lane GEMV with several rows per thread on
 prefill a tiled GEMM and tiled attention, and GPU work is cut into short submits so the page stays
 responsive.
 
-**Checks.** 120 unit tests; a kernel check page (538 checks on GPUs without subgroups, more with
+**Checks.** 121 unit tests; a kernel check page (547 checks on GPUs without subgroups, more with
 them) compares every kernel with a CPU reference; Gemma 3 1B matches a NumPy reference token for
 token in q8 and q4.

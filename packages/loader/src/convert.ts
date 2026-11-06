@@ -265,7 +265,11 @@ export interface Q8Planes {
   scales: Float32Array;
 }
 
-/** Same rounding as llama.cpp Q8_0: d = amax / 127, q = round(x / d). */
+/**
+ * llama.cpp's Q8_0 rule, rounded exactly: d = amax / 127 (as an f32), q = x / d rounded to nearest
+ * with ties away from zero. The tie is decided by (2k - 1)·d against 2|x|, both exact in double, not
+ * by a rounded quotient, so the GPU converter can give the same bits.
+ */
 export function quantizeQ8(x: Float32Array): Q8Planes {
   if (x.length % 32 !== 0) throw new Error(`quantizeQ8: length ${x.length} is not a multiple of 32`);
   const bytes = new Uint32Array(x.length / 4);
@@ -274,10 +278,17 @@ export function quantizeQ8(x: Float32Array): Q8Planes {
   for (let b = 0; b < scales.length; b++) {
     let amax = 0;
     for (let j = 0; j < 32; j++) amax = Math.max(amax, Math.abs(x[b * 32 + j]!));
-    const d = amax / 127;
-    const id = d ? 1 / d : 0;
+    const d = Math.fround(amax / 127);
     scales[b] = d;
-    for (let j = 0; j < 32; j++) q[b * 32 + j] = Math.round(x[b * 32 + j]! * id);
+    if (!d) continue;
+    for (let j = 0; j < 32; j++) {
+      const v = x[b * 32 + j]!;
+      const a = Math.abs(v);
+      let k = Math.min(127, Math.round(a / d));
+      if (k < 127 && (2 * k + 1) * d <= 2 * a) k++;
+      else if ((2 * k - 1) * d > 2 * a) k--;
+      q[b * 32 + j] = v < 0 ? -k : k;
+    }
   }
   return { bytes, scales };
 }
