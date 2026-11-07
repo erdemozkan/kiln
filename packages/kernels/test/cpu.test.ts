@@ -139,3 +139,13 @@ describe("WasmHeap", () => {
     expect([...(small as unknown as { f32: Float32Array }).f32]).toEqual([1, 2, 3, 4]);
   });
 });
+
+describe("attentionTile", () => {
+  it("takes a preferred tile only when it fits workgroup memory", async () => {
+    const { attentionTile } = await import("../src/wgsl");
+    expect(attentionTile(72, 16384)).toMatchObject({ R: 14, BK: 28 });
+    expect(attentionTile(72, 16384, { R: 32, BK: 8 })).toEqual({ R: 32, BK: 8, TPP: 1 });
+    // 64 rows of 72 floats alone are 18 KiB: back to the default.
+    expect(attentionTile(72, 16384, { R: 64, BK: 8 })).toMatchObject({ R: 14, BK: 28 });
+  });
+});

@@ -407,7 +407,8 @@ square on white), matched an independent NumPy forward pass of the f32 weights t
 of 0.9998 (at least 0.999 for every token), and 4B Q4_0 described it as "a red circle and a blue square
 arranged vertically on a white background". Through the API, a 448 × 448 PNG of a green triangle on
 yellow: "The image shows a green triangle on a yellow background." On the Intel Mac the vision tower
-takes about 90 s per image; the follow-up "And what color is the background?" reused the encoded image
+takes about 78 s per image, nearly all of it attention over the 4096 patches (2.05 s per layer with
+32-row tiles, against 2.76 s with the text prefill's 14-row default; the matmuls take 0.85 s); the follow-up "And what color is the background?" reused the encoded image
 and 290 cached prompt tokens and answered "The background is yellow." in 6 s. An image's features stay
 on the GPU (`imageSlots`, 4 by default), keyed by its pixels, so a conversation that keeps the image
 does not run the tower again.
@@ -530,7 +531,9 @@ Known limits, roughly in roadmap order:
 - Single storage binding per tensor: very large f32 embeddings can exceed `maxStorageBufferBindingSize`
   (use q4 or q8).
 - Images: Gemma 3 only, from llama.cpp's mmproj GGUF (the vision weights inside safetensors
-  checkpoints are still skipped), one 896 × 896 crop per image (no pan-and-scan).
+  checkpoints are still skipped), one 896 × 896 crop per image (no pan-and-scan). The vision tower
+  reuses the text model's tiled attention, which reaches about a fifth of the matmuls' throughput on
+  its 4096 × 4096 bidirectional span; a register-tiled kernel for long spans would roughly halve it.
 - Without WebGPU, models run on the CPU: single-threaded (no worker pool), matmuls in WASM SIMD at
   about 3.5 GMAC/s on the test Mac, attention and the rest in TypeScript, and every buffer in one
   wasm32 memory (4 GiB at most). Small models only. WebNN and Node/Dawn backends come later.

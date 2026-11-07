@@ -255,6 +255,12 @@ export interface AttentionShape {
    * for a sliding layer when slots ≥ window + T - 1 and slots ≥ ATTN_WG (see `ringSlots`).
    */
   slots?: number;
+  /**
+   * Query rows and keys per tile of tiled prefill attention, when it fits workgroup memory (else the
+   * default for the head dim). The defaults suit causal text prefill; long bidirectional spans
+   * (the vision tower's 4096 patches) gain from more rows sharing each key block.
+   */
+  tile?: { R: number; BK: number };
 }
 
 export const cacheSlots = (s: Pick<AttentionShape, "maxSeq" | "slots">): number => s.slots ?? s.maxSeq;
@@ -290,7 +296,7 @@ export function attention(ctx: Ctx, q: Tensor, kc: Buf, vc: Buf, s: AttentionSha
     return out;
   }
   if (prefillAttention === "tiled") {
-    const tile = attentionTile(s.D, ctx.backend.limits.maxWorkgroupStorage);
+    const tile = attentionTile(s.D, ctx.backend.limits.maxWorkgroupStorage, s.tile);
     ctx.run(attentionTiledSpec(s.kv ?? "f32", s.D, tile), [params, ctx.step, q.buf, kc, vc, out.buf], [s.Hkv, Math.ceil((s.T * (s.H / s.Hkv)) / tile.R), 1]);
     return out;
   }

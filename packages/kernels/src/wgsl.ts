@@ -857,10 +857,12 @@ export function attentionTileBytes(D: number, R: number, BK: number): number {
  * Query rows and keys per workgroup tile in tiled prefill attention, sized to fit workgroup memory.
  * Head dim 256 (Gemma 3) takes 8 rows of 4 keys, two output rows per thread: on Gemma 3 4B's shapes
  * (128-token chunk at position 1024, Intel Gen9) 29-31 ms against 35-42 for 4 rows of 8 keys, where
- * more rows (16, 32) or more keys per block (8, 16) were slower and fewer keys (2) too.
+ * more rows (16, 32) or more keys per block (8, 16) were slower and fewer keys (2) too. `prefer` is
+ * taken when it fits.
  */
-export function attentionTile(D: number, wgBytes = 16384): AttentionTile {
+export function attentionTile(D: number, wgBytes = 16384, prefer?: { R: number; BK: number }): AttentionTile {
   const tpp = (R: number, BK: number) => Math.max(1, Math.floor(256 / (R * BK)));
+  if (prefer && !tileOverride && attentionTileBytes(D, prefer.R, prefer.BK) <= wgBytes - 256) return { ...prefer, TPP: tpp(prefer.R, prefer.BK) };
   if (tileOverride) {
     if (attentionTileBytes(D, tileOverride.R, tileOverride.BK) > wgBytes - 256) throw new Error(`attention tile ${tileOverride.R}x${tileOverride.BK} does not fit ${wgBytes} bytes of workgroup memory`);
     return { ...tileOverride, TPP: tpp(tileOverride.R, tileOverride.BK) };
