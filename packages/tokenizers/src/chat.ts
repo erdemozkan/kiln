@@ -45,7 +45,7 @@ export interface ChatFormat {
   render(messages: readonly ChatMessage[], opts?: RenderOptions): string;
   /** Token strings that end an assistant turn. */
   readonly stop: readonly string[];
-  /** True when the template asks for tool calls as `<tool_call>{…}</tool_call>` (what `parseToolCalls` reads). */
+  /** True when the template asks for tool calls as `<tool_call>{…}</tool_call>` (what `toolChoice` constrains). */
   readonly toolCallTags?: boolean;
 }
 
@@ -136,34 +136,145 @@ export function detectChatFormat(tok: Tokenizer): ChatFormat {
 const TOOL_CALL = /<tool_call>\s*([\s\S]*?)\s*<\/tool_call>/g;
 
 /**
- * Splits a reply into text and tool calls in the `<tool_call>{"name": …, "arguments": …}</tool_call>`
- * format that Qwen2.5, Qwen3, SmolLM3 and Hermes-style templates ask for. A block that is not valid JSON
- * with a string `name` stays in the text. Formats whose markers are special tokens (Mistral's
- * `[TOOL_CALLS]`, Granite's `<|tool_call|>`) are dropped when decoding and are not recognised.
+ * Special tokens that mark tool calls. The decoder keeps them in the text (it drops other special
+ * tokens), so `parseToolCalls` can find the calls of templates that use them.
+ */
+export const TOOL_CALL_MARKERS: readonly string[] = ["[TOOL_CALLS]", "[CALL_ID]", "[ARGS]", "<|tool_call|>"];
+
+/** One call from a parsed `{"name": …, "arguments": …}` value, or undefined when it is not one. */
+function toCall(v: unknown): ToolCall | undefined {
+  const call = v as { name?: unknown; arguments?: unknown; parameters?: unknown; id?: unknown };
+  if (!call || typeof call !== "object" || typeof call.name !== "string") return undefined;
+  let args = call.arguments ?? call.parameters ?? {};
+  // Some models write the arguments as a JSON string, as the OpenAI wire format does.
+  if (typeof args === "string") {
+    try {
+      args = JSON.parse(args);
+    } catch {
+      return undefined;
+    }
+  }
+  if (!args || typeof args !== "object" || Array.isArray(args)) return undefined;
+  const out: ToolCall = { type: "function", function: { name: call.name, arguments: args as Record<string, unknown> } };
+  if (typeof call.id === "string") out.id = call.id;
+  return out;
+}
+
+/** The end of the JSON object or array that starts at `s[i]`, or -1 when it does not close. */
+function jsonEnd(s: string, i: number): number {
+  let depth = 0;
+  let str = false;
+  for (let j = i; j < s.length; j++) {
+    const c = s[j];
+    if (str) {
+      if (c === "\\") j++;
+      else if (c === '"') str = false;
+    } else if (c === '"') str = true;
+    else if (c === "{" || c === "[") depth++;
+    else if (c === "}" || c === "]") {
+      if (--depth === 0) return j + 1;
+    }
+  }
+  return -1;
+}
+
+/** Reads a JSON value at `s[i]` (after spaces): `[value, end]`, or undefined. */
+function readJSON(s: string, i: number): [unknown, number] | undefined {
+  while (/\s/.test(s[i] ?? "")) i++;
+  if (s[i] !== "{" && s[i] !== "[") return undefined;
+  const end = jsonEnd(s, i);
+  if (end < 0) return undefined;
+  try {
+    return [JSON.parse(s.slice(i, end)), end];
+  } catch {
+    return undefined;
+  }
+}
+
+/** Calls from a JSON list (or one object) of `{"name", "arguments"}`; undefined if any is not a call. */
+function callList(v: unknown): ToolCall[] | undefined {
+  const calls = (Array.isArray(v) ? v : [v]).map(toCall);
+  return calls.length && calls.every((c) => c) ? (calls as ToolCall[]) : undefined;
+}
+
+/** Mistral templates require 9-character alphanumeric call ids; models often write none. */
+function mistralId(): string {
+  const a = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+  return Array.from({ length: 9 }, () => a[Math.floor(Math.random() * a.length)]).join("");
+}
+
+/**
+ * Mistral's calls after `[TOOL_CALLS]`: a JSON list (v3, v7), or `name[ARGS]{…}` per call (v11 and
+ * later, with an optional `[CALL_ID]id` before `[ARGS]`). Returns the calls and where they end.
+ */
+function mistralCalls(s: string, i: number): [ToolCall[], number] | undefined {
+  const json = readJSON(s, i);
+  if (json) {
+    const calls = callList(json[0]);
+    return calls && [calls, json[1]];
+  }
+  const calls: ToolCall[] = [];
+  const named = /\s*([\w.-]+)\s*(?:\[CALL_ID\]\s*(\w+)\s*)?\[ARGS\]/y;
+  for (;;) {
+    named.lastIndex = i;
+    const m = named.exec(s);
+    const args = m && readJSON(s, named.lastIndex);
+    const call = args && toCall({ name: m[1], arguments: args[0], id: m[2] });
+    if (!call) break;
+    calls.push(call);
+    i = args[1];
+    const next = /\s*\[TOOL_CALLS\]/y;
+    next.lastIndex = i;
+    if (!next.test(s)) break;
+    i = next.lastIndex;
+  }
+  return calls.length ? [calls, i] : undefined;
+}
+
+/**
+ * Splits a reply into text and tool calls. It reads the formats that chat templates ask for:
+ * `<tool_call>{"name": …, "arguments": …}</tool_call>` blocks (Qwen2.5, Qwen3, SmolLM3, Hermes),
+ * Granite's `<|tool_call|>[{…}, …]`, and Mistral's `[TOOL_CALLS]`, either as a JSON list or as
+ * `name[ARGS]{…}`. Mistral calls without an id get a random 9-character one, which its templates
+ * need when the calls go back into the history. Anything that is not valid JSON with a string `name`
+ * (and object arguments) stays in the text.
  */
 export function parseToolCalls(text: string): { content: string; toolCalls: ToolCall[] } {
   const toolCalls: ToolCall[] = [];
-  const content = text.replace(TOOL_CALL, (block, body: string) => {
+  let content = text.replace(TOOL_CALL, (block, body: string) => {
     let v: unknown;
     try {
       v = JSON.parse(body);
     } catch {
       return block;
     }
-    const call = v as { name?: unknown; arguments?: unknown; parameters?: unknown };
-    if (!call || typeof call !== "object" || typeof call.name !== "string") return block;
-    let args = call.arguments ?? call.parameters ?? {};
-    // Some models write the arguments as a JSON string, as the OpenAI wire format does.
-    if (typeof args === "string") {
-      try {
-        args = JSON.parse(args);
-      } catch {
-        return block;
-      }
-    }
-    if (!args || typeof args !== "object" || Array.isArray(args)) return block;
-    toolCalls.push({ type: "function", function: { name: call.name, arguments: args as Record<string, unknown> } });
+    const call = toCall(v);
+    if (!call) return block;
+    toolCalls.push(call);
     return "";
   });
+  // Marker formats: each marker starts a run of calls; what does not parse stays as text.
+  for (const marker of ["[TOOL_CALLS]", "<|tool_call|>"]) {
+    let from = 0;
+    for (let at = content.indexOf(marker, from); at >= 0; at = content.indexOf(marker, from)) {
+      const i = at + marker.length;
+      let got: [ToolCall[], number] | undefined;
+      if (marker === "[TOOL_CALLS]") {
+        got = mistralCalls(content, i);
+        for (const c of got?.[0] ?? []) c.id ??= mistralId();
+      } else {
+        const json = readJSON(content, i);
+        const calls = json && callList(json[0]);
+        got = calls && [calls, json[1]];
+      }
+      if (!got) {
+        from = i;
+        continue;
+      }
+      toolCalls.push(...got[0]);
+      content = content.slice(0, at) + content.slice(got[1]);
+      from = at;
+    }
+  }
   return { content: toolCalls.length ? content.trim() : text, toolCalls };
 }

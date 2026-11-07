@@ -13,6 +13,7 @@ function tiny(preTokenizer: TokenizerJSON["pre_tokenizer"] = { type: "ByteLevel"
     added_tokens: [
       { id: 500, content: "<|im_start|>", special: true },
       { id: 501, content: "<|im_end|>", special: true },
+      { id: 502, content: "[TOOL_CALLS]", special: true },
     ],
     pre_tokenizer: preTokenizer,
   });
@@ -53,6 +54,11 @@ describe("byte-level BPE", () => {
     expect(ids).toEqual([500, 259, 501]);
     expect(tok.decode(ids)).toBe("hello");
     expect(tok.encode("<|im_start|>", { allowSpecial: false })).not.toContain(500);
+  });
+
+  it("keeps tool-call markers when decoding, for parseToolCalls", () => {
+    expect(tok.decode(tok.encode("[TOOL_CALLS]hello<|im_end|>"))).toBe("[TOOL_CALLS]hello");
+    expect(tok.decode([502], false)).toBe("[TOOL_CALLS]");
   });
 
   it("supports Split + ByteLevel sequences (Qwen style)", () => {

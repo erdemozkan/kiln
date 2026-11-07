@@ -72,6 +72,48 @@ describe("parseToolCalls", () => {
     expect(parseToolCalls('<tool_call>{"name": "f"}</tool_call>').toolCalls[0]!.function.arguments).toEqual({});
   });
 
+  it("reads Mistral's [TOOL_CALLS] list and round-trips it through the v0.3 template", () => {
+    const reply = '[TOOL_CALLS] [{"name": "get_weather", "arguments": {"city": "Rome", "unit": "celsius"}, "id": "callA1234"}, {"name": "get_time", "arguments": {"city": "Rome"}, "id": "callB5678"}]';
+    const { content, toolCalls } = parseToolCalls(reply);
+    expect(content).toBe("");
+    const conv = fx.conversations["tool-parallel"]!;
+    expect(toolCalls).toEqual(conv[2]!.tool_calls);
+    const f = templateFormat({ source: mistral.template, bosToken: "<s>", eosToken: "</s>" });
+    const want = mistral.cases.find((c) => c.messages === "tool-parallel" && c.vars.tools)!.text;
+    expect(f.render(conv.map((m, i) => (i === 2 ? { ...m, content, tool_calls: toolCalls } : m)), { tools })).toBe(want);
+    // Without ids, each call gets the 9-character one the template insists on.
+    const bare = parseToolCalls('Sure. [TOOL_CALLS][{"name": "get_time", "arguments": {"city": "Rome"}}]');
+    expect(bare.content).toBe("Sure.");
+    expect(bare.toolCalls[0]!.id).toMatch(/^[A-Za-z0-9]{9}$/);
+  });
+
+  it("reads Mistral's name[ARGS]{…} calls, with or without [CALL_ID]", () => {
+    const r = parseToolCalls('[TOOL_CALLS]get_weather[ARGS]{"city": "Paris", "note": "a ] } \\" b"}[TOOL_CALLS]get_time[CALL_ID]abc123XYZ[ARGS]{"city": "Rome"}');
+    expect(r.content).toBe("");
+    expect(r.toolCalls.map((c) => [c.function.name, c.function.arguments])).toEqual([
+      ["get_weather", { city: "Paris", note: 'a ] } " b' }],
+      ["get_time", { city: "Rome" }],
+    ]);
+    expect(r.toolCalls[1]!.id).toBe("abc123XYZ");
+  });
+
+  it("reads Granite's <|tool_call|> list", () => {
+    const r = parseToolCalls('<|tool_call|>[{"name": "get_weather", "arguments": {"city": "Paris"}}, {"name": "get_time", "arguments": {"city": "Paris"}}]');
+    expect(r).toEqual({
+      content: "",
+      toolCalls: [
+        { type: "function", function: { name: "get_weather", arguments: { city: "Paris" } } },
+        { type: "function", function: { name: "get_time", arguments: { city: "Paris" } } },
+      ],
+    });
+  });
+
+  it("leaves markers that are not followed by calls in the text", () => {
+    for (const text of ["[TOOL_CALLS] I cannot call tools.", '<|tool_call|>[{"x": 1}]', "[TOOL_CALLS][{\"name\": \"f\"", "[TOOL_CALLS]f[ARGS]oops", '<|tool_call|>[{"name": "f", "arguments": [1]}]']) {
+      expect(parseToolCalls(text)).toEqual({ content: text, toolCalls: [] });
+    }
+  });
+
   it("round-trips: parsed calls render back into the template's history format", () => {
     const reply = '<tool_call>\n{"name": "get_weather", "arguments": {"city": "Paris"}}\n</tool_call>';
     const { content, toolCalls } = parseToolCalls(reply);

@@ -34,7 +34,7 @@ export interface GenerateOptions {
   /**
    * Functions the model may call (`chat` only), passed to the model's chat template as transformers
    * does. Calls come back as text in the template's format; `parseToolCalls` reads the
-   * `<tool_call>` one. Built-in fallback formats reject tools.
+   * `<tool_call>`, Mistral and Granite ones. Built-in fallback formats reject tools.
    */
   tools?: ToolSpec[];
   /** Documents to ground the answer in (`chat` only), for templates that read `documents`. */

@@ -383,7 +383,9 @@ Supported:
   `tool_calls` and the `tool` role. The test fixture's tool and document cases for SmolLM3,
   Qwen2.5/3, Mistral v0.3 and Granite 3.3 render byte-for-byte like jinja2. `parseToolCalls` reads
   the `<tool_call>{…}</tool_call>` format (Qwen and SmolLM3 templates; SmolLM3 itself does not load
-  yet); on Qwen2.5-0.5B a call, its result
+  yet), Granite's `<|tool_call|>[…]` and Mistral's `[TOOL_CALLS]` (a JSON list, or `name[ARGS]{…}` in
+  newer tokenizers); the decoder keeps those marker tokens in the text. Mistral calls without an id get
+  the 9-character one its templates require; on Qwen2.5-0.5B a call, its result
   and the final answer made a full round trip. Templates that never read `tools` (SmolLM2) and the
   built-in formats refuse tools rather than drop them. `toolChoice: "required"` (or one function by
   name) constrains the reply to exactly one `<tool_call>` whose name is a listed tool and whose
@@ -418,9 +420,8 @@ Known limits, roughly in roadmap order:
   several tokens). No regex or GBNF grammars, and `minimum`/`maximum`/`format` are not enforced.
   `toolChoice` forces one call; under "auto" calls are not checked against the tool schemas.
 - K-quants are re-quantized to q4 or q8 on load (a second rounding) instead of being run natively.
-- Unigram tokenizers (T5, XLM-R, some SentencePiece models) are not supported. Tool calls in formats whose
-  markers are special tokens (Mistral's `[TOOL_CALLS]`, Granite's `<|tool_call|>`) are dropped when
-  decoding, so `parseToolCalls` only reads the `<tool_call>` format.
+- Unigram tokenizers (T5, XLM-R, some SentencePiece models) are not supported. `toolChoice` only
+  constrains the `<tool_call>` format.
 - Single storage binding per tensor: very large f32 embeddings can exceed `maxStorageBufferBindingSize`
   (use q4 or q8).
 - WebGPU only; WASM fallback, WebNN and Node/Dawn backends come later.

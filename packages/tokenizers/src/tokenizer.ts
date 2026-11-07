@@ -1,4 +1,4 @@
-import type { ChatTemplate } from "./chat";
+import { TOOL_CALL_MARKERS, type ChatTemplate } from "./chat";
 import { GPT2_PATTERN, LLAMA3_PATTERN, QWEN2_PATTERN, compilePreTokenizer, splitIsolated, toJsRegex, type PreStep } from "./pretokenize";
 
 /** GPT-2 byte ↔ printable-unicode table used by byte-level BPE. */
@@ -58,6 +58,7 @@ type Scheme = { kind: "byte-level" } | { kind: "metaspace"; prepend: "always" | 
 
 /** U+2581, SentencePiece's visible space. */
 const SPACE = "\u2581";
+const TOOL_MARKERS = new Set(TOOL_CALL_MARKERS);
 const BYTE_TOKEN = /^<0x([0-9A-Fa-f]{2})>$/;
 
 export interface EncodeOptions {
@@ -231,7 +232,8 @@ export class Tokenizer {
         const tok = this.idToToken[id];
         if (tok === undefined) return "";
         if (this.added.has(tok)) {
-          if (skipSpecial && this.specialIds.has(id)) return "";
+          // Tool-call markers stay: they are how `parseToolCalls` finds Mistral's and Granite's calls.
+          if (skipSpecial && this.specialIds.has(id) && !TOOL_MARKERS.has(tok)) return "";
           // Added tokens go through the decoder like any other in HF: Gemma's whitespace tokens ("▁▁")
           // come out as spaces. Special ones are kept as written.
           const text = this.scheme.kind === "metaspace" && !this.specialIds.has(id) ? tok.replaceAll(SPACE, " ") : tok;
