@@ -74,6 +74,8 @@ export interface MatmulVariant {
   epi: MatmulEpilogue;
   /** f16 x tile and 4-wide dot products (needs shader-f16); accumulation stays f32. */
   f16?: boolean;
+  /** Affine q4 / q8: a mins plane after the scales, value = code·scale + min (q4 codes 0…15). */
+  affine?: boolean;
   /**
    * Reduce with subgroup operations instead of workgroup-memory trees (needs `subgroups` and a
    * subgroup size of at least `lanes`): a shuffle butterfly across each row's lanes, and subgroupAdd
@@ -106,9 +108,11 @@ export function matmulSpec(v: MatmulVariant): KernelSpec {
   const silu = isGated(v.epi);
   const h = !!v.f16;
   const sg = !!v.sg;
-  const key = `matmul/${v.wdtype}/mt${mt}/l${v.lanes}${v.norm ? "/norm" : ""}${v.bias ? "/bias" : ""}/${v.epi}${h ? "/f16" : ""}${sg ? "/sg" : ""}`;
+  const aff = quant && !!v.affine;
+  const key = `matmul/${v.wdtype}${aff ? "a" : ""}/mt${mt}/l${v.lanes}${v.norm ? "/norm" : ""}${v.bias ? "/bias" : ""}/${v.epi}${h ? "/f16" : ""}${sg ? "/sg" : ""}`;
   const vt = h ? "vec4<f16>" : "vec4<f32>";
   const bindings: BindingKind[] = quant ? ["uniform", "read", "read", "read"] : ["uniform", "read", "read"];
+  if (aff) bindings.push("read");
   let b = bindings.length;
   const decl: string[] = [];
   if (v.norm) {
@@ -142,7 +146,7 @@ struct P { M: u32, N: u32, K: u32, eps: f32 }
 @group(0) @binding(1) var<storage, read> x: array<vec4<f32>>;
 ${quant
   ? `@group(0) @binding(2) var<storage, read> wq: array<u32>;
-@group(0) @binding(3) var<storage, read> ws: array<f32>;`
+@group(0) @binding(3) var<storage, read> ws: array<f32>;${aff ? "\n@group(0) @binding(4) var<storage, read> wm: array<f32>;" : ""}`
   : `@group(0) @binding(2) var<storage, read> w: array<vec4<f32>>;`}
 ${decl.join("\n")}
 const MT = ${mt}u;
@@ -227,10 +231,12 @@ ${v.norm && sg
       for (var bi = phase; bi < nb; bi += PHASES) {
 ${q4
   ? `        let word = wq[(b0 + bi) * 4u + slot / 2u] >> shift;
-        let wv = (${vt}(vec4<u32>(word, word >> 4u, word >> 8u, word >> 12u) & vec4<u32>(15u)) - ${h ? "8.0h" : "8.0"}) * ${h ? `f16(ws[b0 + bi])` : `ws[b0 + bi]`};`
+        let wv = ${aff
+          ? `${vt}(vec4<u32>(word, word >> 4u, word >> 8u, word >> 12u) & vec4<u32>(15u)) * ${h ? `f16(ws[b0 + bi])` : `ws[b0 + bi]`} + ${h ? `f16(wm[b0 + bi])` : `wm[b0 + bi]`}`
+          : `(${vt}(vec4<u32>(word, word >> 4u, word >> 8u, word >> 12u) & vec4<u32>(15u)) - ${h ? "8.0h" : "8.0"}) * ${h ? `f16(ws[b0 + bi])` : `ws[b0 + bi]`}`};`
   : quant
   ? `        let word = wq[(b0 + bi) * 8u + slot];
-        let wv = ${vt}(bitcast<vec4<i32>>(vec4<u32>(word << 24u, word << 16u, word << 8u, word)) >> vec4<u32>(24u)) * ${h ? `f16(ws[b0 + bi])` : `ws[b0 + bi]`};`
+        let wv = ${vt}(bitcast<vec4<i32>>(vec4<u32>(word << 24u, word << 16u, word << 8u, word)) >> vec4<u32>(24u)) * ${h ? `f16(ws[b0 + bi])` : `ws[b0 + bi]`}${aff ? ` + ${h ? `f16(wm[b0 + bi])` : `wm[b0 + bi]`}` : ""};`
   : `        let wv = ${h ? `vec4<f16>(w[(b0 + bi) * 8u + slot])` : `w[(b0 + bi) * 8u + slot]`};`}
         for (var t = 0u; t < MT; t++) { acc[t] += ${h ? "f32(" : ""}dot(xt[t * KC4 + bi * 8u + slot], wv)${h ? ")" : ""}; }
       }
@@ -279,6 +285,8 @@ export const gemvLayout = (outN: number, K: number): GemvLayout =>
 
 export interface GemvVariant {
   wdtype: WeightDType;
+  /** Affine q4 / q8 (see `MatmulVariant.affine`). */
+  affine?: boolean;
   norm: boolean;
   bias: boolean;
   epi: MatmulEpilogue;
@@ -301,9 +309,11 @@ export const gemvRowsPerGroup = (epi: MatmulEpilogue, l: GemvLayout): number => 
  */
 export function gemvSpec(v: GemvVariant): KernelSpec {
   const gated = isGated(v.epi);
-  const key = `gemv/${v.wdtype}${v.norm ? "/norm" : ""}${v.bias ? "/bias" : ""}/${v.epi}/l${v.layout.lanes}r${v.layout.rows}`;
   const quant = v.wdtype !== "f32";
+  const aff = quant && !!v.affine;
+  const key = `gemv/${v.wdtype}${aff ? "a" : ""}${v.norm ? "/norm" : ""}${v.bias ? "/bias" : ""}/${v.epi}/l${v.layout.lanes}r${v.layout.rows}`;
   const bindings: BindingKind[] = quant ? ["uniform", "read", "read", "read"] : ["uniform", "read", "read"];
+  if (aff) bindings.push("read");
   let b = bindings.length;
   const decl: string[] = [];
   if (v.norm) {
@@ -322,17 +332,20 @@ export function gemvSpec(v: GemvVariant): KernelSpec {
   // Gated with one row per thread: row group gi pairs with gi + groups / 2.
   const split = gated && R === 1;
   const withBias = (row: string, val: string) => (v.bias ? `(${val} + bias[${row}])` : val);
-  // The dot product of one block (index blk) with the x block in registers x0…x7.
+  // The dot product of one block (index blk) with the x block in registers x0…x7. Affine blocks add
+  // min · (sum of the x block), with the sum shared by the thread's rows.
+  const d4 = aff ? "dq4u" : "dq4";
+  const tail = (blk: string) => (aff ? ` + xsum * wm[${blk}]` : "");
   const blockDot = (blk: string) =>
     v.wdtype === "q4"
       ? `let q = wq[${blk}];
-          acc += (dot(x0, dq4(q.x)) + dot(x1, dq4(q.x >> 16u)) + dot(x2, dq4(q.y)) + dot(x3, dq4(q.y >> 16u))
-            + dot(x4, dq4(q.z)) + dot(x5, dq4(q.z >> 16u)) + dot(x6, dq4(q.w)) + dot(x7, dq4(q.w >> 16u))) * ws[${blk}];`
+          acc += (dot(x0, ${d4}(q.x)) + dot(x1, ${d4}(q.x >> 16u)) + dot(x2, ${d4}(q.y)) + dot(x3, ${d4}(q.y >> 16u))
+            + dot(x4, ${d4}(q.z)) + dot(x5, ${d4}(q.z >> 16u)) + dot(x6, ${d4}(q.w)) + dot(x7, ${d4}(q.w >> 16u))) * ws[${blk}]${tail(blk)};`
       : quant
         ? `let q0 = wq[${blk} * 2u];
           let q1 = wq[${blk} * 2u + 1u];
           acc += (dot(x0, dq8(q0.x)) + dot(x1, dq8(q0.y)) + dot(x2, dq8(q0.z)) + dot(x3, dq8(q0.w))
-            + dot(x4, dq8(q1.x)) + dot(x5, dq8(q1.y)) + dot(x6, dq8(q1.z)) + dot(x7, dq8(q1.w))) * ws[${blk}];`
+            + dot(x4, dq8(q1.x)) + dot(x5, dq8(q1.y)) + dot(x6, dq8(q1.z)) + dot(x7, dq8(q1.w))) * ws[${blk}]${tail(blk)};`
         : `let o = ${blk} * 8u;
           acc += dot(x0, w[o]) + dot(x1, w[o + 1u]) + dot(x2, w[o + 2u]) + dot(x3, w[o + 3u])
             + dot(x4, w[o + 4u]) + dot(x5, w[o + 5u]) + dot(x6, w[o + 6u]) + dot(x7, w[o + 7u]);`;
@@ -374,7 +387,7 @@ struct P { M: u32, N: u32, K: u32, eps: f32 }
 @group(0) @binding(1) var<storage, read> x: array<vec4<f32>>;
 ${quant
   ? `@group(0) @binding(2) var<storage, read> wq: array<vec4<u32>>;
-@group(0) @binding(3) var<storage, read> ws: array<f32>;`
+@group(0) @binding(3) var<storage, read> ws: array<f32>;${aff ? "\n@group(0) @binding(4) var<storage, read> wm: array<f32>;" : ""}`
   : `@group(0) @binding(2) var<storage, read> w: array<vec4<f32>>;`}
 ${decl.join("\n")}
 const LANES = ${LANES}u;
@@ -383,6 +396,7 @@ var<workgroup> xt: array<vec4<f32>, ${GEMV_KB * 8}>;
 var<workgroup> red: array<f32, ${256 * R}>;
 
 fn dq4(w: u32) -> vec4<f32> { return vec4<f32>(vec4<u32>(w, w >> 4u, w >> 8u, w >> 12u) & vec4<u32>(15u)) - 8.0; }
+fn dq4u(w: u32) -> vec4<f32> { return vec4<f32>(vec4<u32>(w, w >> 4u, w >> 8u, w >> 12u) & vec4<u32>(15u)); }
 fn dq8(w: u32) -> vec4<f32> { return vec4<f32>(bitcast<vec4<i32>>(vec4<u32>(w << 24u, w << 16u, w << 8u, w)) >> vec4<u32>(24u)); }
 
 @compute @workgroup_size(256)
@@ -417,7 +431,7 @@ ${Array.from({ length: R }, (_, r) => `  var acc${r} = 0.0;`).join("\n")}
     let nb = min(KB, blocks - c0);
     for (var bi = lane; bi < nb; bi += LANES) {
       let x0 = xt[bi]; let x1 = xt[KB + bi]; let x2 = xt[2u * KB + bi]; let x3 = xt[3u * KB + bi];
-      let x4 = xt[4u * KB + bi]; let x5 = xt[5u * KB + bi]; let x6 = xt[6u * KB + bi]; let x7 = xt[7u * KB + bi];${rowsCode}
+      let x4 = xt[4u * KB + bi]; let x5 = xt[5u * KB + bi]; let x6 = xt[6u * KB + bi]; let x7 = xt[7u * KB + bi];${aff ? "\n      let xsum = dot(((x0 + x1) + (x2 + x3)) + ((x4 + x5) + (x6 + x7)), vec4<f32>(1.0));" : ""}${rowsCode}
     }
     workgroupBarrier();
   }
@@ -440,6 +454,8 @@ export const GEMM_TILE = 64;
 
 export interface GemmVariant {
   wdtype: WeightDType;
+  /** Affine q4 / q8 (see `MatmulVariant.affine`). */
+  affine?: boolean;
   bias: boolean;
   epi: MatmulEpilogue;
 }
@@ -456,9 +472,11 @@ export interface GemmVariant {
  */
 export function gemmSpec(v: GemmVariant): KernelSpec {
   const gated = isGated(v.epi);
-  const key = `gemm/${v.wdtype}${v.bias ? "/bias" : ""}/${v.epi}`;
   const quant = v.wdtype !== "f32";
+  const aff = quant && !!v.affine;
+  const key = `gemm/${v.wdtype}${aff ? "a" : ""}${v.bias ? "/bias" : ""}/${v.epi}`;
   const bindings: BindingKind[] = quant ? ["uniform", "read", "read", "read"] : ["uniform", "read", "read"];
+  if (aff) bindings.push("read");
   let b = bindings.length;
   const decl: string[] = [];
   if (v.bias) {
@@ -482,7 +500,10 @@ export function gemmSpec(v: GemmVariant): KernelSpec {
       if (row < p.N) {
         let word = wq[(row * blocks + kb) * 4u + wi];
         let d = ws[row * blocks + kb];
-        for (var e = 0u; e < 8u; e++) { vals[e][c] = (f32((word >> (4u * e)) & 15u) - 8.0) * d; }
+${aff
+  ? `        let mn = wm[row * blocks + kb];
+        for (var e = 0u; e < 8u; e++) { vals[e][c] = f32((word >> (4u * e)) & 15u) * d + mn; }`
+  : `        for (var e = 0u; e < 8u; e++) { vals[e][c] = (f32((word >> (4u * e)) & 15u) - 8.0) * d; }`}
       }
     }
     for (var e = 0u; e < 8u; e++) { wt[(wi * 8u + e) * 16u + g] = vals[e]; }
@@ -497,7 +518,7 @@ export function gemmSpec(v: GemmVariant): KernelSpec {
       if (row < p.N) {
 ${v.wdtype === "q8"
   ? `        let word = wq[(row * blocks + kb) * 8u + q];
-        r4[c] = vec4<f32>(bitcast<vec4<i32>>(vec4<u32>(word << 24u, word << 16u, word << 8u, word)) >> vec4<u32>(24u)) * ws[row * blocks + kb];`
+        r4[c] = vec4<f32>(bitcast<vec4<i32>>(vec4<u32>(word << 24u, word << 16u, word << 8u, word)) >> vec4<u32>(24u)) * ws[row * blocks + kb]${aff ? " + wm[row * blocks + kb]" : ""};`
   : `        r4[c] = w[(row * blocks + kb) * 8u + q];`}
       }
     }
@@ -532,7 +553,7 @@ struct P { M: u32, N: u32, K: u32, _p: u32 }
 @group(0) @binding(1) var<storage, read> x: array<vec4<f32>>;
 ${quant
   ? `@group(0) @binding(2) var<storage, read> wq: array<u32>;
-@group(0) @binding(3) var<storage, read> ws: array<f32>;`
+@group(0) @binding(3) var<storage, read> ws: array<f32>;${aff ? "\n@group(0) @binding(4) var<storage, read> wm: array<f32>;" : ""}`
   : `@group(0) @binding(2) var<storage, read> w: array<vec4<f32>>;`}
 ${decl.join("\n")}
 // [32 k][64 tokens] and [32 k][64 weight rows], as vec4 along the token / row axis.
@@ -1234,16 +1255,20 @@ fn main(${EW_ARGS}) {
 }
 
 /** Gathers embedding rows for token ids. */
-export function embedSpec(wdtype: WeightDType): KernelSpec {
+export function embedSpec(wdtype: WeightDType, affine = false): KernelSpec {
   const quant = wdtype !== "f32";
-  return spec(`embed/${wdtype}`, quant ? ["uniform", "read", "read", "read", "rw"] : ["uniform", "read", "read", "rw"], () => /* wgsl */ `
+  const aff = quant && affine;
+  const bindings: BindingKind[] = quant ? ["uniform", "read", "read", "read", "rw"] : ["uniform", "read", "read", "rw"];
+  if (aff) bindings.splice(4, 0, "read");
+  const out = aff ? 5 : 4;
+  return spec(`embed/${wdtype}${aff ? "a" : ""}`, bindings, () => /* wgsl */ `
 struct P { T: u32, D: u32, scale: f32, _b: u32 }
 @group(0) @binding(0) var<uniform> p: P;
 @group(0) @binding(1) var<storage, read> tokens: array<u32>;
 ${quant
   ? `@group(0) @binding(2) var<storage, read> wq: array<u32>;
-@group(0) @binding(3) var<storage, read> ws: array<f32>;
-@group(0) @binding(4) var<storage, read_write> o: array<f32>;`
+@group(0) @binding(3) var<storage, read> ws: array<f32>;${aff ? "\n@group(0) @binding(4) var<storage, read> wm: array<f32>;" : ""}
+@group(0) @binding(${out}) var<storage, read_write> o: array<f32>;`
   : `@group(0) @binding(2) var<storage, read> w: array<f32>;
 @group(0) @binding(3) var<storage, read_write> o: array<f32>;`}
 
@@ -1253,11 +1278,14 @@ fn main(${EW_ARGS}) {
   if (idx >= p.T * p.D) { return; }
   let e = tokens[idx / p.D] * p.D + idx % p.D;
 ${wdtype === "q4"
-  ? `  let q = f32((wq[e / 8u] >> (4u * (e % 8u))) & 15u) - 8.0;
+  ? aff
+    ? `  let q = f32((wq[e / 8u] >> (4u * (e % 8u))) & 15u);
+  o[idx] = (q * ws[e / 32u] + wm[e / 32u]) * p.scale;`
+    : `  let q = f32((wq[e / 8u] >> (4u * (e % 8u))) & 15u) - 8.0;
   o[idx] = q * ws[e / 32u] * p.scale;`
   : quant
   ? `  let q = f32(bitcast<i32>(wq[e / 4u] << (24u - 8u * (e % 4u))) >> 24u);
-  o[idx] = q * ws[e / 32u] * p.scale;`
+  o[idx] = (q * ws[e / 32u]${aff ? " + wm[e / 32u]" : ""}) * p.scale;`
   : `  o[idx] = w[e] * p.scale;`}
 }`);
 }

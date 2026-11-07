@@ -8,7 +8,9 @@ safetensors and GGUF files directly.
 **Models.** Llama (including Llama 3 rope scaling), Mistral, Qwen2, Qwen3, SmolLM, Granite 3 and 4
 (350M to 2B; for Granite 4, the attention-only models) and Gemma 3 (270M to 4B and larger, text
 only), from safetensors (F32/F16/BF16) or GGUF
-(F32/F16/BF16/Q4_0/Q4_1/Q5_0/Q5_1/Q8_0/Q4_K/Q5_K/Q6_K). Weights are held as q4 (default), q8 or f32.
+(F32/F16/BF16/Q4_0/Q4_1/Q5_0/Q5_1/Q8_0/Q4_K/Q5_K/Q6_K). Weights are held as q4, q8 or f32; the
+default `quant: "auto"` keeps each GGUF tensor at its own precision, every type but Q6_K exactly
+(affine q4/q8 planes for Q4_1, Q4_K, Q5_1 and Q5_K).
 
 **API.** `load(id)` runs the model in a module worker; `chat` and `complete` return async iterators
 of text, with `stats` (timings, token counts, `stopReason`). The model's own Jinja chat template,
@@ -34,6 +36,5 @@ load in 2.4 s. Decode uses a block-per-lane GEMV with several rows per thread on
 prefill a tiled GEMM and tiled attention, and GPU work is cut into short submits so the page stays
 responsive.
 
-**Checks.** 130 unit tests; a kernel check page (547 checks on GPUs without subgroups, more with
-them) compares every kernel with a CPU reference; Gemma 3 1B matches a NumPy reference token for
+**Checks.** 131 unit tests; a kernel check page (785 checks on the Intel GPU) compares every kernel with a CPU reference; Gemma 3 1B matches a NumPy reference token for
 token in q8 and q4.

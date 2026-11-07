@@ -40,7 +40,9 @@ space; `llm.info.persistent` says whether it agreed, and `load(id, { persist: fa
 Llama, Mistral, Qwen2, Qwen3, SmolLM, Granite 3 and 4 (350M to 2B) and Gemma 3 (270M to 4B and larger, text
 only) decoders, from
 safetensors (F32/F16/BF16) or GGUF (F32/F16/BF16/Q4_0/Q4_1/Q5_0/Q5_1/Q8_0/Q4_K/Q5_K/Q6_K).
-Weights are held on the GPU as `quant: "q4"` (default), `"q8"` or `"f32"`. Gemma 3 270M and
+Weights are held on the GPU as q4, q8 or f32. The default, `quant: "auto"`, stores float weights as q4
+and keeps a GGUF file's tensors at their own precision (exactly, except Q6_K, which becomes q8);
+`"q4"`, `"q8"` or `"f32"` force one format. Gemma 3 270M and
 Granite 4 350M need `"q8"` or `"f32"`.
 
 ## Requirements

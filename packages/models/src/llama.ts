@@ -146,13 +146,14 @@ export class LlamaModel {
 
   /**
    * Stacks per-layer weights along N (rows) into one tensor per layer so they run as one matmul,
-   * freeing the originals. Skipped (returns false) unless every part shares dtype and K.
+   * freeing the originals. Skipped (returns false) unless every part shares dtype, K and affine-ness
+   * (a GGUF Q4_K_M file mixes Q4_K q and k with a Q6_K v, so its q/k/v stay separate).
    */
   private fuse(module: string, parts: string[], fused: string, withBias: boolean): boolean {
     const names = (l: number, kind: string) => parts.map((p) => `model.layers.${l}.${module}.${p}.${kind}`);
     for (let l = 0; l < this.cfg.numLayers; l++) {
       const ts = names(l, "weight").map((n) => this.weights.get(n));
-      if (ts.some((t) => !t || t.dtype !== ts[0]!.dtype || t.shape[1] !== ts[0]!.shape[1])) return false;
+      if (ts.some((t) => !t || t.dtype !== ts[0]!.dtype || t.shape[1] !== ts[0]!.shape[1] || !t.mins !== !ts[0]!.mins)) return false;
       if (withBias && names(l, "bias").some((n) => !this.weights.has(n))) return false;
     }
     for (let l = 0; l < this.cfg.numLayers; l++) {
@@ -177,18 +178,20 @@ export class LlamaModel {
     };
     const buf = copyPlane((t) => byteSize(t.shape, dtype), (t) => t.buf, name);
     const scales = isBlockQuant(dtype) ? copyPlane((t) => q4ScaleBytes(t.shape), (t) => t.scales!, `${name}/scales`) : undefined;
+    const mins = ts[0]!.mins ? copyPlane((t) => q4ScaleBytes(t.shape), (t) => t.mins!, `${name}/mins`) : undefined;
     for (const [i, t] of ts.entries()) {
       this.backend.free(t.buf);
       if (t.scales) this.backend.free(t.scales);
+      if (t.mins) this.backend.free(t.mins);
       this.weights.delete(parts[i]!);
     }
-    this.weights.set(name, { shape, dtype, buf, scales });
+    this.weights.set(name, { shape, dtype, buf, scales, mins });
   }
 
   /** GPU bytes held: weights, the KV cache, and the intermediates shared by every plan built so far. */
   get memory(): { weights: number; kv: number; activations: number } {
     let weights = 0;
-    for (const t of this.weights.values()) weights += t.buf.size + (t.scales?.size ?? 0);
+    for (const t of this.weights.values()) weights += t.buf.size + (t.scales?.size ?? 0) + (t.mins?.size ?? 0);
     const kv = this.kv.reduce((n, { k, v }) => n + k.size + v.size, 0);
     return { weights, kv, activations: this.activations.bytes };
   }
@@ -393,6 +396,7 @@ export class LlamaModel {
     for (const t of this.weights.values()) {
       this.backend.free(t.buf);
       if (t.scales) this.backend.free(t.scales);
+      if (t.mins) this.backend.free(t.mins);
     }
     this.backend.free(this.invFreq.buf);
     if (this.localInvFreq !== this.invFreq) this.backend.free(this.localInvFreq.buf);

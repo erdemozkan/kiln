@@ -7,6 +7,8 @@ import type { Buf } from "./backend";
  *   `buf` holds 8 nibbles per u32 (nibble j = element 8i+j, value q-8), `scales` holds one f32 per block.
  * - q8: symmetric 8-bit blocks of 32 along the last axis, the same two planes: `buf` holds 4 int8 per
  *   u32 (byte j = element 4i+j), `scales` one f32 per block.
+ * - Either may be affine, with a third plane `mins` (one f32 per block): value = code·scale + min, the q4
+ *   code read as 0…15. GGUF Q4_1/Q4_K load into affine q4 and Q5_1/Q5_K into affine q8, exactly.
  * - u32: token ids and other integer data.
  */
 export type DType = "f32" | "q4" | "q8" | "u32";
@@ -21,6 +23,8 @@ export interface Tensor {
   readonly buf: Buf;
   /** Per-block scales, present only for q4 and q8. */
   readonly scales?: Buf;
+  /** Per-block mins of an affine q4 or q8 tensor. */
+  readonly mins?: Buf;
 }
 
 export const Q4_BLOCK = 32;

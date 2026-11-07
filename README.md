@@ -103,6 +103,17 @@ Key ideas:
   Intel Mac, cached SmolLM2-360M loads went from 8.3 to 3.5 s (BF16 safetensors) and from 6.6 to 1.4 s
   (Q4_K_M GGUF, mostly Q5_0: llama.cpp's fallback for rows that are not a multiple of 256), and as q8
   from 15.7 to 2.9 s (BF16), with the same replies.
+- **GGUF weights held exactly.** Q4_1 and Q4_K blocks are code·scale + min per 32 values with 4-bit
+  codes, and Q5_x with 5-bit codes, so Kiln's q4 and q8 planes plus one f32 min per block hold them
+  as llama.cpp dequantizes them, where they used to be dequantized and rounded a second time. The GPU
+  writes these planes straight from the raw blocks (the CPU's bits, checked over 7.7M codes per
+  type), and the matmul, GEMV, GEMM and embedding kernels take an affine variant: GEMV folds the
+  mins in as min × (sum of the x block), once per block for all of a thread's rows. With the new
+  `quant: "auto"` default, granite-4.0-350m-Q4_K_M.gguf gave the same 40 greedy tokens as `"f32"`
+  (which holds the dequantized values themselves), where the old all-q4 load diverged at token 8. The cost
+  is bytes: 301 MB of weights against 236 MB, since its Q6_K tensors (the head among them) now take 8
+  bits, and decode at 24.1 against 27.9 tok/s; loading took 2.0 s against 3.4 s, with nothing left to
+  round. `quant: "q4"` keeps the old behaviour.
 - **Why a reply ended.** `stats.stopReason` is `"stop"` (an end-of-turn or stop token),
   `"maxTokens"`, `"context"` (the reply filled the context before maxTokens), `"format"` (the
   structured value is complete) or `"abort"` (the signal fired or the caller stopped reading), the
@@ -313,7 +324,7 @@ cost.
 
 ## Status
 
-Verified on this GPU: all kernel checks pass (547, including q4 and q8 weights in every matmul variant, the decode GEMV and the prefill GEMM, both prefill attention kernels, fused variants, f16 cache paths,
+Verified on this GPU: all kernel checks pass (785 now that Chrome exposes shader-f16 on it, including q4 and q8 weights, symmetric and affine, in every matmul variant, the decode GEMV and the prefill GEMM, both prefill attention kernels, fused variants, f16 cache paths,
 sliding-window attention, GELU gating, grammar masks and sampling distributions). SmolLM2-135M-Instruct chats from Hub safetensors (q4, f32) and from a GGUF
 Q4_K_M file.
 
@@ -386,10 +397,14 @@ and greedy output matched the reference on the short prompts and the 1,138-token
 Supported:
 
 - Models and formats: Llama-family decoders; safetensors F32/F16/BF16; GGUF F32/F16/BF16/Q4_0/Q4_1/
-  Q5_0/Q5_1/Q8_0/Q4_K/Q5_K/Q6_K. Weights are stored on the GPU as `quant: "q4"` (default; 4-bit
-  blocks of 32, an eighth of f32), `"q8"` (8-bit blocks, a quarter, close to f32 in accuracy) or
-  `"f32"`. GGUF Q4_0 stays q4 and Q8_0 is repacked into q8 without rounding (unless q4 is asked for);
-  K-quants and Q5 types are dequantized on load and re-quantized.
+  Q5_0/Q5_1/Q8_0/Q4_K/Q5_K/Q6_K. Weights are stored on the GPU in blocks of 32 as q4 (4-bit codes,
+  about an eighth of f32), q8 (8-bit, about a quarter, close to f32 in accuracy) or f32. Either block
+  format can be affine, with a min per block beside the scale, which is how GGUF Q4_1/Q4_K (in q4) and
+  Q5_1/Q5_K (in q8) are held: every value exactly as llama.cpp dequantizes it. `quant: "auto"` (the
+  default) stores float weights as q4 and keeps each GGUF tensor at its file's precision: Q4_0, Q4_1
+  and Q4_K as q4, Q5_0, Q5_1, Q5_K and Q8_0 as q8, all without rounding, and Q6_K as q8 (one rounding,
+  to 8 bits). `"q4"` rounds the 5-, 6- and 8-bit GGUF types to 4 bits as before, `"q8"` rounds Q6_K and
+  float weights to 8 bits, and `"f32"` dequantizes everything.
 - Text: byte-level BPE (GPT-2, Llama 3, Qwen, SmolLM) and SentencePiece-style BPE with byte
   fallback (Llama 2, TinyLlama, Mistral, Phi-3), from `tokenizer.json` or GGUF (`gpt2` and `llama`
   vocabularies; the latter merge by piece score). On TinyLlama, Mistral v0.3 and Phi-3.5 the
@@ -443,7 +458,8 @@ Known limits, roughly in roadmap order:
 - Constrained decoding waits for the CPU's mask between forward passes (drafts let one pass check
   several tokens). No regex or GBNF grammars, and `minimum`/`maximum`/`format` are not enforced.
   `toolChoice` forces one call; under "auto" calls are not checked against the tool schemas.
-- K-quants are re-quantized to q4 or q8 on load (a second rounding) instead of being run natively.
+- Q6_K (scales every 16 values) is rounded to q8 on load rather than run as stored; the other GGUF
+  block types are held exactly.
 - Unigram tokenizers (T5, XLM-R, some SentencePiece models) are not supported. `toolChoice` only
   constrains the `<tool_call>` format.
 - Single storage binding per tensor: very large f32 embeddings can exceed `maxStorageBufferBindingSize`

@@ -183,10 +183,14 @@ export function dequantQ6_K(bytes: Uint8Array, n: number): Float32Array {
   return out;
 }
 
-/** Kiln's GPU q4 layout: 8 sequential nibbles per u32 (value + 8) and one f32 scale per 32 values. */
+/**
+ * Kiln's GPU q4 layout: 8 sequential nibbles per u32 and one f32 scale per 32 values. Symmetric
+ * (no `mins`): x = (code - 8)·scale. Affine (with `mins`, one f32 per 32 values): x = code·scale + min.
+ */
 export interface Q4Planes {
   nibbles: Uint32Array;
   scales: Float32Array;
+  mins?: Float32Array;
 }
 
 /**
@@ -255,14 +259,22 @@ export function repackQ4_0(bytes: Uint8Array, n: number): Q4Planes {
 
 export function dequantQ4(p: Q4Planes): Float32Array {
   const out = new Float32Array(p.nibbles.length * 8);
-  for (let e = 0; e < out.length; e++) out[e] = (((p.nibbles[e >> 3]! >>> ((e & 7) * 4)) & 15) - 8) * p.scales[e >> 5]!;
+  const m = p.mins;
+  for (let e = 0; e < out.length; e++) {
+    const code = (p.nibbles[e >> 3]! >>> ((e & 7) * 4)) & 15;
+    out[e] = m ? code * p.scales[e >> 5]! + m[e >> 5]! : (code - 8) * p.scales[e >> 5]!;
+  }
   return out;
 }
 
-/** Kiln's GPU q8 layout: 4 sequential int8 per u32 (little-endian bytes) and one f32 scale per 32 values. */
+/**
+ * Kiln's GPU q8 layout: 4 sequential int8 per u32 (little-endian bytes) and one f32 scale per 32 values.
+ * Symmetric: x = code·scale; affine (with `mins`): x = code·scale + min.
+ */
 export interface Q8Planes {
   bytes: Uint32Array;
   scales: Float32Array;
+  mins?: Float32Array;
 }
 
 /**
@@ -310,6 +322,77 @@ export function repackQ8_0(src: Uint8Array, n: number): Q8Planes {
 export function dequantQ8(p: Q8Planes): Float32Array {
   const q = new Int8Array(p.bytes.buffer, p.bytes.byteOffset, p.bytes.byteLength);
   const out = new Float32Array(q.length);
-  for (let e = 0; e < out.length; e++) out[e] = q[e]! * p.scales[e >> 5]!;
+  const m = p.mins;
+  for (let e = 0; e < out.length; e++) out[e] = m ? q[e]! * p.scales[e >> 5]! + m[e >> 5]! : q[e]! * p.scales[e >> 5]!;
   return out;
+}
+
+/**
+ * The plane a GGUF block type is held in exactly: its 32-value blocks are code·scale (+ min) with
+ * codes of at most 5 bits, so Kiln's q4 (4-bit codes) or q8 planes keep every value as `toF32` gives
+ * it. Q6_K's scales change every 16 values, so it has none.
+ */
+export function exactPlane(type: string): "q4" | "q8" | undefined {
+  return type === "Q4_0" || type === "Q4_1" || type === "Q4_K" ? "q4" : type === "Q5_0" || type === "Q5_1" || type === "Q5_K" || type === "Q8_0" ? "q8" : undefined;
+}
+
+/** Codes, scale and min of 32-value block b, for the affine types; the products are exact in f32. */
+function affineBlock(type: "Q4_1" | "Q4_K" | "Q5_1" | "Q5_K", bytes: Uint8Array, b: number, codes: Uint8Array): [number, number] {
+  const f16 = (o: number) => f16Table[bytes[o]! | (bytes[o + 1]! << 8)]!;
+  if (type === "Q4_1" || type === "Q5_1") {
+    const five = type === "Q5_1";
+    const o = b * (five ? 24 : 20);
+    const qh = five ? (bytes[o + 4]! | (bytes[o + 5]! << 8) | (bytes[o + 6]! << 16) | (bytes[o + 7]! << 24)) >>> 0 : 0;
+    const q = o + (five ? 8 : 4);
+    for (let l = 0; l < 32; l++) codes[l] = ((bytes[q + (l & 15)]! >> ((l >> 4) * 4)) & 15) | (((qh >>> l) & 1) << 4);
+    return [f16(o), f16(o + 2)];
+  }
+  const five = type === "Q5_K";
+  const o = (b >> 3) * (five ? 176 : 144);
+  const j = b & 7;
+  const [sc, m] = scaleMinK4(j, bytes, o + 4);
+  const q = o + (five ? 48 : 16) + (j >> 1) * 32;
+  for (let l = 0; l < 32; l++) codes[l] = ((bytes[q + l]! >> ((j & 1) * 4)) & 15) | (five ? ((bytes[o + 16 + l]! >> j) & 1) << 4 : 0);
+  // d·sc and dmin·m: an f16 times a 6-bit integer, exact; the min is subtracted, as toF32 does.
+  return [Math.fround(f16(o) * sc), -Math.fround(f16(o + 2) * m)];
+}
+
+/** Q4_1 or Q4_K blocks as affine q4 planes, exactly (x = code·scale + min, as toF32 computes it). */
+export function exactQ4(type: "Q4_1" | "Q4_K", bytes: Uint8Array, n: number): Q4Planes {
+  const nibbles = new Uint32Array(n / 8);
+  const scales = new Float32Array(n / 32);
+  const mins = new Float32Array(n / 32);
+  const codes = new Uint8Array(32);
+  for (let b = 0; b < n / 32; b++) {
+    [scales[b], mins[b]] = affineBlock(type, bytes, b, codes);
+    for (let w = 0; w < 4; w++) {
+      let word = 0;
+      for (let k = 7; k >= 0; k--) word = (word << 4) | codes[w * 8 + k]!;
+      nibbles[b * 4 + w] = word >>> 0;
+    }
+  }
+  return { nibbles, scales, mins };
+}
+
+/** Q5_0 (symmetric, code - 16), Q5_1 or Q5_K (affine) blocks as q8 planes, exactly. */
+export function exactQ8(type: "Q5_0" | "Q5_1" | "Q5_K", bytes: Uint8Array, n: number): Q8Planes {
+  const out = new Uint32Array(n / 4);
+  const q = new Int8Array(out.buffer);
+  const scales = new Float32Array(n / 32);
+  const codes = new Uint8Array(32);
+  if (type === "Q5_0") {
+    for (let b = 0; b < n / 32; b++) {
+      const o = b * 22;
+      const qh = (bytes[o + 2]! | (bytes[o + 3]! << 8) | (bytes[o + 4]! << 16) | (bytes[o + 5]! << 24)) >>> 0;
+      scales[b] = f16Table[bytes[o]! | (bytes[o + 1]! << 8)]!;
+      for (let l = 0; l < 32; l++) q[b * 32 + l] = (((bytes[o + 6 + (l & 15)]! >> ((l >> 4) * 4)) & 15) | (((qh >>> l) & 1) << 4)) - 16;
+    }
+    return { bytes: out, scales };
+  }
+  const mins = new Float32Array(n / 32);
+  for (let b = 0; b < n / 32; b++) {
+    [scales[b], mins[b]] = affineBlock(type, bytes, b, codes);
+    q.set(codes, b * 32);
+  }
+  return { bytes: out, scales, mins };
 }

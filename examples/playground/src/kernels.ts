@@ -58,10 +58,43 @@ async function main() {
     const t = upload(p.bytes, shape);
     return { ...t, dtype: "q8", scales: upload(p.scales, [p.scales.length]).buf };
   };
-  type WD = "f32" | "q4" | "q8";
-  const uploadW = (wd: WD, data: Float32Array, shape: number[]) => (wd === "q4" ? uploadQ4(data, shape) : wd === "q8" ? uploadQ8(data, shape) : upload(data, shape));
+  /** Affine planes (as GGUF Q4_1/Q4_K load into q4, Q5_1/Q5_K into q8): codes 0…15 or 0…31 between each block's min and max. */
+  const affine = (wd: "q4a" | "q8a", data: Float32Array) => {
+    const top = wd === "q4a" ? 15 : 31;
+    const scales = new Float32Array(data.length / 32);
+    const mins = new Float32Array(data.length / 32);
+    const codes = new Uint8Array(data.length);
+    for (let b = 0; b < scales.length; b++) {
+      const blk = data.subarray(b * 32, b * 32 + 32);
+      const lo = Math.min(...blk);
+      const s = Math.fround((Math.max(...blk) - lo) / top);
+      scales[b] = s;
+      mins[b] = Math.fround(lo);
+      blk.forEach((v, j) => (codes[b * 32 + j] = s ? Math.min(top, Math.round((v - lo) / s)) : 0));
+    }
+    if (wd === "q8a") return { q8: { bytes: new Uint32Array(codes.buffer), scales, mins } };
+    const nibbles = new Uint32Array(data.length / 8);
+    codes.forEach((c, e) => (nibbles[e >> 3]! |= c << ((e & 7) * 4)));
+    return { q4: { nibbles, scales, mins } };
+  };
+  type WD = "f32" | "q4" | "q8" | "q4a" | "q8a";
+  const uploadW = (wd: WD, data: Float32Array, shape: number[]): Tensor => {
+    if (wd === "q4a" || wd === "q8a") {
+      const a = affine(wd, data);
+      const planes = a.q4 ? { data: a.q4.nibbles, scales: a.q4.scales, mins: a.q4.mins } : { data: a.q8!.bytes, scales: a.q8!.scales, mins: a.q8!.mins };
+      const t = upload(planes.data, shape);
+      return { ...t, dtype: wd === "q4a" ? "q4" : "q8", scales: upload(planes.scales, [planes.scales.length]).buf, mins: upload(planes.mins, [planes.mins.length]).buf };
+    }
+    return wd === "q4" ? uploadQ4(data, shape) : wd === "q8" ? uploadQ8(data, shape) : upload(data, shape);
+  };
   /** The values the GPU should see for weights stored as `wd`. */
-  const asStored = (wd: WD, data: Float32Array) => (wd === "q4" ? dequantQ4(quantizeQ4(data)) : wd === "q8" ? dequantQ8(quantizeQ8(data)) : data);
+  const asStored = (wd: WD, data: Float32Array) => {
+    if (wd === "q4a" || wd === "q8a") {
+      const a = affine(wd, data);
+      return a.q4 ? dequantQ4(a.q4) : dequantQ8(a.q8!);
+    }
+    return wd === "q4" ? dequantQ4(quantizeQ4(data)) : wd === "q8" ? dequantQ8(quantizeQ8(data)) : data;
+  };
   const download = async (buf: Buf, n: number) => new Float32Array(await be.readback(buf, 0, n * 4));
   const run = async (s: StepParams, build: (ctx: Ctx) => void) => {
     be.write(step, 0, packStep(s));
@@ -92,7 +125,7 @@ async function main() {
 
   // Prefill GEMM (64 rows and up): every weight format and epilogue, with ragged M and N edges.
   for (const [M, N, K] of [[64, 64, 32], [77, 70, 96], [128, 1000, 640], [200, 33, 256]] as const) {
-    for (const wd of ["f32", "q4", "q8"] as const) {
+    for (const wd of ["f32", "q4", "q8", "q4a", "q8a"] as const) {
       const x = randn(M * K);
       const w = randn(N * K);
       const deq = asStored(wd, w);
@@ -132,7 +165,7 @@ async function main() {
   // Decode GEMV (one token): every weight format, prologue and epilogue; K past one staged chunk
   // (2048) and ragged in the last one, N ragged against the 64 rows of a workgroup.
   for (const [N, K] of [[70, 96], [1000, 640], [66, 2304], [130, 4128], [16400, 128]] as const) {
-    for (const wd of ["f32", "q4", "q8"] as const) {
+    for (const wd of ["f32", "q4", "q8", "q4a", "q8a"] as const) {
       const x = randn(K);
       const w = randn(N * K);
       const nw = randn(K);
@@ -167,7 +200,7 @@ async function main() {
   // Fused matmul variants: every lanes setting, with norm prologue, SiLU gating, residual add and bias.
   for (const lanes of [8, 16, 32] as const) {
     for (const [M, I, K] of [[1, 40, 96], [5, 24, 256], [19, 70, 576]] as const) {
-      for (const wd of ["f32", "q4", "q8"] as const) {
+      for (const wd of ["f32", "q4", "q8", "q4a", "q8a"] as const) {
         const x = randn(M * K);
         const nw = randn(K);
         const wgu = randn(2 * I * K);
@@ -481,6 +514,13 @@ async function main() {
     ids.forEach((id, t) => want8.set(deq8.subarray(id * D, (id + 1) * D), t * D));
     await run(S0, (ctx) => (o = ops.embed(ctx, uploadQ8(table, [V, D]), upload(ids, [4]).buf, ids.length, 25.25)));
     check("embed/q8/scaled", `V${V} D${D} ×25.25`, await download(o.buf, want8.length), want8.map((v) => v * 25.25), 1e-4);
+    for (const wd of ["q4a", "q8a"] as const) {
+      const deqA = asStored(wd, table);
+      const wantA = new Float32Array(ids.length * D);
+      ids.forEach((id, t) => wantA.set(deqA.subarray(id * D, (id + 1) * D), t * D));
+      await run(S0, (ctx) => (o = ops.embed(ctx, uploadW(wd, table, [V, D]), upload(ids, [4]).buf, ids.length, 25.25)));
+      check(`embed/${wd}/scaled`, `V${V} D${D} ×25.25`, await download(o.buf, wantA.length), wantA.map((v) => v * 25.25), 1e-4);
+    }
   }
 
   {
@@ -644,26 +684,33 @@ async function main() {
       bytes[o + 1] = h >> 8;
     }
     const files = [{ name: "check", source: new MemorySource(bytes, "check"), tensors: [{ name: "w.weight", shape: [rows, cols], type, offset: 0, byteLength: bytes.length }] }];
+    // Under "q4" and "q8" Q4_1/Q4_K load as exact affine q4, and under "q8" Q5_x as exact q8 (convert/…/exact).
     for (const out of ["q4", "q8"] as const) {
       if (!gpuConverts(type, out)) continue;
       const planes = async (gpu: boolean) => {
         setGpuConvert(gpu);
         const t = (await loadWeights(be, files, out)).get("w.weight")!;
-        return [new Uint32Array(await be.readback(t.buf, 0, t.buf.size)), new Float32Array(await be.readback(t.scales!, 0, t.scales!.size))] as const;
+        const mins = t.mins ? new Float32Array(await be.readback(t.mins, 0, t.mins.size)) : new Float32Array(0);
+        return [new Uint32Array(await be.readback(t.buf, 0, t.buf.size)), new Float32Array(await be.readback(t.scales!, 0, t.scales!.size)), mins, t.dtype] as const;
       };
-      const [gn, gs] = await planes(true);
-      const [cn, cs] = await planes(false);
+      const [gn, gs0, gm, gd] = await planes(true);
+      const [cn, cs0, cm, cd] = await planes(false);
+      // Spread would overflow the stack on 240k scales.
+      const join = (a: Float32Array, b: Float32Array) => { const o = new Float32Array(a.length + b.length); o.set(a); o.set(b, a.length); return o; };
+      const gs = join(gs0, gm);
+      const cs = join(cs0, cm);
       setGpuConvert(true);
       // Codes compared as whole words: 8 nibbles (q4) or 4 bytes (q8) each.
-      const per = out === "q4" ? 8 : 4;
+      const per = gd === "q4" ? 8 : 4;
       let codes = 0;
       for (let w = 0; w < cn.length; w++) {
         if (gn[w] === cn[w]) continue;
         for (let e = 0; e < per; e++) if (((gn[w]! >>> (e * (32 / per))) ^ (cn[w]! >>> (e * (32 / per)))) & (per === 8 ? 15 : 255)) codes++;
       }
       const scaleDiffs = gs.reduce((n, v, i) => n + (Object.is(v, cs[i]) ? 0 : 1), 0);
-      const pass = scaleDiffs === 0 && codes === 0 && gn.length === cn.length;
-      results.push({ kernel: `convert/${type}/${out}`, case: `${rows}x${cols}, 2 chunks`, error: codes, tol: 0, pass, note: `${codes} of ${cn.length * per} codes differ, ${scaleDiffs} scales` });
+      const pass = scaleDiffs === 0 && codes === 0 && gn.length === cn.length && gs.length === cs.length && gd === cd;
+      const path = gm.length ? `${gd}, affine (exact)` : gd;
+      results.push({ kernel: `convert/${type}/${out}`, case: `${rows}x${cols}, 2 chunks → ${path}`, error: codes, tol: 0, pass, note: `${codes} of ${cn.length * per} codes differ, ${scaleDiffs} scales/mins` });
     }
   }
 

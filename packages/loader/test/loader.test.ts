@@ -6,6 +6,9 @@ import {
   dequantQ4,
   dequantQ8,
   dequantQ8_0,
+  exactPlane,
+  exactQ4,
+  exactQ8,
   f16ToF32,
   parseGGUF,
   parseModelId,
@@ -15,6 +18,8 @@ import {
   readSafetensorsHeader,
   repackQ4_0,
   repackQ8_0,
+  rowBytes,
+  toF32,
 } from "../src";
 
 function safetensors(header: object, data: Uint8Array): Uint8Array {
@@ -164,6 +169,29 @@ describe("conversion", () => {
     const p = quantizeQ8(x);
     expect(p.scales[0]).toBe(1 / 128);
     expect([...new Int8Array(p.bytes.buffer).subarray(0, 7)]).toEqual([127, 3, -3, 1, -1, 127, 3]);
+  });
+
+  it("holds Q4_1/Q4_K as affine q4 and Q5_0/Q5_1/Q5_K as q8, bit for bit as toF32", () => {
+    // Random blocks whose f16 scales (the first bytes of each block or super-block) are finite.
+    const blocks = (type: "Q4_1" | "Q4_K" | "Q5_0" | "Q5_1" | "Q5_K", n: number) => {
+      const bytes = Uint8Array.from({ length: rowBytes(type, n) }, (_, i) => (i * 2654435761) >>> 24);
+      const size = rowBytes(type, type.endsWith("K") ? 256 : 32);
+      const f16s = type === "Q5_0" ? 1 : 2;
+      for (let o = 0; o < bytes.length; o += size) for (let h = 0; h < f16s; h++) bytes[o + 2 * h + 1] = (bytes[o + 2 * h + 1]! & 0x83) | 0x14;
+      return bytes;
+    };
+    const n = 1024;
+    for (const type of ["Q4_1", "Q4_K"] as const) {
+      expect(exactPlane(type)).toBe("q4");
+      expect([...dequantQ4(exactQ4(type, blocks(type, n), n))], type).toEqual([...toF32(type, blocks(type, n), n)]);
+    }
+    for (const type of ["Q5_0", "Q5_1", "Q5_K"] as const) {
+      expect(exactPlane(type)).toBe("q8");
+      const p = exactQ8(type, blocks(type, n), n);
+      expect(!!p.mins, type).toBe(type !== "Q5_0");
+      expect([...dequantQ8(p)], type).toEqual([...toF32(type, blocks(type, n), n)]);
+    }
+    expect([exactPlane("Q4_0"), exactPlane("Q8_0"), exactPlane("Q6_K"), exactPlane("BF16")]).toEqual(["q4", "q8", undefined, undefined]);
   });
 
   it("repacks GGUF Q8_0 blocks exactly", () => {

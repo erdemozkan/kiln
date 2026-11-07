@@ -217,6 +217,75 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) 
   };
 }
 
+/** Types the GPU writes as exact planes: Q4_1/Q4_K as affine q4, Q5_0 as q8, Q5_1/Q5_K as affine q8. */
+export type GpuExactType = "Q4_1" | "Q4_K" | "Q5_0" | "Q5_1" | "Q5_K";
+export const GPU_EXACT_TYPES: ReadonlySet<string> = new Set<GpuExactType>(["Q4_1", "Q4_K", "Q5_0", "Q5_1", "Q5_K"]);
+
+/** Code of element l (u32; Q5_0's is signed after the - 16), and the block's scale and min. */
+const EXACT: Record<GpuExactType, { code: string; scale: string; min?: string }> = {
+  Q4_1: { code: `(rd(o + 4u + (l & 15u)) >> ((l >> 4u) * 4u)) & 15u`, scale: "d", min: "m" },
+  Q5_0: { code: `i32(((rd(o + 6u + (l & 15u)) >> ((l >> 4u) * 4u)) & 15u) | (((qh >> l) & 1u) << 4u)) - 16`, scale: "d" },
+  Q5_1: { code: `((rd(o + 8u + (l & 15u)) >> ((l >> 4u) * 4u)) & 15u) | (((qh >> l) & 1u) << 4u)`, scale: "d", min: "m" },
+  // d·sc and dmin·m are exact in f32 (an f16 times a 6-bit integer), as loader's exactQ4 computes them.
+  Q4_K: { code: `(rd(o + 16u + (j / 2u) * 32u + l) >> ((j & 1u) * 4u)) & 15u`, scale: "d * f32(sm.x)", min: "-(dmin * f32(sm.y))" },
+  Q5_K: { code: `((rd(o + 48u + (j / 2u) * 32u + l) >> ((j & 1u) * 4u)) & 15u) | (((rd(o + 16u + l) >> j) & 1u) << 4u)`, scale: "d * f32(sm.x)", min: "-(dmin * f32(sm.y))" },
+};
+
+/** The plane an exact GPU conversion writes. */
+export const exactOut = (type: GpuExactType): GpuConvertOut => (type === "Q4_1" || type === "Q4_K" ? "q4" : "q8");
+
+/**
+ * GGUF blocks to exact Kiln planes, the same bits as the loader's exactQ4 / exactQ8: codes moved
+ * as they are, scales (and mins, the fifth binding, for the affine types) written per 32 values.
+ */
+export function exactSpec(type: GpuExactType): KernelSpec {
+  const e = EXACT[type];
+  const q4 = exactOut(type) === "q4";
+  return {
+    key: `convert/${type}/exact`,
+    bindings: e.min ? ["uniform", "read", "rw", "rw", "rw"] : ["uniform", "read", "rw", "rw"],
+    code: /* wgsl */ `
+struct P { n: u32, dst0: u32 }
+@group(0) @binding(0) var<uniform> p: P;
+@group(0) @binding(1) var<storage, read> src: array<u32>;
+@group(0) @binding(2) var<storage, read_write> codes: array<u32>;
+@group(0) @binding(3) var<storage, read_write> scales: array<f32>;
+${e.min ? "@group(0) @binding(4) var<storage, read_write> mins: array<f32>;" : ""}
+
+fn rd(at: u32) -> u32 { return (src[at >> 2u] >> ((at & 3u) * 8u)) & 255u; }
+fn f16At(at: u32) -> f32 { return f16Bits(rd(at) | (rd(at + 1u) << 8u)); }
+fn f16Bits(h: u32) -> f32 {
+  let e = i32((h >> 10u) & 31u);
+  let m = f32(h & 1023u);
+  let v = select(ldexp(m + 1024.0, e - 25), ldexp(m, -24), e == 0);
+  return select(v, -v, (h & 0x8000u) != 0u);
+}
+fn scaleMin(j: u32, q: u32) -> vec2<u32> {
+  if (j < 4u) { return vec2<u32>(rd(q + j) & 63u, rd(q + j + 4u) & 63u); }
+  return vec2<u32>((rd(q + j + 4u) & 15u) | ((rd(q + j - 4u) >> 6u) << 4u), (rd(q + j + 4u) >> 4u) | ((rd(q + j) >> 6u) << 4u));
+}
+
+@compute @workgroup_size(${CONVERT_WG})
+fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nw: vec3<u32>) {
+  let i = gid.x + gid.y * nw.x * ${CONVERT_WG}u;
+  if (i >= p.n) { return; }
+  let b = p.dst0 + i;
+  ${SETUP[type]}
+  scales[b] = ${e.scale};
+  ${e.min ? `mins[b] = ${e.min};` : ""}
+  for (var w = 0u; w < ${q4 ? 4 : 8}u; w++) {
+    var word = 0u;
+    for (var k = 0u; k < ${q4 ? 8 : 4}u; k++) {
+      let l = w * ${q4 ? 8 : 4}u + k;
+      word |= (u32(${e.code}) & ${q4 ? "15u" : "255u"}) << (${q4 ? 4 : 8}u * k);
+    }
+    codes[b * ${q4 ? 4 : 8}u + w] = word;
+  }
+}
+`,
+  };
+}
+
 /**
  * Multiplies `n` f32 values in place by a constant: folds a per-tensor factor (Granite's residual and
  * logit multipliers) into a converted weight's scale plane. One rounding, as `Math.fround(x * f)`.

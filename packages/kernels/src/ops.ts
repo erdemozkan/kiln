@@ -44,7 +44,7 @@ export function grid1d(threads: number): Grid {
 function weightBufs(w: Tensor): Buf[] {
   if (isBlockQuant(w.dtype)) {
     if (!w.scales) throw new Error(`${w.dtype} tensor is missing its scales plane`);
-    return [w.buf, w.scales];
+    return w.mins ? [w.buf, w.scales, w.mins] : [w.buf, w.scales];
   }
   return [w.buf];
 }
@@ -134,6 +134,8 @@ export function linear(ctx: Ctx, x: Tensor, w: Tensor, opts: LinearOptions | Ten
   }
   const y = o.residual ?? ctx.alloc([M, outN]);
   const wdtype = weightDType(w);
+  const affine = !!w.mins;
+  const tag = `${wdtype}${affine ? "a" : ""}`;
   const f16 = o.f16 ?? f16Default;
   if (M >= gemmMinRows && !o.lanes && !o.f16 && gated) {
     // The GEMM's gated epilogue pairs 32 gate rows with 32 up rows per tile and ran 7% slower over a
@@ -150,7 +152,7 @@ export function linear(ctx: Ctx, x: Tensor, w: Tensor, opts: LinearOptions | Ten
     const bufs = [ctx.uniform([u32(M), u32(N), u32(K), u32(0)]), x.buf, ...weightBufs(w)];
     if (o.bias) bufs.push(o.bias.buf);
     bufs.push(y.buf);
-    ctx.run(gemmSpec({ wdtype, bias: !!o.bias, epi }), bufs, grid, `gemm/${wdtype} ${N}x${K}${gated ? `+${epi}` : ""}${o.residual ? "+add" : ""}`);
+    ctx.run(gemmSpec({ wdtype, affine, bias: !!o.bias, epi }), bufs, grid, `gemm/${tag} ${N}x${K}${gated ? `+${epi}` : ""}${o.residual ? "+add" : ""}`);
     return y;
   }
   const epi: MatmulEpilogue = o.gelu ? "gelu" : o.silu ? "silu" : o.residual ? "add" : "store";
@@ -162,21 +164,21 @@ export function linear(ctx: Ctx, x: Tensor, w: Tensor, opts: LinearOptions | Ten
     if (o.norm) bufs.push(o.norm.w.buf);
     if (o.bias) bufs.push(o.bias.buf);
     bufs.push(y.buf);
-    ctx.run(gemvSpec({ wdtype, norm: !!o.norm, bias: !!o.bias, epi, layout }), bufs, grid, `gemv/${wdtype} ${N}x${K}${o.norm ? "+norm" : ""}${gated ? `+${epi}` : ""}${o.residual ? "+add" : ""}`);
+    ctx.run(gemvSpec({ wdtype, affine, norm: !!o.norm, bias: !!o.bias, epi, layout }), bufs, grid, `gemv/${tag} ${N}x${K}${o.norm ? "+norm" : ""}${gated ? `+${epi}` : ""}${o.residual ? "+add" : ""}`);
     return y;
   }
   const lanes = o.lanes ?? tunedLanes.get(lanesKey(wdtype, mt, N, K)) ?? 8;
   if (f16 && !ctx.backend.limits.features.has("shader-f16")) throw new Error("linear: f16 math needs the shader-f16 feature");
   // The butterfly needs each row's lanes inside one subgroup.
   const sg = (o.subgroups ?? subgroupsDefault) && lanes <= (ctx.backend.limits.subgroupMinSize ?? 0);
-  const spec = matmulSpec({ wdtype, mt, lanes, norm: !!o.norm, bias: !!o.bias, epi, f16, sg });
+  const spec = matmulSpec({ wdtype, affine, mt, lanes, norm: !!o.norm, bias: !!o.bias, epi, f16, sg });
   const groups = Math.ceil(outN / matmulRowsPerGroup({ lanes, epi }));
   const grid: Grid = [Math.min(groups, MM_SLICE), Math.ceil(M / mt), Math.ceil(groups / MM_SLICE)];
   const bufs = [ctx.uniform([u32(M), u32(N), u32(K), f32(o.norm?.eps ?? 0)]), x.buf, ...weightBufs(w)];
   if (o.norm) bufs.push(o.norm.w.buf);
   if (o.bias) bufs.push(o.bias.buf);
   bufs.push(y.buf);
-  ctx.run(spec, bufs, grid, `matmul/${wdtype}/mt${mt} ${N}x${K}${o.norm ? "+norm" : ""}${gated ? `+${epi}` : ""}${o.residual ? "+add" : ""}`);
+  ctx.run(spec, bufs, grid, `matmul/${tag}/mt${mt} ${N}x${K}${o.norm ? "+norm" : ""}${gated ? `+${epi}` : ""}${o.residual ? "+add" : ""}`);
   return y;
 }
 
@@ -306,7 +308,7 @@ export function addInPlace(ctx: Ctx, a: Tensor, b: Tensor): void {
 export function embed(ctx: Ctx, table: Tensor, tokens: Buf, T: number, scale = 1): Tensor {
   const D = lastDim(table);
   const o = ctx.alloc([T, D]);
-  const spec = embedSpec(weightDType(table));
+  const spec = embedSpec(weightDType(table), !!table.mins);
   ctx.run(spec, [ctx.uniform([u32(T), u32(D), f32(scale), u32(0)]), tokens, ...weightBufs(table), o.buf], grid1d(T * D));
   return o;
 }

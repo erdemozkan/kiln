@@ -22,7 +22,7 @@ import { llamaMatmulShapes, tuneMatmuls } from "./tune";
 import { loadWeights, type LoadProgress, type Quant, type WeightFile } from "./weights";
 
 export interface LoadOptions {
-  /** Weight storage on the GPU: "q4" (default), "q8" or "f32". See `Quant`. */
+  /** Weight storage on the GPU: "auto" (default: q4, with GGUF tensors kept at their own precision), "q4", "q8" or "f32". See `Quant`. */
   quant?: Quant;
   /**
    * KV cache length in tokens. Default: the model's trained context, at most 8192 tokens and 512 MiB
@@ -61,7 +61,7 @@ export interface LoadOptions {
 export async function createEngine(modelId: string, opts: LoadOptions = {}): Promise<Engine> {
   const ref = parseModelId(modelId, opts.revision);
   const backend = opts.backend ?? (await createWebGPUBackend());
-  const quant = opts.quant ?? "q4";
+  const quant = opts.quant ?? "auto";
   ops.setMatmulF16(!!opts.f16Math && backend.limits.features.has("shader-f16"));
   ops.setSubgroups(!!opts.subgroups);
   const { cfg, tokenizer, files } = ref.gguf ? await openGGUF(ref, opts.endpoint) : await openSafetensors(ref, opts.endpoint);
@@ -69,7 +69,7 @@ export async function createEngine(modelId: string, opts: LoadOptions = {}): Pro
     const tuning =
       opts.tune === false
         ? Promise.resolve()
-        : tuneMatmuls(backend, llamaMatmulShapes(cfg, quant)).then(
+        : tuneMatmuls(backend, llamaMatmulShapes(cfg, quant === "auto" ? "q4" : quant)).then(
             () => undefined,
             (err: unknown) => console.warn("[kiln] matmul tuning failed; using defaults:", err),
           );
