@@ -51,5 +51,5 @@ load in 2.4 s. Decode uses a block-per-lane GEMV with several rows per thread on
 prefill a tiled GEMM and tiled attention, and GPU work is cut into short submits so the page stays
 responsive.
 
-**Checks.** 143 unit tests; a kernel check page (802 checks on the Intel GPU) compares every kernel with a CPU reference; Gemma 3 1B matches a NumPy reference token for
+**Checks.** 154 unit tests; a kernel check page (808 checks on the Intel GPU, 763 on the CPU backend) compares every kernel with a CPU reference; Gemma 3 1B matches a NumPy reference token for
 token in q8 and q4.

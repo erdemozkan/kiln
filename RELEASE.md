@@ -14,6 +14,8 @@ Steps for the first public release. Everything up to step 3 is checked in CI on 
 5. **Make the repository public** (GitHub: Settings → General → Danger Zone → Change visibility).
 6. **Publish the demo.** Settings → Pages → Source: GitHub Actions. Then Actions → "Deploy demo" →
    Run workflow. The demo is served from `https://<user>.github.io/kiln/`; the build uses relative
-   paths, so the subpath works as is.
+   paths, so the subpath works as is. Pages cannot send COOP/COEP headers, so the demo is not
+   cross-origin isolated and its CPU fallback (no WebGPU) runs matmuls on one thread; WebGPU is
+   unaffected.
 
 The demo deploy only runs when started by hand, so nothing is published by a push.

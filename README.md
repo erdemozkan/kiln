@@ -390,7 +390,7 @@ cost.
 
 ## Status
 
-Verified on this GPU: all kernel checks pass (802 now that Chrome exposes shader-f16 on it, including q4 and q8 weights, symmetric and affine, in every matmul variant, bidirectional-span attention, LayerNorm and pooling, the decode GEMV and the prefill GEMM, both prefill attention kernels, fused variants, f16 cache paths,
+Verified on this GPU: all kernel checks pass (808 now that Chrome exposes shader-f16 on it, including q4 and q8 weights, symmetric and affine, in every matmul variant, bidirectional-span attention, LayerNorm and pooling, the decode GEMV and the prefill GEMM, both prefill attention kernels, fused variants, f16 cache paths,
 sliding-window attention, GELU gating, grammar masks and sampling distributions). SmolLM2-135M-Instruct chats from Hub safetensors (q4, f32) and from a GGUF
 Q4_K_M file.
 
