@@ -63,14 +63,16 @@ describe.each([
       ["q4a", { ...upload(q4a.nibbles, [N, K]), dtype: "q4", scales: upload(q4a.scales, [0]).buf, mins: upload(q4a.mins!, [0]).buf }, dequantQ4(q4a)],
     ];
     for (const [name, wt, deq] of weights) {
+      // SIMD takes q4/q8 dot products with x as int16 per block: about 1e-5 of the outputs (≈10 here).
+      const tol = simd && name !== "f32" ? 5e-4 : 1e-4;
       let y!: Tensor;
       run(0, (ctx) => (y = ops.linear(ctx, upload(x, [M, K]), wt, { norm: { w: upload(nw, [K]), eps: 1e-5 } })));
       const want = ref.matmulRef(ref.rmsnormRef(x, nw, K, 1e-5), deq, M, N, K);
-      expect(ref.maxAbsDiff(await read(y, M * N), want), name).toBeLessThan(1e-4);
+      expect(ref.maxAbsDiff(await read(y, M * N), want), name).toBeLessThan(tol);
       run(0, (ctx) => (y = ops.linear(ctx, upload(x, [1, K]), wt, { silu: true })));
       const g = ref.matmulRef(x.subarray(0, K), deq, 1, N, K);
       const gated = Float32Array.from({ length: N / 2 }, (_, i) => (g[i]! / (1 + Math.exp(-g[i]!))) * g[N / 2 + i]!);
-      expect(ref.maxAbsDiff(await read(y, N / 2), gated), `${name} silu`).toBeLessThan(1e-4);
+      expect(ref.maxAbsDiff(await read(y, N / 2), gated), `${name} silu`).toBeLessThan(tol);
     }
   });
 

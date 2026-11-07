@@ -1,13 +1,15 @@
 import { SIMD_WASM, SIMD_WASM_SHARED } from "./simd-bytes";
 
-/** The exports of simd.wat: one x row against N weight rows. Pointers are byte offsets. */
+/** The exports of simd.wat. Pointers are byte offsets. */
 export interface SimdKernels {
+  /** One float x row against N f32 weight rows. */
   gemv_f32(x: number, w: number, K: number, N: number, y: number): void;
-  gemv_q8(x: number, q: number, s: number, mn: number, xsum: number, K: number, N: number, y: number): void;
-  gemv_q4(x: number, q: number, s: number, mn: number, xsum: number, K: number, N: number, y: number): void;
-  /** gemv_q4 for four x rows at once (rows K floats apart, sums K/32 apart, outputs ys floats apart), with identical results. */
-  gemm4_q4(x: number, q: number, s: number, mn: number, xsum: number, K: number, N: number, y: number, ys: number): void;
-  gemm4_q8(x: number, q: number, s: number, mn: number, xsum: number, K: number, N: number, y: number, ys: number): void;
+  /** One x row (int16 per block, xq, with block scales xs; q4's in nibble order, see simd.wat) against N q8 / q4 rows. */
+  gemv_q8i(xq: number, xs: number, q: number, s: number, mn: number, xsum: number, K: number, N: number, y: number): void;
+  gemv_q4i(xq: number, xs: number, q: number, s: number, mn: number, xsum: number, K: number, N: number, y: number): void;
+  /** The same for four x rows at once (xq rows K apart, xs/xsum rows K/32 apart, outputs ys floats apart), identical per row. */
+  gemm4_q8i(xq: number, xs: number, q: number, s: number, mn: number, xsum: number, K: number, N: number, y: number, ys: number): void;
+  gemm4_q4i(xq: number, xs: number, q: number, s: number, mn: number, xsum: number, K: number, N: number, y: number, ys: number): void;
   /** out[j] = q · K_j for keys j in [first, n), key j at k + (j mod cap) · stride bytes; returns the largest. */
   att_scores_f32(q: number, k: number, stride: number, cap: number, first: number, n: number, D: number, out: number): number;
   att_scores_f16(q: number, k: number, stride: number, cap: number, first: number, n: number, D: number, out: number): number;
@@ -25,7 +27,7 @@ export const GEMV_Q4 = 2;
  * Control block of a threaded job, as i32 slots in the shared memory: the job generation (bumped
  * to start one, -1 to stop), helpers done, then the job.
  */
-const C_GEN = 0, C_DONE = 1, C_FN = 2, C_M = 3, C_N = 4, C_K = 5, C_X = 6, C_W = 7, C_S = 8, C_MN = 9, C_XSUM = 10, C_Y = 11, C_PARTS = 12, C_READY = 13;
+const C_GEN = 0, C_DONE = 1, C_FN = 2, C_M = 3, C_N = 4, C_K = 5, C_X = 6, C_W = 7, C_S = 8, C_MN = 9, C_XSUM = 10, C_Y = 11, C_PARTS = 12, C_READY = 13, C_XS = 14;
 const CTRL_BYTES = 64;
 
 /**
@@ -45,9 +47,9 @@ const HELPER = `onmessage = (e) => {
     if (gen < 0) return;
     const parts = c[${C_PARTS}];
     if (idx + 1 >= parts) continue;
-    const [fn, M, N, K, x, w, s, mn, xsum, y] = [c[${C_FN}], c[${C_M}], c[${C_N}], c[${C_K}], c[${C_X}], c[${C_W}], c[${C_S}], c[${C_MN}], c[${C_XSUM}], c[${C_Y}]];
+    const [fn, M, N, K, x, xs, w, s, mn, xsum, y] = [c[${C_FN}], c[${C_M}], c[${C_N}], c[${C_K}], c[${C_X}], c[${C_XS}], c[${C_W}], c[${C_S}], c[${C_MN}], c[${C_XSUM}], c[${C_Y}]];
     const [n0, n1] = slice(N, parts, idx + 1);
-    if (n0 < n1) run(k, fn, M, N, K, x, w, s, mn, xsum, y, n0, n1);
+    if (n0 < n1) run(k, fn, M, N, K, x, xs, w, s, mn, xsum, y, n0, n1);
     Atomics.add(c, ${C_DONE}, 1);
     Atomics.notify(c, ${C_DONE});
   }
@@ -61,25 +63,24 @@ function slice(N: number, parts: number, i: number): [number, number] {
   return [Math.min(N, i * per), Math.min(N, (i + 1) * per)];
 }
 
-/** Every x row against weight rows [n0, n1): offsets into the weight planes and the output rows. */
-function runRows(k: SimdKernels, fn: number, M: number, N: number, K: number, x: number, w: number, s: number, mn: number, xsum: number, y: number, n0: number, n1: number): void {
+/**
+ * Every x row against weight rows [n0, n1): offsets into the weight planes and the output rows. x is
+ * float rows for f32 weights, else int16 rows (xq) with block scales at xs.
+ */
+function runRows(k: SimdKernels, fn: number, M: number, N: number, K: number, x: number, xs: number, w: number, s: number, mn: number, xsum: number, y: number, n0: number, n1: number): void {
   const KB = K >>> 5;
   const rows = n1 - n0;
+  if (fn === 0) {
+    for (let m = 0; m < M; m++) k.gemv_f32(x + m * K * 4, w + n0 * K * 4, K, rows, y + (m * N + n0) * 4);
+    return;
+  }
+  const wq = w + n0 * (fn === 2 ? K >>> 1 : K), sm = s + n0 * KB * 4, mm = mn ? mn + n0 * KB * 4 : 0;
   let m = 0;
   // Four x rows per pass over the weights where there are four (identical results to one at a time).
-  if (fn === 2)
-    for (; m + 4 <= M; m += 4) k.gemm4_q4(x + m * K * 4, w + n0 * (K >>> 1), s + n0 * KB * 4, mn ? mn + n0 * KB * 4 : 0, xsum + m * KB * 4, K, rows, y + (m * N + n0) * 4, N);
-  else if (fn === 1)
-    for (; m + 4 <= M; m += 4) k.gemm4_q8(x + m * K * 4, w + n0 * K, s + n0 * KB * 4, mn ? mn + n0 * KB * 4 : 0, xsum + m * KB * 4, K, rows, y + (m * N + n0) * 4, N);
-  for (; m < M; m++) {
-    const xm = x + m * K * 4, ym = y + (m * N + n0) * 4;
-    if (fn === 0) k.gemv_f32(xm, w + n0 * K * 4, K, rows, ym);
-    else {
-      const sm = s + n0 * KB * 4, mm = mn ? mn + n0 * KB * 4 : 0, xs = xsum + m * KB * 4;
-      if (fn === 1) k.gemv_q8(xm, w + n0 * K, sm, mm, xs, K, rows, ym);
-      else k.gemv_q4(xm, w + n0 * (K >>> 1), sm, mm, xs, K, rows, ym);
-    }
-  }
+  const four = fn === 2 ? k.gemm4_q4i : k.gemm4_q8i;
+  for (; m + 4 <= M; m += 4) four(x + m * K * 2, xs + m * KB * 4, wq, sm, mm, xsum + m * KB * 4, K, rows, y + (m * N + n0) * 4, N);
+  const one = fn === 2 ? k.gemv_q4i : k.gemv_q8i;
+  for (; m < M; m++) one(x + m * K * 2, xs + m * KB * 4, wq, sm, mm, xsum + m * KB * 4, K, rows, y + (m * N + n0) * 4);
 }
 
 /** Multiply-adds below which a matmul stays on one thread (waking helpers costs tens of µs). */
@@ -152,22 +153,23 @@ export class WasmHeap {
   }
 
   /**
-   * y rows for every x row against N weight rows (`fn`: GEMV_F32 / GEMV_Q8 / GEMV_Q4; pointers as
-   * the gemv exports take them), split across the helper threads when large enough.
+   * y rows for every x row against N weight rows (`fn`: GEMV_F32 / GEMV_Q8 / GEMV_Q4; x as float
+   * rows, or int16 rows with block scales xs; pointers as the kernels take them), split across the
+   * helper threads when large enough.
    */
-  gemm(fn: number, M: number, N: number, K: number, x: number, w: number, s: number, mn: number, xsum: number, y: number): void {
+  gemm(fn: number, M: number, N: number, K: number, x: number, xs: number, w: number, s: number, mn: number, xsum: number, y: number): void {
     const c = this.ctrl;
     const parts = c ? Math.min(1 + Atomics.load(c, C_READY), Math.ceil(N / 8)) : 1;
     if (!c || parts < 2 || M * N * K < THREAD_MIN_MACS) {
-      runRows(this.kernels, fn, M, N, K, x, w, s, mn, xsum, y, 0, N);
+      runRows(this.kernels, fn, M, N, K, x, xs, w, s, mn, xsum, y, 0, N);
       return;
     }
-    c[C_FN] = fn; c[C_M] = M; c[C_N] = N; c[C_K] = K; c[C_X] = x; c[C_W] = w; c[C_S] = s; c[C_MN] = mn; c[C_XSUM] = xsum; c[C_Y] = y; c[C_PARTS] = parts;
+    c[C_FN] = fn; c[C_M] = M; c[C_N] = N; c[C_K] = K; c[C_X] = x; c[C_XS] = xs; c[C_W] = w; c[C_S] = s; c[C_MN] = mn; c[C_XSUM] = xsum; c[C_Y] = y; c[C_PARTS] = parts;
     Atomics.store(c, C_DONE, 0);
     Atomics.add(c, C_GEN, 1);
     Atomics.notify(c, C_GEN);
     const [n0, n1] = slice(N, parts, 0);
-    runRows(this.kernels, fn, M, N, K, x, w, s, mn, xsum, y, n0, n1);
+    runRows(this.kernels, fn, M, N, K, x, xs, w, s, mn, xsum, y, n0, n1);
     for (let d = Atomics.load(c, C_DONE); d < parts - 1; d = Atomics.load(c, C_DONE)) Atomics.wait(c, C_DONE, d);
   }
 

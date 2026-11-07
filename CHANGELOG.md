@@ -38,8 +38,9 @@ calls queue.
 
 **CPU fallback.** Without WebGPU (or with `device: "cpu"`), the same engine runs on CPU versions of
 every kernel: matmuls and attention in WASM SIMD (TypeScript where SIMD is missing), the rest in
-TypeScript; large matmuls use several threads on cross-origin isolated pages. 26–29 tok/s for
-SmolLM2-135M on an Intel Mac; meant for small models. `info.backend` reports which
+TypeScript; q4/q8 matmuls are integer dot products with x as int16 per block, and large ones use
+several threads on cross-origin isolated pages. About 37 tok/s for SmolLM2-135M on an Intel Mac,
+with the GPU's greedy tokens; meant for small models. `info.backend` reports which
 backend runs.
 
 **Context.** The default context is the model's trained context, up to 8192 tokens and 512 MiB of

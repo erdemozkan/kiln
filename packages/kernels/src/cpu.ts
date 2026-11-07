@@ -162,10 +162,14 @@ interface HeapView extends CpuView {
 }
 
 /**
- * acc[m, n] = Σ_k xs[m, k] · W[n, k] in WASM SIMD: x rows (permuted per block for q4, see simd.wat)
- * and their block sums go to heap scratch, then one gemv per row. Returns a copy of the result.
+ * acc[m, n] = Σ_k xs[m, k] · W[n, k] in WASM SIMD: x rows go to heap scratch (as floats for f32
+ * weights; as int16 per block with scales and exact block sums for q4/q8, see simd.wat), then the
+ * kernels run over them, four rows per pass where they can. Returns a copy of the result.
  */
-const simdScratch = (M: number, N: number, K: number) => M * K * 4 + Math.ceil((M * (K >>> 5) * 4) / 16) * 16 + M * N * 4;
+const simdScratch = (M: number, N: number, K: number) => M * K * 4 + 2 * Math.ceil((M * (K >>> 5) * 4) / 16) * 16 + M * N * 4;
+
+/** Where element e of a 32-value block sits in q4's int16 x layout (low nibbles' lanes, then high ones'; see simd.wat). */
+const Q4_LANE = Int32Array.from({ length: 32 }, (_, e) => (e & 1) * 16 + 4 * (e >>> 3) + ((e & 7) >>> 1));
 
 function simdMatmul(heap: WasmHeap, wdtype: WeightDType, xs: Float32Array, w: HeapView[], M: number, N: number, K: number): Float32Array {
   const KB = K >>> 5;
@@ -173,20 +177,34 @@ function simdMatmul(heap: WasmHeap, wdtype: WeightDType, xs: Float32Array, w: He
   const sumBytes = Math.ceil((M * KB * 4) / 16) * 16;
   const at = heap.scratch(simdScratch(M, N, K)); // reserved by the caller: no growth here
   const mem = new Float32Array(heap.buffer);
-  const xp = at, sp = at + xBytes, yp = sp + sumBytes;
-  const x = mem.subarray(xp / 4, xp / 4 + M * K);
-  if (wdtype === "q4")
-    for (let base = 0; base < M * K; base += 32)
-      for (let j = 0; j < 4; j++) for (let e = 0; e < 8; e++) x[base + 4 * e + j] = xs[base + 8 * j + e]!;
-  else x.set(xs);
-  if (wdtype !== "f32")
+  const xp = at, sp = at + xBytes, scp = sp + sumBytes, yp = scp + sumBytes;
+  if (wdtype === "f32") {
+    mem.set(xs.subarray(0, M * K), xp / 4);
+    heap.gemm(GEMV_F32, M, N, K, xp, 0, w[0]!.ptr, 0, 0, 0, yp);
+  } else {
+    // x as int16 per 32-value block, scaled to the block's largest magnitude (error ≤ amax / 65534),
+    // plus each block's exact float sum for the min term.
+    const xq = new Int16Array(heap.buffer, xp, M * K);
+    const sc = mem.subarray(scp / 4, scp / 4 + M * KB);
+    const sum = mem.subarray(sp / 4, sp / 4 + M * KB);
+    const q4 = wdtype === "q4";
     for (let r = 0; r < M * KB; r++) {
-      let t = 0;
-      for (let e = 0, o = r * 32; e < 32; e++) t += xs[o + e]!;
-      mem[sp / 4 + r] = t;
+      const o = r * 32;
+      let amax = 0, t = 0;
+      for (let e = 0; e < 32; e++) {
+        const v = xs[o + e]!;
+        t += v;
+        if (v > amax) amax = v;
+        else if (-v > amax) amax = -v;
+      }
+      sum[r] = t;
+      const scale = amax > 0 ? amax / 32767 : 1;
+      sc[r] = scale;
+      const inv = 1 / scale;
+      for (let e = 0; e < 32; e++) xq[o + (q4 ? Q4_LANE[e]! : e)] = Math.max(-32767, Math.min(32767, Math.round(xs[o + e]! * inv)));
     }
-  const fn = wdtype === "f32" ? GEMV_F32 : wdtype === "q4" ? GEMV_Q4 : GEMV_Q8;
-  heap.gemm(fn, M, N, K, xp, w[0]!.ptr, w[1]?.ptr ?? 0, w[2]?.ptr ?? 0, sp, yp);
+    heap.gemm(q4 ? GEMV_Q4 : GEMV_Q8, M, N, K, xp, scp, w[0]!.ptr, w[1]!.ptr, w[2]?.ptr ?? 0, sp, yp);
+  }
   return new Float32Array(heap.buffer, yp, M * N).slice();
 }
 

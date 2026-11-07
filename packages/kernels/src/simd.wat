@@ -1,19 +1,17 @@
-;; WASM SIMD matrix-vector kernels for the CPU backend (see simd.ts). Rebuild simd-bytes.ts after
-;; editing: `node packages/kernels/scripts/build-simd.mjs` (needs wabt's wat2wasm on the PATH or
-;; through npx).
+;; WASM SIMD kernels for the CPU backend (see simd.ts). Rebuild simd-bytes.ts after editing:
+;; `node packages/kernels/scripts/build-simd.mjs` (needs wabt's wat2wasm on the PATH or through npx).
 ;;
-;; Every pointer is a byte offset into the imported memory. Each function computes, for n < N,
+;; Every pointer is a byte offset into the imported memory. The matvec functions compute, for n < N,
 ;;   y[n] = Σ_k x[k] · W[n, k]
-;; for one x row, with W in one of the weight formats:
-;;   f32: rows of K floats.
+;; with W in one of the weight formats:
+;;   f32: rows of K floats (gemv_f32, x as floats; K a multiple of 4).
 ;;   q8:  32-value blocks of int8 codes, a scale per block (s), optionally a min per block (mn):
 ;;        W = code · s + min. Symmetric when mn is 0.
 ;;   q4:  32-value blocks of four u32 words (element 8j + e at nibble e of word j), codes 0–15:
-;;        W = code · s + min (affine) or (code − 8) · s (symmetric, mn = 0). x must be given
-;;        permuted per block (x'[32b + 4e + j] = x[32b + 8j + e]) so a nibble lane meets
-;;        contiguous x.
-;; xsum holds Σ x over each block (q8 affine and q4 only). K is a multiple of 32 for q8 and q4 and
-;; of 4 for f32.
+;;        W = code · s + min (affine) or (code − 8) · s (symmetric, mn = 0).
+;; For q8 and q4, x comes as int16 per block (xq) with a scale per block (xs), and the products are
+;; integer dot products (i32x4.dot_i16x8_s); xsum holds each block's exact float Σx for the min term.
+;; K is a multiple of 32.
 (module
   (import "env" "memory" (memory 1 65536))
 
@@ -61,38 +59,81 @@
         (local.set $n (i32.add (local.get $n) (i32.const 1)))
         (br $rows))))
 
-  (func (export "gemv_q8") (param $x i32) (param $q i32) (param $s i32) (param $mn i32) (param $xsum i32)
+  ;; ---- Integer dot products: x as int16 per 32-value block (xq, with a scale per block in xs) ----
+  ;; q4: xq holds each block's 32 values as 16 for the low nibbles then 16 for the high ones, in the
+  ;; order the code bytes hold them: lane 4j + i of the low half is x[8j + 2i], of the high half
+  ;; x[8j + 2i + 1]. Symmetric codes are shifted to -8…7 before the dot, so only affine blocks need
+  ;; the min · Σx term (xsum, the exact float sums).
+  (func (export "gemv_q4i") (param $xq i32) (param $xs i32) (param $q i32) (param $s i32) (param $mn i32) (param $xsum i32)
     (param $K i32) (param $N i32) (param $y i32)
     (local $n i32) (local $b i32) (local $KB i32) (local $xp i32) (local $v v128) (local $lo v128) (local $hi v128)
-    (local $blk v128) (local $tot v128) (local $extra f32)
+    (local $acc v128) (local $tot v128) (local $extra f32) (local $off v128)
+    (local.set $KB (i32.shr_u (local.get $K) (i32.const 5)))
+    (local.set $off (select (v128.const i8x16 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0) (v128.const i8x16 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8) (local.get $mn)))
+    (block $done
+      (loop $rows
+        (br_if $done (i32.ge_u (local.get $n) (local.get $N)))
+        (local.set $tot (v128.const i32x4 0 0 0 0))
+        (local.set $extra (f32.const 0))
+        (local.set $xp (local.get $xq))
+        (local.set $b (i32.const 0))
+        (block $db
+          (loop $lb
+            (br_if $db (i32.ge_u (local.get $b) (local.get $KB)))
+            (local.set $v (v128.load (local.get $q)))
+            (local.set $lo (i8x16.sub (v128.and (local.get $v) (v128.const i8x16 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15)) (local.get $off)))
+            (local.set $hi (i8x16.sub (i8x16.shr_u (local.get $v) (i32.const 4)) (local.get $off)))
+            (local.set $acc (i32x4.add
+              (i32x4.add
+                (i32x4.dot_i16x8_s (i16x8.extend_low_i8x16_s (local.get $lo)) (v128.load (local.get $xp)))
+                (i32x4.dot_i16x8_s (i16x8.extend_high_i8x16_s (local.get $lo)) (v128.load offset=16 (local.get $xp))))
+              (i32x4.add
+                (i32x4.dot_i16x8_s (i16x8.extend_low_i8x16_s (local.get $hi)) (v128.load offset=32 (local.get $xp)))
+                (i32x4.dot_i16x8_s (i16x8.extend_high_i8x16_s (local.get $hi)) (v128.load offset=48 (local.get $xp))))))
+            (local.set $tot (f32x4.add (local.get $tot) (f32x4.mul (f32x4.convert_i32x4_s (local.get $acc))
+              (f32x4.splat (f32.mul (f32.load (local.get $s)) (f32.load (i32.add (local.get $xs) (i32.shl (local.get $b) (i32.const 2)))))))))
+            (if (local.get $mn)
+              (then
+                (local.set $extra (f32.add (local.get $extra)
+                  (f32.mul (f32.load (local.get $mn)) (f32.load (i32.add (local.get $xsum) (i32.shl (local.get $b) (i32.const 2)))))))
+                (local.set $mn (i32.add (local.get $mn) (i32.const 4)))))
+            (local.set $q (i32.add (local.get $q) (i32.const 16)))
+            (local.set $s (i32.add (local.get $s) (i32.const 4)))
+            (local.set $xp (i32.add (local.get $xp) (i32.const 64)))
+            (local.set $b (i32.add (local.get $b) (i32.const 1)))
+            (br $lb)))
+        (f32.store (i32.add (local.get $y) (i32.shl (local.get $n) (i32.const 2)))
+          (f32.add (call $hsum (local.get $tot)) (local.get $extra)))
+        (local.set $n (i32.add (local.get $n) (i32.const 1)))
+        (br $rows))))
+
+  ;; q8: xq holds each block's 32 values in order.
+  (func (export "gemv_q8i") (param $xq i32) (param $xs i32) (param $q i32) (param $s i32) (param $mn i32) (param $xsum i32)
+    (param $K i32) (param $N i32) (param $y i32)
+    (local $n i32) (local $b i32) (local $KB i32) (local $xp i32) (local $v0 v128) (local $v1 v128)
+    (local $acc v128) (local $tot v128) (local $extra f32)
     (local.set $KB (i32.shr_u (local.get $K) (i32.const 5)))
     (block $done
       (loop $rows
         (br_if $done (i32.ge_u (local.get $n) (local.get $N)))
         (local.set $tot (v128.const i32x4 0 0 0 0))
         (local.set $extra (f32.const 0))
-        (local.set $xp (local.get $x))
+        (local.set $xp (local.get $xq))
         (local.set $b (i32.const 0))
         (block $db
           (loop $lb
             (br_if $db (i32.ge_u (local.get $b) (local.get $KB)))
-            ;; codes 0–15 of the block
-            (local.set $v (v128.load (local.get $q)))
-            (local.set $lo (i16x8.extend_low_i8x16_s (local.get $v)))
-            (local.set $hi (i16x8.extend_high_i8x16_s (local.get $v)))
-            (local.set $blk (f32x4.mul (f32x4.convert_i32x4_s (i32x4.extend_low_i16x8_s (local.get $lo))) (v128.load (local.get $xp))))
-            (local.set $blk (f32x4.add (local.get $blk) (f32x4.mul (f32x4.convert_i32x4_s (i32x4.extend_high_i16x8_s (local.get $lo))) (v128.load offset=16 (local.get $xp)))))
-            (local.set $blk (f32x4.add (local.get $blk) (f32x4.mul (f32x4.convert_i32x4_s (i32x4.extend_low_i16x8_s (local.get $hi))) (v128.load offset=32 (local.get $xp)))))
-            (local.set $blk (f32x4.add (local.get $blk) (f32x4.mul (f32x4.convert_i32x4_s (i32x4.extend_high_i16x8_s (local.get $hi))) (v128.load offset=48 (local.get $xp)))))
-            ;; codes 16–31
-            (local.set $v (v128.load offset=16 (local.get $q)))
-            (local.set $lo (i16x8.extend_low_i8x16_s (local.get $v)))
-            (local.set $hi (i16x8.extend_high_i8x16_s (local.get $v)))
-            (local.set $blk (f32x4.add (local.get $blk) (f32x4.mul (f32x4.convert_i32x4_s (i32x4.extend_low_i16x8_s (local.get $lo))) (v128.load offset=64 (local.get $xp)))))
-            (local.set $blk (f32x4.add (local.get $blk) (f32x4.mul (f32x4.convert_i32x4_s (i32x4.extend_high_i16x8_s (local.get $lo))) (v128.load offset=80 (local.get $xp)))))
-            (local.set $blk (f32x4.add (local.get $blk) (f32x4.mul (f32x4.convert_i32x4_s (i32x4.extend_low_i16x8_s (local.get $hi))) (v128.load offset=96 (local.get $xp)))))
-            (local.set $blk (f32x4.add (local.get $blk) (f32x4.mul (f32x4.convert_i32x4_s (i32x4.extend_high_i16x8_s (local.get $hi))) (v128.load offset=112 (local.get $xp)))))
-            (local.set $tot (f32x4.add (local.get $tot) (f32x4.mul (local.get $blk) (v128.load32_splat (local.get $s)))))
+            (local.set $v0 (v128.load (local.get $q)))
+            (local.set $v1 (v128.load offset=16 (local.get $q)))
+            (local.set $acc (i32x4.add
+              (i32x4.add
+                (i32x4.dot_i16x8_s (i16x8.extend_low_i8x16_s (local.get $v0)) (v128.load (local.get $xp)))
+                (i32x4.dot_i16x8_s (i16x8.extend_high_i8x16_s (local.get $v0)) (v128.load offset=16 (local.get $xp))))
+              (i32x4.add
+                (i32x4.dot_i16x8_s (i16x8.extend_low_i8x16_s (local.get $v1)) (v128.load offset=32 (local.get $xp)))
+                (i32x4.dot_i16x8_s (i16x8.extend_high_i8x16_s (local.get $v1)) (v128.load offset=48 (local.get $xp))))))
+            (local.set $tot (f32x4.add (local.get $tot) (f32x4.mul (f32x4.convert_i32x4_s (local.get $acc))
+              (f32x4.splat (f32.mul (f32.load (local.get $s)) (f32.load (i32.add (local.get $xs) (i32.shl (local.get $b) (i32.const 2)))))))))
             (if (local.get $mn)
               (then
                 (local.set $extra (f32.add (local.get $extra)
@@ -100,69 +141,25 @@
                 (local.set $mn (i32.add (local.get $mn) (i32.const 4)))))
             (local.set $q (i32.add (local.get $q) (i32.const 32)))
             (local.set $s (i32.add (local.get $s) (i32.const 4)))
-            (local.set $xp (i32.add (local.get $xp) (i32.const 128)))
+            (local.set $xp (i32.add (local.get $xp) (i32.const 64)))
             (local.set $b (i32.add (local.get $b) (i32.const 1)))
             (br $lb)))
-        (f32.store
-          (i32.add (local.get $y) (i32.shl (local.get $n) (i32.const 2)))
+        (f32.store (i32.add (local.get $y) (i32.shl (local.get $n) (i32.const 2)))
           (f32.add (call $hsum (local.get $tot)) (local.get $extra)))
         (local.set $n (i32.add (local.get $n) (i32.const 1)))
         (br $rows))))
 
-  (func (export "gemv_q4") (param $x i32) (param $q i32) (param $s i32) (param $mn i32) (param $xsum i32)
-    (param $K i32) (param $N i32) (param $y i32)
-    (local $n i32) (local $b i32) (local $KB i32) (local $xp i32) (local $v v128) (local $blk v128)
-    (local $tot v128) (local $extra f32) (local $sx f32)
-    (local.set $KB (i32.shr_u (local.get $K) (i32.const 5)))
-    (block $done
-      (loop $rows
-        (br_if $done (i32.ge_u (local.get $n) (local.get $N)))
-        (local.set $tot (v128.const i32x4 0 0 0 0))
-        (local.set $extra (f32.const 0))
-        (local.set $xp (local.get $x))
-        (local.set $b (i32.const 0))
-        (block $db
-          (loop $lb
-            (br_if $db (i32.ge_u (local.get $b) (local.get $KB)))
-            (local.set $v (v128.load (local.get $q)))
-            (local.set $blk (f32x4.mul (f32x4.convert_i32x4_s (v128.and (local.get $v) (v128.const i32x4 15 15 15 15))) (v128.load (local.get $xp))))
-            (local.set $blk (f32x4.add (local.get $blk) (f32x4.mul (f32x4.convert_i32x4_s (v128.and (i32x4.shr_u (local.get $v) (i32.const 4)) (v128.const i32x4 15 15 15 15))) (v128.load offset=16 (local.get $xp)))))
-            (local.set $blk (f32x4.add (local.get $blk) (f32x4.mul (f32x4.convert_i32x4_s (v128.and (i32x4.shr_u (local.get $v) (i32.const 8)) (v128.const i32x4 15 15 15 15))) (v128.load offset=32 (local.get $xp)))))
-            (local.set $blk (f32x4.add (local.get $blk) (f32x4.mul (f32x4.convert_i32x4_s (v128.and (i32x4.shr_u (local.get $v) (i32.const 12)) (v128.const i32x4 15 15 15 15))) (v128.load offset=48 (local.get $xp)))))
-            (local.set $blk (f32x4.add (local.get $blk) (f32x4.mul (f32x4.convert_i32x4_s (v128.and (i32x4.shr_u (local.get $v) (i32.const 16)) (v128.const i32x4 15 15 15 15))) (v128.load offset=64 (local.get $xp)))))
-            (local.set $blk (f32x4.add (local.get $blk) (f32x4.mul (f32x4.convert_i32x4_s (v128.and (i32x4.shr_u (local.get $v) (i32.const 20)) (v128.const i32x4 15 15 15 15))) (v128.load offset=80 (local.get $xp)))))
-            (local.set $blk (f32x4.add (local.get $blk) (f32x4.mul (f32x4.convert_i32x4_s (v128.and (i32x4.shr_u (local.get $v) (i32.const 24)) (v128.const i32x4 15 15 15 15))) (v128.load offset=96 (local.get $xp)))))
-            (local.set $blk (f32x4.add (local.get $blk) (f32x4.mul (f32x4.convert_i32x4_s (i32x4.shr_u (local.get $v) (i32.const 28))) (v128.load offset=112 (local.get $xp)))))
-            (local.set $tot (f32x4.add (local.get $tot) (f32x4.mul (local.get $blk) (v128.load32_splat (local.get $s)))))
-            (local.set $sx (f32.load (i32.add (local.get $xsum) (i32.shl (local.get $b) (i32.const 2)))))
-            (if (local.get $mn)
-              (then
-                (local.set $extra (f32.add (local.get $extra) (f32.mul (f32.load (local.get $mn)) (local.get $sx))))
-                (local.set $mn (i32.add (local.get $mn) (i32.const 4))))
-              (else
-                (local.set $extra (f32.sub (local.get $extra) (f32.mul (f32.mul (f32.load (local.get $s)) (f32.const 8)) (local.get $sx))))))
-            (local.set $q (i32.add (local.get $q) (i32.const 16)))
-            (local.set $s (i32.add (local.get $s) (i32.const 4)))
-            (local.set $xp (i32.add (local.get $xp) (i32.const 128)))
-            (local.set $b (i32.add (local.get $b) (i32.const 1)))
-            (br $lb)))
-        (f32.store
-          (i32.add (local.get $y) (i32.shl (local.get $n) (i32.const 2)))
-          (f32.add (call $hsum (local.get $tot)) (local.get $extra)))
-        (local.set $n (i32.add (local.get $n) (i32.const 1)))
-        (br $rows))))
-
-  ;; Four x rows at once (rows K floats apart, their block sums KB apart, outputs ys floats apart): each
-  ;; weight block is unpacked once for all four. Per row, the same operations in the same order as
-  ;; gemv_q4, so the results are identical.
-  (func (export "gemm4_q4") (param $x i32) (param $q i32) (param $s i32) (param $mn i32) (param $xsum i32)
+  ;; gemv_q4i for four x rows at once (xq rows K int16 apart, xs and xsum rows KB apart, outputs ys floats
+  ;; apart): each block's codes are widened once for the four.
+  (func (export "gemm4_q4i") (param $xq i32) (param $xs i32) (param $q i32) (param $s i32) (param $mn i32) (param $xsum i32)
     (param $K i32) (param $N i32) (param $y i32) (param $ys i32)
-    (local $n i32) (local $b i32) (local $KB i32) (local $xp i32) (local $xs i32) (local $v v128) (local $c v128) (local $sc v128)
-    (local $rs i32) (local $ss i32) (local $mnv f32) (local $sv f32)
-    (local $blk0 v128) (local $tot0 v128) (local $ex0 f32) (local $blk1 v128) (local $tot1 v128) (local $ex1 f32) (local $blk2 v128) (local $tot2 v128) (local $ex2 f32) (local $blk3 v128) (local $tot3 v128) (local $ex3 f32)
+    (local $n i32) (local $b i32) (local $KB i32) (local $xp i32) (local $xsp i32) (local $sxp i32) (local $v v128) (local $v1 v128) (local $off v128)
+    (local $e0 v128) (local $e1 v128) (local $e2 v128) (local $e3 v128) (local $sv f32) (local $mnv f32) (local $rs i32) (local $ss i32)
+    (local $tot0 v128) (local $ex0 f32) (local $tot1 v128) (local $ex1 f32) (local $tot2 v128) (local $ex2 f32) (local $tot3 v128) (local $ex3 f32)
     (local.set $KB (i32.shr_u (local.get $K) (i32.const 5)))
-    (local.set $rs (i32.shl (local.get $K) (i32.const 2)))
+    (local.set $rs (i32.shl (local.get $K) (i32.const 1)))
     (local.set $ss (i32.shl (local.get $KB) (i32.const 2)))
+    (local.set $off (select (v128.const i8x16 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0) (v128.const i8x16 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8) (local.get $mn)))
     (block $done
       (loop $rows
         (br_if $done (i32.ge_u (local.get $n) (local.get $N)))
@@ -170,77 +167,54 @@
         (local.set $tot1 (v128.const i32x4 0 0 0 0)) (local.set $ex1 (f32.const 0))
         (local.set $tot2 (v128.const i32x4 0 0 0 0)) (local.set $ex2 (f32.const 0))
         (local.set $tot3 (v128.const i32x4 0 0 0 0)) (local.set $ex3 (f32.const 0))
-        (local.set $xp (local.get $x))
-        (local.set $xs (local.get $xsum))
+        (local.set $xp (local.get $xq))
+        (local.set $xsp (local.get $xs))
+        (local.set $sxp (local.get $xsum))
         (local.set $b (i32.const 0))
         (block $db
           (loop $lb
             (br_if $db (i32.ge_u (local.get $b) (local.get $KB)))
             (local.set $v (v128.load (local.get $q)))
-            (local.set $c (f32x4.convert_i32x4_s (v128.and (local.get $v) (v128.const i32x4 15 15 15 15))))
-            (local.set $blk0 (f32x4.mul (local.get $c) (v128.load offset=0 (local.get $xp))))
-            (local.set $blk1 (f32x4.mul (local.get $c) (v128.load offset=0 (i32.add (local.get $xp) (i32.mul (local.get $rs) (i32.const 1))))))
-            (local.set $blk2 (f32x4.mul (local.get $c) (v128.load offset=0 (i32.add (local.get $xp) (i32.mul (local.get $rs) (i32.const 2))))))
-            (local.set $blk3 (f32x4.mul (local.get $c) (v128.load offset=0 (i32.add (local.get $xp) (i32.mul (local.get $rs) (i32.const 3))))))
-            (local.set $c (f32x4.convert_i32x4_s (v128.and (i32x4.shr_u (local.get $v) (i32.const 4)) (v128.const i32x4 15 15 15 15))))
-            (local.set $blk0 (f32x4.add (local.get $blk0) (f32x4.mul (local.get $c) (v128.load offset=16 (local.get $xp)))))
-            (local.set $blk1 (f32x4.add (local.get $blk1) (f32x4.mul (local.get $c) (v128.load offset=16 (i32.add (local.get $xp) (i32.mul (local.get $rs) (i32.const 1)))))))
-            (local.set $blk2 (f32x4.add (local.get $blk2) (f32x4.mul (local.get $c) (v128.load offset=16 (i32.add (local.get $xp) (i32.mul (local.get $rs) (i32.const 2)))))))
-            (local.set $blk3 (f32x4.add (local.get $blk3) (f32x4.mul (local.get $c) (v128.load offset=16 (i32.add (local.get $xp) (i32.mul (local.get $rs) (i32.const 3)))))))
-            (local.set $c (f32x4.convert_i32x4_s (v128.and (i32x4.shr_u (local.get $v) (i32.const 8)) (v128.const i32x4 15 15 15 15))))
-            (local.set $blk0 (f32x4.add (local.get $blk0) (f32x4.mul (local.get $c) (v128.load offset=32 (local.get $xp)))))
-            (local.set $blk1 (f32x4.add (local.get $blk1) (f32x4.mul (local.get $c) (v128.load offset=32 (i32.add (local.get $xp) (i32.mul (local.get $rs) (i32.const 1)))))))
-            (local.set $blk2 (f32x4.add (local.get $blk2) (f32x4.mul (local.get $c) (v128.load offset=32 (i32.add (local.get $xp) (i32.mul (local.get $rs) (i32.const 2)))))))
-            (local.set $blk3 (f32x4.add (local.get $blk3) (f32x4.mul (local.get $c) (v128.load offset=32 (i32.add (local.get $xp) (i32.mul (local.get $rs) (i32.const 3)))))))
-            (local.set $c (f32x4.convert_i32x4_s (v128.and (i32x4.shr_u (local.get $v) (i32.const 12)) (v128.const i32x4 15 15 15 15))))
-            (local.set $blk0 (f32x4.add (local.get $blk0) (f32x4.mul (local.get $c) (v128.load offset=48 (local.get $xp)))))
-            (local.set $blk1 (f32x4.add (local.get $blk1) (f32x4.mul (local.get $c) (v128.load offset=48 (i32.add (local.get $xp) (i32.mul (local.get $rs) (i32.const 1)))))))
-            (local.set $blk2 (f32x4.add (local.get $blk2) (f32x4.mul (local.get $c) (v128.load offset=48 (i32.add (local.get $xp) (i32.mul (local.get $rs) (i32.const 2)))))))
-            (local.set $blk3 (f32x4.add (local.get $blk3) (f32x4.mul (local.get $c) (v128.load offset=48 (i32.add (local.get $xp) (i32.mul (local.get $rs) (i32.const 3)))))))
-            (local.set $c (f32x4.convert_i32x4_s (v128.and (i32x4.shr_u (local.get $v) (i32.const 16)) (v128.const i32x4 15 15 15 15))))
-            (local.set $blk0 (f32x4.add (local.get $blk0) (f32x4.mul (local.get $c) (v128.load offset=64 (local.get $xp)))))
-            (local.set $blk1 (f32x4.add (local.get $blk1) (f32x4.mul (local.get $c) (v128.load offset=64 (i32.add (local.get $xp) (i32.mul (local.get $rs) (i32.const 1)))))))
-            (local.set $blk2 (f32x4.add (local.get $blk2) (f32x4.mul (local.get $c) (v128.load offset=64 (i32.add (local.get $xp) (i32.mul (local.get $rs) (i32.const 2)))))))
-            (local.set $blk3 (f32x4.add (local.get $blk3) (f32x4.mul (local.get $c) (v128.load offset=64 (i32.add (local.get $xp) (i32.mul (local.get $rs) (i32.const 3)))))))
-            (local.set $c (f32x4.convert_i32x4_s (v128.and (i32x4.shr_u (local.get $v) (i32.const 20)) (v128.const i32x4 15 15 15 15))))
-            (local.set $blk0 (f32x4.add (local.get $blk0) (f32x4.mul (local.get $c) (v128.load offset=80 (local.get $xp)))))
-            (local.set $blk1 (f32x4.add (local.get $blk1) (f32x4.mul (local.get $c) (v128.load offset=80 (i32.add (local.get $xp) (i32.mul (local.get $rs) (i32.const 1)))))))
-            (local.set $blk2 (f32x4.add (local.get $blk2) (f32x4.mul (local.get $c) (v128.load offset=80 (i32.add (local.get $xp) (i32.mul (local.get $rs) (i32.const 2)))))))
-            (local.set $blk3 (f32x4.add (local.get $blk3) (f32x4.mul (local.get $c) (v128.load offset=80 (i32.add (local.get $xp) (i32.mul (local.get $rs) (i32.const 3)))))))
-            (local.set $c (f32x4.convert_i32x4_s (v128.and (i32x4.shr_u (local.get $v) (i32.const 24)) (v128.const i32x4 15 15 15 15))))
-            (local.set $blk0 (f32x4.add (local.get $blk0) (f32x4.mul (local.get $c) (v128.load offset=96 (local.get $xp)))))
-            (local.set $blk1 (f32x4.add (local.get $blk1) (f32x4.mul (local.get $c) (v128.load offset=96 (i32.add (local.get $xp) (i32.mul (local.get $rs) (i32.const 1)))))))
-            (local.set $blk2 (f32x4.add (local.get $blk2) (f32x4.mul (local.get $c) (v128.load offset=96 (i32.add (local.get $xp) (i32.mul (local.get $rs) (i32.const 2)))))))
-            (local.set $blk3 (f32x4.add (local.get $blk3) (f32x4.mul (local.get $c) (v128.load offset=96 (i32.add (local.get $xp) (i32.mul (local.get $rs) (i32.const 3)))))))
-            (local.set $c (f32x4.convert_i32x4_s (i32x4.shr_u (local.get $v) (i32.const 28))))
-            (local.set $blk0 (f32x4.add (local.get $blk0) (f32x4.mul (local.get $c) (v128.load offset=112 (local.get $xp)))))
-            (local.set $blk1 (f32x4.add (local.get $blk1) (f32x4.mul (local.get $c) (v128.load offset=112 (i32.add (local.get $xp) (i32.mul (local.get $rs) (i32.const 1)))))))
-            (local.set $blk2 (f32x4.add (local.get $blk2) (f32x4.mul (local.get $c) (v128.load offset=112 (i32.add (local.get $xp) (i32.mul (local.get $rs) (i32.const 2)))))))
-            (local.set $blk3 (f32x4.add (local.get $blk3) (f32x4.mul (local.get $c) (v128.load offset=112 (i32.add (local.get $xp) (i32.mul (local.get $rs) (i32.const 3)))))))
-            (local.set $sc (v128.load32_splat (local.get $s)))
+            (local.set $v1 (i8x16.sub (i8x16.shr_u (local.get $v) (i32.const 4)) (local.get $off)))
+            (local.set $v (i8x16.sub (v128.and (local.get $v) (v128.const i8x16 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15)) (local.get $off)))
+            (local.set $e0 (i16x8.extend_low_i8x16_s (local.get $v)))
+            (local.set $e1 (i16x8.extend_high_i8x16_s (local.get $v)))
+            (local.set $e2 (i16x8.extend_low_i8x16_s (local.get $v1)))
+            (local.set $e3 (i16x8.extend_high_i8x16_s (local.get $v1)))
             (local.set $sv (f32.load (local.get $s)))
-            (local.set $tot0 (f32x4.add (local.get $tot0) (f32x4.mul (local.get $blk0) (local.get $sc))))
-            (local.set $tot1 (f32x4.add (local.get $tot1) (f32x4.mul (local.get $blk1) (local.get $sc))))
-            (local.set $tot2 (f32x4.add (local.get $tot2) (f32x4.mul (local.get $blk2) (local.get $sc))))
-            (local.set $tot3 (f32x4.add (local.get $tot3) (f32x4.mul (local.get $blk3) (local.get $sc))))
+            (local.set $tot0 (f32x4.add (local.get $tot0) (f32x4.mul (f32x4.convert_i32x4_s
+              (i32x4.add
+                (i32x4.add (i32x4.dot_i16x8_s (local.get $e0) (v128.load (local.get $xp))) (i32x4.dot_i16x8_s (local.get $e1) (v128.load offset=16 (local.get $xp))))
+                (i32x4.add (i32x4.dot_i16x8_s (local.get $e2) (v128.load offset=32 (local.get $xp))) (i32x4.dot_i16x8_s (local.get $e3) (v128.load offset=48 (local.get $xp))))))
+              (f32x4.splat (f32.mul (local.get $sv) (f32.load (local.get $xsp)))))))
+            (local.set $tot1 (f32x4.add (local.get $tot1) (f32x4.mul (f32x4.convert_i32x4_s
+              (i32x4.add
+                (i32x4.add (i32x4.dot_i16x8_s (local.get $e0) (v128.load (i32.add (local.get $xp) (i32.mul (local.get $rs) (i32.const 1))))) (i32x4.dot_i16x8_s (local.get $e1) (v128.load offset=16 (i32.add (local.get $xp) (i32.mul (local.get $rs) (i32.const 1))))))
+                (i32x4.add (i32x4.dot_i16x8_s (local.get $e2) (v128.load offset=32 (i32.add (local.get $xp) (i32.mul (local.get $rs) (i32.const 1))))) (i32x4.dot_i16x8_s (local.get $e3) (v128.load offset=48 (i32.add (local.get $xp) (i32.mul (local.get $rs) (i32.const 1))))))))
+              (f32x4.splat (f32.mul (local.get $sv) (f32.load (i32.add (local.get $xsp) (i32.mul (local.get $ss) (i32.const 1)))))))))
+            (local.set $tot2 (f32x4.add (local.get $tot2) (f32x4.mul (f32x4.convert_i32x4_s
+              (i32x4.add
+                (i32x4.add (i32x4.dot_i16x8_s (local.get $e0) (v128.load (i32.add (local.get $xp) (i32.mul (local.get $rs) (i32.const 2))))) (i32x4.dot_i16x8_s (local.get $e1) (v128.load offset=16 (i32.add (local.get $xp) (i32.mul (local.get $rs) (i32.const 2))))))
+                (i32x4.add (i32x4.dot_i16x8_s (local.get $e2) (v128.load offset=32 (i32.add (local.get $xp) (i32.mul (local.get $rs) (i32.const 2))))) (i32x4.dot_i16x8_s (local.get $e3) (v128.load offset=48 (i32.add (local.get $xp) (i32.mul (local.get $rs) (i32.const 2))))))))
+              (f32x4.splat (f32.mul (local.get $sv) (f32.load (i32.add (local.get $xsp) (i32.mul (local.get $ss) (i32.const 2)))))))))
+            (local.set $tot3 (f32x4.add (local.get $tot3) (f32x4.mul (f32x4.convert_i32x4_s
+              (i32x4.add
+                (i32x4.add (i32x4.dot_i16x8_s (local.get $e0) (v128.load (i32.add (local.get $xp) (i32.mul (local.get $rs) (i32.const 3))))) (i32x4.dot_i16x8_s (local.get $e1) (v128.load offset=16 (i32.add (local.get $xp) (i32.mul (local.get $rs) (i32.const 3))))))
+                (i32x4.add (i32x4.dot_i16x8_s (local.get $e2) (v128.load offset=32 (i32.add (local.get $xp) (i32.mul (local.get $rs) (i32.const 3))))) (i32x4.dot_i16x8_s (local.get $e3) (v128.load offset=48 (i32.add (local.get $xp) (i32.mul (local.get $rs) (i32.const 3))))))))
+              (f32x4.splat (f32.mul (local.get $sv) (f32.load (i32.add (local.get $xsp) (i32.mul (local.get $ss) (i32.const 3)))))))))
             (if (local.get $mn)
               (then
                 (local.set $mnv (f32.load (local.get $mn)))
-                (local.set $ex0 (f32.add (local.get $ex0) (f32.mul (local.get $mnv) (f32.load (local.get $xs)))))
-                (local.set $ex1 (f32.add (local.get $ex1) (f32.mul (local.get $mnv) (f32.load (i32.add (local.get $xs) (i32.mul (local.get $ss) (i32.const 1)))))))
-                (local.set $ex2 (f32.add (local.get $ex2) (f32.mul (local.get $mnv) (f32.load (i32.add (local.get $xs) (i32.mul (local.get $ss) (i32.const 2)))))))
-                (local.set $ex3 (f32.add (local.get $ex3) (f32.mul (local.get $mnv) (f32.load (i32.add (local.get $xs) (i32.mul (local.get $ss) (i32.const 3)))))))
-                (local.set $mn (i32.add (local.get $mn) (i32.const 4))))
-              (else
-                (local.set $ex0 (f32.sub (local.get $ex0) (f32.mul (f32.mul (local.get $sv) (f32.const 8)) (f32.load (local.get $xs)))))
-                (local.set $ex1 (f32.sub (local.get $ex1) (f32.mul (f32.mul (local.get $sv) (f32.const 8)) (f32.load (i32.add (local.get $xs) (i32.mul (local.get $ss) (i32.const 1)))))))
-                (local.set $ex2 (f32.sub (local.get $ex2) (f32.mul (f32.mul (local.get $sv) (f32.const 8)) (f32.load (i32.add (local.get $xs) (i32.mul (local.get $ss) (i32.const 2)))))))
-                (local.set $ex3 (f32.sub (local.get $ex3) (f32.mul (f32.mul (local.get $sv) (f32.const 8)) (f32.load (i32.add (local.get $xs) (i32.mul (local.get $ss) (i32.const 3)))))))
-))
+                (local.set $ex0 (f32.add (local.get $ex0) (f32.mul (local.get $mnv) (f32.load (local.get $sxp)))))
+                (local.set $ex1 (f32.add (local.get $ex1) (f32.mul (local.get $mnv) (f32.load (i32.add (local.get $sxp) (i32.mul (local.get $ss) (i32.const 1)))))))
+                (local.set $ex2 (f32.add (local.get $ex2) (f32.mul (local.get $mnv) (f32.load (i32.add (local.get $sxp) (i32.mul (local.get $ss) (i32.const 2)))))))
+                (local.set $ex3 (f32.add (local.get $ex3) (f32.mul (local.get $mnv) (f32.load (i32.add (local.get $sxp) (i32.mul (local.get $ss) (i32.const 3)))))))
+                (local.set $mn (i32.add (local.get $mn) (i32.const 4)))))
             (local.set $q (i32.add (local.get $q) (i32.const 16)))
             (local.set $s (i32.add (local.get $s) (i32.const 4)))
-            (local.set $xp (i32.add (local.get $xp) (i32.const 128)))
-            (local.set $xs (i32.add (local.get $xs) (i32.const 4)))
+            (local.set $xp (i32.add (local.get $xp) (i32.const 64)))
+            (local.set $xsp (i32.add (local.get $xsp) (i32.const 4)))
+            (local.set $sxp (i32.add (local.get $sxp) (i32.const 4)))
             (local.set $b (i32.add (local.get $b) (i32.const 1)))
             (br $lb)))
         (f32.store (i32.add (local.get $y) (i32.shl (i32.add (local.get $n) (i32.mul (local.get $ys) (i32.const 0))) (i32.const 2))) (f32.add (call $hsum (local.get $tot0)) (local.get $ex0)))
@@ -250,14 +224,15 @@
         (local.set $n (i32.add (local.get $n) (i32.const 1)))
         (br $rows))))
 
-  ;; gemv_q8 for four x rows at once, laid out as for gemm4_q4; identical results per row.
-  (func (export "gemm4_q8") (param $x i32) (param $q i32) (param $s i32) (param $mn i32) (param $xsum i32)
+  ;; gemv_q8i for four x rows at once (xq rows K int16 apart, xs and xsum rows KB apart, outputs ys floats
+  ;; apart): each block's codes are widened once for the four.
+  (func (export "gemm4_q8i") (param $xq i32) (param $xs i32) (param $q i32) (param $s i32) (param $mn i32) (param $xsum i32)
     (param $K i32) (param $N i32) (param $y i32) (param $ys i32)
-    (local $n i32) (local $b i32) (local $KB i32) (local $xp i32) (local $xs i32) (local $v v128) (local $lo v128) (local $hi v128) (local $c v128) (local $sc v128)
-    (local $rs i32) (local $ss i32) (local $mnv f32)
-    (local $blk0 v128) (local $tot0 v128) (local $ex0 f32) (local $blk1 v128) (local $tot1 v128) (local $ex1 f32) (local $blk2 v128) (local $tot2 v128) (local $ex2 f32) (local $blk3 v128) (local $tot3 v128) (local $ex3 f32)
+    (local $n i32) (local $b i32) (local $KB i32) (local $xp i32) (local $xsp i32) (local $sxp i32) (local $v v128) (local $v1 v128) (local $off v128)
+    (local $e0 v128) (local $e1 v128) (local $e2 v128) (local $e3 v128) (local $sv f32) (local $mnv f32) (local $rs i32) (local $ss i32)
+    (local $tot0 v128) (local $ex0 f32) (local $tot1 v128) (local $ex1 f32) (local $tot2 v128) (local $ex2 f32) (local $tot3 v128) (local $ex3 f32)
     (local.set $KB (i32.shr_u (local.get $K) (i32.const 5)))
-    (local.set $rs (i32.shl (local.get $K) (i32.const 2)))
+    (local.set $rs (i32.shl (local.get $K) (i32.const 1)))
     (local.set $ss (i32.shl (local.get $KB) (i32.const 2)))
     (block $done
       (loop $rows
@@ -266,75 +241,53 @@
         (local.set $tot1 (v128.const i32x4 0 0 0 0)) (local.set $ex1 (f32.const 0))
         (local.set $tot2 (v128.const i32x4 0 0 0 0)) (local.set $ex2 (f32.const 0))
         (local.set $tot3 (v128.const i32x4 0 0 0 0)) (local.set $ex3 (f32.const 0))
-        (local.set $xp (local.get $x))
-        (local.set $xs (local.get $xsum))
+        (local.set $xp (local.get $xq))
+        (local.set $xsp (local.get $xs))
+        (local.set $sxp (local.get $xsum))
         (local.set $b (i32.const 0))
         (block $db
           (loop $lb
             (br_if $db (i32.ge_u (local.get $b) (local.get $KB)))
-            (local.set $v (v128.load offset=0 (local.get $q)))
-            (local.set $lo (i16x8.extend_low_i8x16_s (local.get $v)))
-            (local.set $hi (i16x8.extend_high_i8x16_s (local.get $v)))
-            (local.set $c (f32x4.convert_i32x4_s (i32x4.extend_low_i16x8_s (local.get $lo))))
-            (local.set $blk0 (f32x4.mul (local.get $c) (v128.load offset=0 (local.get $xp))))
-            (local.set $blk1 (f32x4.mul (local.get $c) (v128.load offset=0 (i32.add (local.get $xp) (i32.mul (local.get $rs) (i32.const 1))))))
-            (local.set $blk2 (f32x4.mul (local.get $c) (v128.load offset=0 (i32.add (local.get $xp) (i32.mul (local.get $rs) (i32.const 2))))))
-            (local.set $blk3 (f32x4.mul (local.get $c) (v128.load offset=0 (i32.add (local.get $xp) (i32.mul (local.get $rs) (i32.const 3))))))
-            (local.set $c (f32x4.convert_i32x4_s (i32x4.extend_high_i16x8_s (local.get $lo))))
-            (local.set $blk0 (f32x4.add (local.get $blk0) (f32x4.mul (local.get $c) (v128.load offset=16 (local.get $xp)))))
-            (local.set $blk1 (f32x4.add (local.get $blk1) (f32x4.mul (local.get $c) (v128.load offset=16 (i32.add (local.get $xp) (i32.mul (local.get $rs) (i32.const 1)))))))
-            (local.set $blk2 (f32x4.add (local.get $blk2) (f32x4.mul (local.get $c) (v128.load offset=16 (i32.add (local.get $xp) (i32.mul (local.get $rs) (i32.const 2)))))))
-            (local.set $blk3 (f32x4.add (local.get $blk3) (f32x4.mul (local.get $c) (v128.load offset=16 (i32.add (local.get $xp) (i32.mul (local.get $rs) (i32.const 3)))))))
-            (local.set $c (f32x4.convert_i32x4_s (i32x4.extend_low_i16x8_s (local.get $hi))))
-            (local.set $blk0 (f32x4.add (local.get $blk0) (f32x4.mul (local.get $c) (v128.load offset=32 (local.get $xp)))))
-            (local.set $blk1 (f32x4.add (local.get $blk1) (f32x4.mul (local.get $c) (v128.load offset=32 (i32.add (local.get $xp) (i32.mul (local.get $rs) (i32.const 1)))))))
-            (local.set $blk2 (f32x4.add (local.get $blk2) (f32x4.mul (local.get $c) (v128.load offset=32 (i32.add (local.get $xp) (i32.mul (local.get $rs) (i32.const 2)))))))
-            (local.set $blk3 (f32x4.add (local.get $blk3) (f32x4.mul (local.get $c) (v128.load offset=32 (i32.add (local.get $xp) (i32.mul (local.get $rs) (i32.const 3)))))))
-            (local.set $c (f32x4.convert_i32x4_s (i32x4.extend_high_i16x8_s (local.get $hi))))
-            (local.set $blk0 (f32x4.add (local.get $blk0) (f32x4.mul (local.get $c) (v128.load offset=48 (local.get $xp)))))
-            (local.set $blk1 (f32x4.add (local.get $blk1) (f32x4.mul (local.get $c) (v128.load offset=48 (i32.add (local.get $xp) (i32.mul (local.get $rs) (i32.const 1)))))))
-            (local.set $blk2 (f32x4.add (local.get $blk2) (f32x4.mul (local.get $c) (v128.load offset=48 (i32.add (local.get $xp) (i32.mul (local.get $rs) (i32.const 2)))))))
-            (local.set $blk3 (f32x4.add (local.get $blk3) (f32x4.mul (local.get $c) (v128.load offset=48 (i32.add (local.get $xp) (i32.mul (local.get $rs) (i32.const 3)))))))
-            (local.set $v (v128.load offset=16 (local.get $q)))
-            (local.set $lo (i16x8.extend_low_i8x16_s (local.get $v)))
-            (local.set $hi (i16x8.extend_high_i8x16_s (local.get $v)))
-            (local.set $c (f32x4.convert_i32x4_s (i32x4.extend_low_i16x8_s (local.get $lo))))
-            (local.set $blk0 (f32x4.add (local.get $blk0) (f32x4.mul (local.get $c) (v128.load offset=64 (local.get $xp)))))
-            (local.set $blk1 (f32x4.add (local.get $blk1) (f32x4.mul (local.get $c) (v128.load offset=64 (i32.add (local.get $xp) (i32.mul (local.get $rs) (i32.const 1)))))))
-            (local.set $blk2 (f32x4.add (local.get $blk2) (f32x4.mul (local.get $c) (v128.load offset=64 (i32.add (local.get $xp) (i32.mul (local.get $rs) (i32.const 2)))))))
-            (local.set $blk3 (f32x4.add (local.get $blk3) (f32x4.mul (local.get $c) (v128.load offset=64 (i32.add (local.get $xp) (i32.mul (local.get $rs) (i32.const 3)))))))
-            (local.set $c (f32x4.convert_i32x4_s (i32x4.extend_high_i16x8_s (local.get $lo))))
-            (local.set $blk0 (f32x4.add (local.get $blk0) (f32x4.mul (local.get $c) (v128.load offset=80 (local.get $xp)))))
-            (local.set $blk1 (f32x4.add (local.get $blk1) (f32x4.mul (local.get $c) (v128.load offset=80 (i32.add (local.get $xp) (i32.mul (local.get $rs) (i32.const 1)))))))
-            (local.set $blk2 (f32x4.add (local.get $blk2) (f32x4.mul (local.get $c) (v128.load offset=80 (i32.add (local.get $xp) (i32.mul (local.get $rs) (i32.const 2)))))))
-            (local.set $blk3 (f32x4.add (local.get $blk3) (f32x4.mul (local.get $c) (v128.load offset=80 (i32.add (local.get $xp) (i32.mul (local.get $rs) (i32.const 3)))))))
-            (local.set $c (f32x4.convert_i32x4_s (i32x4.extend_low_i16x8_s (local.get $hi))))
-            (local.set $blk0 (f32x4.add (local.get $blk0) (f32x4.mul (local.get $c) (v128.load offset=96 (local.get $xp)))))
-            (local.set $blk1 (f32x4.add (local.get $blk1) (f32x4.mul (local.get $c) (v128.load offset=96 (i32.add (local.get $xp) (i32.mul (local.get $rs) (i32.const 1)))))))
-            (local.set $blk2 (f32x4.add (local.get $blk2) (f32x4.mul (local.get $c) (v128.load offset=96 (i32.add (local.get $xp) (i32.mul (local.get $rs) (i32.const 2)))))))
-            (local.set $blk3 (f32x4.add (local.get $blk3) (f32x4.mul (local.get $c) (v128.load offset=96 (i32.add (local.get $xp) (i32.mul (local.get $rs) (i32.const 3)))))))
-            (local.set $c (f32x4.convert_i32x4_s (i32x4.extend_high_i16x8_s (local.get $hi))))
-            (local.set $blk0 (f32x4.add (local.get $blk0) (f32x4.mul (local.get $c) (v128.load offset=112 (local.get $xp)))))
-            (local.set $blk1 (f32x4.add (local.get $blk1) (f32x4.mul (local.get $c) (v128.load offset=112 (i32.add (local.get $xp) (i32.mul (local.get $rs) (i32.const 1)))))))
-            (local.set $blk2 (f32x4.add (local.get $blk2) (f32x4.mul (local.get $c) (v128.load offset=112 (i32.add (local.get $xp) (i32.mul (local.get $rs) (i32.const 2)))))))
-            (local.set $blk3 (f32x4.add (local.get $blk3) (f32x4.mul (local.get $c) (v128.load offset=112 (i32.add (local.get $xp) (i32.mul (local.get $rs) (i32.const 3)))))))
-            (local.set $sc (v128.load32_splat (local.get $s)))
-            (local.set $tot0 (f32x4.add (local.get $tot0) (f32x4.mul (local.get $blk0) (local.get $sc))))
-            (local.set $tot1 (f32x4.add (local.get $tot1) (f32x4.mul (local.get $blk1) (local.get $sc))))
-            (local.set $tot2 (f32x4.add (local.get $tot2) (f32x4.mul (local.get $blk2) (local.get $sc))))
-            (local.set $tot3 (f32x4.add (local.get $tot3) (f32x4.mul (local.get $blk3) (local.get $sc))))
+            (local.set $v (v128.load (local.get $q)))
+            (local.set $v1 (v128.load offset=16 (local.get $q)))
+            (local.set $e0 (i16x8.extend_low_i8x16_s (local.get $v)))
+            (local.set $e1 (i16x8.extend_high_i8x16_s (local.get $v)))
+            (local.set $e2 (i16x8.extend_low_i8x16_s (local.get $v1)))
+            (local.set $e3 (i16x8.extend_high_i8x16_s (local.get $v1)))
+            (local.set $sv (f32.load (local.get $s)))
+            (local.set $tot0 (f32x4.add (local.get $tot0) (f32x4.mul (f32x4.convert_i32x4_s
+              (i32x4.add
+                (i32x4.add (i32x4.dot_i16x8_s (local.get $e0) (v128.load (local.get $xp))) (i32x4.dot_i16x8_s (local.get $e1) (v128.load offset=16 (local.get $xp))))
+                (i32x4.add (i32x4.dot_i16x8_s (local.get $e2) (v128.load offset=32 (local.get $xp))) (i32x4.dot_i16x8_s (local.get $e3) (v128.load offset=48 (local.get $xp))))))
+              (f32x4.splat (f32.mul (local.get $sv) (f32.load (local.get $xsp)))))))
+            (local.set $tot1 (f32x4.add (local.get $tot1) (f32x4.mul (f32x4.convert_i32x4_s
+              (i32x4.add
+                (i32x4.add (i32x4.dot_i16x8_s (local.get $e0) (v128.load (i32.add (local.get $xp) (i32.mul (local.get $rs) (i32.const 1))))) (i32x4.dot_i16x8_s (local.get $e1) (v128.load offset=16 (i32.add (local.get $xp) (i32.mul (local.get $rs) (i32.const 1))))))
+                (i32x4.add (i32x4.dot_i16x8_s (local.get $e2) (v128.load offset=32 (i32.add (local.get $xp) (i32.mul (local.get $rs) (i32.const 1))))) (i32x4.dot_i16x8_s (local.get $e3) (v128.load offset=48 (i32.add (local.get $xp) (i32.mul (local.get $rs) (i32.const 1))))))))
+              (f32x4.splat (f32.mul (local.get $sv) (f32.load (i32.add (local.get $xsp) (i32.mul (local.get $ss) (i32.const 1)))))))))
+            (local.set $tot2 (f32x4.add (local.get $tot2) (f32x4.mul (f32x4.convert_i32x4_s
+              (i32x4.add
+                (i32x4.add (i32x4.dot_i16x8_s (local.get $e0) (v128.load (i32.add (local.get $xp) (i32.mul (local.get $rs) (i32.const 2))))) (i32x4.dot_i16x8_s (local.get $e1) (v128.load offset=16 (i32.add (local.get $xp) (i32.mul (local.get $rs) (i32.const 2))))))
+                (i32x4.add (i32x4.dot_i16x8_s (local.get $e2) (v128.load offset=32 (i32.add (local.get $xp) (i32.mul (local.get $rs) (i32.const 2))))) (i32x4.dot_i16x8_s (local.get $e3) (v128.load offset=48 (i32.add (local.get $xp) (i32.mul (local.get $rs) (i32.const 2))))))))
+              (f32x4.splat (f32.mul (local.get $sv) (f32.load (i32.add (local.get $xsp) (i32.mul (local.get $ss) (i32.const 2)))))))))
+            (local.set $tot3 (f32x4.add (local.get $tot3) (f32x4.mul (f32x4.convert_i32x4_s
+              (i32x4.add
+                (i32x4.add (i32x4.dot_i16x8_s (local.get $e0) (v128.load (i32.add (local.get $xp) (i32.mul (local.get $rs) (i32.const 3))))) (i32x4.dot_i16x8_s (local.get $e1) (v128.load offset=16 (i32.add (local.get $xp) (i32.mul (local.get $rs) (i32.const 3))))))
+                (i32x4.add (i32x4.dot_i16x8_s (local.get $e2) (v128.load offset=32 (i32.add (local.get $xp) (i32.mul (local.get $rs) (i32.const 3))))) (i32x4.dot_i16x8_s (local.get $e3) (v128.load offset=48 (i32.add (local.get $xp) (i32.mul (local.get $rs) (i32.const 3))))))))
+              (f32x4.splat (f32.mul (local.get $sv) (f32.load (i32.add (local.get $xsp) (i32.mul (local.get $ss) (i32.const 3)))))))))
             (if (local.get $mn)
               (then
                 (local.set $mnv (f32.load (local.get $mn)))
-                (local.set $ex0 (f32.add (local.get $ex0) (f32.mul (local.get $mnv) (f32.load (local.get $xs)))))
-                (local.set $ex1 (f32.add (local.get $ex1) (f32.mul (local.get $mnv) (f32.load (i32.add (local.get $xs) (i32.mul (local.get $ss) (i32.const 1)))))))
-                (local.set $ex2 (f32.add (local.get $ex2) (f32.mul (local.get $mnv) (f32.load (i32.add (local.get $xs) (i32.mul (local.get $ss) (i32.const 2)))))))
-                (local.set $ex3 (f32.add (local.get $ex3) (f32.mul (local.get $mnv) (f32.load (i32.add (local.get $xs) (i32.mul (local.get $ss) (i32.const 3)))))))
+                (local.set $ex0 (f32.add (local.get $ex0) (f32.mul (local.get $mnv) (f32.load (local.get $sxp)))))
+                (local.set $ex1 (f32.add (local.get $ex1) (f32.mul (local.get $mnv) (f32.load (i32.add (local.get $sxp) (i32.mul (local.get $ss) (i32.const 1)))))))
+                (local.set $ex2 (f32.add (local.get $ex2) (f32.mul (local.get $mnv) (f32.load (i32.add (local.get $sxp) (i32.mul (local.get $ss) (i32.const 2)))))))
+                (local.set $ex3 (f32.add (local.get $ex3) (f32.mul (local.get $mnv) (f32.load (i32.add (local.get $sxp) (i32.mul (local.get $ss) (i32.const 3)))))))
                 (local.set $mn (i32.add (local.get $mn) (i32.const 4)))))
             (local.set $q (i32.add (local.get $q) (i32.const 32)))
             (local.set $s (i32.add (local.get $s) (i32.const 4)))
-            (local.set $xp (i32.add (local.get $xp) (i32.const 128)))
-            (local.set $xs (i32.add (local.get $xs) (i32.const 4)))
+            (local.set $xp (i32.add (local.get $xp) (i32.const 64)))
+            (local.set $xsp (i32.add (local.get $xsp) (i32.const 4)))
+            (local.set $sxp (i32.add (local.get $sxp) (i32.const 4)))
             (local.set $b (i32.add (local.get $b) (i32.const 1)))
             (br $lb)))
         (f32.store (i32.add (local.get $y) (i32.shl (i32.add (local.get $n) (i32.mul (local.get $ys) (i32.const 0))) (i32.const 2))) (f32.add (call $hsum (local.get $tot0)) (local.get $ex0)))

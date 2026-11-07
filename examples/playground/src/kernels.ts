@@ -106,6 +106,14 @@ async function main() {
     return ctx;
   };
   const check = (kernel: string, name: string, got: Float32Array, want: Float32Array, tol: number) => {
+    // The CPU backend's q4/q8 matmuls take integer dot products with x as int16 per 32-value block
+    // (about 2e-5 of the block's largest value per element), so their error also scales with the
+    // outputs' size: large in the gated checks, where two outputs of ~60 are multiplied.
+    if (onCpu && /^(matmul|gemm|gemv)/.test(kernel) && /q4|q8/.test(`${kernel} ${name}`)) {
+      let mx = 0;
+      for (const v of want) mx = Math.max(mx, Math.abs(v));
+      tol = Math.max(tol, 2e-4 * mx);
+    }
     const error = ref.maxAbsDiff(got, want);
     results.push({ kernel, case: name, error, tol, pass: error <= tol && got.length === want.length });
   };
