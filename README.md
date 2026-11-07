@@ -141,7 +141,7 @@ Key ideas:
   unchanged on it: grammars, saved prefixes, the prompt cache. The kernel check page runs every check
   against it too (`/kernels.html?backend=cpu`, 763 of 763 passing; the f16 matmul variants need
   shader-f16), and Node tests cover it in CI. Matmuls run in WASM SIMD (`packages/kernels/src/simd.wat`,
-  1.4 KB compiled): every CPU buffer lives in one WebAssembly memory, so the kernels read weights,
+  5.3 KB compiled): every CPU buffer lives in one WebAssembly memory, so the kernels read weights,
   activations and scratch in place, taking f32x4 dot products straight from the 4- and 8-bit codes.
   That runs a 1536 × 576 q4 or q8 matvec at 3.2–3.6 GMAC/s on the Intel Mac, against 0.24–0.42 in
   TypeScript (which remains the path without WASM SIMD). Prefill builds plans of the exact prompt
@@ -155,8 +155,15 @@ Key ideas:
   are bit-identical to one thread. On the Intel Mac (2 cores, 4 threads): a 64 × 3072 × 576 matmul
   27 → 12 ms in f32 and 27 → 16 ms in q4; SmolLM2-135M's first token 1.77 → 1.36 s and decode 16.7 →
   17.7 tok/s (same tokens; decode's small matmuls stay on one thread, where waking helpers would
-  cost more than they save, and attention is still TypeScript). Without isolation, or with the
-  engine on a page's main thread, it stays on one thread.
+  cost more than they save). Without isolation, or with the engine on a page's main thread, it
+  stays on one thread. Prefill matmuls take four x rows per pass over a q4 or q8 weight block
+  (`gemm4_q4`, `gemm4_q8`: each block unpacked once for the four, same operations per row, so the
+  results are identical): the 64 × 3072 × 576 matmul 27 → 16 ms in q4 and 27 → 13 ms in q8 on one
+  thread. Attention runs in WASM too (`att_scores`, `att_wsum` for f32 and f16 caches: one query
+  against a run of cached keys, ring wraparound included, f16 widened by an exact
+  shift-and-rescale), with masking and the softmax in TypeScript: 875 → 139 ms of a profiled
+  SmolLM2-135M call. With these, SmolLM2-135M on the CPU backend: first token 1.02 s and 26.4 tok/s
+  on one thread, 0.78 s and 29.2 tok/s on four, the same tokens as the GPU.
 - **GGUF weights held exactly.** Q4_1 and Q4_K blocks are code·scale + min per 32 values with 4-bit
   codes, and Q5_x with 5-bit codes, so Kiln's q4 and q8 planes plus one f32 min per block hold them
   as llama.cpp dequantizes them, where they used to be dequantized and rounded a second time. The GPU
@@ -574,8 +581,8 @@ Known limits, roughly in roadmap order:
   a 275-token image prompt on the Intel Mac, about 0.6 s of Gemma 3 4B's 14 s to the first token
   (the matmuls are the rest), so a span kernel there would save at most a few percent.
 - Without WebGPU, models run on the CPU: matmuls in WASM SIMD at about 3.5 GMAC/s per thread on the
-  test Mac (several threads only on cross-origin isolated pages), attention and the rest in
-  TypeScript, and every buffer in one
+  test Mac (several threads only on cross-origin isolated pages), attention in WASM SIMD, the rest
+  in TypeScript, and every buffer in one
   wasm32 memory (4 GiB at most). Small models only. WebNN and Node/Dawn backends come later.
 
 ## License

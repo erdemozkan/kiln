@@ -37,8 +37,9 @@ last prompt's K/V survives page reloads, and earlier prefixes stay on the GPU (`
 calls queue.
 
 **CPU fallback.** Without WebGPU (or with `device: "cpu"`), the same engine runs on CPU versions of
-every kernel: matmuls in WASM SIMD (TypeScript where SIMD is missing), the rest in TypeScript. About
-18 tok/s for SmolLM2-135M on an Intel Mac; meant for small models. `info.backend` reports which
+every kernel: matmuls and attention in WASM SIMD (TypeScript where SIMD is missing), the rest in
+TypeScript; large matmuls use several threads on cross-origin isolated pages. 26–29 tok/s for
+SmolLM2-135M on an Intel Mac; meant for small models. `info.backend` reports which
 backend runs.
 
 **Context.** The default context is the model's trained context, up to 8192 tokens and 512 MiB of

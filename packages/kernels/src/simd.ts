@@ -5,6 +5,9 @@ export interface SimdKernels {
   gemv_f32(x: number, w: number, K: number, N: number, y: number): void;
   gemv_q8(x: number, q: number, s: number, mn: number, xsum: number, K: number, N: number, y: number): void;
   gemv_q4(x: number, q: number, s: number, mn: number, xsum: number, K: number, N: number, y: number): void;
+  /** gemv_q4 for four x rows at once (rows K floats apart, sums K/32 apart, outputs ys floats apart), with identical results. */
+  gemm4_q4(x: number, q: number, s: number, mn: number, xsum: number, K: number, N: number, y: number, ys: number): void;
+  gemm4_q8(x: number, q: number, s: number, mn: number, xsum: number, K: number, N: number, y: number, ys: number): void;
   /** out[j] = q · K_j for keys j in [first, n), key j at k + (j mod cap) · stride bytes; returns the largest. */
   att_scores_f32(q: number, k: number, stride: number, cap: number, first: number, n: number, D: number, out: number): number;
   att_scores_f16(q: number, k: number, stride: number, cap: number, first: number, n: number, D: number, out: number): number;
@@ -62,7 +65,13 @@ function slice(N: number, parts: number, i: number): [number, number] {
 function runRows(k: SimdKernels, fn: number, M: number, N: number, K: number, x: number, w: number, s: number, mn: number, xsum: number, y: number, n0: number, n1: number): void {
   const KB = K >>> 5;
   const rows = n1 - n0;
-  for (let m = 0; m < M; m++) {
+  let m = 0;
+  // Four x rows per pass over the weights where there are four (identical results to one at a time).
+  if (fn === 2)
+    for (; m + 4 <= M; m += 4) k.gemm4_q4(x + m * K * 4, w + n0 * (K >>> 1), s + n0 * KB * 4, mn ? mn + n0 * KB * 4 : 0, xsum + m * KB * 4, K, rows, y + (m * N + n0) * 4, N);
+  else if (fn === 1)
+    for (; m + 4 <= M; m += 4) k.gemm4_q8(x + m * K * 4, w + n0 * K, s + n0 * KB * 4, mn ? mn + n0 * KB * 4 : 0, xsum + m * KB * 4, K, rows, y + (m * N + n0) * 4, N);
+  for (; m < M; m++) {
     const xm = x + m * K * 4, ym = y + (m * N + n0) * 4;
     if (fn === 0) k.gemv_f32(xm, w + n0 * K * 4, K, rows, ym);
     else {
