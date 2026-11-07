@@ -469,6 +469,11 @@ export interface GemmVariant {
  * each k step is three vec4 reads per thread for 32 multiply-adds. On Intel Gen9 this is 1.9x the
  * 256-thread 4 × 4 version, and larger blocks or tiles were slower (register pressure).
  *
+ * Each block's global reads are all issued, branch-free (rows past the edge read a clamped row with a
+ * zero scale), before anything is written to the tiles: on Gen9 that took Gemma 3 4B's gate/up matmul
+ * from 121 to 100 ms and the vision tower's MLP up from 291 to 272 ms against reads guarded by `if`
+ * and interleaved with the stores.
+ *
  * For gated epilogues the tile's 64 rows are 32 gate rows and the 32 matching up rows, stored so each
  * thread's four columns are gate i, gate i + 1, up i, up i + 1 and it can write act(gate) * up itself.
  */
@@ -487,68 +492,75 @@ export function gemmSpec(v: GemmVariant): KernelSpec {
   }
   decl.push(`@group(0) @binding(${b}) var<storage, read_write> y: array<f32>;`);
   bindings.push("rw");
-  // Weight tile loads (after the x tile, by the same threads): thread j takes the 4 rows of one tile column group and one
-  // word of their block (neighbouring threads, neighbouring words), and writes whole vec4s (one per k):
-  // threads writing components of one shared vec4 race on some drivers.
-  const loadW =
-    v.wdtype === "q4"
-      ? `  if (li < 64u) {
-    let j = li;
-    let g = j / 4u;
-    let wi = j % 4u;
-    var vals: array<vec4<f32>, 8>;
-    for (var c = 0u; c < 4u; c++) {
-      let row = slotRow(g * 4u + c);
-      if (row < p.N) {
-        let word = wq[(row * blocks + kb) * 4u + wi];
-        let d = ws[row * blocks + kb];
-${aff
-  ? `        let mn = wm[row * blocks + kb];
-        for (var e = 0u; e < 8u; e++) { vals[e][c] = f32((word >> (4u * e)) & 15u) * d + mn; }`
-  : `        for (var e = 0u; e < 8u; e++) { vals[e][c] = (f32((word >> (4u * e)) & 15u) - 8.0) * d; }`}
+  const R8 = [0, 1, 2, 3, 4, 5, 6, 7];
+
+  // x tile: thread j takes tokens 4g…4g+3 (g = j / 8) at vec4 q = j % 8 of the block, so 8
+  // neighbouring threads read one row's 128 contiguous bytes.
+  const readX = `    for (var c = 0u; c < 4u; c++) {
+      let m = m0 + (li / 8u) * 4u + c;
+      xr[c] = select(vec4<f32>(0.0), x[min(m, p.M - 1u) * xs4 + kb * 8u + li % 8u], m < p.M);
+    }`;
+  const storeX = `    for (var e = 0u; e < 4u; e++) { xt[((li % 8u) * 4u + e) * 16u + li / 8u] = vec4<f32>(xr[0][e], xr[1][e], xr[2][e], xr[3][e]); }`;
+  // Weight tile: a thread takes the 4 rows of one tile column group and one word of their block
+  // (neighbouring threads, neighbouring words), and writes whole vec4s (one per k): threads writing
+  // components of one shared vec4 race on some drivers. q4 takes 64 threads, the others all 128.
+  const regsW = v.wdtype === "f32" ? "  var wr4: array<vec4<f32>, 4>;" : `  var wr: array<u32, 4>;\n  var wd: array<f32, 4>;${aff ? "\n  var wn: array<f32, 4>;" : ""}`;
+  const scales = (i: string) =>
+    `        wd[${i}] = select(0.0, ws[r * blocks + kb], row < p.N);${aff ? `\n        wn[${i}] = select(0.0, wm[r * blocks + kb], row < p.N);` : ""}`;
+  let readW: string;
+  let storeW: string;
+  if (v.wdtype === "q4") {
+    readW = `    if (li < 64u) {
+      for (var c = 0u; c < 4u; c++) {
+        let row = slotRow((li / 4u) * 4u + c);
+        let r = min(row, p.N - 1u);
+        wr[c] = wq[(r * blocks + kb) * 4u + li % 4u];
+${scales("c")}
       }
-    }
-    for (var e = 0u; e < 8u; e++) { wt[(wi * 8u + e) * 16u + g] = vals[e]; }
-  }`
-      : `  {
-    let j = li;
-    let g = j / 8u;
-    let q = j % 8u;
-    var r4: array<vec4<f32>, 4>;
-    for (var c = 0u; c < 4u; c++) {
-      let row = slotRow(g * 4u + c);
-      if (row < p.N) {
-${v.wdtype === "q8"
-  ? `        let word = wq[(row * blocks + kb) * 8u + q];
-        r4[c] = vec4<f32>(bitcast<vec4<i32>>(vec4<u32>(word << 24u, word << 16u, word << 8u, word)) >> vec4<u32>(24u)) * ws[row * blocks + kb]${aff ? " + wm[row * blocks + kb]" : ""};`
-  : `        r4[c] = w[(row * blocks + kb) * 8u + q];`}
+    }`;
+    storeW = `    if (li < 64u) {
+      var vals: array<vec4<f32>, 8>;
+      for (var c = 0u; c < 4u; c++) {
+        for (var e = 0u; e < 8u; e++) { vals[e][c] = ${aff ? "f32((wr[c] >> (4u * e)) & 15u) * wd[c] + wn[c]" : "(f32((wr[c] >> (4u * e)) & 15u) - 8.0) * wd[c]"}; }
       }
-    }
-    for (var e = 0u; e < 4u; e++) { wt[(q * 4u + e) * 16u + g] = vec4<f32>(r4[0][e], r4[1][e], r4[2][e], r4[3][e]); }
-  }`;
+      for (var e = 0u; e < 8u; e++) { wt[((li % 4u) * 8u + e) * 16u + li / 4u] = vals[e]; }
+    }`;
+  } else {
+    readW = `    for (var c = 0u; c < 4u; c++) {
+      let row = slotRow((li / 8u) * 4u + c);
+      let r = min(row, p.N - 1u);
+${v.wdtype === "q8" ? `        wr[c] = wq[(r * blocks + kb) * 8u + li % 8u];\n${scales("c")}` : "        wr4[c] = select(vec4<f32>(0.0), w[(r * blocks + kb) * 8u + li % 8u], row < p.N);"}
+    }`;
+    const val =
+      v.wdtype === "q8"
+        ? `vec4<f32>(bitcast<vec4<i32>>(vec4<u32>(wr[c] << 24u, wr[c] << 16u, wr[c] << 8u, wr[c])) >> vec4<u32>(24u)) * wd[c]${aff ? " + wn[c]" : ""}`
+        : "wr4[c]";
+    storeW = `    {
+      var r4: array<vec4<f32>, 4>;
+      for (var c = 0u; c < 4u; c++) { r4[c] = ${val}; }
+      for (var e = 0u; e < 4u; e++) { wt[((li % 8u) * 4u + e) * 16u + li / 8u] = vec4<f32>(r4[0][e], r4[1][e], r4[2][e], r4[3][e]); }
+    }`;
+  }
+
   const withBias = (row: string, val: string) => (v.bias ? `(${val} + bias[${row}])` : val);
+  // Unrolled, with the accumulators as separate variables.
   const store = gated
     ? `  let half = p.N / 2u;
-  for (var i = 0u; i < 8u; i++) {
-    let m = m0 + tm * 8u + i;
-    if (m >= p.M) { break; }
-    for (var j = 0u; j < 2u; j++) {
-      let col = grp * 32u + tn * 2u + j;
-      if (col < half) {
-        let g = ${withBias("col", "acc[i][j]")};
-        let u = ${withBias("half + col", "acc[i][j + 2u]")};
-        y[m * half + col] = ${actWgsl(v.epi as "silu" | "gelu", "g")} * u;
-      }
-    }
-  }`
-    : `  for (var i = 0u; i < 8u; i++) {
-    let m = m0 + tm * 8u + i;
-    if (m >= p.M) { break; }
-    for (var j = 0u; j < 4u; j++) {
-      let n = grp * 64u + tn * 4u + j;
-      if (n < p.N) { y[m * p.N + n] ${v.epi === "add" ? "+=" : "="} ${withBias("n", "acc[i][j]")}; }
-    }
-  }`;
+${R8.map((i) => `  if (m0 + tm * 8u + ${i}u < p.M) {
+    let m = m0 + tm * 8u + ${i}u;
+${[0, 1].map((j) => `    if (grp * 32u + tn * 2u + ${j}u < half) {
+      let col = grp * 32u + tn * 2u + ${j}u;
+      let g = ${withBias("col", `acc${i}[${j}]`)};
+      let u = ${withBias("half + col", `acc${i}[${j + 2}]`)};
+      y[m * half + col] = ${actWgsl(v.epi as "silu" | "gelu", "g")} * u;
+    }`).join("\n")}
+  }`).join("\n")}`
+    : R8.map(
+        (i) => `  if (m0 + tm * 8u + ${i}u < p.M) {
+    let m = m0 + tm * 8u + ${i}u;
+${[0, 1, 2, 3].map((j) => `    if (grp * 64u + tn * 4u + ${j}u < p.N) { let n = grp * 64u + tn * 4u + ${j}u; y[m * p.N + n] ${v.epi === "add" ? "+=" : "="} ${withBias("n", `acc${i}[${j}]`)}; }`).join("\n")}
+  }`,
+      ).join("\n");
   return spec(key, bindings, cpu.cpuMatmul({ ...v, norm: false }), () => /* wgsl */ `
 struct P { M: u32, N: u32, K: u32, _p: u32 }
 @group(0) @binding(0) var<uniform> p: P;
@@ -580,34 +592,20 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
   let tm = li / 16u;
   let blocks = p.K / 32u;
   let xs4 = p.K / 4u;
-  var acc: array<vec4<f32>, 8>;
+${R8.map((i) => `  var acc${i} = vec4<f32>();`).join("\n")}
+  var xr: array<vec4<f32>, 4>;
+${regsW}
   for (var kb = 0u; kb < blocks; kb++) {
-    // x tile: thread j takes tokens 4g…4g+3 (g = j / 8) at vec4 q = j % 8 of the block, so 8
-    // neighbouring threads read one row's 128 contiguous bytes.
-    {
-      let g = li / 8u;
-      let q = li % 8u;
-      var r4: array<vec4<f32>, 4>;
-      for (var c = 0u; c < 4u; c++) {
-        let m = m0 + g * 4u + c;
-        r4[c] = select(vec4<f32>(0.0), x[min(m, p.M - 1u) * xs4 + kb * 8u + q], m < p.M);
-      }
-      for (var e = 0u; e < 4u; e++) { xt[(q * 4u + e) * 16u + g] = vec4<f32>(r4[0][e], r4[1][e], r4[2][e], r4[3][e]); }
-    }
-${loadW}
+${readX}
+${readW}
+${storeX}
+${storeW}
     workgroupBarrier();
     for (var k = 0u; k < 32u; k++) {
       let a0 = xt[k * 16u + tm * 2u];
       let a1 = xt[k * 16u + tm * 2u + 1u];
       let bv = wt[k * 16u + tn];
-      acc[0] += a0.x * bv;
-      acc[1] += a0.y * bv;
-      acc[2] += a0.z * bv;
-      acc[3] += a0.w * bv;
-      acc[4] += a1.x * bv;
-      acc[5] += a1.y * bv;
-      acc[6] += a1.z * bv;
-      acc[7] += a1.w * bv;
+${R8.map((i) => `      acc${i} += a${i >> 2}.${"xyzw"[i & 3]} * bv;`).join("\n")}
     }
     workgroupBarrier();
   }

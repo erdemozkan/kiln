@@ -279,6 +279,18 @@ How it got there, each step measured in one session with identical greedy output
   qkv 50 → 22), about 120 GFLOP/s. In a sweep of tile and block shapes, 64 × 128 tiles, 8 × 8 or
   16 × 4 blocks, and 256 threads were all slower. The 1,138-token prompt prefills in 65.6 against
   106 s, with the same answer tokens ("BLUE HERON"). Attention is now about 20% of a prefill chunk.
+- **GEMM reads issued up front** (Intel Iris Plus 650, the kernels alternated in one page, medians of
+  6–8 rounds). Each K block's global reads (x, weight words, scales) are now all issued before the
+  workgroup tiles are written, and branch-free: rows past the edge read a clamped row with a zero
+  scale instead of sitting behind `if (row < N)`. Gemma 3 4B in a 128-token chunk: gate/up 121 →
+  100 ms, down 78 → 65 ms; the vision tower (4096 patches, q8): MLP up 291 → 272 ms, down 286 →
+  272 ms, q/k/v/o 96 → 92 ms, and a whole vision layer 1.70 → 1.66 s. Tried and not kept: 128-row
+  tiles with 8 × 8 per thread or 256 threads, prefetching the next block into registers, unrolling
+  the k loop, f16 tiles or f16 math (f16 math alone was no faster: the loop is limited by workgroup
+  memory reads and register pressure, not arithmetic). The 32 accumulators are now separate
+  variables with an unrolled epilogue, which on its own changed nothing. Some of the discarded
+  variants looked 10–20% faster in short runs; under sustained load, interleaved with the old
+  kernel, none were.
 - **Attention tiles for head dim 256.** Tiled prefill attention held 4 query rows and 8 keys per
   tile at head dim 256, one output vec4 per thread. Threads can now own several output rows (each
   with its own running max and sum), and Gemma's heads take 8 rows of 4 keys: 29-31 against 35-42 ms
