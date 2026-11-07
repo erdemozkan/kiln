@@ -1,23 +1,56 @@
+import { WasmHeap } from "./simd";
 import { physical, type Backend, type Binding, type Buf, type BufUsage, type CpuKernel, type CpuView, type DeviceLimits, type Dispatch, type KernelSpec, type Pipeline } from "@kiln/core";
 
-/** A buffer of the CPU backend: one ArrayBuffer with the views kernels read it through. */
+/**
+ * A buffer of the CPU backend, with the views kernels read it through: a region of the backend's
+ * WASM heap when it has one (so the SIMD kernels can address it), else its own ArrayBuffer.
+ */
 class CpuBuf implements Buf, CpuView {
-  readonly bytes: Uint8Array;
-  readonly f32: Float32Array;
-  readonly u32: Uint32Array;
-  readonly i32: Int32Array;
-  readonly i8: Int8Array;
+  private data: ArrayBuffer | undefined;
+  private views!: { bytes: Uint8Array; f32: Float32Array; u32: Uint32Array; i32: Int32Array; i8: Int8Array };
+  readonly ptr: number;
 
   constructor(
     readonly size: number,
     readonly label: string,
+    readonly heap?: WasmHeap,
   ) {
-    const data = new ArrayBuffer(Math.ceil(size / 4) * 4);
-    this.bytes = new Uint8Array(data);
-    this.f32 = new Float32Array(data);
-    this.u32 = new Uint32Array(data);
-    this.i32 = new Int32Array(data);
-    this.i8 = new Int8Array(data);
+    this.ptr = heap ? heap.alloc(size) : 0;
+    if (!heap) this.view(new ArrayBuffer(Math.ceil(size / 4) * 4));
+  }
+
+  /** The views, made again when the heap has grown (which detaches the old ones). */
+  private get v() {
+    const buf = this.heap ? this.heap.buffer : this.data!;
+    if (buf !== this.data) this.view(buf);
+    return this.views;
+  }
+
+  private view(buf: ArrayBuffer): void {
+    this.data = buf;
+    const at = this.ptr;
+    const words = Math.ceil(this.size / 4);
+    this.views = {
+      bytes: new Uint8Array(buf, at, words * 4),
+      f32: new Float32Array(buf, at, words),
+      u32: new Uint32Array(buf, at, words),
+      i32: new Int32Array(buf, at, words),
+      i8: new Int8Array(buf, at, words * 4),
+    };
+  }
+
+  get bytes(): Uint8Array { return this.v.bytes; }
+  get f32(): Float32Array { return this.v.f32; }
+  get u32(): Uint32Array { return this.v.u32; }
+  get i32(): Int32Array { return this.v.i32; }
+  get i8(): Int8Array { return this.v.i8; }
+
+  private freed = false;
+
+  release(): void {
+    if (!this.heap || this.freed) return;
+    this.freed = true;
+    this.heap.release(this.ptr, Math.ceil(this.size / 4) * 4);
   }
 }
 
@@ -38,9 +71,10 @@ const asCpu = (buf: Buf): CpuBuf => {
 };
 
 /**
- * Runs every kernel on the CPU, in TypeScript (each kernel spec's `cpu` implementation), for
- * browsers and devices without WebGPU. Work runs when it is submitted, on the calling thread (the
- * model's worker), so queue order is program order. Much slower than a GPU: meant for small models.
+ * Runs every kernel on the CPU (each kernel spec's `cpu` implementation), for browsers and devices
+ * without WebGPU: matmuls in WASM SIMD where available (simd.wat), everything else in TypeScript.
+ * Work runs when it is submitted, on the calling thread (the model's worker), so queue order is
+ * program order. Much slower than a GPU: meant for small models.
  */
 export class CpuBackend implements Backend {
   readonly name = "cpu";
@@ -53,12 +87,25 @@ export class CpuBackend implements Backend {
     maxWorkgroupStorage: 16384,
   };
 
-  alloc(bytes: number, _usage: BufUsage = "storage", label = "buf"): Buf {
-    return new CpuBuf(bytes, label);
+  /** Where buffers live: a WASM heap the SIMD kernels use, when WebAssembly SIMD is available. */
+  readonly heap: WasmHeap | undefined;
+
+  constructor(opts: { simd?: boolean } = {}) {
+    this.heap = opts.simd === false ? undefined : WasmHeap.create();
   }
 
-  free(_buf: Buf): void {
-    // Garbage collected once nothing references it.
+  /** Whether matmuls run in WASM SIMD (else in plain TypeScript). */
+  get simd(): boolean {
+    return !!this.heap;
+  }
+
+  alloc(bytes: number, _usage: BufUsage = "storage", label = "buf"): Buf {
+    return new CpuBuf(bytes, label, this.heap);
+  }
+
+  free(buf: Buf): void {
+    // Heap regions go back to the free list; plain ArrayBuffers are garbage collected.
+    if (buf instanceof CpuBuf) buf.release();
   }
 
   write(buf: Buf, offset: number, data: ArrayBufferView): void {

@@ -26,6 +26,8 @@ export interface NumberBounds {
   max?: number;
   exclusiveMin?: boolean;
   exclusiveMax?: boolean;
+  /** The value must be an integer multiple of this (JSON Schema multipleOf), up to float rounding. */
+  multipleOf?: number;
 }
 
 /** Whitespace allowed between the tokens of an object or array. */
@@ -238,8 +240,20 @@ function meets(lo: number, loIn: boolean, hi: number, hiIn: boolean, b: NumberBo
   let z = hi;
   let zIn = hiIn;
   if (b.max !== undefined && (b.max < z || (b.max === z && b.exclusiveMax))) [z, zIn] = [b.max, !b.exclusiveMax];
-  return a < z || (a === z && aIn && zIn);
+  if (!(a < z || (a === z && aIn && zIn))) return false;
+  const m = b.multipleOf;
+  if (!m) return true;
+  // The first multiple of m at or past a (past it when a is excluded), then: is it before z?
+  let k = Math.ceil(a / m - 1e-9);
+  if (!aIn && near(k * m, a)) k++;
+  const v = k * m;
+  return near(v, z) ? zIn : v < z;
 }
+
+/** Equal up to float rounding (multiples of decimal steps like 0.1 are inexact in binary). */
+const near = (x: number, y: number) => Math.abs(x - y) <= 1e-9 * Math.max(1, Math.abs(x), Math.abs(y));
+
+const isMultiple = (v: number, m: number) => near(v / m, Math.round(v / m));
 
 /**
  * Whether the number text so far (no exponent) can still be completed to a value within the bounds:
@@ -267,7 +281,9 @@ export function feasibleNumber(text: string, integer: boolean, b: NumberBounds):
 
 /** Whether a complete number is within the bounds. */
 const inBounds = (v: number, b: NumberBounds) =>
-  (b.min === undefined || v > b.min || (v === b.min && !b.exclusiveMin)) && (b.max === undefined || v < b.max || (v === b.max && !b.exclusiveMax));
+  (b.min === undefined || v > b.min || (v === b.min && !b.exclusiveMin)) &&
+  (b.max === undefined || v < b.max || (v === b.max && !b.exclusiveMax)) &&
+  (!b.multipleOf || isMultiple(v, b.multipleOf));
 
 /**
  * -?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][+-]?[0-9]+)?, with each digit run capped. With bounds, no

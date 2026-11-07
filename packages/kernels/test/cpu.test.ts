@@ -1,16 +1,21 @@
 import { describe, expect, it } from "vitest";
 import { Ctx, STEP_BYTES, packStep, type Tensor } from "@kiln/core";
-import { dequantQ4, dequantQ8, exactQ4, quantizeQ4, quantizeQ8 } from "@kiln/loader";
+import { dequantQ4, dequantQ8, exactQ4, exactQ8, quantizeQ4, quantizeQ8 } from "@kiln/loader";
 import { CpuBackend, ops, ref } from "../src";
 import { toF16 } from "../src/cpu";
+import { WasmHeap } from "../src/simd";
 
 let seed = 99;
 const rand = () => ((seed = (seed * 1103515245 + 12345) >>> 0) / 2 ** 32) * 2 - 1;
 const randn = (n: number) => Float32Array.from({ length: n }, rand);
 
 /** The CPU backend runs the same ops as WebGPU; the browser kernel page checks all of them (?backend=cpu). */
-describe("CPU backend", () => {
-  const be = new CpuBackend();
+describe.each([
+  ["SIMD", true],
+  ["TypeScript", false],
+])("CPU backend, matmuls in %s", (_, simd) => {
+  const be = new CpuBackend({ simd });
+  it("uses the path asked for", () => expect(be.simd).toBe(simd));
   const step = be.alloc(STEP_BYTES);
   const upload = (data: Float32Array | Uint32Array, shape: number[]): Tensor => {
     const buf = be.alloc(data.byteLength);
@@ -41,10 +46,20 @@ describe("CPU backend", () => {
       for (let j = 0; j < 16; j++) blocks[b * 20 + 4 + j] = (b * 7 + j * 13) & 255;
     }
     const q4a = exactQ4("Q4_1", blocks, N * K);
+    // And Q5_1 (f16 d and m, 4 bytes of high bits, 16 of nibbles): affine q8.
+    const b5 = new Uint8Array((N * K) / 32 * 24);
+    for (let b = 0; b < (N * K) / 32; b++) {
+      const dv = new DataView(b5.buffer, b * 24);
+      dv.setUint16(0, toF16(0.005 + b * 1e-4), true);
+      dv.setUint16(2, toF16(-0.08), true);
+      for (let j = 0; j < 20; j++) b5[b * 24 + 4 + j] = (b * 11 + j * 29) & 255;
+    }
+    const q8a = exactQ8("Q5_1", b5, N * K);
     const weights: [string, Tensor, Float32Array][] = [
       ["f32", upload(w, [N, K]), w],
       ["q4", { ...upload(q4.nibbles, [N, K]), dtype: "q4", scales: upload(q4.scales, [0]).buf }, dequantQ4(q4)],
       ["q8", { ...upload(q8.bytes, [N, K]), dtype: "q8", scales: upload(q8.scales, [0]).buf }, dequantQ8(q8)],
+      ["q8a", { ...upload(q8a.bytes, [N, K]), dtype: "q8", scales: upload(q8a.scales, [0]).buf, mins: upload(q8a.mins!, [0]).buf }, dequantQ8(q8a)],
       ["q4a", { ...upload(q4a.nibbles, [N, K]), dtype: "q4", scales: upload(q4a.scales, [0]).buf, mins: upload(q4a.mins!, [0]).buf }, dequantQ4(q4a)],
     ];
     for (const [name, wt, deq] of weights) {
@@ -95,5 +110,32 @@ describe("CPU backend", () => {
     const allowed = upload(new Uint32Array(5), [0]).buf;
     run(0, (ctx) => ops.sample(ctx, upload(logits, [1, V]), out, seen, allowed));
     expect(new Uint32Array(await be.readback(out, 0, 4))[0]).toBe(37);
+  });
+});
+
+describe("WasmHeap", () => {
+  it("reuses freed regions, coalesces holes and shrinks the top", () => {
+    const h = WasmHeap.create()!;
+    const a = h.alloc(100), b = h.alloc(10), c = h.alloc(64);
+    expect(a).toBeGreaterThan(0);
+    expect([b - a, c - b]).toEqual([112, 16]);
+    h.release(a, 100);
+    expect(h.alloc(40)).toBe(a); // first fit, inside a's hole
+    h.release(a, 40);
+    h.release(b, 10); // merges with the hole left of it
+    expect(h.alloc(128)).toBe(a);
+    h.release(a, 128);
+    h.release(c, 64); // at the top: the top falls back past the merged hole too
+    expect(h.bytes).toBe(a);
+  });
+
+  it("grows the memory and keeps buffer contents across growth", () => {
+    const be = new CpuBackend();
+    const small = be.alloc(16);
+    be.write(small, 0, Float32Array.of(1, 2, 3, 4));
+    const before = be.heap!.buffer.byteLength;
+    be.alloc(4 * before);
+    expect(be.heap!.buffer.byteLength).toBeGreaterThan(before);
+    expect([...(small as unknown as { f32: Float32Array }).f32]).toEqual([1, 2, 3, 4]);
   });
 });

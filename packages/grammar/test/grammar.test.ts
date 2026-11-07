@@ -138,6 +138,25 @@ describe("JSON grammar", () => {
     expect(match(neg, "5").prefix).toBe(false);
   });
 
+  it("enforces multipleOf, with or without bounds", () => {
+    const even = json({ type: "integer", multipleOf: 2, minimum: 0, maximum: 9 });
+    for (const [t, ok] of [["0", true], ["4", true], ["8", true], ["3", false], ["10", false]] as const) expect(full(even, t), t).toBe(ok);
+    expect(match(even, "9").prefix).toBe(false); // no even number starts with 9 below 10
+    const tens = json({ type: "integer", multipleOf: 10 });
+    expect(full(tens, "120")).toBe(true);
+    expect(full(tens, "125")).toBe(false);
+    expect(match(tens, "12").prefix).toBe(true);
+    expect(full(tens, "1e2")).toBe(false); // bounded numbers have no exponent
+    const step = json({ type: "number", multipleOf: 0.1, minimum: 0, maximum: 1 });
+    for (const [t, ok] of [["0.3", true], ["0.7", true], ["1", true], ["0.30", true], ["0.35", false], ["1.1", false]] as const) expect(full(step, t), t).toBe(ok);
+    expect(match(step, "0.35").prefix).toBe(false);
+    const half = json({ type: "number", multipleOf: 0.5, exclusiveMinimum: 1 });
+    expect(full(half, "1")).toBe(false);
+    expect(full(half, "1.5")).toBe(true);
+    expect(full(half, "2.25")).toBe(false);
+    expect(() => match(json({ type: "number", multipleOf: 0 }), "1")).toThrow(/positive/);
+  });
+
   it("matches regular expressions", () => {
     const r = (pattern: string): ResponseFormat => ({ type: "regex", pattern });
     expect(full(r("(yes|no)!?"), "yes!")).toBe(true);

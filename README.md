@@ -122,12 +122,15 @@ Key ideas:
   thread. `load` uses it when the browser has no WebGPU or no adapter (`device: "auto"`, the
   default), or when asked (`device: "cpu"`); `info.backend` says which ran. The whole engine works
   unchanged on it: grammars, saved prefixes, the prompt cache. The kernel check page runs every check
-  against it too (`/kernels.html?backend=cpu`, 740 of 740 passing; the f16 matmul variants need
-  shader-f16), and Node tests cover it in CI. On the CPU, matmuls take dot products straight from the
-  4- and 8-bit codes, prefill builds plans of the exact prompt length instead of padded buckets, and
-  draft tokens are off by default (a checked row costs as much as a decoded one). SmolLM2-135M gives the GPU's tokens in
-  q4 and q8; on the Intel Mac it decodes at about 1 to 2 tokens per second, with a 42-token prompt
-  taking 15 s.
+  against it too (`/kernels.html?backend=cpu`, 757 of 757 passing; the f16 matmul variants need
+  shader-f16), and Node tests cover it in CI. Matmuls run in WASM SIMD (`packages/kernels/src/simd.wat`,
+  1.4 KB compiled): every CPU buffer lives in one WebAssembly memory, so the kernels read weights,
+  activations and scratch in place, taking f32x4 dot products straight from the 4- and 8-bit codes.
+  That runs a 1536 × 576 q4 or q8 matvec at 3.2–3.6 GMAC/s on the Intel Mac, against 0.24–0.42 in
+  TypeScript (which remains the path without WASM SIMD). Prefill builds plans of the exact prompt
+  length instead of padded buckets, and draft tokens are off by default (a checked row costs as much as
+  a decoded one). SmolLM2-135M gives the GPU's tokens in q4 and q8, decoding at 18 tok/s on the Intel
+  Mac (it was 1–2 with TypeScript matmuls), with a 42-token prompt in 0.4 s.
 - **GGUF weights held exactly.** Q4_1 and Q4_K blocks are code·scale + min per 32 values with 4-bit
   codes, and Q5_x with 5-bit codes, so Kiln's q4 and q8 planes plus one f32 min per block hold them
   as llama.cpp dequantizes them, where they used to be dequantized and rounded a second time. The GPU
@@ -484,13 +487,14 @@ Supported:
 - Structured output: any JSON, JSON Schema (`type`, `properties`, `required`, `additionalProperties`,
   `items`, `minItems`/`maxItems`, `minLength`/`maxLength`, `pattern`, `format` (date, time,
   date-time, email, uuid, ipv4; others stay annotations), `minimum`/`maximum` and their exclusive
-  forms, `enum`, `const`, `anyOf`/`oneOf`, local `$ref`, including recursive ones), a regular
+  forms, `multipleOf`, `enum`, `const`, `anyOf`/`oneOf`, local `$ref`, including recursive ones), a regular
   expression (`{ type: "regex", pattern }`), a GBNF grammar in llama.cpp's format (`{ type: "grammar",
   grammar }`), or one of a list of strings. Properties come in declared order. Keywords that would
   change what matches but are not enforced (`not`, `if`, `uniqueItems`, …) are rejected rather than
   ignored. Bounded numbers carry their text so far, and a digit is refused as soon as no value within
   the bounds can still follow it (`{"minimum": 18, "maximum": 120}` refuses "13" but keeps "1", which
-  may become 18 or 1xx); they are written without exponents. Regex and GBNF compile to two new
+  may become 18 or 1xx), and under `multipleOf` as soon as no multiple can follow (`0.35` under 0.1;
+  decimal steps are compared with a 1e-9 relative tolerance); they are written without exponents. Regex and GBNF compile to two new
   grammar nodes, a Unicode character class read byte by byte as UTF-8 (refused at the lead byte when
   no code point it starts is in the class) and a bounded repetition, on top of literals, sequences and
   alternatives; a repetition round that matches nothing is cut off where the matcher would otherwise
@@ -516,7 +520,7 @@ Known limits, roughly in roadmap order:
   rather than being batched into one forward pass, and the cache is contiguous, not paged.
 - Constrained decoding waits for the CPU's mask between forward passes (drafts let one pass check
   several tokens). Regexes have no backreferences, lookaround or word boundaries; GBNF rules may not
-  be left-recursive; `multipleOf` is not enforced; a string with `pattern` cannot also have
+  be left-recursive; a string with `pattern` cannot also have
   `minLength`/`maxLength`.
   `toolChoice` forces one call; under "auto" calls are not checked against the tool schemas.
 - Q6_K (scales every 16 values) is rounded to q8 on load rather than run as stored; the other GGUF
@@ -527,8 +531,9 @@ Known limits, roughly in roadmap order:
   (use q4 or q8).
 - Images: Gemma 3 only, from llama.cpp's mmproj GGUF (the vision weights inside safetensors
   checkpoints are still skipped), one 896 × 896 crop per image (no pan-and-scan).
-- Without WebGPU, models run on the CPU in plain TypeScript: single-threaded, no WASM SIMD, about 0.5
-  GMAC/s on the test Mac, so only small models are usable there. WebNN and Node/Dawn backends come later.
+- Without WebGPU, models run on the CPU: single-threaded (no worker pool), matmuls in WASM SIMD at
+  about 3.5 GMAC/s on the test Mac, attention and the rest in TypeScript, and every buffer in one
+  wasm32 memory (4 GiB at most). Small models only. WebNN and Node/Dawn backends come later.
 
 ## License
 

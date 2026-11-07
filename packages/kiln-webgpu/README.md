@@ -33,7 +33,7 @@ const list = llm.chat(messages, { format: { type: "grammar", grammar: 'root ::= 
 ```
 
 Schemas may use `pattern`, `format` (date, time, date-time, email, uuid, ipv4) and
-`minimum`/`maximum`; grammars are llama.cpp's GBNF.
+`minimum`/`maximum`/`multipleOf`; grammars are llama.cpp's GBNF.
 
 Each stream's `stats` resolve when it ends, with token counts, timings and `stopReason`: `"stop"`
 (end of turn), `"maxTokens"`, `"context"` (the reply filled the context), `"format"` (the structured
@@ -68,7 +68,7 @@ Granite 4 350M need `"q8"` or `"f32"`.
 ## Requirements
 
 A browser with WebGPU (Chrome or Edge 113+, Safari 26+, Firefox 141+ on Windows) for real speed.
-Without it, `load` falls back to running on the CPU (much slower; fine for models around 135M) and
+Without it, `load` falls back to running on the CPU (matmuls in WASM SIMD; much slower than a GPU, fine for models around 135M) and
 `llm.info.backend` is `"cpu"`; `load(id, { device: "gpu" })` fails instead. Use it from a bundler
 that understands `new URL("…", import.meta.url)` workers (Vite, webpack 5, Parcel, esbuild with
 a plugin). To host the worker yourself, pass `load(id, { worker })`.

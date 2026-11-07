@@ -23,6 +23,7 @@ export interface JsonSchema {
   /** A number (draft 6 and later), or true to make `minimum` exclusive (draft 4). */
   exclusiveMinimum?: number | boolean;
   exclusiveMaximum?: number | boolean;
+  multipleOf?: number;
   enum?: unknown[];
   const?: unknown;
   anyOf?: JsonSchema[];
@@ -155,7 +156,7 @@ export function compileSchema(root: JsonSchema, ws: Whitespace = PRETTY): Node {
   return compile(root);
 }
 
-/** A schema's numeric bounds, from either draft's exclusive keywords; undefined when there are none. */
+/** A schema's numeric bounds (either draft's exclusive keywords) and multipleOf; undefined when there are none. */
 function bounds(s: JsonSchema): NumberBounds | undefined {
   const b: NumberBounds = {};
   if (s.minimum !== undefined) b.min = s.minimum;
@@ -166,7 +167,11 @@ function bounds(s: JsonSchema): NumberBounds | undefined {
   if (typeof s.exclusiveMaximum === "number") {
     if (b.max === undefined || s.exclusiveMaximum <= b.max) [b.max, b.exclusiveMax] = [s.exclusiveMaximum, true];
   } else if (s.exclusiveMaximum === true) b.exclusiveMax = true;
-  return b.min === undefined && b.max === undefined ? undefined : b;
+  if (s.multipleOf !== undefined) {
+    if (!(s.multipleOf > 0)) throw new Error("schema: multipleOf must be a positive number");
+    b.multipleOf = s.multipleOf;
+  }
+  return b.min === undefined && b.max === undefined && b.multipleOf === undefined ? undefined : b;
 }
 
 export function compileFormat(f: ResponseFormat): Node {

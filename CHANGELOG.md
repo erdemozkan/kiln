@@ -20,7 +20,7 @@ bidirectional attention among each image's 256 tokens.
 of text, with `stats` (timings, token counts, `stopReason`). The model's own Jinja chat template,
 tools and documents, parsed tool calls (`<tool_call>`, Mistral's `[TOOL_CALLS]`, Granite's
 `<|tool_call|>`) and `toolChoice`. Structured output: JSON, JSON Schema (with
-`pattern`, common `format`s and numeric bounds), regular expressions, GBNF grammars or a fixed choice,
+`pattern`, common `format`s, numeric bounds and `multipleOf`), regular expressions, GBNF grammars or a fixed choice,
 enforced by a grammar mask at every token. Draft tokens (speculative decoding by
 prompt lookup) on by default, also under a grammar.
 
@@ -33,8 +33,10 @@ last prompt's K/V survives page reloads, and earlier prefixes stay on the GPU (`
 256 MiB by default), so conversations used in turn each prefill only their new turn; overlapping
 calls queue.
 
-**CPU fallback.** Without WebGPU (or with `device: "cpu"`), the same engine runs on TypeScript
-versions of every kernel; slow, for small models. `info.backend` reports which backend runs.
+**CPU fallback.** Without WebGPU (or with `device: "cpu"`), the same engine runs on CPU versions of
+every kernel: matmuls in WASM SIMD (TypeScript where SIMD is missing), the rest in TypeScript. About
+18 tok/s for SmolLM2-135M on an Intel Mac; meant for small models. `info.backend` reports which
+backend runs.
 
 **Context.** The default context is the model's trained context, up to 8192 tokens and 512 MiB of
 KV cache; sliding-window layers keep a ring of window + 256 slots, so Gemma 3 4B gets 8192 tokens in

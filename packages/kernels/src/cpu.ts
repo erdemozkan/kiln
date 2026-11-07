@@ -1,4 +1,5 @@
 import type { CpuKernel, CpuView, WeightDType } from "@kiln/core";
+import type { WasmHeap } from "./simd";
 
 /**
  * TypeScript versions of the WGSL kernels, for the CPU backend. Each takes the same bindings, in the
@@ -48,8 +49,6 @@ const F16 = (() => {
   return t;
 })();
 
-/** Element e of a cache stored as f16 pairs in u32 words, or as f32. */
-const kvGet = (c: CpuView, e: number, f16: boolean) => (f16 ? F16[(c.u32[e >>> 1]! >>> ((e & 1) * 16)) & 0xffff]! : c.f32[e]!);
 
 /** Writes elements e and e + 1 (e even) of a cache. */
 function kvPut2(c: CpuView, e: number, a: number, b: number, f16: boolean): void {
@@ -148,6 +147,48 @@ function dotQ8(x: Float32Array, xo: number, q: Int8Array, qo: number): number {
   return s0 + s1 + (s2 + s3);
 }
 
+/** A view of a buffer in the CPU backend's WASM heap. */
+interface HeapView extends CpuView {
+  readonly heap?: WasmHeap;
+  readonly ptr: number;
+}
+
+/**
+ * acc[m, n] = Σ_k xs[m, k] · W[n, k] in WASM SIMD: x rows (permuted per block for q4, see simd.wat)
+ * and their block sums go to heap scratch, then one gemv per row. Returns a copy of the result.
+ */
+const simdScratch = (M: number, N: number, K: number) => M * K * 4 + Math.ceil((M * (K >>> 5) * 4) / 16) * 16 + M * N * 4;
+
+function simdMatmul(heap: WasmHeap, wdtype: WeightDType, xs: Float32Array, w: HeapView[], M: number, N: number, K: number): Float32Array {
+  const KB = K >>> 5;
+  const xBytes = M * K * 4;
+  const sumBytes = Math.ceil((M * KB * 4) / 16) * 16;
+  const at = heap.scratch(simdScratch(M, N, K)); // reserved by the caller: no growth here
+  const mem = new Float32Array(heap.buffer);
+  const xp = at, sp = at + xBytes, yp = sp + sumBytes;
+  const x = mem.subarray(xp / 4, xp / 4 + M * K);
+  if (wdtype === "q4")
+    for (let base = 0; base < M * K; base += 32)
+      for (let j = 0; j < 4; j++) for (let e = 0; e < 8; e++) x[base + 4 * e + j] = xs[base + 8 * j + e]!;
+  else x.set(xs);
+  if (wdtype !== "f32")
+    for (let r = 0; r < M * KB; r++) {
+      let t = 0;
+      for (let e = 0, o = r * 32; e < 32; e++) t += xs[o + e]!;
+      mem[sp / 4 + r] = t;
+    }
+  const k = heap.kernels;
+  for (let m = 0; m < M; m++) {
+    const xm = xp + m * K * 4, ym = yp + m * N * 4;
+    if (wdtype === "f32") k.gemv_f32(xm, w[0]!.ptr, K, N, ym);
+    else {
+      const mn = w[2]?.ptr ?? 0;
+      (wdtype === "q4" ? k.gemv_q4 : k.gemv_q8)(xm, w[0]!.ptr, w[1]!.ptr, mn, sp + m * KB * 4, K, N, ym);
+    }
+  }
+  return new Float32Array(heap.buffer, yp, M * N).slice();
+}
+
 export function cpuMatmul(v: CpuMatmulVariant): CpuKernel {
   const quant = v.wdtype !== "f32";
   const affine = quant && !!v.affine;
@@ -156,6 +197,9 @@ export function cpuMatmul(v: CpuMatmulVariant): CpuKernel {
     const p = b[0]!;
     const [M, N, K] = [p.u32[0]!, p.u32[1]!, p.u32[2]!];
     const eps = p.f32[3]!;
+    const heap = (b[1] as HeapView).heap;
+    // Reserve the SIMD scratch before taking views: growing the heap would detach them.
+    heap?.scratch(simdScratch(M, N, K));
     const x = b[1]!.f32;
     const w = b.slice(2, nw);
     let at = nw;
@@ -174,13 +218,16 @@ export function cpuMatmul(v: CpuMatmulVariant): CpuKernel {
       }
     }
     const gated = v.epi === "silu" || v.epi === "gelu";
-    const acc = new Float32Array(M * N);
     const KB = K >>> 5;
-    if (v.wdtype === "f32") {
+    let acc: Float32Array;
+    if (heap) acc = simdMatmul(heap, v.wdtype, xs, w as HeapView[], M, N, K);
+    else if (v.wdtype === "f32") {
+      acc = new Float32Array(M * N);
       const wf = w[0]!.f32;
       for (let n = 0; n < N; n++)
-        for (let m = 0; m < M; m++) acc[m * N + n] = dotF32(xs, m * K, wf, n * K, K) + (bias ? bias[n]! : 0);
+        for (let m = 0; m < M; m++) acc[m * N + n] = dotF32(xs, m * K, wf, n * K, K);
     } else {
+      acc = new Float32Array(M * N);
       // Dots straight from the codes, one block of 32 at a time: scale · Σ x·code, plus the block's
       // x sum times the min (affine) or times -8·scale (symmetric q4's code offset).
       const xsum = new Float32Array(M * KB);
@@ -205,9 +252,10 @@ export function cpuMatmul(v: CpuMatmulVariant): CpuKernel {
             const sx = xsum[m * KB + bl]!;
             total += wm ? ws[blk]! * t + wm[blk]! * sx : q4 ? ws[blk]! * (t - 8 * sx) : ws[blk]! * t;
           }
-          acc[m * N + n] = total + (bias ? bias[n]! : 0);
+          acc[m * N + n] = total;
         }
     }
+    if (bias) for (let m = 0; m < M; m++) for (let n = 0; n < N; n++) acc[m * N + n]! += bias[n]!;
     if (gated) {
       const I = N / 2;
       for (let m = 0; m < M; m++) for (let i = 0; i < I; i++) y[m * I + i] = act(v.epi as "silu" | "gelu", acc[m * N + i]!) * acc[m * N + I + i]!;
@@ -357,7 +405,22 @@ export function cpuQkNormRopeKv(interleaved: boolean, f16: boolean): CpuKernel {
 // ---- attention ----
 
 /** Causal GQA attention over the cache, with the sliding window and ring slots of ATTN_P. */
+/** Row `e / D` (D values from element e) of a cache, decoded into out. */
+function kvRow(u: Uint32Array, f: Float32Array, e: number, D: number, f16: boolean, out: Float32Array): void {
+  if (!f16) {
+    for (let i = 0; i < D; i++) out[i] = f[e + i]!;
+    return;
+  }
+  // e and D are even: whole words, two halves each.
+  for (let i = 0, w = e >>> 1; i < D; i += 2, w++) {
+    const x = u[w]!;
+    out[i] = F16[x & 0xffff]!;
+    out[i + 1] = F16[x >>> 16]!;
+  }
+}
+
 export function cpuAttention(f16: boolean): CpuKernel {
+  let scores = new Float32Array(0);
   return (b) => {
     const u = b[0]!.u32;
     const [T, H, Hkv, D, maxSeq] = [u[0]!, u[1]!, u[2]!, u[3]!, u[4]!];
@@ -365,11 +428,14 @@ export function cpuAttention(f16: boolean): CpuKernel {
     const [win, cap] = [u[7]!, u[8]!];
     const { pos0, spanLo, spanHi } = step(b[1]!);
     const q = b[2]!.f32;
-    const kc = b[3]!;
-    const vc = b[4]!;
+    // Views taken once: a heap buffer's view getter is too slow for the inner loops.
+    const [ku, kf, vu, vf] = [b[3]!.u32, b[3]!.f32, b[4]!.u32, b[4]!.f32];
     const o = b[5]!.f32;
     const stride = Hkv * D;
-    const scores = new Float32Array(maxSeq);
+    if (scores.length < maxSeq) scores = new Float32Array(maxSeq);
+    const qs = new Float32Array(D);
+    const row = new Float32Array(D);
+    const acc = new Float32Array(D);
     for (let t = 0; t < T; t++)
       for (let h = 0; h < H; h++) {
         const kvh = Math.floor(h / (H / Hkv));
@@ -378,21 +444,24 @@ export function cpuAttention(f16: boolean): CpuKernel {
         const n = Math.min(pos >= spanLo && pos < spanHi ? spanHi : pos + 1, maxSeq);
         const first = win > 0 && n > win ? n - win : 0;
         const qo = (t * H + h) * D;
+        for (let i = 0; i < D; i++) qs[i] = q[qo + i]! * scale;
         let mx = -Infinity;
         for (let j = first; j < n; j++) {
-          const kb = (j % cap) * stride + kvh * D;
+          kvRow(ku, kf, (j % cap) * stride + kvh * D, D, f16, row);
           let d = 0;
-          for (let i = 0; i < D; i++) d += q[qo + i]! * scale * kvGet(kc, kb + i, f16);
+          for (let i = 0; i < D; i++) d += qs[i]! * row[i]!;
           scores[j] = d;
           if (d > mx) mx = d;
         }
         let l = 0;
         for (let j = first; j < n; j++) l += scores[j] = Math.exp(scores[j]! - mx);
-        for (let i = 0; i < D; i++) {
-          let acc = 0;
-          for (let j = first; j < n; j++) acc += scores[j]! * kvGet(vc, (j % cap) * stride + kvh * D + i, f16);
-          o[qo + i] = acc / l;
+        acc.fill(0);
+        for (let j = first; j < n; j++) {
+          kvRow(vu, vf, (j % cap) * stride + kvh * D, D, f16, row);
+          const p = scores[j]!;
+          for (let i = 0; i < D; i++) acc[i]! += p * row[i]!;
         }
+        for (let i = 0; i < D; i++) o[qo + i] = acc[i]! / l;
       }
   };
 }
