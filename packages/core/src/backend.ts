@@ -12,7 +12,19 @@ export interface KernelSpec {
   /** One entry per `@binding(i)` in `@group(0)`, in order. */
   readonly bindings: readonly BindingKind[];
   readonly entry?: string;
+  /** The same computation in TypeScript, for the CPU backend: the bound buffers in binding order. */
+  readonly cpu?: CpuKernel;
 }
+
+/** A bound buffer as the CPU backend sees it: views of one ArrayBuffer. */
+export interface CpuView {
+  readonly f32: Float32Array;
+  readonly u32: Uint32Array;
+  readonly i32: Int32Array;
+  readonly i8: Int8Array;
+}
+
+export type CpuKernel = (bufs: readonly CpuView[], grid: Grid) => void;
 
 /** Opaque buffer handle. Backends extend it with their native object. */
 export interface Buf {

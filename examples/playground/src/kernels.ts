@@ -1,6 +1,6 @@
-import { createWebGPUBackend, type WebGPUBackend } from "@kiln/backend-webgpu";
-import { Ctx, packStep, type Buf, type StepParams, type Tensor } from "@kiln/core";
-import { gpuConverts, ops, ref } from "@kiln/kernels";
+import { createWebGPUBackend } from "@kiln/backend-webgpu";
+import { Ctx, packStep, type Backend, type Buf, type StepParams, type Tensor } from "@kiln/core";
+import { CpuBackend, gpuConverts, ops, ref } from "@kiln/kernels";
 import { dequantQ4, dequantQ8, f16ToF32, MemorySource, quantizeQ4, quantizeQ8, rowBytes, type SrcType } from "@kiln/loader";
 import { loadWeights, setGpuConvert } from "@kiln/runtime";
 
@@ -38,8 +38,10 @@ const packHalf = (a: Float32Array) => {
 const unpackHalf = (w: Uint32Array) => f16ToF32(new Uint8Array(w.buffer, w.byteOffset, w.length * 4));
 
 async function main() {
-  const be = await createWebGPUBackend();
-  document.getElementById("device")!.textContent = `features: ${[...be.limits.features].join(", ") || "none"}${be.limits.subgroupMinSize ? ` · subgroup size ≥ ${be.limits.subgroupMinSize}` : ""} · max binding ${(be.limits.maxStorageBufferBindingSize / 2 ** 20).toFixed(0)} MiB`;
+  // ?backend=cpu checks the CPU backend's TypeScript kernels against the same references.
+  const onCpu = new URLSearchParams(location.search).get("backend") === "cpu";
+  const be: Backend = onCpu ? new CpuBackend() : await createWebGPUBackend();
+  document.getElementById("device")!.textContent = `${onCpu ? "CPU backend · " : ""}features: ${[...be.limits.features].join(", ") || "none"}${be.limits.subgroupMinSize ? ` · subgroup size ≥ ${be.limits.subgroupMinSize}` : ""} · max binding ${(be.limits.maxStorageBufferBindingSize / 2 ** 20).toFixed(0)} MiB`;
   const step = be.alloc(32, "storage", "step");
   const results: Result[] = [];
 
@@ -717,7 +719,7 @@ async function main() {
   render(results, be);
 }
 
-function render(results: Result[], be: WebGPUBackend) {
+function render(results: Result[], be: Backend & { lostReason?: string }) {
   const rows = document.getElementById("rows")!;
   for (const r of results) {
     const tr = document.createElement("tr");

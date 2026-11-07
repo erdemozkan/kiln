@@ -28,6 +28,9 @@ last prompt's K/V survives page reloads, and earlier prefixes stay on the GPU (`
 256 MiB by default), so conversations used in turn each prefill only their new turn; overlapping
 calls queue.
 
+**CPU fallback.** Without WebGPU (or with `device: "cpu"`), the same engine runs on TypeScript
+versions of every kernel; slow, for small models. `info.backend` reports which backend runs.
+
 **Context.** The default context is the model's trained context, up to 8192 tokens and 512 MiB of
 KV cache; sliding-window layers keep a ring of window + 128 slots, so Gemma 3 4B gets 8192 tokens in
 290 MB. Prompts that do not fit say how to make room.
@@ -38,5 +41,5 @@ load in 2.4 s. Decode uses a block-per-lane GEMV with several rows per thread on
 prefill a tiled GEMM and tiled attention, and GPU work is cut into short submits so the page stays
 responsive.
 
-**Checks.** 135 unit tests; a kernel check page (785 checks on the Intel GPU) compares every kernel with a CPU reference; Gemma 3 1B matches a NumPy reference token for
+**Checks.** 138 unit tests; a kernel check page (785 checks on the Intel GPU) compares every kernel with a CPU reference; Gemma 3 1B matches a NumPy reference token for
 token in q8 and q4.

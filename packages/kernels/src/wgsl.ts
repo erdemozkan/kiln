@@ -1,4 +1,5 @@
-import { STEP_WGSL, type BindingKind, type KernelSpec, type WeightDType } from "@kiln/core";
+import { STEP_WGSL, type BindingKind, type CpuKernel, type KernelSpec, type WeightDType } from "@kiln/core";
+import * as cpu from "./cpu";
 
 /**
  * Baseline WGSL kernels. They favour clarity over speed: correct first, then specialised
@@ -33,10 +34,11 @@ function kvRead(kv: KvDtype): { kDecl: string; vDecl: string; k4: (i: string) =>
 const KV4_FN = /* wgsl */ `fn kv4(w: vec2<u32>) -> vec4<f32> { return vec4<f32>(unpack2x16float(w.x), unpack2x16float(w.y)); }`;
 
 const cache = new Map<string, KernelSpec>();
-function spec(key: string, bindings: KernelSpec["bindings"], code: () => string): KernelSpec {
+/** A kernel by key: WGSL for the GPU, and the same computation in TypeScript for the CPU backend (if any). */
+function spec(key: string, bindings: KernelSpec["bindings"], cpuImpl: CpuKernel | undefined, code: () => string): KernelSpec {
   let s = cache.get(key);
   if (!s) {
-    s = { key, bindings, code: code() };
+    s = { key, bindings, code: code(), cpu: cpuImpl };
     cache.set(key, s);
   }
   return s;
@@ -138,7 +140,7 @@ export function matmulSpec(v: MatmulVariant): KernelSpec {
       let val = ${withBias("n", `red[lane * 256u + r * LANES]`)};
       y[(m0 + lane) * p.N + n] ${v.epi === "add" ? "+=" : "="} val;
     }`;
-  return spec(key, bindings, () => /* wgsl */ `
+  return spec(key, bindings, cpu.cpuMatmul(v), () => /* wgsl */ `
 ${h ? "enable f16;" : ""}
 ${sg ? "enable subgroups;" : ""}
 struct P { M: u32, N: u32, K: u32, eps: f32 }
@@ -381,7 +383,7 @@ ${Array.from({ length: R }, (_, r) => `  let row${r} = n0 + ${r}u;
       y[i0 + ${j}u] = ${actWgsl(v.epi as "silu" | "gelu", "g")} * u;
     }`).join("\n")
     : Array.from({ length: R }, (_, r) => `    if (ok${r}) { y[row${r}] ${v.epi === "add" ? "+=" : "="} ${withBias(`row${r}`, `red[${r * 256}u + li]`)}; }`).join("\n");
-  return spec(key, bindings, () => /* wgsl */ `
+  return spec(key, bindings, cpu.cpuMatmul({ ...v, wdtype: v.wdtype }), () => /* wgsl */ `
 struct P { M: u32, N: u32, K: u32, eps: f32 }
 @group(0) @binding(0) var<uniform> p: P;
 @group(0) @binding(1) var<storage, read> x: array<vec4<f32>>;
@@ -547,7 +549,7 @@ ${v.wdtype === "q8"
       if (n < p.N) { y[m * p.N + n] ${v.epi === "add" ? "+=" : "="} ${withBias("n", "acc[i][j]")}; }
     }
   }`;
-  return spec(key, bindings, () => /* wgsl */ `
+  return spec(key, bindings, cpu.cpuMatmul({ ...v, norm: false }), () => /* wgsl */ `
 struct P { M: u32, N: u32, K: u32, _p: u32 }
 @group(0) @binding(0) var<uniform> p: P;
 @group(0) @binding(1) var<storage, read> x: array<vec4<f32>>;
@@ -615,7 +617,7 @@ ${store}
 
 /** y = x * rsqrt(mean(x^2) + eps) * w, one workgroup per row. */
 export function rmsnormSpec(): KernelSpec {
-  return spec("rmsnorm", ["uniform", "read", "read", "rw"], () => /* wgsl */ `
+  return spec("rmsnorm", ["uniform", "read", "read", "rw"], cpu.cpuRmsnorm, () => /* wgsl */ `
 struct P { R: u32, D: u32, eps: f32, _p: u32 }
 @group(0) @binding(0) var<uniform> p: P;
 @group(0) @binding(1) var<storage, read> x: array<f32>;
@@ -641,7 +643,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
 
 /** In-place rotary embedding on [T, H, D]. Rotate-half (HF) or interleaved pairs (GGUF llama). */
 export function ropeSpec(interleaved: boolean): KernelSpec {
-  return spec(`rope/${interleaved ? "interleaved" : "half"}`, ["uniform", "read", "read", "rw"], () => /* wgsl */ `
+  return spec(`rope/${interleaved ? "interleaved" : "half"}`, ["uniform", "read", "read", "rw"], cpu.cpuRope(interleaved), () => /* wgsl */ `
 ${STEP_WGSL}
 struct P { T: u32, H: u32, D: u32, _p: u32 }
 @group(0) @binding(0) var<uniform> p: P;
@@ -672,7 +674,7 @@ fn main(${EW_ARGS}) {
 /** Writes k/v rows [T, rowSize] into the caches at positions pos0..pos0+T (slot = position % cap). */
 export function kvWriteSpec(kv: KvDtype = "f32"): KernelSpec {
   const h = kv === "f16";
-  return spec(`kv_write/${kv}`, ["uniform", "read", "read", "read", "rw", "rw"], () => /* wgsl */ `
+  return spec(`kv_write/${kv}`, ["uniform", "read", "read", "read", "rw", "rw"], cpu.cpuKvWrite(kv === "f16"), () => /* wgsl */ `
 ${STEP_WGSL}
 struct P { T: u32, row: u32, maxSeq: u32, cap: u32 }
 @group(0) @binding(0) var<uniform> p: P;
@@ -729,7 +731,7 @@ const ATTN_P = (third: string) => `struct P { T: u32, H: u32, Hkv: u32, D: u32, 
  */
 export function attentionSpec(kv: KvDtype = "f32"): KernelSpec {
   const r = kvRead(kv);
-  return spec(`attention/online/${kv}`, ["uniform", "read", "read", "read", "read", "rw"], () => /* wgsl */ `
+  return spec(`attention/online/${kv}`, ["uniform", "read", "read", "read", "read", "rw"], cpu.cpuAttention(kv === "f16"), () => /* wgsl */ `
 ${STEP_WGSL}
 ${kv === "f16" ? KV4_FN : ""}
 ${ATTN_P("_a")}
@@ -890,7 +892,7 @@ export function attentionTiledSpec(kv: KvDtype, D: number, tile: AttentionTile =
     kv === "f16"
       ? { kDecl: "array<vec2<u32>>", vDecl: "array<vec2<u32>>", k: "kv4(kc[i])", v: "kv4(vc[i])" }
       : { kDecl: "array<vec4<f32>>", vDecl: "array<vec4<f32>>", k: "kc[i]", v: "vc[i]" };
-  return spec(`attention/tiled/${kv}/D${D}/R${R}/BK${BK}`, ["uniform", "read", "read", "read", "read", "rw"], () => /* wgsl */ `
+  return spec(`attention/tiled/${kv}/D${D}/R${R}/BK${BK}`, ["uniform", "read", "read", "read", "read", "rw"], cpu.cpuAttention(kv === "f16"), () => /* wgsl */ `
 ${STEP_WGSL}
 ${kv === "f16" ? KV4_FN : ""}
 ${ATTN_P("_a")}
@@ -1051,7 +1053,7 @@ export const ATTN_CHUNK = 64;
  */
 export function attentionSplitSpec(kv: KvDtype = "f32"): KernelSpec {
   const r = kvRead(kv);
-  return spec(`attention/split/${kv}`, ["uniform", "read", "read", "read", "read", "rw", "rw"], () => /* wgsl */ `
+  return spec(`attention/split/${kv}`, ["uniform", "read", "read", "read", "read", "rw", "rw"], undefined, () => /* wgsl */ `
 ${STEP_WGSL}
 ${kv === "f16" ? KV4_FN : ""}
 ${ATTN_P("S")}
@@ -1172,7 +1174,7 @@ ${kv === "f16"
 
 /** Split-K attention, pass 2: rescales every split to the global max and normalises. */
 export function attentionCombineSpec(): KernelSpec {
-  return spec("attention/combine", ["uniform", "read", "read", "read", "rw"], () => /* wgsl */ `
+  return spec("attention/combine", ["uniform", "read", "read", "read", "rw"], undefined, () => /* wgsl */ `
 ${STEP_WGSL}
 ${ATTN_P("S")}
 ${FIRST_KEY_WGSL}
@@ -1203,7 +1205,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
 
 /** out = act(gate) * up, with SiLU (default) or tanh-approximated GELU. */
 export function siluMulSpec(act: "silu" | "gelu" = "silu"): KernelSpec {
-  return spec(`${act}_mul`, ["uniform", "read", "read", "rw"], () => /* wgsl */ `
+  return spec(`${act}_mul`, ["uniform", "read", "read", "rw"], cpu.cpuSiluMul(act), () => /* wgsl */ `
 struct P { n: u32, _a: u32, _b: u32, _c: u32 }
 @group(0) @binding(0) var<uniform> p: P;
 @group(0) @binding(1) var<storage, read> g: array<f32>;
@@ -1221,7 +1223,7 @@ fn main(${EW_ARGS}) {
 
 /** y[r, i] = act(x[r, i]) * x[r, I + i]: a gated activation over [gate | up] rows of width 2I. */
 export function gatedActSpec(act: "silu" | "gelu"): KernelSpec {
-  return spec(`gated_${act}`, ["uniform", "read", "rw"], () => /* wgsl */ `
+  return spec(`gated_${act}`, ["uniform", "read", "rw"], cpu.cpuGatedAct(act), () => /* wgsl */ `
 struct P { n: u32, I: u32, _b: u32, _c: u32 }
 @group(0) @binding(0) var<uniform> p: P;
 @group(0) @binding(1) var<storage, read> x: array<f32>;
@@ -1240,7 +1242,7 @@ fn main(${EW_ARGS}) {
 
 /** a += b, with b broadcast over rows when `cols` < n (bias add). */
 export function addSpec(): KernelSpec {
-  return spec("add", ["uniform", "rw", "read"], () => /* wgsl */ `
+  return spec("add", ["uniform", "rw", "read"], cpu.cpuAdd, () => /* wgsl */ `
 struct P { n: u32, cols: u32, _a: u32, _b: u32 }
 @group(0) @binding(0) var<uniform> p: P;
 @group(0) @binding(1) var<storage, read_write> a: array<f32>;
@@ -1261,7 +1263,7 @@ export function embedSpec(wdtype: WeightDType, affine = false): KernelSpec {
   const bindings: BindingKind[] = quant ? ["uniform", "read", "read", "read", "rw"] : ["uniform", "read", "read", "rw"];
   if (aff) bindings.splice(4, 0, "read");
   const out = aff ? 5 : 4;
-  return spec(`embed/${wdtype}${aff ? "a" : ""}`, bindings, () => /* wgsl */ `
+  return spec(`embed/${wdtype}${aff ? "a" : ""}`, bindings, cpu.cpuEmbed(wdtype, aff), () => /* wgsl */ `
 struct P { T: u32, D: u32, scale: f32, _b: u32 }
 @group(0) @binding(0) var<uniform> p: P;
 @group(0) @binding(1) var<storage, read> tokens: array<u32>;
@@ -1292,7 +1294,7 @@ ${wdtype === "q4"
 
 /** Copies row `st.lastRow` of x [T, D] into out [1, D]. */
 export function copyRowSpec(): KernelSpec {
-  return spec("copy_row", ["uniform", "read", "read", "rw"], () => /* wgsl */ `
+  return spec("copy_row", ["uniform", "read", "read", "rw"], cpu.cpuCopyRow, () => /* wgsl */ `
 ${STEP_WGSL}
 struct P { D: u32, _a: u32, _b: u32, _c: u32 }
 @group(0) @binding(0) var<uniform> p: P;
@@ -1320,7 +1322,7 @@ fn main(${EW_ARGS}) {
  * would (speculative verification).
  */
 export function sampleSpec(rows = false): KernelSpec {
-  return spec(rows ? "sample/rows" : "sample", ["uniform", "read", "read", "read", "read", "rw"], () => /* wgsl */ `
+  return spec(rows ? "sample/rows" : "sample", ["uniform", "read", "read", "read", "read", "rw"], cpu.cpuSample(rows), () => /* wgsl */ `
 ${STEP_WGSL}
 struct P { V: u32, _a: u32, _b: u32, _c: u32 }
 @group(0) @binding(0) var<uniform> p: P;
@@ -1462,7 +1464,7 @@ fn main(@builtin(local_invocation_index) li: u32, @builtin(workgroup_id) wid: ve
  * repetition penalty) and advances pos0.
  */
 export function advanceSpec(): KernelSpec {
-  return spec("advance", ["rw", "read", "rw", "rw", "rw"], () => /* wgsl */ `
+  return spec("advance", ["rw", "read", "rw", "rw", "rw"], cpu.cpuAdvance, () => /* wgsl */ `
 ${STEP_WGSL}
 @group(0) @binding(0) var<storage, read_write> st: Step;
 @group(0) @binding(1) var<storage, read> sampled: array<u32>;
@@ -1490,7 +1492,7 @@ fn main() {
  */
 export function qkNormRopeKvSpec(interleaved: boolean, kv: KvDtype = "f32"): KernelSpec {
   const h = kv === "f16";
-  return spec(`qknorm_rope_kv/${interleaved ? "interleaved" : "half"}/${kv}`, ["uniform", "read", "read", "read", "read", "read", "rw", "rw", "rw"], () => /* wgsl */ `
+  return spec(`qknorm_rope_kv/${interleaved ? "interleaved" : "half"}/${kv}`, ["uniform", "read", "read", "read", "read", "read", "rw", "rw", "rw"], cpu.cpuQkNormRopeKv(interleaved, h), () => /* wgsl */ `
 ${STEP_WGSL}
 struct P { T: u32, H: u32, Hkv: u32, D: u32, maxSeq: u32, cap: u32, eps: f32, _c: u32 }
 @group(0) @binding(0) var<uniform> p: P;
@@ -1575,7 +1577,7 @@ ${h
  */
 export function ropeKvSpec(interleaved: boolean, kv: KvDtype = "f32"): KernelSpec {
   const h = kv === "f16";
-  return spec(`rope_kv/${interleaved ? "interleaved" : "half"}/${kv}`, ["uniform", "read", "read", "read", "rw", "rw", "rw"], () => /* wgsl */ `
+  return spec(`rope_kv/${interleaved ? "interleaved" : "half"}/${kv}`, ["uniform", "read", "read", "read", "rw", "rw", "rw"], cpu.cpuRopeKv(interleaved, h), () => /* wgsl */ `
 ${STEP_WGSL}
 struct P { T: u32, H: u32, Hkv: u32, D: u32, maxSeq: u32, cap: u32, _b: u32, _c: u32 }
 @group(0) @binding(0) var<uniform> p: P;

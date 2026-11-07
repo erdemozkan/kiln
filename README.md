@@ -112,6 +112,17 @@ Key ideas:
   Intel Mac, cached SmolLM2-360M loads went from 8.3 to 3.5 s (BF16 safetensors) and from 6.6 to 1.4 s
   (Q4_K_M GGUF, mostly Q5_0: llama.cpp's fallback for rows that are not a multiple of 256), and as q8
   from 15.7 to 2.9 s (BF16), with the same replies.
+- **A CPU fallback.** Every kernel the models use also exists in TypeScript, attached to its WGSL spec
+  with the same bindings and uniform layout, and a `CpuBackend` runs them on the model's worker
+  thread. `load` uses it when the browser has no WebGPU or no adapter (`device: "auto"`, the
+  default), or when asked (`device: "cpu"`); `info.backend` says which ran. The whole engine works
+  unchanged on it: grammars, saved prefixes, the prompt cache. The kernel check page runs every check
+  against it too (`/kernels.html?backend=cpu`, 740 of 740 passing; the f16 matmul variants need
+  shader-f16), and Node tests cover it in CI. On the CPU, matmuls take dot products straight from the
+  4- and 8-bit codes, prefill builds plans of the exact prompt length instead of padded buckets, and
+  draft tokens are off by default (a checked row costs as much as a decoded one). SmolLM2-135M gives the GPU's tokens in
+  q4 and q8; on the Intel Mac it decodes at about 1 to 2 tokens per second, with a 42-token prompt
+  taking 15 s.
 - **GGUF weights held exactly.** Q4_1 and Q4_K blocks are code·scale + min per 32 values with 4-bit
   codes, and Q5_x with 5-bit codes, so Kiln's q4 and q8 planes plus one f32 min per block hold them
   as llama.cpp dequantizes them, where they used to be dequantized and rounded a second time. The GPU
@@ -476,7 +487,8 @@ Known limits, roughly in roadmap order:
   constrains the `<tool_call>` format.
 - Single storage binding per tensor: very large f32 embeddings can exceed `maxStorageBufferBindingSize`
   (use q4 or q8).
-- WebGPU only; WASM fallback, WebNN and Node/Dawn backends come later.
+- Without WebGPU, models run on the CPU in plain TypeScript: single-threaded, no WASM SIMD, about 0.5
+  GMAC/s on the test Mac, so only small models are usable there. WebNN and Node/Dawn backends come later.
 
 ## License
 

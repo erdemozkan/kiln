@@ -51,7 +51,9 @@ Granite 4 350M need `"q8"` or `"f32"`.
 
 ## Requirements
 
-A browser with WebGPU (Chrome or Edge 113+, Safari 26+, Firefox 141+ on Windows). Use it from a bundler
+A browser with WebGPU (Chrome or Edge 113+, Safari 26+, Firefox 141+ on Windows) for real speed.
+Without it, `load` falls back to running on the CPU (much slower; fine for models around 135M) and
+`llm.info.backend` is `"cpu"`; `load(id, { device: "gpu" })` fails instead. Use it from a bundler
 that understands `new URL("…", import.meta.url)` workers (Vite, webpack 5, Parcel, esbuild with
 a plugin). To host the worker yourself, pass `load(id, { worker })`.
 

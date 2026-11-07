@@ -56,7 +56,8 @@ export interface GenerateOptions {
   /**
    * Speculative decoding by prompt lookup: when the last tokens appeared earlier in the prompt or the
    * output, up to this many of the tokens that followed are guessed and checked in one forward pass
-   * (default 7, which fills one 8-row matmul tile; 0 = off; at most 31). Faster when the output repeats its
+   * (default 7, which fills one 8-row matmul tile, and 0 on the CPU backend, where a checked row costs as
+   * much as a decoded one; 0 = off; at most 31). Faster when the output repeats its
    * input, and a check is only spent when it is likely to pay off on this GPU. Works with `format`:
    * drafts are cut at the first token the grammar rejects and each row samples under its own mask.
    * Sampling draws the same random numbers either way, but the multi-row kernels round differently
@@ -238,7 +239,7 @@ export class Engine {
     const stop = new Set([...this.stopIds, ...(opts.stopTokenIds ?? [])]);
     const t0 = performance.now();
     const grammar = opts.format ? this.matcher(opts.format, [...stop]) : undefined;
-    const draftTokens = sampling.repetitionPenalty !== 1 ? 0 : Math.min(MAX_VERIFY_ROWS - 1, Math.max(0, Math.floor(opts.draftTokens ?? 7)));
+    const draftTokens = sampling.repetitionPenalty !== 1 ? 0 : Math.min(MAX_VERIFY_ROWS - 1, Math.max(0, Math.floor(opts.draftTokens ?? (this.backend.name === "cpu" ? 0 : 7))));
     this.busy = true;
     // Reuse the shared prefix, but always prefill at least the last prompt token to get its logits.
     let start = 0;
@@ -280,7 +281,10 @@ export class Engine {
       let prefillUnits = 0;
       while (pos < promptIds.length) {
         const remaining = promptIds.length - pos;
-        const T = BUCKETS.find((b) => b >= remaining) ?? BUCKETS[BUCKETS.length - 1]!;
+        const top = BUCKETS[BUCKETS.length - 1]!;
+        // Padding rows are nearly free on a GPU, which reuses a few plan sizes, but cost their full
+        // work on the CPU, which builds a plan of the exact size instead.
+        const T = this.backend.name === "cpu" ? Math.min(remaining, top) : (BUCKETS.find((b) => b >= remaining) ?? top);
         const n = Math.min(T, remaining);
         const plan = this.plan(T);
         const tokens = new Uint32Array(T);

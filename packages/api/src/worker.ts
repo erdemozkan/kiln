@@ -73,6 +73,7 @@ scope.onmessage = async (e: MessageEvent<Request>) => {
           info: {
             model: msg.model,
             family: cfg.family,
+            backend: engine.backend.name,
             layers: cfg.numLayers,
             hiddenSize: cfg.hiddenSize,
             vocabSize: cfg.vocabSize,

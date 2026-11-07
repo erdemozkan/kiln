@@ -14,7 +14,7 @@ import {
   type ByteSource,
   type ModelRef,
 } from "@kiln/loader";
-import { ops, type KvDtype } from "@kiln/kernels";
+import { CpuBackend, ops, type KvDtype } from "@kiln/kernels";
 import { LlamaModel, configFromGGUF, configFromHF, ggufToHF, graniteName, multimodalTextName, weightScale, type LlamaConfig } from "@kiln/models";
 import { Tokenizer, type ChatTemplate, type TokenizerJSON } from "@kiln/tokenizers";
 import { Engine } from "./engine";
@@ -50,6 +50,12 @@ export interface LoadOptions {
   endpoint?: string;
   backend?: Backend;
   /**
+   * Where the model runs: "gpu" (WebGPU, fails without it), "cpu" (TypeScript kernels on the worker
+   * thread, slow, for small models), or "auto" (default): WebGPU when the browser has a usable
+   * adapter, else the CPU. Ignored when `backend` is given.
+   */
+  device?: "auto" | "gpu" | "cpu";
+  /**
    * Time matmul variants on this GPU and keep the fastest per shape (default true). Runs while the
    * weights download and is cached per device, so later loads only read the cached choice.
    */
@@ -65,14 +71,14 @@ export interface LoadOptions {
  */
 export async function createEngine(modelId: string, opts: LoadOptions = {}): Promise<Engine> {
   const ref = parseModelId(modelId, opts.revision);
-  const backend = opts.backend ?? (await createWebGPUBackend());
+  const backend = opts.backend ?? (await openBackend(opts.device ?? "auto"));
   const quant = opts.quant ?? "auto";
   ops.setMatmulF16(!!opts.f16Math && backend.limits.features.has("shader-f16"));
   ops.setSubgroups(!!opts.subgroups);
   const { cfg, tokenizer, files } = ref.gguf ? await openGGUF(ref, opts.endpoint) : await openSafetensors(ref, opts.endpoint);
   try {
     const tuning =
-      opts.tune === false
+      opts.tune === false || backend.name === "cpu"
         ? Promise.resolve()
         : tuneMatmuls(backend, llamaMatmulShapes(cfg, quant === "auto" ? "q4" : quant)).then(
             () => undefined,
@@ -87,6 +93,18 @@ export async function createEngine(modelId: string, opts: LoadOptions = {}): Pro
     return engine;
   } finally {
     for (const f of files) f.source.close?.();
+  }
+}
+
+/** WebGPU, or the CPU backend when asked for or (for "auto") when WebGPU is missing or has no adapter. */
+async function openBackend(device: "auto" | "gpu" | "cpu"): Promise<Backend> {
+  if (device === "cpu") return new CpuBackend();
+  try {
+    return await createWebGPUBackend();
+  } catch (err) {
+    if (device === "gpu") throw err;
+    console.warn(`[kiln] ${err instanceof Error ? err.message : String(err)}; running on the CPU, which is much slower`);
+    return new CpuBackend();
   }
 }
 

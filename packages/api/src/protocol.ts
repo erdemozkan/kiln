@@ -14,6 +14,8 @@ export interface WireLoadOptions {
    * reload does not prefill a shared prefix such as the system prompt again. A few MB per model.
    */
   promptCache?: boolean;
+  /** "auto" (default): WebGPU, or the CPU when the browser has none; "gpu" or "cpu" to choose. */
+  device?: "auto" | "gpu" | "cpu";
   /** Longest GPU work in one submit, in estimated ms (default 50). */
   maxSubmitMs?: number;
   /**
@@ -29,6 +31,8 @@ export interface ModelInfo {
   layers: number;
   hiddenSize: number;
   vocabSize: number;
+  /** Where the model runs: "webgpu", or "cpu" (the fallback without WebGPU, or `device: "cpu"`). */
+  backend: string;
   /** Context length this load allocated, in tokens. */
   maxSeq: number;
   /** Longest context the model was trained for, if its files say; pass a larger `maxSeq` to use more. */

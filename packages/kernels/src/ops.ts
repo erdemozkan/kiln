@@ -274,6 +274,11 @@ export function attention(ctx: Ctx, q: Tensor, kc: Buf, vc: Buf, s: AttentionSha
     u32(s.T), u32(s.H), u32(s.Hkv), u32(s.D), u32(s.maxSeq), f32(s.scale ?? 1 / Math.sqrt(s.D)), u32(splits), u32(s.window ?? 0),
     u32(slots), u32(0), u32(0), u32(0),
   ]);
+  if (ctx.backend.name === "cpu") {
+    // One CPU implementation serves every attention shape; the split-K pair is a GPU occupancy trick.
+    ctx.run(attentionSpec(s.kv), [params, ctx.step, q.buf, kc, vc, out.buf], [s.H, s.T, 1]);
+    return out;
+  }
   if (s.T === 1) {
     const ml = ctx.alloc([s.H, splits, 2]);
     const po = ctx.alloc([s.H, splits, s.D]);

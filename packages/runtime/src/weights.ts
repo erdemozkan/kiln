@@ -116,7 +116,8 @@ export async function loadWeights(
   onProgress?: (p: LoadProgress) => void,
 ): Promise<Map<string, Tensor>> {
   const out = new Map<string, Tensor>();
-  const gpu = gpuConvert ? new GpuConverter(backend) : undefined;
+  // The CPU backend has no convert kernels; its planes come from the CPU converters, the same bits.
+  const gpu = gpuConvert && backend.name !== "cpu" ? new GpuConverter(backend) : undefined;
   try {
     for (const file of files) {
       const total = file.tensors.reduce((s, t) => s + t.byteLength, 0);
