@@ -189,6 +189,29 @@ describe("GGUF", () => {
     expect(ggufToHF("rope_freqs.weight")).toBeUndefined();
   });
 
+  it("reads granite metadata: per-layer kv heads and the four multipliers (granite-4.0-350m Q8_0)", () => {
+    const meta = new Map<string, unknown>([
+      ["general.architecture", "granite"],
+      ["granite.block_count", 28],
+      ["granite.embedding_length", 1024],
+      ["granite.feed_forward_length", 2048],
+      ["granite.attention.head_count", 16],
+      ["granite.attention.head_count_kv", Array(28).fill(4)],
+      ["granite.vocab_size", 100352],
+      ["granite.attention.scale", 0.015625],
+      ["granite.embedding_scale", 12],
+      ["granite.residual_scale", Math.fround(0.263)],
+      ["granite.logit_scale", 4],
+      ["granite.expert_count", 0],
+    ]);
+    const c = configFromGGUF(meta, ["token_embd.weight"]);
+    expect(c).toMatchObject({ numKvHeads: 4, headDim: 64, ropeInterleaved: true, attnScale: 0.015625, logitScale: 0.25, embedScale: 48, residualScale: Math.fround(0.263) });
+    expect(weightScale(c, ggufToHF("blk.2.attn_output.weight")!)).toBe(Math.fround(0.263));
+    expect(configFromGGUF(meta, ["token_embd.weight", "output.weight"]).embedScale).toBe(12);
+    expect(() => configFromGGUF(new Map([...meta, ["granite.attention.head_count_kv", [4, 8]]]), [])).toThrow(/differs between layers/);
+    expect(() => configFromGGUF(new Map([...meta, ["granite.expert_count", 32]]), [])).toThrow(/experts/);
+  });
+
   it("maps gemma3 the way llama.cpp writes it (Gemma 3 270M-it metadata)", () => {
     const tokens = Array.from({ length: 262144 }, (_, i) => (i === 106 ? "<end_of_turn>" : i === 1 ? "<eos>" : `t${i}`));
     const meta = new Map<string, unknown>([

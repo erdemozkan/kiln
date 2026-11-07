@@ -330,7 +330,8 @@ Models run end to end (greedy answers to fixed questions checked by hand; tool c
 | `qwen3` | Qwen3-0.6B (`toolChoice`) | safetensors | 20–32 tok/s |
 | `gemma3_text` | Gemma 3 1B-it (sliding window: recalls a fact 1,100 tokens back) | safetensors (unsloth mirror) | 12–20 tok/s |
 | `gemma3_text` | Gemma 3 270M-it, with `quant: "q8"` or `"f32"` | safetensors, GGUF Q8_0 | 25–42 tok/s |
-| `granitemoehybrid` | granite-4.0-350m (tool calls), with `quant: "q8"` | safetensors | 26 tok/s |
+| `granite` | granite-3.3-2b-instruct (`<\|tool_call\|>` calls) | safetensors (5 GB), GGUF Q4_K_M | 5.5 tok/s (q8), 6.4 tok/s (Q4_K_M) |
+| `granitemoehybrid` | granite-4.0-350m (tool calls), with `quant: "q8"` | safetensors, GGUF Q8_0 | 26 tok/s; 38.7 tok/s (Q8_0) |
 | `granitemoehybrid` | granite-4.0-1b (tool calls) | safetensors (3.3 GB) | 11.5 tok/s (q4) |
 | `gemma3` | Gemma 3 4B-it, text only (recalls a fact 1,100 and 3,000 tokens back) | GGUF Q4_0 (2.4 GB) | 177–180 ms GPU per step (about 5.5 tok/s); 24.6 tok/s on an M3 |
 
@@ -362,8 +363,17 @@ weight. They were checked against an independent NumPy forward pass written from
 gave the reference's greedy tokens on every prompt tried, including a `<tool_call>` for
 `get_weather` with `{"city": "Paris"}`, and conversion on the GPU and the CPU gave the same tokens.
 350M does not survive q4 on that prompt (it opens a `<tool_call>` and then writes a refusal), so load
-it with `quant: "q8"`; 1B in q4 still makes the call. Granite 3 (`granite`) uses the same mapping but has
-not been run, and GGUF Granite files are not read yet.
+it with `quant: "q8"`; 1B in q4 still makes the call.
+
+Granite 3 (`granite`, separate gate and up projections) uses the same mapping. GGUF `granite` files
+load too, Granite 3 and the dense Granite 4 models alike (llama.cpp writes both under that
+architecture): the multipliers come from the metadata, a per-layer `head_count_kv` list is accepted
+when its entries agree, and Q/K are read in llama.cpp's interleaved order. granite-4.0-350m-Q8_0.gguf
+gave the reference's greedy tokens on both prompts above. Its tokenizer (pre-tokenizer `dbrx`, which
+needs Llama 3's split pattern) and that of granite-3.3-2b-instruct-Q4_K_M.gguf (`refact`) give the same ids as
+`tokenizer.json` on every test string. Granite 3.3 2B Instruct answered "What's the weather like in
+Paris right now?" with `<|tool_call|>[{"name": "get_weather", "arguments": {"city": "Paris", "unit":
+"celsius"}}]`, the same tokens from GGUF Q4_K_M and from safetensors in q8, and `parseToolCalls` read the call.
 
 Other architectures are rejected at load: SmolLM3, hybrid (Mamba) and mixture-of-experts Granite, Phi-3, Gemma 1/2, mixture-of-experts
 models, Llama 4, and rope scaling other than Llama 3's and linear (Gemma 3).

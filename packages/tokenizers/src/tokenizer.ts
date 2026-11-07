@@ -139,10 +139,11 @@ export class Tokenizer {
       if (types[id] === 3 || types[id] === 4) added.push({ id, content: t, special: types[id] === 3 });
       else vocab.set(t, id);
     });
-    const pattern = pre === "llama-bpe" || pre === "llama3" ? LLAMA3_PATTERN : pre.startsWith("qwen") ? QWEN2_PATTERN : GPT2_PATTERN;
+    // llama.cpp gives dbrx (Granite 4) Llama 3's split, and refact (Granite 3) SmolLM's isolated digits.
+    const pattern = pre === "llama-bpe" || pre === "llama3" || pre === "dbrx" ? LLAMA3_PATTERN : pre.startsWith("qwen") ? QWEN2_PATTERN : GPT2_PATTERN;
     const re = toJsRegex(pattern);
     const steps: PreStep[] = [(ps) => ps.flatMap((p) => splitIsolated(p, re))];
-    if (pre === "smollm") steps.unshift((ps) => ps.flatMap((p) => splitIsolated(p, /\p{N}/gu)));
+    if (pre === "smollm" || pre === "refact") steps.unshift((ps) => ps.flatMap((p) => splitIsolated(p, /\p{N}/gu)));
     return withTemplate(new Tokenizer(vocab, merges, added, steps, { ignoreMerges: pre === "llama-bpe" || pre === "llama3" }), meta, tokens);
   }
 

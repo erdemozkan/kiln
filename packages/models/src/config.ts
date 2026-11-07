@@ -252,11 +252,17 @@ function ropeScalingFromHF(s: HFConfig | null | undefined): Llama3RopeScaling | 
 
 export function configFromGGUF(meta: Map<string, unknown>, tensorNames: readonly string[]): LlamaConfig {
   const arch = String(meta.get("general.architecture"));
-  if (!["llama", "qwen2", "qwen3", "gemma3"].includes(arch)) {
-    throw new UnsupportedModelError(`GGUF architecture "${arch}" is not supported yet (llama, qwen2, qwen3, gemma3)`);
+  if (!["llama", "qwen2", "qwen3", "granite", "gemma3"].includes(arch)) {
+    throw new UnsupportedModelError(`GGUF architecture "${arch}" is not supported yet (llama, qwen2, qwen3, granite, gemma3)`);
   }
   const get = (k: string, fallback?: number): number => {
-    const v = meta.get(`${arch}.${k}`) ?? fallback;
+    let v: unknown = meta.get(`${arch}.${k}`) ?? fallback;
+    // Per-layer values (Granite 4 lists head_count_kv for every layer): Kiln needs them equal.
+    if (Array.isArray(v)) {
+      const vs = v as unknown[];
+      if (!vs.length || vs.some((x) => Number(x) !== Number(vs[0]))) throw new UnsupportedModelError(`GGUF "${arch}.${k}" differs between layers`);
+      v = vs[0];
+    }
     if (v === undefined) throw new UnsupportedModelError(`GGUF metadata is missing "${arch}.${k}"`);
     return Number(v);
   };
@@ -264,7 +270,8 @@ export function configFromGGUF(meta: Map<string, unknown>, tensorNames: readonly
   const hiddenSize = get("embedding_length");
   const tokens = meta.get("tokenizer.ggml.tokens") as unknown[] | undefined;
   if (arch === "gemma3") return gemma3FromGGUF(meta, tensorNames, get, tokens);
-  return {
+  if (arch === "granite" && get("expert_count", 0)) throw new UnsupportedModelError("Granite mixture-of-experts models are not supported");
+  const base: LlamaConfig = {
     family: arch as LlamaConfig["family"],
     hiddenSize,
     intermediateSize: get("feed_forward_length"),
@@ -275,13 +282,24 @@ export function configFromGGUF(meta: Map<string, unknown>, tensorNames: readonly
     vocabSize: get("vocab_size", tokens?.length ?? 0),
     rmsEps: get("attention.layer_norm_rms_epsilon", 1e-6),
     ropeTheta: get("rope.freq_base", 10000),
-    ropeInterleaved: arch === "llama",
+    // llama.cpp permutes Q/K of llama-converted checkpoints, Granite's included.
+    ropeInterleaved: arch === "llama" || arch === "granite",
     tieEmbeddings: !tensorNames.includes("output.weight"),
     attentionBias: tensorNames.includes("blk.0.attn_q.bias"),
     qkNorm: tensorNames.includes("blk.0.attn_q_norm.weight"),
     eosTokenIds: ids(meta.get("tokenizer.ggml.eos_token_id")),
     bosTokenId: meta.has("tokenizer.ggml.bos_token_id") ? Number(meta.get("tokenizer.ggml.bos_token_id")) : undefined,
     contextLength: optNum(meta.get(`${arch}.context_length`)),
+  };
+  if (arch !== "granite") return base;
+  const logitScale = 1 / get("logit_scale", 1);
+  const embed = get("embedding_scale", 1);
+  return {
+    ...base,
+    embedScale: base.tieEmbeddings ? embed / logitScale : embed,
+    attnScale: get("attention.scale", base.headDim ** -0.5),
+    residualScale: get("residual_scale", 1),
+    logitScale,
   };
 }
 

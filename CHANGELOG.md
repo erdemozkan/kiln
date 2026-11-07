@@ -5,8 +5,8 @@
 First release of `kiln-webgpu`: LLM inference in the browser on WebGPU, loading Hugging Face
 safetensors and GGUF files directly.
 
-**Models.** Llama (including Llama 3 rope scaling), Mistral, Qwen2, Qwen3, SmolLM, Granite 4
-(350M and 1B, the attention-only models; safetensors only) and Gemma 3 (270M to 4B and larger, text
+**Models.** Llama (including Llama 3 rope scaling), Mistral, Qwen2, Qwen3, SmolLM, Granite 3 and 4
+(350M to 2B; for Granite 4, the attention-only models) and Gemma 3 (270M to 4B and larger, text
 only), from safetensors (F32/F16/BF16) or GGUF
 (F32/F16/BF16/Q4_0/Q4_1/Q5_0/Q5_1/Q8_0/Q4_K/Q5_K/Q6_K). Weights are held as q4 (default), q8 or f32.
 
@@ -34,6 +34,6 @@ load in 2.4 s. Decode uses a block-per-lane GEMV with several rows per thread on
 prefill a tiled GEMM and tiled attention, and GPU work is cut into short submits so the page stays
 responsive.
 
-**Checks.** 129 unit tests; a kernel check page (547 checks on GPUs without subgroups, more with
+**Checks.** 130 unit tests; a kernel check page (547 checks on GPUs without subgroups, more with
 them) compares every kernel with a CPU reference; Gemma 3 1B matches a NumPy reference token for
 token in q8 and q4.

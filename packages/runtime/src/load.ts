@@ -173,10 +173,11 @@ async function openGGUF(ref: ModelRef, endpoint?: string): Promise<{ cfg: LlamaC
   const file = ref.gguf!;
   const { source, header: gguf } = await openParsed(ref, file, endpoint, readGGUFHeader);
   const cfg = configFromGGUF(gguf.metadata, gguf.tensors.map((t) => t.name));
+  const scale = cfg.residualScale !== undefined || cfg.logitScale !== undefined ? (name: string) => weightScale(cfg, name) : undefined;
   return {
     cfg,
     tokenizer: Tokenizer.fromGGUF(gguf.metadata),
     // Norms in gemma3 files already hold 1 + w, so unlike safetensors there is nothing to transform.
-    files: [{ name: file, source, tensors: gguf.tensors, rename: (n) => ggufToHF(n, cfg.family) }],
+    files: [{ name: file, source, tensors: gguf.tensors, rename: (n) => ggufToHF(n, cfg.family), scale }],
   };
 }
