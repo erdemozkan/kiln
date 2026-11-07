@@ -569,9 +569,13 @@ Known limits, roughly in roadmap order:
   (use q4 or q8).
 - Images: Gemma 3 only, from llama.cpp's mmproj GGUF (the vision weights inside safetensors
   checkpoints are still skipped), one 896 × 896 crop per image (no pan-and-scan). Span attention
-  covers f32 caches only, so the text model's image chunks (f16 cache) still use the tiled kernel.
-- Without WebGPU, models run on the CPU: single-threaded (no worker pool), matmuls in WASM SIMD at
-  about 3.5 GMAC/s on the test Mac, attention and the rest in TypeScript, and every buffer in one
+  covers the vision tower only; the text model's image chunks (f16 cache, causal text rows, sliding
+  layers) use the tiled kernel. Measured with the profiler, that attention is 16.7 ms per layer for
+  a 275-token image prompt on the Intel Mac, about 0.6 s of Gemma 3 4B's 14 s to the first token
+  (the matmuls are the rest), so a span kernel there would save at most a few percent.
+- Without WebGPU, models run on the CPU: matmuls in WASM SIMD at about 3.5 GMAC/s per thread on the
+  test Mac (several threads only on cross-origin isolated pages), attention and the rest in
+  TypeScript, and every buffer in one
   wasm32 memory (4 GiB at most). Small models only. WebNN and Node/Dawn backends come later.
 
 ## License
