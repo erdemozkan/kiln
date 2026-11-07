@@ -140,7 +140,8 @@ export class LlamaModel {
     this.w("model.embed_tokens.weight");
     const fuse = typeof opts.fuse === "object" ? { qkv: true, mlp: true, ...opts.fuse } : { qkv: opts.fuse ?? true, mlp: opts.fuse ?? true };
     this.fusedQkv = fuse.qkv && this.fuse("self_attn", ["q_proj", "k_proj", "v_proj"], "qkv", cfg.attentionBias);
-    this.fusedMlp = fuse.mlp && this.fuse("mlp", ["gate_proj", "up_proj"], "gate_up", false);
+    // Granite 4 checkpoints store gate_up already stacked.
+    this.fusedMlp = weights.has("model.layers.0.mlp.gate_up.weight") || (fuse.mlp && this.fuse("mlp", ["gate_proj", "up_proj"], "gate_up", false));
   }
 
   /**

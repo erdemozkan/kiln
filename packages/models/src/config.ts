@@ -1,4 +1,4 @@
-/** Normalised config for every Llama-shaped decoder (Llama 2/3, Mistral, Qwen2/2.5, Qwen3, SmolLM, Gemma 3). */
+/** Normalised config for every Llama-shaped decoder (Llama 2/3, Mistral, Qwen2/2.5, Qwen3, SmolLM, Granite, Gemma 3). */
 export interface LlamaConfig {
   family: "llama" | "qwen2" | "qwen3" | "gemma3";
   hiddenSize: number;
@@ -40,6 +40,16 @@ export interface LlamaConfig {
   slidingLayers?: boolean[];
   /** RoPE base of the sliding layers, when it differs from `ropeTheta` (Gemma 3: 10k local, 1M global). */
   ropeLocalTheta?: number;
+  /**
+   * Granite: each attention and MLP output is multiplied by this before its residual add. Folded into
+   * the o_proj and down_proj weights at load (see `weightScale`).
+   */
+  residualScale?: number;
+  /**
+   * Granite: logits are multiplied by this (1 / logits_scaling). Folded into the output head at load;
+   * with a tied head the embedding table is scaled too, and `embedScale` undoes it.
+   */
+  logitScale?: number;
   /** Longest context the model was trained for (max_position_embeddings / GGUF context_length), if stated. */
   contextLength?: number;
 }
@@ -55,7 +65,7 @@ export interface Llama3RopeScaling {
 
 export class UnsupportedModelError extends Error {}
 
-const SUPPORTED = ["llama", "mistral", "qwen2", "qwen3", "gemma3_text"];
+const SUPPORTED = ["llama", "mistral", "qwen2", "qwen3", "granite", "granitemoehybrid", "gemma3_text"];
 
 type HFConfig = Record<string, unknown>;
 const num = (c: HFConfig, k: string, fallback?: number): number => {
@@ -108,7 +118,7 @@ export function configFromHF(c: HFConfig, generation?: HFConfig): LlamaConfig {
   const hiddenSize = num(c, "hidden_size");
   const family = type === "qwen2" ? "qwen2" : type === "qwen3" ? "qwen3" : type === "gemma3_text" ? "gemma3" : "llama";
   if (family === "gemma3") return gemma3({ ...GEMMA3_DEFAULTS, ...c }, generation);
-  return {
+  const base: LlamaConfig = {
     family,
     hiddenSize,
     intermediateSize: num(c, "intermediate_size"),
@@ -128,6 +138,46 @@ export function configFromHF(c: HFConfig, generation?: HFConfig): LlamaConfig {
     bosTokenId: typeof c.bos_token_id === "number" ? c.bos_token_id : undefined,
     contextLength: optNum(c.max_position_embeddings),
   };
+  return type === "granite" || type === "granitemoehybrid" ? granite(c, base) : base;
+}
+
+/**
+ * Granite 3 (`granite`) and the attention-only, expert-free Granite 4 models (`granitemoehybrid` with
+ * every layer "attention" and no experts, such as granite-4.0-350m and 1b): Llama with four
+ * multipliers. Granite 4's MLP is one `shared_mlp.input_linear` (gate rows, then up rows), loaded as
+ * the fused gate_up weight (see `graniteName`).
+ */
+function granite(c: HFConfig, base: LlamaConfig): LlamaConfig {
+  if (c.model_type === "granitemoehybrid") {
+    const types = Array.isArray(c.layer_types) ? (c.layer_types as string[]) : [];
+    if (types.some((t) => t !== "attention")) throw new UnsupportedModelError("hybrid Granite models (Mamba layers) are not supported; the attention-only ones are");
+    if (optNum(c.num_local_experts)) throw new UnsupportedModelError("Granite mixture-of-experts models are not supported");
+    if ((c.position_embedding_type ?? "rope") !== "rope") throw new UnsupportedModelError(`Granite with position_embedding_type "${String(c.position_embedding_type)}" is not supported`);
+  }
+  if (c.mlp_bias) throw new UnsupportedModelError("Granite with mlp_bias is not supported");
+  const logitScale = 1 / num(c, "logits_scaling", 1);
+  const embed = num(c, "embedding_multiplier", 1);
+  return {
+    ...base,
+    // Granite 4's MLP is the shared one; intermediate_size would size the (absent) experts.
+    intermediateSize: c.model_type === "granitemoehybrid" ? num(c, "shared_intermediate_size", base.intermediateSize) : base.intermediateSize,
+    embedScale: base.tieEmbeddings ? embed / logitScale : embed,
+    attnScale: num(c, "attention_multiplier", base.headDim ** -0.5),
+    residualScale: num(c, "residual_multiplier", 1),
+    logitScale,
+  };
+}
+
+/** Granite 4 checkpoints' MLP names → the fused gate_up and down_proj that the model reads. */
+export function graniteName(name: string): string {
+  return name.replace(".shared_mlp.input_linear.", ".mlp.gate_up.").replace(".shared_mlp.output_linear.", ".mlp.down_proj.");
+}
+
+/** The factor a weight is multiplied by at load (Granite's residual and logit multipliers), if any. */
+export function weightScale(cfg: Pick<LlamaConfig, "residualScale" | "logitScale" | "tieEmbeddings">, name: string): number | undefined {
+  if (cfg.residualScale !== undefined && /\.(o_proj|down_proj)\.weight$/.test(name)) return cfg.residualScale;
+  if (cfg.logitScale !== undefined && (name === "lm_head.weight" || (cfg.tieEmbeddings && name === "model.embed_tokens.weight"))) return cfg.logitScale;
+  return undefined;
 }
 
 /** Rounds to bfloat16 (round to nearest even), as a bf16 checkpoint's constants are in HF. */

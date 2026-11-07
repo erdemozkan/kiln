@@ -25,7 +25,7 @@ const json = llm.chat(messages, { format: { type: "json", schema } }); // or { t
 |---|---|
 | `@kiln/api` | Main-thread client, worker RPC, streaming `TextStream` |
 | `@kiln/runtime` | `Engine`: chunked prefill, pipelined decode, weight streaming |
-| `@kiln/models` | Code-defined architectures (Llama / Mistral / Qwen2 / Qwen3 / SmolLM / Gemma 3), HF + GGUF config mapping |
+| `@kiln/models` | Code-defined architectures (Llama / Mistral / Qwen2 / Qwen3 / SmolLM / Granite / Gemma 3), HF + GGUF config mapping |
 | `@kiln/tokenizers` | Byte-level and SentencePiece-style BPE from `tokenizer.json` or GGUF metadata, streaming UTF-8 decode, a Jinja interpreter for chat templates |
 | `@kiln/grammar` | JSON / JSON Schema / choice grammars as a byte-level pushdown matcher, token masks over a vocabulary trie |
 | `@kiln/kernels` | WGSL kernels, op wrappers, CPU reference implementations |
@@ -330,6 +330,8 @@ Models run end to end (greedy answers to fixed questions checked by hand; tool c
 | `qwen3` | Qwen3-0.6B (`toolChoice`) | safetensors | 20–32 tok/s |
 | `gemma3_text` | Gemma 3 1B-it (sliding window: recalls a fact 1,100 tokens back) | safetensors (unsloth mirror) | 12–20 tok/s |
 | `gemma3_text` | Gemma 3 270M-it, with `quant: "q8"` or `"f32"` | safetensors, GGUF Q8_0 | 25–42 tok/s |
+| `granitemoehybrid` | granite-4.0-350m (tool calls), with `quant: "q8"` | safetensors | 26 tok/s |
+| `granitemoehybrid` | granite-4.0-1b (tool calls) | safetensors (3.3 GB) | 11.5 tok/s (q4) |
 | `gemma3` | Gemma 3 4B-it, text only (recalls a fact 1,100 and 3,000 tokens back) | GGUF Q4_0 (2.4 GB) | 177–180 ms GPU per step (about 5.5 tok/s); 24.6 tok/s on an M3 |
 
 Gemma 3 was checked token by token against an independent NumPy forward pass written from
@@ -351,7 +353,19 @@ its greedy tokens on both prompts are the same as 1B's. The 2.4 GB file is cache
 segments) and the next load reads it from the cache in about 10 s on the test Mac (Iris Plus 650), 6 s
 of it reading; converting on the CPU instead takes about 24 s. Images are not supported.
 
-Other architectures are rejected at load: SmolLM3, Granite, Phi-3, Gemma 1/2, mixture-of-experts
+Granite 4's dense models (`granitemoehybrid` with every layer "attention" and no experts: 350M and
+1B) are Llama with four multipliers, folded in at load: the residual multiplier into o_proj and
+down_proj, 1 / logits_scaling into the tied head (and the embedding scale raised to match), plus the
+embedding and attention multipliers; the shared MLP's `input_linear` is already the fused gate/up
+weight. They were checked against an independent NumPy forward pass written from transformers'
+`modeling_granitemoehybrid`, applying the multipliers at run time: 350M in f32 and q8 and 1B in q8
+gave the reference's greedy tokens on every prompt tried, including a `<tool_call>` for
+`get_weather` with `{"city": "Paris"}`, and conversion on the GPU and the CPU gave the same tokens.
+350M does not survive q4 on that prompt (it opens a `<tool_call>` and then writes a refusal), so load
+it with `quant: "q8"`; 1B in q4 still makes the call. Granite 3 (`granite`) uses the same mapping but has
+not been run, and GGUF Granite files are not read yet.
+
+Other architectures are rejected at load: SmolLM3, hybrid (Mamba) and mixture-of-experts Granite, Phi-3, Gemma 1/2, mixture-of-experts
 models, Llama 4, and rope scaling other than Llama 3's and linear (Gemma 3).
 
 GGUF `gemma3` files load the way llama.cpp writes them: norms already hold Gemma's 1 + w, and the

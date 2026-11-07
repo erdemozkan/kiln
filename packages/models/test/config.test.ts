@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { UnsupportedModelError, configFromGGUF, configFromHF, defaultMaxSeq, ggufToHF, isQuantizable, kvCacheBytes, multimodalTextName, ringSlots, ropeInvFreq } from "../src";
+import { UnsupportedModelError, configFromGGUF, configFromHF, defaultMaxSeq, ggufToHF, graniteName, isQuantizable, kvCacheBytes, multimodalTextName, ringSlots, ropeInvFreq, weightScale } from "../src";
 
 const qwen3 = {
   model_type: "qwen3",
@@ -113,6 +113,54 @@ describe("configFromHF", () => {
 
   it("refuses unknown architectures by name", () => {
     expect(() => configFromHF({ ...qwen3, model_type: "mamba" })).toThrow(UnsupportedModelError);
+  });
+});
+
+describe("Granite", () => {
+  // ibm-granite/granite-4.0-350m's config.json, trimmed.
+  const g4 = {
+    model_type: "granitemoehybrid",
+    hidden_size: 1024,
+    intermediate_size: 2048,
+    num_hidden_layers: 28,
+    num_attention_heads: 16,
+    num_key_value_heads: 4,
+    vocab_size: 100352,
+    rms_norm_eps: 1e-5,
+    rope_theta: 10000000,
+    attention_multiplier: 0.015625,
+    embedding_multiplier: 12,
+    residual_multiplier: 0.263,
+    logits_scaling: 4,
+    layer_types: Array(28).fill("attention"),
+    num_local_experts: 0,
+    position_embedding_type: "rope",
+    tie_word_embeddings: true,
+    eos_token_id: 100257,
+  };
+
+  it("reads the multipliers, folding the tied head's 1/4 into the embedding scale", () => {
+    const c = configFromHF(g4);
+    expect([c.family, c.headDim, c.attnScale, c.residualScale, c.logitScale, c.embedScale]).toEqual(["llama", 64, 0.015625, 0.263, 0.25, 48]);
+    expect(weightScale(c, "model.layers.3.self_attn.o_proj.weight")).toBe(0.263);
+    expect(weightScale(c, "model.layers.3.mlp.down_proj.weight")).toBe(0.263);
+    expect(weightScale(c, "model.embed_tokens.weight")).toBe(0.25);
+    expect(weightScale(c, "model.layers.3.self_attn.q_proj.weight")).toBeUndefined();
+    const untied = configFromHF({ ...g4, model_type: "granite", tie_word_embeddings: false });
+    expect([untied.embedScale, weightScale(untied, "model.embed_tokens.weight"), weightScale(untied, "lm_head.weight")]).toEqual([12, undefined, 0.25]);
+    expect(weightScale(configFromHF({ ...g4, model_type: "llama" }), "model.layers.0.mlp.down_proj.weight")).toBeUndefined();
+    expect(configFromHF({ ...g4, intermediate_size: 512, shared_intermediate_size: 2048 }).intermediateSize).toBe(2048);
+  });
+
+  it("maps Granite 4's shared MLP onto the fused gate_up and down_proj", () => {
+    expect(graniteName("model.layers.7.shared_mlp.input_linear.weight")).toBe("model.layers.7.mlp.gate_up.weight");
+    expect(graniteName("model.layers.7.shared_mlp.output_linear.weight")).toBe("model.layers.7.mlp.down_proj.weight");
+  });
+
+  it("refuses the hybrid and mixture-of-experts variants", () => {
+    expect(() => configFromHF({ ...g4, layer_types: ["mamba", ...Array(27).fill("attention")] })).toThrow(/Mamba/);
+    expect(() => configFromHF({ ...g4, num_local_experts: 32 })).toThrow(/experts/);
+    expect(() => configFromHF({ ...g4, position_embedding_type: "nope" })).toThrow(/nope/);
   });
 });
 

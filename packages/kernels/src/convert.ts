@@ -216,3 +216,25 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) 
 `,
   };
 }
+
+/**
+ * Multiplies `n` f32 values in place by a constant: folds a per-tensor factor (Granite's residual and
+ * logit multipliers) into a converted weight's scale plane. One rounding, as `Math.fround(x * f)`.
+ */
+export function scaleSpec(): KernelSpec {
+  return {
+    key: "convert/scale",
+    bindings: ["uniform", "rw"],
+    code: /* wgsl */ `
+struct P { n: u32, f: f32 }
+@group(0) @binding(0) var<uniform> p: P;
+@group(0) @binding(1) var<storage, read_write> x: array<f32>;
+
+@compute @workgroup_size(${CONVERT_WG})
+fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nw: vec3<u32>) {
+  let i = gid.x + gid.y * nw.x * ${CONVERT_WG}u;
+  if (i < p.n) { x[i] = x[i] * p.f; }
+}
+`,
+  };
+}

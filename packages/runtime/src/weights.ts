@@ -1,5 +1,5 @@
-import { byteSize, packUniform, q4ScaleBytes, roundUp, u32, type Backend, type Buf, type Tensor } from "@kiln/core";
-import { convertSpec, gpuConverts, grid1d, MAX_X, type GpuConvertOut, type GpuConvertType } from "@kiln/kernels";
+import { byteSize, f32, packUniform, q4ScaleBytes, roundUp, u32, type Backend, type Buf, type Tensor } from "@kiln/core";
+import { convertSpec, gpuConverts, scaleSpec, grid1d, MAX_X, type GpuConvertOut, type GpuConvertType } from "@kiln/kernels";
 import { quantizeQ4, quantizeQ8, repackQ4_0, repackQ8_0, rowBytes, toF32, type ByteSource, type TensorEntry } from "@kiln/loader";
 import { isQuantizable } from "@kiln/models";
 
@@ -27,6 +27,11 @@ export interface WeightFile {
    * never quantized), e.g. Gemma's 1 + w norms.
    */
   transform?: (name: string, values: Float32Array) => void;
+  /**
+   * A factor to multiply a tensor by, by model name (Granite's residual and logit multipliers, folded
+   * into the weights). Applied to f32 values, or to a quantized tensor's scales.
+   */
+  scale?: (name: string) => number | undefined;
 }
 
 /** Bytes read per step. Bounds peak CPU memory regardless of model size. */
@@ -65,6 +70,14 @@ class GpuConverter {
     be.submit([{ binding, grid: grid1d(blocks), label: `convert/${type}/${out}` }]);
   }
 
+  /** Multiplies the first `n` floats of `buf` by `f`, after the conversions already queued. */
+  scale(buf: Buf, n: number, f: number): void {
+    const be = this.backend;
+    be.write(this.uniform, 0, packUniform([u32(n), f32(f)]));
+    const binding = be.bind(be.pipeline(scaleSpec()), [this.uniform, buf]);
+    be.submit([{ binding, grid: grid1d(n), label: "convert/scale" }]);
+  }
+
   destroy(): void {
     // Destroying a buffer leaves already-submitted work that uses it to finish.
     if (this.staging) this.backend.free(this.staging);
@@ -97,7 +110,7 @@ export async function loadWeights(
       };
       for (const entry of file.tensors) {
         const name = file.rename ? file.rename(entry.name) : entry.name;
-        if (name) out.set(name, await loadTensor(backend, file.source, entry, name, quant, onBytes, file.transform, gpu));
+        if (name) out.set(name, await loadTensor(backend, file.source, entry, name, quant, onBytes, file.transform, gpu, file.scale?.(name)));
         else onBytes(entry.byteLength);
       }
     }
@@ -116,7 +129,13 @@ async function loadTensor(
   onBytes: (n: number) => void,
   transform?: (name: string, values: Float32Array) => void,
   gpu?: GpuConverter,
+  factor?: number,
 ): Promise<Tensor> {
+  const scaleAll = (v: Float32Array) => {
+    // An f32 factor, as the GPU uses: the product of two f32 is exact in a double, so one rounding.
+    const f = Math.fround(factor ?? 1);
+    if (f !== 1) for (let i = 0; i < v.length; i++) v[i] = v[i]! * f;
+  };
   const shape = e.shape.length === 1 ? e.shape : [e.shape.slice(0, -1).reduce((a, b) => a * b, 1), e.shape[e.shape.length - 1]!];
   const cols = shape[shape.length - 1]!;
   const rows = shape.length === 2 ? shape[0]! : 1;
@@ -154,10 +173,13 @@ async function loadTensor(
         const p = e.type === "Q8_0" ? repackQ8_0(bytes, n * cols) : quantizeQ8(toF32(e.type as Exclude<typeof e.type, "Q4_0">, bytes, n * cols));
         planes = { data: p.bytes, scales: p.scales };
       }
+      scaleAll(planes.scales);
       backend.write(buf, r * perRow, planes.data);
       backend.write(scales, (r * cols) / 8, planes.scales);
       onBytes(n * srcRow);
     }
+    // GPU-converted scales get the factor once every chunk is in; CPU ones got it per chunk.
+    if (onGpu && factor !== undefined && factor !== 1) gpu.scale(scales, (rows * cols) / 32, factor);
     return { shape, dtype, buf, scales };
   }
 
@@ -167,6 +189,7 @@ async function loadTensor(
     const bytes = await src.read(e.offset + r * srcRow, n * srcRow);
     const values = toF32(e.type as Exclude<typeof e.type, "Q4_0">, bytes, n * cols);
     transform?.(name, values);
+    scaleAll(values);
     backend.write(buf, r * cols * 4, values);
     onBytes(n * srcRow);
   }
