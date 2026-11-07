@@ -147,7 +147,16 @@ Key ideas:
   TypeScript (which remains the path without WASM SIMD). Prefill builds plans of the exact prompt
   length instead of padded buckets, and draft tokens are off by default (a checked row costs as much as
   a decoded one). SmolLM2-135M gives the GPU's tokens in q4 and q8, decoding at 18 tok/s on the Intel
-  Mac (it was 1–2 with TypeScript matmuls), with a 42-token prompt in 0.4 s.
+  Mac (it was 1–2 with TypeScript matmuls), with a 42-token prompt in 0.4 s. On a cross-origin
+  isolated page (COOP/COEP headers, as the playground's dev server sends) the heap is a shared
+  memory and large matmuls (a million multiply-adds and up) split their rows across helper workers
+  running the same module (`load(id, { cpuThreads })`, default the browser's hardwareConcurrency up
+  to 4); the model's thread posts each job in a control block and waits on `Atomics.wait`. Results
+  are bit-identical to one thread. On the Intel Mac (2 cores, 4 threads): a 64 × 3072 × 576 matmul
+  27 → 12 ms in f32 and 27 → 16 ms in q4; SmolLM2-135M's first token 1.77 → 1.36 s and decode 16.7 →
+  17.7 tok/s (same tokens; decode's small matmuls stay on one thread, where waking helpers would
+  cost more than they save, and attention is still TypeScript). Without isolation, or with the
+  engine on a page's main thread, it stays on one thread.
 - **GGUF weights held exactly.** Q4_1 and Q4_K blocks are code·scale + min per 32 values with 4-bit
   codes, and Q5_x with 5-bit codes, so Kiln's q4 and q8 planes plus one f32 min per block hold them
   as llama.cpp dequantizes them, where they used to be dequantized and rounded a second time. The GPU

@@ -59,6 +59,11 @@ export interface LoadOptions {
    */
   device?: "auto" | "gpu" | "cpu";
   /**
+   * Threads for the CPU backend's matmuls (default: the browser's hardwareConcurrency, at most 4).
+   * More than one needs a cross-origin isolated page (COOP/COEP headers); otherwise one is used.
+   */
+  cpuThreads?: number;
+  /**
    * Time matmul variants on this GPU and keep the fastest per shape (default true). Runs while the
    * weights download and is cached per device, so later loads only read the cached choice.
    */
@@ -81,7 +86,7 @@ export interface LoadOptions {
  */
 export async function createEngine(modelId: string, opts: LoadOptions = {}): Promise<Engine> {
   const ref = parseModelId(modelId, opts.revision);
-  const backend = opts.backend ?? (await openBackend(opts.device ?? "auto"));
+  const backend = opts.backend ?? (await openBackend(opts.device ?? "auto", opts.cpuThreads));
   const quant = opts.quant ?? "auto";
   ops.setMatmulF16(!!opts.f16Math && backend.limits.features.has("shader-f16"));
   ops.setSubgroups(!!opts.subgroups);
@@ -189,14 +194,15 @@ async function openVision(backend: Backend, ref: ModelRef, opts: LoadOptions): P
 }
 
 /** WebGPU, or the CPU backend when asked for or (for "auto") when WebGPU is missing or has no adapter. */
-async function openBackend(device: "auto" | "gpu" | "cpu"): Promise<Backend> {
-  if (device === "cpu") return new CpuBackend();
+async function openBackend(device: "auto" | "gpu" | "cpu", cpuThreads?: number): Promise<Backend> {
+  const threads = cpuThreads ?? Math.min(4, globalThis.navigator?.hardwareConcurrency ?? 1);
+  if (device === "cpu") return new CpuBackend({ threads });
   try {
     return await createWebGPUBackend();
   } catch (err) {
     if (device === "gpu") throw err;
     console.warn(`[kiln] ${err instanceof Error ? err.message : String(err)}; running on the CPU, which is much slower`);
-    return new CpuBackend();
+    return new CpuBackend({ threads });
   }
 }
 

@@ -90,8 +90,17 @@ export class CpuBackend implements Backend {
   /** Where buffers live: a WASM heap the SIMD kernels use, when WebAssembly SIMD is available. */
   readonly heap: WasmHeap | undefined;
 
-  constructor(opts: { simd?: boolean } = {}) {
-    this.heap = opts.simd === false ? undefined : WasmHeap.create();
+  /**
+   * `threads` > 1 splits large matmuls across helper workers (cross-origin isolated pages only, and
+   * not on a page's main thread; see `WasmHeap.create`).
+   */
+  constructor(opts: { simd?: boolean; threads?: number } = {}) {
+    this.heap = opts.simd === false ? undefined : WasmHeap.create({ threads: opts.threads });
+  }
+
+  /** Threads large matmuls run on (helpers count once they have started). */
+  get threads(): number {
+    return this.heap?.threads ?? 1;
   }
 
   /** Whether matmuls run in WASM SIMD (else in plain TypeScript). */
@@ -154,5 +163,7 @@ export class CpuBackend implements Backend {
     return asCpu(buf).bytes.slice(offset, offset + bytes).buffer;
   }
 
-  destroy(): void {}
+  destroy(): void {
+    this.heap?.destroy();
+  }
 }

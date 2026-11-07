@@ -1,5 +1,5 @@
 import type { CpuKernel, CpuView, WeightDType } from "@kiln/core";
-import type { WasmHeap } from "./simd";
+import { GEMV_F32, GEMV_Q4, GEMV_Q8, type WasmHeap } from "./simd";
 
 /**
  * TypeScript versions of the WGSL kernels, for the CPU backend. Each takes the same bindings, in the
@@ -177,15 +177,8 @@ function simdMatmul(heap: WasmHeap, wdtype: WeightDType, xs: Float32Array, w: He
       for (let e = 0, o = r * 32; e < 32; e++) t += xs[o + e]!;
       mem[sp / 4 + r] = t;
     }
-  const k = heap.kernels;
-  for (let m = 0; m < M; m++) {
-    const xm = xp + m * K * 4, ym = yp + m * N * 4;
-    if (wdtype === "f32") k.gemv_f32(xm, w[0]!.ptr, K, N, ym);
-    else {
-      const mn = w[2]?.ptr ?? 0;
-      (wdtype === "q4" ? k.gemv_q4 : k.gemv_q8)(xm, w[0]!.ptr, w[1]!.ptr, mn, sp + m * KB * 4, K, N, ym);
-    }
-  }
+  const fn = wdtype === "f32" ? GEMV_F32 : wdtype === "q4" ? GEMV_Q4 : GEMV_Q8;
+  heap.gemm(fn, M, N, K, xp, w[0]!.ptr, w[1]?.ptr ?? 0, w[2]?.ptr ?? 0, sp, yp);
   return new Float32Array(heap.buffer, yp, M * N).slice();
 }
 

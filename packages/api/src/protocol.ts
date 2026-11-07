@@ -24,6 +24,8 @@ export interface WireLoadOptions {
   imageSlots?: number;
   /** "auto" (default): WebGPU, or the CPU when the browser has none; "gpu" or "cpu" to choose. */
   device?: "auto" | "gpu" | "cpu";
+  /** Threads for CPU matmuls (default hardwareConcurrency, at most 4; more than one needs a cross-origin isolated page). */
+  cpuThreads?: number;
   /** Longest GPU work in one submit, in estimated ms (default 50). */
   maxSubmitMs?: number;
   /**
