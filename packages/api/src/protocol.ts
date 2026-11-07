@@ -16,6 +16,11 @@ export interface WireLoadOptions {
   promptCache?: boolean;
   /** Longest GPU work in one submit, in estimated ms (default 50). */
   maxSubmitMs?: number;
+  /**
+   * GPU bytes for the K/V of earlier prompts (other conversations, other system prompts), so going
+   * back to one does not prefill it again. Default 256 MiB; 0 keeps only the live cache.
+   */
+  prefixCacheBytes?: number;
 }
 
 export interface ModelInfo {

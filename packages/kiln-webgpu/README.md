@@ -19,6 +19,10 @@ to the model's own, up to 8192 tokens and 512 MiB of KV cache; `load(id, { maxSe
 `llm.info.contextLength` says how long the model was trained for. A model id is
 `org/repo` for safetensors or `org/repo/file.gguf` for one GGUF file.
 
+Several conversations can share one model: each call reuses the cached K/V of whichever earlier
+prompt shares the most tokens with it (kept on the GPU up to `load(id, { prefixCacheBytes })`, 256 MiB
+by default), and calls that overlap run one after another.
+
 Structured output is a generate option:
 
 ```ts

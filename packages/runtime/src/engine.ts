@@ -3,6 +3,7 @@ import { GrammarMatcher, TokenTrie, compileFormat, type ResponseFormat } from "@
 import { LlamaModel, MAX_VERIFY_ROWS, type ForwardPlan } from "@kiln/models";
 import { detectChatFormat, type ChatDocument, type ChatFormat, type ChatMessage, type Tokenizer, type ToolSpec } from "@kiln/tokenizers";
 import { SubmitPacer } from "./pace";
+import { PrefixStore } from "./prefix-store";
 import { DraftGate, acceptedLength, lookupDraft } from "./speculate";
 
 export interface GenerateOptions {
@@ -105,6 +106,9 @@ export interface TextDelta {
   tokenId: number;
 }
 
+/** Shortest cached prefix worth saving before a call overwrites it. */
+const MIN_SAVED_TOKENS = 32;
+
 /** Prefill buckets. Prompts longer than the largest bucket are prefilled in chunks. */
 const BUCKETS = [16, 64, 128];
 
@@ -132,6 +136,27 @@ export class Engine {
   private trie: { trie: TokenTrie; tokens: (Uint8Array | undefined)[] } | undefined;
   /** Upper bound on the cache positions written so far (for ring caches, see `minReuseStart`). */
   private written = 0;
+  /**
+   * K/V of earlier prefixes kept on the GPU (other conversations, other system prompts), up to
+   * `prefixCacheBytes` (default 256 MiB, 0 to keep none). A call starts from whichever prefix, the
+   * live cache or a saved one, shares the most tokens with its prompt; the live cache is saved first
+   * when a call would overwrite it. Continuing one conversation saves nothing.
+   */
+  private readonly prefixes = new PrefixStore<Buf[]>(256 * 2 ** 20, (bufs) => bufs.forEach((b) => this.backend.free(b)));
+
+  get prefixCacheBytes(): number {
+    return this.prefixes.budget;
+  }
+
+  set prefixCacheBytes(bytes: number) {
+    this.prefixes.budget = bytes;
+    if (bytes <= 0) this.prefixes.clear();
+  }
+
+  /** Saved prefixes and the GPU bytes they hold. */
+  get savedPrefixes(): { count: number; bytes: number } {
+    return { count: this.prefixes.size, bytes: this.prefixes.bytes };
+  }
 
   constructor(
     readonly backend: Backend,
@@ -217,12 +242,21 @@ export class Engine {
     this.busy = true;
     // Reuse the shared prefix, but always prefill at least the last prompt token to get its logits.
     let start = 0;
-    if (opts.reuseCache ?? true) {
+    const reuse = opts.reuseCache ?? true;
+    if (reuse) {
       const prev = this.cached;
       while (start < prev.length && start < promptIds.length - 1 && prev[start] === promptIds[start]) start++;
       // Ring caches (sliding layers) keep only the last window + slack positions written; resuming
       // further back would read overwritten keys, so the prompt is prefilled from the start instead.
       if (start < this.model.minReuseStart(this.written)) start = 0;
+    }
+    const saved = reuse ? this.prefixes.best(promptIds, start, (w) => this.model.minReuseStart(w)) : undefined;
+    // The live cache is about to be overwritten past `start` (or replaced): keep it for later calls.
+    if (saved || start < this.cached.length) this.saveLive();
+    if (saved) {
+      this.model.restoreKv(saved.entry.tokens.length, saved.entry.data);
+      this.written = saved.entry.written;
+      start = saved.length;
     }
     this.cached = [];
     const stats: GenerateStats = { promptTokens: promptIds.length, cachedTokens: start, generatedTokens: 0, prefillMs: 0, decodeMs: 0, ttftMs: 0 };
@@ -601,12 +635,21 @@ export class Engine {
     return true;
   }
 
-  /** Forgets the cached prefix; the next call prefills its whole prompt. */
+  /** Forgets the cached prefix and the saved ones; the next call prefills its whole prompt. */
   resetCache(): void {
     this.cached = [];
+    this.prefixes.clear();
+  }
+
+  /** Saves the live cache's K/V (GPU to GPU) unless it is short or already saved. */
+  private saveLive(): void {
+    const n = this.cached.length;
+    if (n < MIN_SAVED_TOKENS || this.prefixes.budget <= 0) return;
+    this.prefixes.add(this.cached, this.written, this.model.kvSnapshotBytes(n), () => this.model.saveKv(n));
   }
 
   destroy(): void {
+    this.prefixes.clear();
     for (const p of this.plans.values()) p.destroy();
     for (const p of this.verifyPlans.values()) p.destroy();
     for (const a of this.advances.values()) a.destroy();

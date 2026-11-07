@@ -26,11 +26,39 @@ async function saveCache(e: Engine, name: string): Promise<void> {
 
 const post = (msg: Response) => scope.postMessage(msg);
 
+/**
+ * Generation calls run one at a time, in arrival order: a second conversation's call waits for the
+ * first instead of failing, and starts from its own saved prefix (see `Engine.prefixCacheBytes`).
+ */
+let queue: Promise<void> = Promise.resolve();
+
+async function generate(msg: Extract<Request, { type: "chat" | "complete" }>, ac: AbortController): Promise<void> {
+  try {
+    if (!engine) throw new Error("no model loaded");
+    const opts = { ...msg.opts, signal: ac.signal };
+    const stream: AsyncGenerator<TextDelta> = msg.type === "chat" ? engine.chat(msg.messages, opts) : engine.complete(msg.prompt, opts);
+    try {
+      for await (const d of stream) post({ id: msg.id, type: "delta", text: d.text });
+    } finally {
+      aborts.delete(msg.id);
+    }
+    post({ id: msg.id, type: "done", stats: engine.lastStats });
+    // After the reply is out, so saving never delays it.
+    const e = engine;
+    const name = cacheName;
+    if (name) saving = saving.then(() => saveCache(e, name));
+  } catch (err) {
+    aborts.delete(msg.id);
+    post({ id: msg.id, type: "error", message: err instanceof Error ? err.message : String(err) });
+  }
+}
+
 scope.onmessage = async (e: MessageEvent<Request>) => {
   const msg = e.data;
   try {
     switch (msg.type) {
       case "load": {
+        await queue;
         await saving;
         engine?.destroy();
         engine = await createEngine(msg.model, { ...msg.opts, onProgress: (progress) => post({ id: msg.id, type: "progress", progress }) });
@@ -60,26 +88,17 @@ scope.onmessage = async (e: MessageEvent<Request>) => {
       case "chat":
       case "complete": {
         if (!engine) throw new Error("no model loaded");
+        // Registered now, so a call still waiting in the queue can be aborted too.
         const ac = new AbortController();
         aborts.set(msg.id, ac);
-        const opts = { ...msg.opts, signal: ac.signal };
-        const stream: AsyncGenerator<TextDelta> = msg.type === "chat" ? engine.chat(msg.messages, opts) : engine.complete(msg.prompt, opts);
-        try {
-          for await (const d of stream) post({ id: msg.id, type: "delta", text: d.text });
-        } finally {
-          aborts.delete(msg.id);
-        }
-        post({ id: msg.id, type: "done", stats: engine.lastStats });
-        // After the reply is out, so saving never delays it.
-        const e = engine;
-        const name = cacheName;
-        if (name) saving = saving.then(() => saveCache(e, name));
+        queue = queue.then(() => generate(msg, ac));
         break;
       }
       case "abort":
         aborts.get(msg.target)?.abort();
         break;
       case "unload":
+        await queue;
         await saving;
         engine?.destroy();
         engine = undefined;

@@ -227,6 +227,30 @@ export class LlamaModel {
     return out;
   }
 
+  /**
+   * GPU copies of the K/V of positions 0…n-1 (per layer: K, then V, as `readKv` lays them out),
+   * queued now, so they hold the cache as it stands. `restoreKv` puts them back.
+   */
+  saveKv(n: number): Buf[] {
+    return this.kv.flatMap(({ k, v }, l) => {
+      const bytes = Math.min(n, this.slots[l]!) * this.kvRowBytes;
+      return [k, v].map((src, i) => {
+        const dst = this.backend.alloc(bytes, "storage", `kv/saved/${l}/${i ? "v" : "k"}`);
+        this.backend.copy(src, 0, dst, 0, bytes);
+        return dst;
+      });
+    });
+  }
+
+  /** Copies `saveKv(n)`'s buffers back into the cache. */
+  restoreKv(n: number, saved: readonly Buf[]): void {
+    for (const [l, { k, v }] of this.kv.entries()) {
+      const bytes = Math.min(n, this.slots[l]!) * this.kvRowBytes;
+      this.backend.copy(saved[2 * l]!, 0, k, 0, bytes);
+      this.backend.copy(saved[2 * l + 1]!, 0, v, 0, bytes);
+    }
+  }
+
   /** Writes K/V for positions 0…n-1 back into every layer's cache, in `readKv`'s layout. */
   writeKv(n: number, data: Uint8Array): void {
     if (n > this.maxSeq || data.length !== this.kvSnapshotBytes(n)) throw new Error(`writeKv: ${data.length} bytes do not hold ${n} positions`);

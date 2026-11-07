@@ -95,6 +95,15 @@ Key ideas:
   prefilled again: with a 214-token system prompt, time to first token fell from 1231 to 325 ms on
   the Intel GPU, with the same reply. The file is keyed by model, revision, weight format and f16
   math, written after the reply goes out, and a half-written file is ignored.
+- **Several conversations, each with its own cached prefix.** Before a call overwrites the cache, the
+  engine copies the K/V it holds into a GPU buffer (GPU to GPU), keeping up to `prefixCacheBytes`
+  (default 256 MiB, least recently used dropped first, a saved prefix dropped when a longer one
+  extends it). Each call starts from whichever prefix, live or saved, shares the most tokens with its
+  prompt, so two chats (or two system prompts) used in turn each prefill only their new turn. Calls
+  that overlap queue in the worker instead of failing. Continuing a single chat copies nothing. Gemma
+  3 270M Q8_0, two conversations with 650-token system prompts in turn: going back to the first
+  restored 660 tokens and gave its first token in 208 ms against 1,846 ms for a full prefill, with
+  the same reply, its sliding layers' rings already wrapped; SmolLM2-135M likewise (189 against 366 ms).
 - **1× memory while loading.** Weights stream row-chunk by row-chunk from the network into GPU buffers,
   quantized to q4 or q8 on the way if requested. Nothing holds the whole model in CPU memory. F32/F16/BF16
   tensors and every GGUF block type are uploaded raw and converted to q4 or q8 by a compute kernel, bit
@@ -385,6 +394,8 @@ needs Llama 3's split pattern) and that of granite-3.3-2b-instruct-Q4_K_M.gguf (
 `tokenizer.json` on every test string. Granite 3.3 2B Instruct answered "What's the weather like in
 Paris right now?" with `<|tool_call|>[{"name": "get_weather", "arguments": {"city": "Paris", "unit":
 "celsius"}}]`, the same tokens from GGUF Q4_K_M and from safetensors in q8, and `parseToolCalls` read the call.
+The q8 reply matched the NumPy reference (extended to Granite 3's separate gate and up projections)
+token for token, all 28 and the end of turn.
 
 Other architectures are rejected at load: SmolLM3, hybrid (Mamba) and mixture-of-experts Granite, Phi-3, Gemma 1/2, mixture-of-experts
 models, Llama 4, and rope scaling other than Llama 3's and linear (Gemma 3).
@@ -454,7 +465,8 @@ Known limits, roughly in roadmap order:
 - Matmul needs K to be a multiple of 32; attention needs head dim ≤ 256 and a multiple of 4.
 - Prefill attention does not split keys across workgroups, so a short prompt (few tiles) far into a long
   context runs on few workgroups.
-- The KV cache is contiguous: one sequence, no paging, and one reusable prefix (the last prompt).
+- One sequence decodes at a time: overlapping calls wait their turn (each from its own saved prefix)
+  rather than being batched into one forward pass, and the cache is contiguous, not paged.
 - Constrained decoding waits for the CPU's mask between forward passes (drafts let one pass check
   several tokens). No regex or GBNF grammars, and `minimum`/`maximum`/`format` are not enforced.
   `toolChoice` forces one call; under "auto" calls are not checked against the tool schemas.

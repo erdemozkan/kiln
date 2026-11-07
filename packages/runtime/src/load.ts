@@ -29,6 +29,11 @@ export interface LoadOptions {
    * of cache (see `defaultMaxSeq`).
    */
   maxSeq?: number;
+  /**
+   * GPU bytes for K/V of earlier prompts (other conversations, other system prompts), so returning to
+   * one does not prefill it again. Default 256 MiB; 0 keeps only the live cache.
+   */
+  prefixCacheBytes?: number;
   /** KV cache storage, f16 (default) or f32. */
   kvDtype?: KvDtype;
   /** f16 dot products in matmuls when the GPU has shader-f16 (default false; accumulation stays f32). */
@@ -78,6 +83,7 @@ export async function createEngine(modelId: string, opts: LoadOptions = {}): Pro
     const model = new LlamaModel(backend, cfg, weights, { maxSeq: opts.maxSeq, kvDtype: opts.kvDtype, fuse: opts.fuse });
     const engine = new Engine(backend, model, tokenizer);
     if (opts.maxSubmitMs !== undefined) engine.maxSubmitMs = opts.maxSubmitMs;
+    if (opts.prefixCacheBytes !== undefined) engine.prefixCacheBytes = opts.prefixCacheBytes;
     return engine;
   } finally {
     for (const f of files) f.source.close?.();

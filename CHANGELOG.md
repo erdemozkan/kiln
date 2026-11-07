@@ -24,7 +24,9 @@ the cache: files land in OPFS as 1 GiB segments, interrupted downloads resume, d
 retry, and `listCache` / `clearCache` manage it. `load` asks the browser to keep the cache
 (`navigator.storage.persist()`); `info.persistent` gives the answer. Conversion to q4 and q8 runs on the GPU for F32/F16/BF16 safetensors and every GGUF block type
 Kiln reads, with the CPU converter's exact bits. The
-last prompt's K/V survives page reloads.
+last prompt's K/V survives page reloads, and earlier prefixes stay on the GPU (`prefixCacheBytes`,
+256 MiB by default), so conversations used in turn each prefill only their new turn; overlapping
+calls queue.
 
 **Context.** The default context is the model's trained context, up to 8192 tokens and 512 MiB of
 KV cache; sliding-window layers keep a ring of window + 128 slots, so Gemma 3 4B gets 8192 tokens in
@@ -36,5 +38,5 @@ load in 2.4 s. Decode uses a block-per-lane GEMV with several rows per thread on
 prefill a tiled GEMM and tiled attention, and GPU work is cut into short submits so the page stays
 responsive.
 
-**Checks.** 131 unit tests; a kernel check page (785 checks on the Intel GPU) compares every kernel with a CPU reference; Gemma 3 1B matches a NumPy reference token for
+**Checks.** 135 unit tests; a kernel check page (785 checks on the Intel GPU) compares every kernel with a CPU reference; Gemma 3 1B matches a NumPy reference token for
 token in q8 and q4.
