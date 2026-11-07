@@ -1,4 +1,6 @@
-import { COMPACT, PRETTY, type Node, type Prop, type Whitespace } from "./matcher";
+import { COMPACT, PRETTY, type Node, type NumberBounds, type Prop, type Whitespace } from "./matcher";
+import { gbnfNode } from "./gbnf";
+import { FORMATS, regexNode } from "./regex";
 
 /** The JSON Schema subset `compileSchema` understands. */
 export interface JsonSchema {
@@ -12,6 +14,15 @@ export interface JsonSchema {
   maxItems?: number;
   minLength?: number;
   maxLength?: number;
+  /** A regular expression the string's value must match in full (see `regexNode`). */
+  pattern?: string;
+  /** Enforced: date, time, date-time, email, uuid, ipv4. Other formats are annotations. */
+  format?: string;
+  minimum?: number;
+  maximum?: number;
+  /** A number (draft 6 and later), or true to make `minimum` exclusive (draft 4). */
+  exclusiveMinimum?: number | boolean;
+  exclusiveMaximum?: number | boolean;
   enum?: unknown[];
   const?: unknown;
   anyOf?: JsonSchema[];
@@ -36,6 +47,10 @@ export type ResponseFormat =
   | { type: "json"; schema?: JsonSchema; whitespace?: "pretty" | "compact" }
   /** Exactly one of these strings. */
   | { type: "choice"; choices: string[] }
+  /** Text matching a regular expression in full (JavaScript syntax; see `regexNode` for the subset). */
+  | { type: "regex"; pattern: string }
+  /** Text matching a GBNF grammar, llama.cpp's format, from rule `root` (default "root"). */
+  | { type: "grammar"; grammar: string; root?: string }
   /**
    * One call to one of these functions, as `<tool_call>\n{"name": …, "arguments": …}\n</tool_call>`
    * (the format of Qwen, SmolLM3 and Hermes-style templates), with the arguments following the
@@ -62,7 +77,7 @@ export function anyJson(ws: Whitespace = PRETTY): Node {
 }
 
 /** Keywords that would change what matches but are not implemented; ignoring them would accept wrong output. */
-const UNSUPPORTED = ["pattern", "patternProperties", "not", "if", "then", "else", "dependentRequired", "dependentSchemas", "propertyNames", "prefixItems", "contains", "uniqueItems"];
+const UNSUPPORTED = ["patternProperties", "not", "if", "then", "else", "dependentRequired", "dependentSchemas", "propertyNames", "prefixItems", "contains", "uniqueItems"];
 
 export function compileSchema(root: JsonSchema, ws: Whitespace = PRETTY): Node {
   const refs = new Map<string, Node & { nodes: Node[] }>();
@@ -106,11 +121,18 @@ export function compileSchema(root: JsonSchema, ws: Whitespace = PRETTY): Node {
 
   const compileType = (s: JsonSchema, t: JsonType): Node => {
     switch (t) {
-      case "string":
-        return { kind: "string", minLength: s.minLength ?? 0, maxLength: s.maxLength ?? Infinity };
+      case "string": {
+        const pattern = s.pattern ?? (s.format ? FORMATS[s.format] : undefined);
+        if (pattern === undefined) return { kind: "string", minLength: s.minLength ?? 0, maxLength: s.maxLength ?? Infinity };
+        if (s.minLength !== undefined || s.maxLength !== undefined) throw new Error("schema: minLength / maxLength together with pattern or format are not supported");
+        if (s.pattern !== undefined && s.format !== undefined && FORMATS[s.format]) throw new Error("schema: pattern together with an enforced format is not supported");
+        return { kind: "seq", nodes: [lit('"'), regexNode(pattern, { json: true }), lit('"')] };
+      }
       case "number":
-      case "integer":
-        return { kind: "number", integer: t === "integer" };
+      case "integer": {
+        const b = bounds(s);
+        return b ? { kind: "number", integer: t === "integer", bounds: b } : { kind: "number", integer: t === "integer" };
+      }
       case "boolean":
         return { kind: "alt", nodes: [lit("true"), lit("false")] };
       case "null":
@@ -133,6 +155,20 @@ export function compileSchema(root: JsonSchema, ws: Whitespace = PRETTY): Node {
   return compile(root);
 }
 
+/** A schema's numeric bounds, from either draft's exclusive keywords; undefined when there are none. */
+function bounds(s: JsonSchema): NumberBounds | undefined {
+  const b: NumberBounds = {};
+  if (s.minimum !== undefined) b.min = s.minimum;
+  if (s.maximum !== undefined) b.max = s.maximum;
+  if (typeof s.exclusiveMinimum === "number") {
+    if (b.min === undefined || s.exclusiveMinimum >= b.min) [b.min, b.exclusiveMin] = [s.exclusiveMinimum, true];
+  } else if (s.exclusiveMinimum === true) b.exclusiveMin = true;
+  if (typeof s.exclusiveMaximum === "number") {
+    if (b.max === undefined || s.exclusiveMaximum <= b.max) [b.max, b.exclusiveMax] = [s.exclusiveMaximum, true];
+  } else if (s.exclusiveMaximum === true) b.exclusiveMax = true;
+  return b.min === undefined && b.max === undefined ? undefined : b;
+}
+
 export function compileFormat(f: ResponseFormat): Node {
   if (f.type === "json") {
     const ws = f.whitespace === "pretty" ? PRETTY : COMPACT;
@@ -143,6 +179,8 @@ export function compileFormat(f: ResponseFormat): Node {
     return { kind: "alt", nodes: f.choices.map(lit) };
   }
   if (f.type === "tool_call") return toolCallGrammar(f.tools);
+  if (f.type === "regex") return regexNode(f.pattern);
+  if (f.type === "grammar") return gbnfNode(f.grammar, f.root);
   throw new Error(`unknown response format ${JSON.stringify(f)}`);
 }
 

@@ -49,8 +49,9 @@ export interface GenerateOptions {
   toolChoice?: "auto" | "required" | { type: "function"; function: { name: string } };
   /**
    * Constrain the output: `{ type: "json" }` for any JSON value, `{ type: "json", schema }` for a JSON
-   * Schema (properties in declared order), `{ type: "choice", choices }` for one of a set of strings.
-   * Each step then waits for the CPU to compute the next token mask, so steps are not chained.
+   * Schema (properties in declared order), `{ type: "choice", choices }` for one of a set of strings,
+   * `{ type: "regex", pattern }` for a regular expression, `{ type: "grammar", grammar }` for a GBNF
+   * grammar. Each step then waits for the CPU to compute the next token mask, so steps are not chained.
    */
   format?: ResponseFormat;
   /**

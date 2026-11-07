@@ -28,7 +28,12 @@ Structured output is a generate option:
 ```ts
 const schema = { type: "object", properties: { city: { type: "string" }, population: { type: "integer" } }, required: ["city", "population"] };
 const json = llm.chat(messages, { format: { type: "json", schema } }); // or { type: "json" }, { type: "choice", choices: ["yes", "no"] }
+const phone = llm.chat(messages, { format: { type: "regex", pattern: "\\(\\d{3}\\) \\d{3}-\\d{4}" } });
+const list = llm.chat(messages, { format: { type: "grammar", grammar: 'root ::= item (", " item)*\nitem ::= "yes" | "no"' } });
 ```
+
+Schemas may use `pattern`, `format` (date, time, date-time, email, uuid, ipv4) and
+`minimum`/`maximum`; grammars are llama.cpp's GBNF.
 
 Each stream's `stats` resolve when it ends, with token counts, timings and `stopReason`: `"stop"`
 (end of turn), `"maxTokens"`, `"context"` (the reply filled the context), `"format"` (the structured

@@ -16,7 +16,8 @@ Structured output is a generate option:
 
 ```ts
 const schema = { type: "object", properties: { city: { type: "string" }, population: { type: "integer" } }, required: ["city", "population"] };
-const json = llm.chat(messages, { format: { type: "json", schema } }); // or { type: "json" }, { type: "choice", choices: ["yes", "no"] }
+const json = llm.chat(messages, { format: { type: "json", schema } }); // or { type: "json" }, { type: "choice", choices: ["yes", "no"] },
+// { type: "regex", pattern: "\\d{3}-\\d{4}" }, or { type: "grammar", grammar: 'root ::= "yes" | "no"' } (GBNF)
 ```
 
 ## Design
@@ -481,10 +482,22 @@ Supported:
   prompts (greedy and sampled) gave the same text as plain decoding. The verify pass uses the 8-row
   kernels, which round differently from single-token decode, so a near-tied token can still differ.
 - Structured output: any JSON, JSON Schema (`type`, `properties`, `required`, `additionalProperties`,
-  `items`, `minItems`/`maxItems`, `minLength`/`maxLength`, `enum`, `const`, `anyOf`/`oneOf`, local
-  `$ref`, including recursive ones), or one of a list of strings. Properties come in declared order.
-  Keywords that would change what matches but are not enforced (`pattern`, `not`, `if`, …) are
-  rejected rather than ignored. Whitespace between tokens is compact by default (one space, no line
+  `items`, `minItems`/`maxItems`, `minLength`/`maxLength`, `pattern`, `format` (date, time,
+  date-time, email, uuid, ipv4; others stay annotations), `minimum`/`maximum` and their exclusive
+  forms, `enum`, `const`, `anyOf`/`oneOf`, local `$ref`, including recursive ones), a regular
+  expression (`{ type: "regex", pattern }`), a GBNF grammar in llama.cpp's format (`{ type: "grammar",
+  grammar }`), or one of a list of strings. Properties come in declared order. Keywords that would
+  change what matches but are not enforced (`not`, `if`, `uniqueItems`, …) are rejected rather than
+  ignored. Bounded numbers carry their text so far, and a digit is refused as soon as no value within
+  the bounds can still follow it (`{"minimum": 18, "maximum": 120}` refuses "13" but keeps "1", which
+  may become 18 or 1xx); they are written without exponents. Regex and GBNF compile to two new
+  grammar nodes, a Unicode character class read byte by byte as UTF-8 (refused at the lead byte when
+  no code point it starts is in the class) and a bounded repetition, on top of literals, sequences and
+  alternatives; a repetition round that matches nothing is cut off where the matcher would otherwise
+  loop. On Qwen2.5-0.5B: `\(\d{3}\) \d{3}-\d{4}` gave "(123) 555-5555"; a GBNF list of three
+  yes/no answers gave "no, no, no" (the format holds, the 0.5B model's answers do not); a schema
+  with a `date` and bounded integers gave `{"name": "Ada", "born": "1815-12-10", "age": 25, "score":
+  1}`; `^[A-Z]{3}-[0-9]{4}$` as a `pattern` gave "ABC-1234". Masks took 3 to 25 ms per call. Whitespace between tokens is compact by default (one space, no line
   breaks): on SmolLM2-135M it cut a schema answer from 57 to 47 tokens and 1958 to 1521 ms, and
   stopped the model repeating itself. `whitespace: "pretty"` allows indentation.
 
@@ -502,7 +515,9 @@ Known limits, roughly in roadmap order:
 - One sequence decodes at a time: overlapping calls wait their turn (each from its own saved prefix)
   rather than being batched into one forward pass, and the cache is contiguous, not paged.
 - Constrained decoding waits for the CPU's mask between forward passes (drafts let one pass check
-  several tokens). No regex or GBNF grammars, and `minimum`/`maximum`/`format` are not enforced.
+  several tokens). Regexes have no backreferences, lookaround or word boundaries; GBNF rules may not
+  be left-recursive; `multipleOf` is not enforced; a string with `pattern` cannot also have
+  `minLength`/`maxLength`.
   `toolChoice` forces one call; under "auto" calls are not checked against the tool schemas.
 - Q6_K (scales every 16 values) is rounded to q8 on load rather than run as stored; the other GGUF
   block types are held exactly.

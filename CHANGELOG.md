@@ -19,8 +19,9 @@ bidirectional attention among each image's 256 tokens.
 **API.** `load(id)` runs the model in a module worker; `chat` and `complete` return async iterators
 of text, with `stats` (timings, token counts, `stopReason`). The model's own Jinja chat template,
 tools and documents, parsed tool calls (`<tool_call>`, Mistral's `[TOOL_CALLS]`, Granite's
-`<|tool_call|>`) and `toolChoice`. Structured output: JSON, JSON Schema or a
-fixed choice, enforced by a grammar mask at every token. Draft tokens (speculative decoding by
+`<|tool_call|>`) and `toolChoice`. Structured output: JSON, JSON Schema (with
+`pattern`, common `format`s and numeric bounds), regular expressions, GBNF grammars or a fixed choice,
+enforced by a grammar mask at every token. Draft tokens (speculative decoding by
 prompt lookup) on by default, also under a grammar.
 
 **Loading.** Weights stream into GPU buffers without holding the model in CPU memory. The download is
@@ -45,5 +46,5 @@ load in 2.4 s. Decode uses a block-per-lane GEMV with several rows per thread on
 prefill a tiled GEMM and tiled attention, and GPU work is cut into short submits so the page stays
 responsive.
 
-**Checks.** 139 unit tests; a kernel check page (802 checks on the Intel GPU) compares every kernel with a CPU reference; Gemma 3 1B matches a NumPy reference token for
+**Checks.** 143 unit tests; a kernel check page (802 checks on the Intel GPU) compares every kernel with a CPU reference; Gemma 3 1B matches a NumPy reference token for
 token in q8 and q4.

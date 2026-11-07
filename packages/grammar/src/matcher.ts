@@ -10,11 +10,23 @@
 export type Node =
   | { kind: "lit"; bytes: Uint8Array }
   | { kind: "string"; minLength: number; maxLength: number }
-  | { kind: "number"; integer: boolean }
+  | { kind: "number"; integer: boolean; bounds?: NumberBounds }
+  /** One character (code point, as UTF-8) in the ranges, or outside them when `negate`. */
+  | { kind: "chars"; ranges: readonly (readonly [number, number])[]; negate?: boolean }
+  /** `node` between min and max times (max may be Infinity). */
+  | { kind: "repeat"; node: Node; min: number; max: number }
   | { kind: "object"; props: readonly Prop[]; additional: Node | undefined; ws?: Whitespace }
   | { kind: "array"; items: Node; minItems: number; maxItems: number; ws?: Whitespace }
   | { kind: "alt"; nodes: readonly Node[] }
   | { kind: "seq"; nodes: readonly Node[] };
+
+/** Bounds on a number's value (JSON Schema minimum, maximum and their exclusive forms). */
+export interface NumberBounds {
+  min?: number;
+  max?: number;
+  exclusiveMin?: boolean;
+  exclusiveMax?: boolean;
+}
 
 /** Whitespace allowed between the tokens of an object or array. */
 export interface Whitespace {
@@ -77,18 +89,38 @@ function pushAll(up: Stack, frames: readonly Frame[]): Stack {
   return s;
 }
 
+/**
+ * Repetition frames already expanded in this zero-width closure, by the stack below them: meeting the
+ * same one again on the same stack means a round matched nothing, and expanding it again would loop.
+ */
+type Seen = Map<Stack, Set<string>>;
+function revisits(s: StackNode, seen: Seen): boolean {
+  if (!(s.f instanceof Rep)) return false;
+  let keys = seen.get(s.up);
+  if (!keys) seen.set(s.up, (keys = new Set()));
+  if (keys.has(s.f.key)) return true;
+  keys.add(s.f.key);
+  return false;
+}
+
 /** Every state reachable from `s` by consuming byte `b`. */
-export function stepStack(s: Stack, b: number, out: Stack[] = []): Stack[] {
+export function stepStack(s: Stack, b: number, out: Stack[] = [], seen?: Seen): Stack[] {
   if (!s) return out;
+  if (s.f instanceof Rep && revisits(s, (seen ??= new Map()))) return out;
   for (const r of s.f.step(b)) out.push(r.length === 1 && r[0] === s.f ? s : pushAll(s.up, r));
-  for (const r of s.f.eps()) stepStack(pushAll(s.up, r), b, out);
+  for (const r of s.f.eps()) stepStack(pushAll(s.up, r), b, out, seen);
   return out;
 }
 
 /** Whether the input so far is a complete match. */
 export function accepts(s: Stack): boolean {
+  return acceptsFrom(s, undefined);
+}
+
+function acceptsFrom(s: Stack, seen: Seen | undefined): boolean {
   if (!s) return true;
-  return s.f.eps().some((r) => accepts(pushAll(s.up, r)));
+  if (s.f instanceof Rep && revisits(s, (seen ??= new Map()))) return false;
+  return s.f.eps().some((r) => acceptsFrom(pushAll(s.up, r), seen));
 }
 
 /** States after consuming `b` from any of `states`, without duplicates. */
@@ -198,48 +230,185 @@ class Str implements Frame {
 
 type NumPhase = "start" | "minus" | "zero" | "int" | "dot" | "frac" | "e" | "esign" | "exp";
 
-/** -?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][+-]?[0-9]+)?, with each digit run capped. */
+/** True when some x in the interval from lo to hi (inclusive per flag) also lies within the bounds. */
+function meets(lo: number, loIn: boolean, hi: number, hiIn: boolean, b: NumberBounds): boolean {
+  let a = lo;
+  let aIn = loIn;
+  if (b.min !== undefined && (b.min > a || (b.min === a && b.exclusiveMin))) [a, aIn] = [b.min, !b.exclusiveMin];
+  let z = hi;
+  let zIn = hiIn;
+  if (b.max !== undefined && (b.max < z || (b.max === z && b.exclusiveMax))) [z, zIn] = [b.max, !b.exclusiveMax];
+  return a < z || (a === z && aIn && zIn);
+}
+
+/**
+ * Whether the number text so far (no exponent) can still be completed to a value within the bounds:
+ * the values it can reach form intervals (more integer digits, more fraction digits), checked against them.
+ */
+export function feasibleNumber(text: string, integer: boolean, b: NumberBounds): boolean {
+  const neg = text.startsWith("-");
+  const [ip = "", fp] = (neg ? text.slice(1) : text).split(".");
+  /** Reachable magnitudes as [lo, hi] intervals with inclusive flags. */
+  const mags: [number, boolean, number, boolean][] = [];
+  if (ip === "") mags.push([0, true, 10 ** MAX_DIGITS, false]);
+  else if (fp === undefined) {
+    if (ip === "0") mags.push(integer ? [0, true, 0, true] : [0, true, 1, false]);
+    else
+      for (let k = 0; k + ip.length <= MAX_DIGITS; k++) {
+        const base = Number(ip) * 10 ** k;
+        mags.push(integer ? [base, true, base + 10 ** k - 1, true] : [base, true, base + 10 ** k, false]);
+      }
+  } else {
+    const v = Number(`${ip}.${fp || "0"}`);
+    mags.push([v, true, v + 10 ** -fp.length, fp.length < MAX_DIGITS]);
+  }
+  return mags.some(([lo, loIn, hi, hiIn]) => (neg ? meets(-hi, hiIn, -lo, loIn, b) : meets(lo, loIn, hi, hiIn, b)));
+}
+
+/** Whether a complete number is within the bounds. */
+const inBounds = (v: number, b: NumberBounds) =>
+  (b.min === undefined || v > b.min || (v === b.min && !b.exclusiveMin)) && (b.max === undefined || v < b.max || (v === b.max && !b.exclusiveMax));
+
+/**
+ * -?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][+-]?[0-9]+)?, with each digit run capped. With bounds, no
+ * exponent, and every digit must keep a value within them reachable (the text so far is tracked).
+ */
 class Num implements Frame {
   readonly key: string;
   constructor(
     readonly integer: boolean,
     readonly phase: NumPhase = "start",
     readonly digits = 0,
+    readonly bounds?: NumberBounds,
+    readonly text = "",
   ) {
-    this.key = `n${integer ? "i" : "f"}:${phase}:${digits}`;
+    this.key = `n${integer ? "i" : "f"}:${phase}:${digits}${bounds ? `:${text}` : ""}`;
   }
-  private to(phase: NumPhase, digits = 0) {
-    return [[new Num(this.integer, phase, digits)]];
+  private to(phase: NumPhase, digits = 0, b?: number) {
+    if (!this.bounds) return [[new Num(this.integer, phase, digits)]];
+    if (phase === "e" || phase === "esign" || phase === "exp") return NONE;
+    const text = this.text + String.fromCharCode(b!);
+    return feasibleNumber(text, this.integer, this.bounds) ? [[new Num(this.integer, phase, digits, this.bounds, text)]] : NONE;
   }
   step(b: number): Frame[][] {
+    const r = this.next(b);
+    return this.bounds && r !== NONE ? this.to((r[0]![0] as Num).phase, (r[0]![0] as Num).digits, b) : r;
+  }
+  private raw(phase: NumPhase, digits = 0): Frame[][] {
+    return [[new Num(this.integer, phase, digits)]];
+  }
+  private next(b: number): Frame[][] {
     const { phase, digits, integer } = this;
     const d = isDigit(b);
     const exp = b === ch("e") || b === ch("E");
     switch (phase) {
       case "start":
       case "minus":
-        if (phase === "start" && b === ch("-")) return this.to("minus");
-        return b === ch("0") ? this.to("zero") : d ? this.to("int", 1) : NONE;
+        if (phase === "start" && b === ch("-")) return this.raw("minus");
+        return b === ch("0") ? this.raw("zero") : d ? this.raw("int", 1) : NONE;
       case "int":
       case "zero":
-        if (d) return phase === "int" && digits < MAX_DIGITS ? this.to("int", digits + 1) : NONE;
+        if (d) return phase === "int" && digits < MAX_DIGITS ? this.raw("int", digits + 1) : NONE;
         if (integer) return NONE;
-        return b === ch(".") ? this.to("dot") : exp ? this.to("e") : NONE;
+        return b === ch(".") ? this.raw("dot") : exp ? this.raw("e") : NONE;
       case "dot":
-        return d ? this.to("frac", 1) : NONE;
+        return d ? this.raw("frac", 1) : NONE;
       case "frac":
-        if (d) return digits < MAX_DIGITS ? this.to("frac", digits + 1) : NONE;
-        return exp && !integer ? this.to("e") : NONE;
+        if (d) return digits < MAX_DIGITS ? this.raw("frac", digits + 1) : NONE;
+        return exp && !integer ? this.raw("e") : NONE;
       case "e":
       case "esign":
-        if (phase === "e" && (b === ch("+") || b === ch("-"))) return this.to("esign");
-        return d ? this.to("exp", 1) : NONE;
+        if (phase === "e" && (b === ch("+") || b === ch("-"))) return this.raw("esign");
+        return d ? this.raw("exp", 1) : NONE;
       case "exp":
-        return d && digits < 3 ? this.to("exp", digits + 1) : NONE;
+        return d && digits < 3 ? this.raw("exp", digits + 1) : NONE;
     }
   }
   eps(): Frame[][] {
-    return this.phase === "zero" || this.phase === "int" || this.phase === "frac" || this.phase === "exp" ? DONE : NONE;
+    const end = this.phase === "zero" || this.phase === "int" || this.phase === "frac" || this.phase === "exp";
+    return end && (!this.bounds || inBounds(Number(this.text), this.bounds)) ? DONE : NONE;
+  }
+}
+
+/** Whether code point cp is in the class. */
+function inClass(node: Extract<Node, { kind: "chars" }>, cp: number): boolean {
+  let hit = false;
+  for (const [lo, hi] of node.ranges) if (cp >= lo && cp <= hi) { hit = true; break; }
+  return hit !== !!node.negate;
+}
+
+/** Whether some code point between lo and hi is in the class. */
+function classMeets(node: Extract<Node, { kind: "chars" }>, lo: number, hi: number): boolean {
+  if (!node.negate) return node.ranges.some(([a, z]) => a <= hi && z >= lo);
+  // Negated: some point of [lo, hi] lies outside every range.
+  const inside = node.ranges.filter(([a, z]) => a <= hi && z >= lo).sort((x, y) => x[0] - y[0]);
+  let at = lo;
+  for (const [a, z] of inside) {
+    if (a > at) return true;
+    at = Math.max(at, z + 1);
+    if (at > hi) return false;
+  }
+  return at <= hi;
+}
+
+/**
+ * One character of a class, read as UTF-8: the lead byte says how many continuation bytes follow, and
+ * each byte is refused as soon as no code point it could still form is in the class.
+ */
+class Chr implements Frame {
+  readonly key: string;
+  constructor(
+    readonly node: Extract<Node, { kind: "chars" }>,
+    readonly id: string,
+    readonly need = 0,
+    readonly cp = 0,
+  ) {
+    this.key = `c${id}:${need}:${cp}`;
+  }
+  private partial(need: number, cp: number): Frame[][] {
+    const lo = cp * 2 ** (6 * need);
+    return classMeets(this.node, lo, lo + 2 ** (6 * need) - 1) ? [[new Chr(this.node, this.id, need, cp)]] : NONE;
+  }
+  step(b: number): Frame[][] {
+    if (this.need === 0) {
+      if (b < 0x80) return inClass(this.node, b) ? DONE : NONE;
+      if ((b & 0xe0) === 0xc0) return b >= 0xc2 ? this.partial(1, b & 0x1f) : NONE;
+      if ((b & 0xf0) === 0xe0) return this.partial(2, b & 0x0f);
+      if ((b & 0xf8) === 0xf0 && b <= 0xf4) return this.partial(3, b & 0x07);
+      return NONE;
+    }
+    if ((b & 0xc0) !== 0x80) return NONE;
+    const cp = this.cp * 64 + (b & 0x3f);
+    if (this.need > 1) return this.partial(this.need - 1, cp);
+    return cp >= 0x80 && !(cp >= 0xd800 && cp <= 0xdfff) && inClass(this.node, cp) ? DONE : NONE;
+  }
+  eps(): Frame[][] {
+    return NONE;
+  }
+}
+
+/**
+ * `node` repeated: done once count ≥ min, another round while count < max. A round that matches
+ * nothing brings back the same frame on the same stack, which the closure walks stop at (`revisits`).
+ */
+class Rep implements Frame {
+  readonly key: string;
+  constructor(
+    readonly node: Extract<Node, { kind: "repeat" }>,
+    readonly id: string,
+    readonly count = 0,
+  ) {
+    this.key = `r${id}:${node.max === Infinity ? Math.min(count, node.min) : count}`;
+  }
+  step(): Frame[][] {
+    return NONE;
+  }
+  eps(): Frame[][] {
+    const { min, max } = this.node;
+    const out: Frame[][] = [];
+    if (this.count >= min) out.push([]);
+    if (this.count < max) out.push([new Rep(this.node, this.id, this.count + 1), start(this.node.node)]);
+    return out;
   }
 }
 
@@ -394,7 +563,11 @@ export function start(node: Node): Frame {
     case "string":
       return new Str(node);
     case "number":
-      return new Num(node.integer);
+      return new Num(node.integer, "start", 0, node.bounds);
+    case "chars":
+      return new Chr(node, idOf(node));
+    case "repeat":
+      return new Rep(node, idOf(node));
     case "object":
       return new Obj(node, idOf(node));
     case "array":

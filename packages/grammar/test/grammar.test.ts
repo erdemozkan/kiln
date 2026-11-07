@@ -90,7 +90,97 @@ describe("JSON grammar", () => {
   });
 
   it("rejects keywords it cannot enforce", () => {
-    expect(() => compileFormat(json({ type: "string", pattern: "^a" }))).toThrow(/pattern/);
+    expect(() => compileFormat(json({ type: "array", uniqueItems: true }))).toThrow(/uniqueItems/);
+    expect(() => compileFormat(json({ type: "string", pattern: "a", maxLength: 3 }))).toThrow(/pattern/);
+  });
+
+  it("enforces string patterns and formats, escaping what JSON must", () => {
+    const zip = json({ type: "string", pattern: "^[0-9]{5}(-[0-9]{4})?$" });
+    expect(full(zip, '"12345"')).toBe(true);
+    expect(full(zip, '"12345-6789"')).toBe(true);
+    expect(full(zip, '"1234"')).toBe(false);
+    expect(match(zip, '"123a').prefix).toBe(false);
+    // A literal quote or backslash in the pattern is written as JSON's escape; classes leave them out.
+    const q = json({ type: "string", pattern: 'say "[a-z]+\\\\' });
+    expect(full(q, '"say \\"hi\\\\"')).toBe(true);
+    expect(full(json({ type: "string", pattern: "[^x]{2}" }), '"a\""')).toBe(false);
+    const date = json({ type: "string", format: "date" });
+    expect(full(date, '"2026-11-07"')).toBe(true);
+    expect(full(date, '"2026-13-07"')).toBe(false);
+    expect(full(json({ type: "string", format: "email" }), '"ada@example.org"')).toBe(true);
+    expect(full(json({ type: "string", format: "email" }), '"ada@"')).toBe(false);
+    expect(full(json({ type: "string", format: "uuid" }), '"123e4567-e89b-12d3-a456-426614174000"')).toBe(true);
+    expect(full(json({ type: "string", format: "ipv4" }), '"192.168.0.256"')).toBe(false);
+    // Unknown formats stay annotations.
+    expect(full(json({ type: "string", format: "uri" }), '"anything"')).toBe(true);
+  });
+
+  it("keeps numbers within minimum and maximum, refusing digits that cannot lead there", () => {
+    const age = json({ type: "integer", minimum: 18, maximum: 120 });
+    for (const [t, ok] of [["18", true], ["120", true], ["65", true], ["17", false], ["121", false], ["-5", false], ["1", false]] as const) expect(full(age, t), t).toBe(ok);
+    expect(match(age, "1").prefix).toBe(true); // 18 or 1xx still possible
+    expect(match(age, "13").prefix).toBe(false); // 13 too small, 13x too large
+    expect(match(age, "-").prefix).toBe(false);
+    expect(match(age, "2").prefix).toBe(true);
+    expect(match(age, "20").prefix).toBe(true);
+    expect(match(age, "200").prefix).toBe(false);
+    const p = json({ type: "number", exclusiveMinimum: 0, maximum: 1 });
+    for (const [t, ok] of [["0.5", true], ["1", true], ["0", false], ["1.5", false], ["0.0001", true], ["-0.1", false], ["1.0", true], ["1.01", false]] as const) expect(full(p, t), t).toBe(ok);
+    expect(match(p, "0.").prefix).toBe(true);
+    expect(match(p, "2").prefix).toBe(false);
+    expect(match(p, "1e").prefix).toBe(false);
+    // Draft 4 booleans.
+    expect(full(json({ type: "integer", minimum: 0, exclusiveMinimum: true }), "0")).toBe(false);
+    const neg = json({ type: "integer", maximum: -10 });
+    expect(full(neg, "-10")).toBe(true);
+    expect(full(neg, "-9")).toBe(false);
+    expect(full(neg, "-1000")).toBe(true);
+    expect(match(neg, "5").prefix).toBe(false);
+  });
+
+  it("matches regular expressions", () => {
+    const r = (pattern: string): ResponseFormat => ({ type: "regex", pattern });
+    expect(full(r("(yes|no)!?"), "yes!")).toBe(true);
+    expect(full(r("(yes|no)!?"), "maybe")).toBe(false);
+    expect(full(r("\\d{3}-\\d{4}"), "555-1234")).toBe(true);
+    expect(full(r("\\d{3}-\\d{4}"), "55-1234")).toBe(false);
+    expect(full(r("[A-Z][a-z]*( [A-Z][a-z]*)*"), "Ada Lovelace")).toBe(true);
+    expect(full(r("[A-Z][a-z]*( [A-Z][a-z]*)*"), "ada")).toBe(false);
+    expect(full(r("[^\\s]+"), "日本語")).toBe(true);
+    expect(full(r("[a-c]+"), "日")).toBe(false);
+    expect(match(r("[a-c]+"), "\u00e9").prefix).toBe(false); // refused at the lead byte
+    expect(full(r("a{2,3}"), "aaaa")).toBe(false);
+    expect(full(r("(a*)*b"), "aab")).toBe(true);
+    expect(full(r("x.y"), "x\ny")).toBe(false);
+    expect(full(r("\\u00e9+"), "\u00e9\u00e9")).toBe(true);
+    for (const bad of ["(a", "a)", "\\1", "a(?=b)", "\\bword", "*a"]) expect(() => compileFormat(r(bad)), bad).toThrow();
+  });
+
+  it("matches GBNF grammars, recursive rules included", () => {
+    const g = (grammar: string): ResponseFormat => ({ type: "grammar", grammar });
+    const list = g(`
+      # A list of answers.
+      root   ::= answer ("," ws answer)*
+      answer ::= "yes" | "no" | [0-9]+
+      ws     ::= [ \\t]*
+    `);
+    expect(full(list, "yes, 42,no")).toBe(true);
+    expect(full(list, "yes,maybe")).toBe(false);
+    const arith = g(`root ::= expr
+expr ::= term (("+" | "-") term)*
+term ::= num | "(" expr ")"
+num  ::= [0-9]{1,3}`);
+    expect(full(arith, "(1+2)-(30+(4))")).toBe(true);
+    expect(full(arith, "(1+2")).toBe(false);
+    expect(full(arith, "1234")).toBe(false);
+    expect(match(arith, "((((1").prefix).toBe(true);
+    const nested = g(`root ::= "{" (
+        "a" | "b"
+      )+ "}"`);
+    expect(full(nested, "{abba}")).toBe(true);
+    expect(full(g(`root ::= "\\x41" . "\\n"`), "A\u00e9\n")).toBe(true);
+    expect(() => compileFormat(g("root ::= missing"))).toThrow(/not defined/);
+    expect(() => compileFormat(g("other ::= \"a\""))).toThrow(/root/);
   });
 
   it("matches one of a set of strings", () => {
