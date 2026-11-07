@@ -1,5 +1,5 @@
 import { createWebGPUBackend } from "@kiln/backend-webgpu";
-import { Ctx, packStep, type Backend, type Buf, type StepParams, type Tensor } from "@kiln/core";
+import { Ctx, STEP_BYTES, packStep, type Backend, type Buf, type StepParams, type Tensor } from "@kiln/core";
 import { CpuBackend, gpuConverts, ops, ref } from "@kiln/kernels";
 import { dequantQ4, dequantQ8, f16ToF32, MemorySource, quantizeQ4, quantizeQ8, rowBytes, type SrcType } from "@kiln/loader";
 import { loadWeights, setGpuConvert } from "@kiln/runtime";
@@ -42,7 +42,7 @@ async function main() {
   const onCpu = new URLSearchParams(location.search).get("backend") === "cpu";
   const be: Backend = onCpu ? new CpuBackend() : await createWebGPUBackend();
   document.getElementById("device")!.textContent = `${onCpu ? "CPU backend · " : ""}features: ${[...be.limits.features].join(", ") || "none"}${be.limits.subgroupMinSize ? ` · subgroup size ≥ ${be.limits.subgroupMinSize}` : ""} · max binding ${(be.limits.maxStorageBufferBindingSize / 2 ** 20).toFixed(0)} MiB`;
-  const step = be.alloc(32, "storage", "step");
+  const step = be.alloc(STEP_BYTES, "storage", "step");
   const results: Result[] = [];
 
   const upload = (data: Float32Array | Uint32Array, shape: number[]): Tensor => {
@@ -406,6 +406,24 @@ async function main() {
     ops.setPrefillAttention("tiled");
   }
 
+  // Bidirectional spans: queries inside [lo, hi) see every key of the span (Gemma 3 image tokens, the
+  // vision encoder's patches), the rest stay causal; the chunk may start before the span or end after it.
+  for (const [T, H, Hkv, D, pos0, lo, hi, window] of [[40, 4, 2, 64, 10, 20, 44, 0], [64, 8, 2, 128, 0, 0, 64, 0], [33, 4, 4, 72, 100, 100, 133, 0], [30, 4, 1, 256, 600, 605, 625, 512], [100, 16, 16, 72, 0, 0, 100, 0]] as const) {
+    const maxSeq = 1024;
+    const q = randn(T * H * D);
+    const kc = randn(maxSeq * Hkv * D);
+    const vc = randn(maxSeq * Hkv * D);
+    const scale = 1 / Math.sqrt(D);
+    const want = ref.attentionRef(q, kc, vc, { T, H, Hkv, D, pos0, scale, window, span: [lo, hi] });
+    for (const kind of ["tiled", "rows"] as const) {
+      ops.setPrefillAttention(kind);
+      let o!: Tensor;
+      await run({ ...S0, pos0, spanLo: lo, spanHi: hi }, (ctx) => (o = ops.attention(ctx, upload(q, [T, H * D]), upload(kc, [0]).buf, upload(vc, [0]).buf, { T, H, Hkv, D, maxSeq, scale, window })));
+      check("attention/span", `T${T} H${H}/${Hkv} D${D} pos${pos0} span ${lo}-${hi}${window ? ` win${window}` : ""} ${kind}`, await download(o.buf, q.length), want, 1e-4);
+    }
+    ops.setPrefillAttention("tiled");
+  }
+
   // Ring caches (sliding layers keep window + slack slots, key j in slot j % slots): filled from the
   // same keys as a full cache at positions far past the ring size, they must give the same output.
   for (const [T, H, Hkv, D, pos0, maxSeq, window, slots] of [[1, 4, 1, 256, 1700, 2048, 512, 640], [1, 9, 3, 64, 3001, 4096, 300, 428], [64, 4, 1, 256, 1500, 2048, 512, 640], [33, 8, 2, 128, 900, 2048, 256, 384], [5, 9, 3, 64, 3000, 4096, 300, 428]] as const) {
@@ -522,6 +540,55 @@ async function main() {
       ids.forEach((id, t) => wantA.set(deqA.subarray(id * D, (id + 1) * D), t * D));
       await run(S0, (ctx) => (o = ops.embed(ctx, uploadW(wd, table, [V, D]), upload(ids, [4]).buf, ids.length, 25.25)));
       check(`embed/${wd}/scaled`, `V${V} D${D} ×25.25`, await download(o.buf, wantA.length), wantA.map((v) => v * 25.25), 1e-4);
+    }
+  }
+
+  // Image tokens: ids from V on read rows of the features, unscaled; the rest are scaled table rows.
+  {
+    const [V, D] = [50, 64];
+    const table = randn(V * D);
+    const feats = randn(3 * D);
+    const ids = Uint32Array.from([3, V + 2, 0, V, 49]);
+    const want = new Float32Array(ids.length * D);
+    ids.forEach((id, t) => want.set(id >= V ? feats.subarray((id - V) * D, (id - V + 1) * D) : table.subarray(id * D, (id + 1) * D).map((v) => v * 2), t * D));
+    let o!: Tensor;
+    await run(S0, (ctx) => (o = ops.embed(ctx, upload(table, [V, D]), upload(ids, [ids.length]).buf, ids.length, 2, { buf: upload(feats, [3, D]).buf, vocab: V })));
+    check("embed/features", `V${V} D${D}`, await download(o.buf, want.length), want, 1e-6);
+  }
+
+  // Vision encoder pieces: LayerNorm with bias, GELU in place, 4 × 4 average pooling of a token grid.
+  for (const [R, D] of [[5, 1152], [3, 70], [70000, 32]] as const) {
+    const x = randn(R * D).map((v, i) => v * 3 + (i % 7));
+    const w = randn(D);
+    const bias = randn(D);
+    const want = new Float32Array(R * D);
+    for (let r = 0; r < R; r++) {
+      const row = x.subarray(r * D, (r + 1) * D);
+      const mean = row.reduce((a, v) => a + v, 0) / D;
+      const inv = 1 / Math.sqrt(row.reduce((a, v) => a + (v - mean) ** 2, 0) / D + 1e-6);
+      for (let i = 0; i < D; i++) want[r * D + i] = (row[i]! - mean) * inv * w[i]! + bias[i]!;
+    }
+    let y!: Tensor;
+    await run(S0, (ctx) => (y = ops.layernorm(ctx, upload(x, [R, D]), upload(w, [D]), upload(bias, [D]), 1e-6)));
+    check("layernorm", `R${R} D${D}`, await download(y.buf, R * D), want, 1e-4);
+  }
+  {
+    const x = randn(1000).map((v) => v * 6);
+    const t = upload(x, [1000]);
+    await run(S0, (ctx) => ops.gelu(ctx, t));
+    check("gelu", "n1000", await download(t.buf, 1000), x.map(ref.geluTanh), 1e-5);
+    for (const [side, k, C] of [[64, 4, 24], [8, 2, 1152]] as const) {
+      const g = randn(side * side * C);
+      const out = side / k;
+      const want = new Float32Array(out * out * C);
+      for (let ty = 0; ty < out; ty++) for (let tx = 0; tx < out; tx++) for (let c = 0; c < C; c++) {
+        let sum = 0;
+        for (let dy = 0; dy < k; dy++) for (let dx = 0; dx < k; dx++) sum += g[((ty * k + dy) * side + tx * k + dx) * C + c]!;
+        want[(ty * out + tx) * C + c] = sum / (k * k);
+      }
+      let y!: Tensor;
+      await run(S0, (ctx) => (y = ops.avgPool(ctx, upload(g, [side * side, C]), side, k)));
+      check("avg_pool", `${side}² by ${k}, C${C}`, await download(y.buf, want.length), want, 1e-5);
     }
   }
 

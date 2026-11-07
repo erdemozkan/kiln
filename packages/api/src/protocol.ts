@@ -14,6 +14,13 @@ export interface WireLoadOptions {
    * reload does not prefill a shared prefix such as the system prompt again. A few MB per model.
    */
   promptCache?: boolean;
+  /**
+   * Gemma 3's vision tower, as llama.cpp's mmproj GGUF: a file in the model's repo ("mmproj-F16.gguf")
+   * or a full id. Messages may then hold `{ type: "image", image }` parts (Blob, ImageBitmap, ImageData).
+   */
+  mmproj?: string;
+  /** Images whose features stay on the GPU at once, with `mmproj` (default 4). */
+  imageSlots?: number;
   /** "auto" (default): WebGPU, or the CPU when the browser has none; "gpu" or "cpu" to choose. */
   device?: "auto" | "gpu" | "cpu";
   /** Longest GPU work in one submit, in estimated ms (default 50). */
@@ -33,6 +40,8 @@ export interface ModelInfo {
   vocabSize: number;
   /** Where the model runs: "webgpu", or "cpu" (the fallback without WebGPU, or `device: "cpu"`). */
   backend: string;
+  /** True when chat messages may hold images (Gemma 3 loaded with `mmproj`). */
+  vision: boolean;
   /** Context length this load allocated, in tokens. */
   maxSeq: number;
   /** Longest context the model was trained for, if its files say; pass a larger `maxSeq` to use more. */

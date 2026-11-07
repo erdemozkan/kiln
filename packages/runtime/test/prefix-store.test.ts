@@ -54,3 +54,12 @@ describe("PrefixStore", () => {
     expect(commonPrefix([5, 6], [5, 6])).toBe(2);
   });
 });
+
+describe("imageSpans", () => {
+  it("finds runs of ids past the vocabulary (image tokens) as [start, end)", async () => {
+    const { imageSpans } = await import("../src/engine");
+    expect(imageSpans([1, 2, 100, 101, 102, 3, 105, 4], 100)).toEqual([[2, 5], [6, 7]]);
+    expect(imageSpans([1, 2, 3], 100)).toEqual([]);
+    expect(imageSpans([200, 201], 100)).toEqual([[0, 2]]);
+  });
+});

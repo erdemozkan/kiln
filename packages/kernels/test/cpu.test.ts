@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { Ctx, packStep, type Tensor } from "@kiln/core";
+import { Ctx, STEP_BYTES, packStep, type Tensor } from "@kiln/core";
 import { dequantQ4, dequantQ8, exactQ4, quantizeQ4, quantizeQ8 } from "@kiln/loader";
 import { CpuBackend, ops, ref } from "../src";
 import { toF16 } from "../src/cpu";
@@ -11,7 +11,7 @@ const randn = (n: number) => Float32Array.from({ length: n }, rand);
 /** The CPU backend runs the same ops as WebGPU; the browser kernel page checks all of them (?backend=cpu). */
 describe("CPU backend", () => {
   const be = new CpuBackend();
-  const step = be.alloc(32);
+  const step = be.alloc(STEP_BYTES);
   const upload = (data: Float32Array | Uint32Array, shape: number[]): Tensor => {
     const buf = be.alloc(data.byteLength);
     be.write(buf, 0, data);

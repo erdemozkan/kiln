@@ -713,6 +713,9 @@ export const ATTN_WG = 256;
  * 0…n-1 keeps only the last `win` of them, as Gemma's sliding layers do.
  */
 const FIRST_KEY_WGSL = /* wgsl */ `fn firstKey(n: u32, win: u32) -> u32 { return select(0u, n - win, win > 0u && n > win); }
+// Keys the query at position pos sees: causally pos + 1, or the whole span [spanLo, spanHi) for a query
+// inside it (bidirectional attention: an image's tokens, all of a vision encoder's patches).
+fn keys(pos: u32) -> u32 { return min(select(pos + 1u, st.spanHi, pos >= st.spanLo && pos < st.spanHi), p.maxSeq); }
 // Cache slot of a key, given base = (first key of a run) % cap and an offset into the run of at most cap.
 fn wrap(s: u32) -> u32 { return select(s, s - p.cap, s >= p.cap); }`;
 
@@ -752,7 +755,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
   let h = wid.x;
   let t = wid.y;
   let kvh = h / (p.H / p.Hkv);
-  let n = min(st.pos0 + t + 1u, p.maxSeq);
+  let n = keys(st.pos0 + t);
   let qo = (t * p.H + h) * p.D;
   let stride = p.Hkv * p.D;
   let ko = kvh * p.D;
@@ -936,14 +939,14 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
     qs[e] = v;
   }
   // Keys visible to the tile's last row; earlier rows mask the tail of the last block.
-  let nMax = min(st.pos0 + (min(r0 + R, rows) - 1u) / G + 1u, p.maxSeq);
+  let nMax = keys(st.pos0 + (min(r0 + R, rows) - 1u) / G);
   // Scoring role: row sr, keys sl, sl + TPR, ...
   let sr = li / TPR;
   let sl = li % TPR;
-  let sn = min(st.pos0 + (r0 + sr) / G + 1u, p.maxSeq);
+  let sn = keys(st.pos0 + (r0 + sr) / G);
   let slo = firstKey(sn, p.win);
   // The tile's first row sees the earliest keys (rows are ordered by position).
-  let lo = firstKey(min(st.pos0 + r0 / G + 1u, p.maxSeq), p.win);
+  let lo = firstKey(keys(st.pos0 + r0 / G), p.win);
   // Output role: slots e = li + 256 k, each row e / D4, columns 4 * (e % D4) .. + 3, with its own
   // running max and exp-sum.
   var m: array<f32, ${ORR}>;
@@ -977,7 +980,7 @@ ${split
     if (li < R * BK) {
       let rr = li / BK;
       let jj = li % BK;
-      let n = min(st.pos0 + (r0 + rr) / G + 1u, p.maxSeq);
+      let n = keys(st.pos0 + (r0 + rr) / G);
       var d = -3.0e38;
       if (b0 + jj < n && b0 + jj >= firstKey(n, p.win)) {
         d = 0.0;
@@ -1078,7 +1081,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
   let t = wid.y;
   let split = wid.z;
   let kvh = h / (p.H / p.Hkv);
-  let n = min(st.pos0 + t + 1u, p.maxSeq);
+  let n = keys(st.pos0 + t);
   // Keys before the sliding window are skipped: splits wholly before it exit, and the first live split
   // starts at the window's first key. Combine reads the same live splits.
   let lo = firstKey(n, p.win);
@@ -1187,7 +1190,7 @@ ${FIRST_KEY_WGSL}
 @compute @workgroup_size(64)
 fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) li: u32) {
   let base = (wid.y * p.H + wid.x) * p.S;
-  let n = min(st.pos0 + wid.y + 1u, p.maxSeq);
+  let n = keys(st.pos0 + wid.y);
   let live = (n + ${ATTN_CHUNK - 1}u) / ${ATTN_CHUNK}u;
   let first = firstKey(n, p.win) / ${ATTN_CHUNK}u;
   var mx = -3.0e38;
@@ -1257,27 +1260,35 @@ fn main(${EW_ARGS}) {
 }
 
 /** Gathers embedding rows for token ids. */
-export function embedSpec(wdtype: WeightDType, affine = false): KernelSpec {
+export function embedSpec(wdtype: WeightDType, affine = false, features = false): KernelSpec {
   const quant = wdtype !== "f32";
   const aff = quant && affine;
-  const bindings: BindingKind[] = quant ? ["uniform", "read", "read", "read", "rw"] : ["uniform", "read", "read", "rw"];
-  if (aff) bindings.splice(4, 0, "read");
-  const out = aff ? 5 : 4;
-  return spec(`embed/${wdtype}${aff ? "a" : ""}`, bindings, cpu.cpuEmbed(wdtype, aff), () => /* wgsl */ `
-struct P { T: u32, D: u32, scale: f32, _b: u32 }
+  const bindings: BindingKind[] = quant ? ["uniform", "read", "read", "read"] : ["uniform", "read", "read"];
+  if (aff) bindings.push("read");
+  const feat = bindings.length;
+  if (features) bindings.push("read");
+  const out = bindings.length;
+  bindings.push("rw");
+  return spec(`embed/${wdtype}${aff ? "a" : ""}${features ? "/features" : ""}`, bindings, cpu.cpuEmbed(wdtype, aff, features), () => /* wgsl */ `
+struct P { T: u32, D: u32, scale: f32, V: u32 }
 @group(0) @binding(0) var<uniform> p: P;
 @group(0) @binding(1) var<storage, read> tokens: array<u32>;
 ${quant
   ? `@group(0) @binding(2) var<storage, read> wq: array<u32>;
-@group(0) @binding(3) var<storage, read> ws: array<f32>;${aff ? "\n@group(0) @binding(4) var<storage, read> wm: array<f32>;" : ""}
-@group(0) @binding(${out}) var<storage, read_write> o: array<f32>;`
-  : `@group(0) @binding(2) var<storage, read> w: array<f32>;
-@group(0) @binding(3) var<storage, read_write> o: array<f32>;`}
+@group(0) @binding(3) var<storage, read> ws: array<f32>;${aff ? "\n@group(0) @binding(4) var<storage, read> wm: array<f32>;" : ""}`
+  : `@group(0) @binding(2) var<storage, read> w: array<f32>;`}
+${features ? `@group(0) @binding(${feat}) var<storage, read> feat: array<f32>;` : ""}
+@group(0) @binding(${out}) var<storage, read_write> o: array<f32>;
 
 @compute @workgroup_size(${EW})
 fn main(${EW_ARGS}) {
   ${FLAT}
   if (idx >= p.T * p.D) { return; }
+${features
+  ? `  // Ids from V on are rows of the image features (unscaled), as Gemma 3 places them in the prompt.
+  let id = tokens[idx / p.D];
+  if (id >= p.V) { o[idx] = feat[(id - p.V) * p.D + idx % p.D]; return; }`
+  : ""}
   let e = tokens[idx / p.D] * p.D + idx % p.D;
 ${wdtype === "q4"
   ? aff
@@ -1289,6 +1300,87 @@ ${wdtype === "q4"
   ? `  let q = f32(bitcast<i32>(wq[e / 4u] << (24u - 8u * (e % 4u))) >> 24u);
   o[idx] = (q * ws[e / 32u]${aff ? " + wm[e / 32u]" : ""}) * p.scale;`
   : `  o[idx] = w[e] * p.scale;`}
+}`);
+}
+
+/** y = (x - mean) / sqrt(var + eps) * w + b over rows of D (LayerNorm, the vision encoder's norm). */
+export function layernormSpec(): KernelSpec {
+  return spec("layernorm", ["uniform", "read", "read", "read", "rw"], cpu.cpuLayernorm, () => /* wgsl */ `
+struct P { R: u32, D: u32, eps: f32, _p: u32 }
+@group(0) @binding(0) var<uniform> p: P;
+@group(0) @binding(1) var<storage, read> x: array<f32>;
+@group(0) @binding(2) var<storage, read> w: array<f32>;
+@group(0) @binding(3) var<storage, read> b: array<f32>;
+@group(0) @binding(4) var<storage, read_write> y: array<f32>;
+var<workgroup> red: array<f32, 256>;
+
+fn total(li: u32, v: f32) -> f32 {
+  red[li] = v;
+  workgroupBarrier();
+  for (var s = 128u; s > 0u; s >>= 1u) {
+    if (li < s) { red[li] += red[li + s]; }
+    workgroupBarrier();
+  }
+  let t = red[0];
+  workgroupBarrier();
+  return t;
+}
+
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) li: u32) {
+  let o = (wid.x + wid.y * ${MAX_X}u) * p.D;
+  if (wid.x + wid.y * ${MAX_X}u >= p.R) { return; }
+  var s = 0.0;
+  for (var i = li; i < p.D; i += 256u) { s += x[o + i]; }
+  let mean = total(li, s) / f32(p.D);
+  var v = 0.0;
+  for (var i = li; i < p.D; i += 256u) { let d = x[o + i] - mean; v += d * d; }
+  let inv = inverseSqrt(total(li, v) / f32(p.D) + p.eps);
+  for (var i = li; i < p.D; i += 256u) { y[o + i] = (x[o + i] - mean) * inv * w[i] + b[i]; }
+}`);
+}
+
+/** x = gelu_tanh(x) in place. */
+export function geluSpec(): KernelSpec {
+  return spec("gelu", ["uniform", "rw"], cpu.cpuGelu, () => /* wgsl */ `
+struct P { n: u32, _a: u32, _b: u32, _c: u32 }
+@group(0) @binding(0) var<uniform> p: P;
+@group(0) @binding(1) var<storage, read_write> x: array<f32>;
+
+@compute @workgroup_size(${EW})
+fn main(${EW_ARGS}) {
+  ${FLAT}
+  if (idx >= p.n) { return; }
+  let a = x[idx];
+  x[idx] = ${GELU_WGSL("a")};
+}`);
+}
+
+/**
+ * Average pooling of a square grid of tokens: x [side·side, C] in raster order → y [(side/k)², C],
+ * each output the mean of a k × k patch (Gemma 3's projector: 64 × 64 patches → 16 × 16 tokens).
+ */
+export function avgPoolSpec(): KernelSpec {
+  return spec("avg_pool", ["uniform", "read", "rw"], cpu.cpuAvgPool, () => /* wgsl */ `
+struct P { side: u32, k: u32, C: u32, _p: u32 }
+@group(0) @binding(0) var<uniform> p: P;
+@group(0) @binding(1) var<storage, read> x: array<f32>;
+@group(0) @binding(2) var<storage, read_write> y: array<f32>;
+
+@compute @workgroup_size(${EW})
+fn main(${EW_ARGS}) {
+  ${FLAT}
+  let out = p.side / p.k;
+  if (idx >= out * out * p.C) { return; }
+  let c = idx % p.C;
+  let t = idx / p.C;
+  let y0 = (t / out) * p.k;
+  let x0 = (t % out) * p.k;
+  var s = 0.0;
+  for (var dy = 0u; dy < p.k; dy++) {
+    for (var dx = 0u; dx < p.k; dx++) { s += x[((y0 + dy) * p.side + x0 + dx) * p.C + c]; }
+  }
+  y[idx] = s / f32(p.k * p.k);
 }`);
 }
 

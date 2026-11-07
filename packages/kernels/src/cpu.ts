@@ -64,7 +64,10 @@ const geluTanh = (x: number) => 0.5 * x * (1 + Math.tanh(Math.max(-15, Math.min(
 const act = (epi: "silu" | "gelu", x: number) => (epi === "gelu" ? geluTanh(x) : x / (1 + Math.exp(-x)));
 
 /** Step buffer fields (STEP_WGSL). */
-const step = (s: CpuView) => ({ pos0: s.u32[0]!, lastRow: s.u32[1]!, seed: s.u32[2]!, temperature: s.f32[3]!, n: s.u32[4]!, topK: s.u32[5]!, topP: s.f32[6]!, rep: s.f32[7]! });
+const step = (s: CpuView) => ({
+  pos0: s.u32[0]!, lastRow: s.u32[1]!, seed: s.u32[2]!, temperature: s.f32[3]!, n: s.u32[4]!, topK: s.u32[5]!, topP: s.f32[6]!, rep: s.f32[7]!,
+  spanLo: s.u32[8]!, spanHi: s.u32[9]!,
+});
 
 // ---- matmul, GEMV and GEMM: one implementation for all three ----
 
@@ -360,7 +363,7 @@ export function cpuAttention(f16: boolean): CpuKernel {
     const [T, H, Hkv, D, maxSeq] = [u[0]!, u[1]!, u[2]!, u[3]!, u[4]!];
     const scale = b[0]!.f32[5]!;
     const [win, cap] = [u[7]!, u[8]!];
-    const { pos0 } = step(b[1]!);
+    const { pos0, spanLo, spanHi } = step(b[1]!);
     const q = b[2]!.f32;
     const kc = b[3]!;
     const vc = b[4]!;
@@ -370,7 +373,9 @@ export function cpuAttention(f16: boolean): CpuKernel {
     for (let t = 0; t < T; t++)
       for (let h = 0; h < H; h++) {
         const kvh = Math.floor(h / (H / Hkv));
-        const n = Math.min(pos0 + t + 1, maxSeq);
+        const pos = pos0 + t;
+        // Causal, or the whole bidirectional span for a query inside it (as the kernels' keys()).
+        const n = Math.min(pos >= spanLo && pos < spanHi ? spanHi : pos + 1, maxSeq);
         const first = win > 0 && n > win ? n - win : 0;
         const qo = (t * H + h) * D;
         let mx = -Infinity;
@@ -424,22 +429,69 @@ export const cpuAdd: CpuKernel = (b) => {
   for (let i = 0; i < n; i++) a[i]! += c[i % cols]!;
 };
 
-export function cpuEmbed(wdtype: WeightDType, affine: boolean): CpuKernel {
+export function cpuEmbed(wdtype: WeightDType, affine: boolean, features = false): CpuKernel {
   const quant = wdtype !== "f32";
   const aff = quant && affine;
+  const nw = quant ? (aff ? 3 : 2) : 1;
   return (b) => {
-    const [T, D] = [b[0]!.u32[0]!, b[0]!.u32[1]!];
+    const [T, D, , V] = [b[0]!.u32[0]!, b[0]!.u32[1]!, 0, b[0]!.u32[3]!];
     const scale = b[0]!.f32[2]!;
     const tokens = b[1]!.u32;
-    const w = b.slice(2, quant ? (aff ? 5 : 4) : 3);
-    const o = b[quant ? (aff ? 5 : 4) : 3]!.f32;
+    const w = b.slice(2, 2 + nw);
+    const feat = features ? b[2 + nw]!.f32 : undefined;
+    const o = b[2 + nw + (features ? 1 : 0)]!.f32;
     const row = new Float32Array(D);
     for (let t = 0; t < T; t++) {
-      weightRow(w, wdtype, aff, tokens[t]!, D, row);
+      const id = tokens[t]!;
+      if (feat && id >= V) {
+        o.set(feat.subarray((id - V) * D, (id - V + 1) * D), t * D);
+        continue;
+      }
+      weightRow(w, wdtype, aff, id, D, row);
       for (let i = 0; i < D; i++) o[t * D + i] = row[i]! * scale;
     }
   };
 }
+
+export const cpuLayernorm: CpuKernel = (b) => {
+  const [R, D] = [b[0]!.u32[0]!, b[0]!.u32[1]!];
+  const eps = b[0]!.f32[2]!;
+  const x = b[1]!.f32;
+  const w = b[2]!.f32;
+  const bias = b[3]!.f32;
+  const y = b[4]!.f32;
+  for (let r = 0; r < R; r++) {
+    let s = 0;
+    for (let i = 0; i < D; i++) s += x[r * D + i]!;
+    const mean = s / D;
+    let v = 0;
+    for (let i = 0; i < D; i++) v += (x[r * D + i]! - mean) ** 2;
+    const inv = 1 / Math.sqrt(v / D + eps);
+    for (let i = 0; i < D; i++) y[r * D + i] = (x[r * D + i]! - mean) * inv * w[i]! + bias[i]!;
+  }
+};
+
+export const cpuGelu: CpuKernel = (b) => {
+  const n = b[0]!.u32[0]!;
+  const x = b[1]!.f32;
+  for (let i = 0; i < n; i++) x[i] = geluTanh(x[i]!);
+};
+
+export const cpuAvgPool: CpuKernel = (b) => {
+  const [side, k, C] = [b[0]!.u32[0]!, b[0]!.u32[1]!, b[0]!.u32[2]!];
+  const x = b[1]!.f32;
+  const y = b[2]!.f32;
+  const out = side / k;
+  for (let t = 0; t < out * out; t++) {
+    const y0 = Math.floor(t / out) * k;
+    const x0 = (t % out) * k;
+    for (let c = 0; c < C; c++) {
+      let s = 0;
+      for (let dy = 0; dy < k; dy++) for (let dx = 0; dx < k; dx++) s += x[((y0 + dy) * side + x0 + dx) * C + c]!;
+      y[t * C + c] = s / (k * k);
+    }
+  }
+};
 
 export const cpuCopyRow: CpuKernel = (b) => {
   const D = b[0]!.u32[0]!;

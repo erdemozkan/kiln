@@ -1,4 +1,4 @@
-import { Ctx, byteSize, type Backend, type Tensor, type WeightDType } from "@kiln/core";
+import { Ctx, STEP_BYTES, byteSize, type Backend, type Tensor, type WeightDType } from "@kiln/core";
 import { ops, type MatmulLanes } from "@kiln/kernels";
 import { readCacheJSON, writeCacheJSON } from "@kiln/loader";
 import type { LlamaConfig } from "@kiln/models";
@@ -57,7 +57,7 @@ async function fastest(be: Backend, s: MatmulShape): Promise<MatmulLanes | undef
   const quant = s.wdtype !== "f32";
   if (wBytes > MAX_SCRATCH) return undefined;
   const M = s.mt === 1 ? 1 : 64;
-  const bufs = [be.alloc(M * s.K * 4), be.alloc(wBytes), be.alloc(quant ? (s.N * s.K) / 8 : 4), be.alloc(s.K * 4), be.alloc(32)];
+  const bufs = [be.alloc(M * s.K * 4), be.alloc(wBytes), be.alloc(quant ? (s.N * s.K) / 8 : 4), be.alloc(s.K * 4), be.alloc(STEP_BYTES)];
   const [xb, wb, sb, nb, step] = bufs as [typeof bufs[0], typeof bufs[0], typeof bufs[0], typeof bufs[0], typeof bufs[0]];
   const x: Tensor = { shape: [M, s.K], dtype: "f32", buf: xb };
   const w: Tensor = quant ? { shape: [s.N, s.K], dtype: s.wdtype, buf: wb, scales: sb } : { shape: [s.N, s.K], dtype: "f32", buf: wb };

@@ -2,6 +2,7 @@ import type { Backend } from "@kiln/core";
 import { createWebGPUBackend } from "@kiln/backend-webgpu";
 import {
   CachedHttpSource,
+  MemorySource,
   cacheKey,
   fetchJSON,
   fetchText,
@@ -10,12 +11,14 @@ import {
   parseModelId,
   readGGUFHeader,
   readSafetensorsHeader,
+  toF32,
   safetensorsFiles,
   type ByteSource,
   type ModelRef,
+  type TensorEntry,
 } from "@kiln/loader";
 import { CpuBackend, ops, type KvDtype } from "@kiln/kernels";
-import { LlamaModel, configFromGGUF, configFromHF, ggufToHF, graniteName, multimodalTextName, weightScale, type LlamaConfig } from "@kiln/models";
+import { LlamaModel, VisionTower, configFromGGUF, configFromHF, ggufToHF, graniteName, multimodalTextName, patchK, visionConfigFromGGUF, weightScale, type LlamaConfig } from "@kiln/models";
 import { Tokenizer, type ChatTemplate, type TokenizerJSON } from "@kiln/tokenizers";
 import { Engine } from "./engine";
 import { llamaMatmulShapes, tuneMatmuls } from "./tune";
@@ -62,6 +65,13 @@ export interface LoadOptions {
   tune?: boolean;
   /** Longest GPU work in one submit, in estimated ms (default 50; see `Engine.maxSubmitMs`). */
   maxSubmitMs?: number;
+  /**
+   * Gemma 3's vision tower, as llama.cpp's mmproj GGUF: a file name in the model's repo
+   * ("mmproj-F16.gguf") or a full id ("org/repo/mmproj.gguf"). Chat messages may then hold images.
+   */
+  mmproj?: string;
+  /** Images whose features stay on the GPU at once, with `mmproj` (default 4, 256 tokens each). */
+  imageSlots?: number;
   onProgress?: (p: LoadProgress) => void;
 }
 
@@ -85,14 +95,96 @@ export async function createEngine(modelId: string, opts: LoadOptions = {}): Pro
             (err: unknown) => console.warn("[kiln] matmul tuning failed; using defaults:", err),
           );
     const weights = await loadWeights(backend, files, quant, opts.onProgress);
+    const vision = opts.mmproj ? await openVision(backend, opts.mmproj.split("/").length >= 3 ? parseModelId(opts.mmproj, opts.revision) : { ...ref, gguf: opts.mmproj }, opts) : undefined;
+    if (vision && vision.cfg.projectionDim !== cfg.hiddenSize) throw new Error(`mmproj projects to ${vision.cfg.projectionDim}, but the model is ${cfg.hiddenSize} wide`);
     await tuning;
-    const model = new LlamaModel(backend, cfg, weights, { maxSeq: opts.maxSeq, kvDtype: opts.kvDtype, fuse: opts.fuse });
-    const engine = new Engine(backend, model, tokenizer);
+    const imageTokens = vision ? (opts.imageSlots ?? 4) * vision.tokens : 0;
+    const model = new LlamaModel(backend, cfg, weights, { maxSeq: opts.maxSeq, kvDtype: opts.kvDtype, fuse: opts.fuse, imageTokens });
+    const engine = new Engine(backend, model, tokenizer, vision);
     if (opts.maxSubmitMs !== undefined) engine.maxSubmitMs = opts.maxSubmitMs;
     if (opts.prefixCacheBytes !== undefined) engine.prefixCacheBytes = opts.prefixCacheBytes;
     return engine;
   } finally {
     for (const f of files) f.source.close?.();
+  }
+}
+
+/**
+ * Gemma 3's vision tower from an mmproj GGUF. Matmul weights load as q8; position embeddings, norms
+ * and biases as f32; the patch convolution is read as a [hidden, 3·14·14] matrix padded to `patchK`
+ * columns, and the projection transposed to [text width, hidden], as the matmul kernels take them.
+ */
+async function openVision(backend: Backend, ref: ModelRef, opts: LoadOptions): Promise<VisionTower> {
+  const { source, header } = await openParsed(ref, ref.gguf!, opts.endpoint, readGGUFHeader);
+  try {
+    const cfg = visionConfigFromGGUF(header.metadata);
+    const linear = /^v\.blk\.\d+\.(attn_[qkv]|attn_out|ffn_up|ffn_down)\.weight$/;
+    const ffn = /^v\.blk\.\d+\.ffn_(up|down)\.(weight|bias)$/;
+    const manual = new Set(["v.patch_embd.weight", "mm.input_projection.weight"]);
+    // The MLP width (4304) is padded with zeros to a multiple of 32 for the matmul kernels: zero rows
+    // of ffn_up and its bias give gelu(0) = 0 in the extra columns, which zero ffn_down columns ignore.
+    const I = cfg.intermediate;
+    const Ip = Math.ceil(I / 32) * 32;
+    const padded: TensorEntry[] = [];
+    const parts: Uint8Array[] = [];
+    let at = 0;
+    for (const t of header.tensors.filter((t) => ffn.test(t.name))) {
+      const raw = await source.read(t.offset, t.byteLength);
+      const size = t.type === "F32" ? 4 : t.type === "F16" ? 2 : 0;
+      if (!size) throw new Error(`mmproj: ${t.name} is ${t.type}; F16 or F32 expected`);
+      let bytes: Uint8Array;
+      let shape: number[];
+      if (t.name.endsWith(".bias") || t.name.includes("ffn_up")) {
+        // [I] or [I, hidden]: zero rows appended.
+        const row = t.shape.length === 2 ? t.shape[1]! * size : size;
+        bytes = new Uint8Array(Ip * row);
+        bytes.set(raw);
+        shape = t.shape.length === 2 ? [Ip, t.shape[1]!] : [Ip];
+      } else {
+        // ffn_down [hidden, I]: zero columns appended to every row.
+        const rows = t.shape[0]!;
+        bytes = new Uint8Array(rows * Ip * size);
+        for (let r = 0; r < rows; r++) bytes.set(raw.subarray(r * I * size, (r + 1) * I * size), r * Ip * size);
+        shape = [rows, Ip];
+      }
+      padded.push({ ...t, shape, offset: at, byteLength: bytes.length });
+      parts.push(bytes);
+      at += bytes.length;
+    }
+    const blob = new Uint8Array(at);
+    parts.reduce((o, p) => (blob.set(p, o), o + p.length), 0);
+    const padSource = new MemorySource(blob, "mmproj-ffn");
+    const keep = header.tensors.filter((t) => !manual.has(t.name) && !ffn.test(t.name));
+    const weights = new Map([
+      ...(await loadWeights(backend, [{ name: ref.gguf!, source, tensors: keep.filter((t) => linear.test(t.name)) }], "q8", opts.onProgress)),
+      ...(await loadWeights(backend, [{ name: ref.gguf!, source, tensors: keep.filter((t) => !linear.test(t.name)) }], "f32")),
+      ...(await loadWeights(backend, [{ name: "mmproj-ffn", source: padSource, tensors: padded.filter((t) => t.name.endsWith(".weight")) }], "q8")),
+      ...(await loadWeights(backend, [{ name: "mmproj-ffn", source: padSource, tensors: padded.filter((t) => t.name.endsWith(".bias")) }], "f32")),
+    ]);
+    const read = async (name: string) => {
+      const t = header.tensors.find((x) => x.name === name);
+      if (!t) throw new Error(`mmproj: missing ${name}`);
+      const n = t.shape.reduce((a, b) => a * b, 1);
+      return { values: toF32(t.type as Parameters<typeof toF32>[0], await source.read(t.offset, t.byteLength), n), shape: t.shape };
+    };
+    const upload = (values: Float32Array, shape: number[]) => {
+      const buf = backend.alloc(values.byteLength, "storage", "vision/w");
+      backend.write(buf, 0, values);
+      return { shape, dtype: "f32" as const, buf };
+    };
+    const K = 3 * cfg.patchSize * cfg.patchSize;
+    const patch = (await read("v.patch_embd.weight")).values;
+    const patchW = new Float32Array(cfg.hidden * patchK(cfg));
+    for (let r = 0; r < cfg.hidden; r++) patchW.set(patch.subarray(r * K, (r + 1) * K), r * patchK(cfg));
+    weights.set("v.patch_embd.weight", upload(patchW, [cfg.hidden, patchK(cfg)]));
+    // Stored [hidden, projectionDim] (x @ W in transformers); the kernels take [N, K].
+    const proj = (await read("mm.input_projection.weight")).values;
+    const t = new Float32Array(proj.length);
+    for (let i = 0; i < cfg.hidden; i++) for (let j = 0; j < cfg.projectionDim; j++) t[j * cfg.hidden + i] = proj[i * cfg.projectionDim + j]!;
+    weights.set("mm.input_projection.weight", upload(t, [cfg.projectionDim, cfg.hidden]));
+    return new VisionTower(backend, cfg, weights);
+  } finally {
+    source.close?.();
   }
 }
 

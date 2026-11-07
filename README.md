@@ -112,6 +112,10 @@ Key ideas:
   Intel Mac, cached SmolLM2-360M loads went from 8.3 to 3.5 s (BF16 safetensors) and from 6.6 to 1.4 s
   (Q4_K_M GGUF, mostly Q5_0: llama.cpp's fallback for rows that are not a multiple of 256), and as q8
   from 15.7 to 2.9 s (BF16), with the same replies.
+- **Images for Gemma 3.** A SigLIP vision tower and Gemma 3's projector run on the same kernels as
+  the text model plus LayerNorm, GELU and 4 × 4 pooling, and attention takes a bidirectional span from
+  the step buffer: queries inside it see every key of the span (all 4096 patches in the vision tower,
+  each image's 256 tokens in the prompt). See Models for the check against a NumPy reference.
 - **A CPU fallback.** Every kernel the models use also exists in TypeScript, attached to its WGSL spec
   with the same bindings and uniform layout, and a `CpuBackend` runs them on the model's worker
   thread. `load` uses it when the browser has no WebGPU or no adapter (`device: "auto"`, the
@@ -142,8 +146,8 @@ Key ideas:
   (`max_position_embeddings`, GGUF `context_length`), at most 8192 tokens and 512 MiB of KV cache,
   where it was 2048 for every model. `info.contextLength` tells an app how far a larger `maxSeq` can
   go, and a prompt that does not fit says so. Sliding-window layers (Gemma 3: 29 of 34 in 4B, window
-  1024) keep a ring of window + 128 slots, key j in slot j % slots, instead of a row per position:
-  Gemma 3 4B gets 8192 tokens in 290 MB, where a full cache per layer held 3840 tokens in 510 MB.
+  1024) keep a ring of window + 256 slots (room for an image's 256 tokens prefilled at once), key j in slot j % slots, instead of a row per position:
+  Gemma 3 4B gets 8192 tokens in 305 MiB, where a full cache per layer held 3840 tokens in 510 MB.
   Same greedy tokens as the full cache on a 1,518-token prompt (the ring wraps after 1,152), same
   prefill time, and the decode step does not grow with the slots (attention 4.0 ms at position 256
   with 3840, 4.8 with 2048). Reusing a cached prefix stays exact across the ring: a second question
@@ -344,7 +348,7 @@ cost.
 
 ## Status
 
-Verified on this GPU: all kernel checks pass (785 now that Chrome exposes shader-f16 on it, including q4 and q8 weights, symmetric and affine, in every matmul variant, the decode GEMV and the prefill GEMM, both prefill attention kernels, fused variants, f16 cache paths,
+Verified on this GPU: all kernel checks pass (802 now that Chrome exposes shader-f16 on it, including q4 and q8 weights, symmetric and affine, in every matmul variant, bidirectional-span attention, LayerNorm and pooling, the decode GEMV and the prefill GEMM, both prefill attention kernels, fused variants, f16 cache paths,
 sliding-window attention, GELU gating, grammar masks and sampling distributions). SmolLM2-135M-Instruct chats from Hub safetensors (q4, f32) and from a GGUF
 Q4_K_M file.
 
@@ -364,7 +368,7 @@ Models run end to end (greedy answers to fixed questions checked by hand; tool c
 | `granite` | granite-3.3-2b-instruct (`<\|tool_call\|>` calls) | safetensors (5 GB), GGUF Q4_K_M | 5.5 tok/s (q8), 6.4 tok/s (Q4_K_M) |
 | `granitemoehybrid` | granite-4.0-350m (tool calls), with `quant: "q8"` | safetensors, GGUF Q8_0 | 26 tok/s; 38.7 tok/s (Q8_0) |
 | `granitemoehybrid` | granite-4.0-1b (tool calls) | safetensors (3.3 GB) | 11.5 tok/s (q4) |
-| `gemma3` | Gemma 3 4B-it, text only (recalls a fact 1,100 and 3,000 tokens back) | GGUF Q4_0 (2.4 GB) | 177–180 ms GPU per step (about 5.5 tok/s); 24.6 tok/s on an M3 |
+| `gemma3` | Gemma 3 4B-it (recalls a fact 1,100 and 3,000 tokens back; images with `mmproj`) | GGUF Q4_0 (2.4 GB) + mmproj-F16 | 177–180 ms GPU per step (about 5.5 tok/s); 24.6 tok/s on an M3 |
 
 Gemma 3 was checked token by token against an independent NumPy forward pass written from
 transformers' `modeling_gemma3`: greedy output matched on every prompt tried, for 1B in q4 and q8 and 270M
@@ -383,7 +387,26 @@ with linear rope scaling on the global layers only, from safetensors or GGUF. 4B
 window. There is no token-level reference for 4B (the NumPy pass would need the 8.6 GB checkpoint);
 its greedy tokens on both prompts are the same as 1B's. The 2.4 GB file is cached whole (three
 segments) and the next load reads it from the cache in about 10 s on the test Mac (Iris Plus 650), 6 s
-of it reading; converting on the CPU instead takes about 24 s. Images are not supported.
+of it reading; converting on the CPU instead takes about 24 s.
+
+Images work for Gemma 3 4B and larger with llama.cpp's mmproj file:
+`load("unsloth/gemma-3-4b-it-GGUF/gemma-3-4b-it-Q4_0.gguf", { mmproj: "mmproj-F16.gguf" })`, then
+messages with `{ type: "image", image }` parts (a Blob, ImageBitmap or ImageData, resized to 896 × 896
+by the browser). The vision tower is SigLIP: 4096 patches through 27 layers with full attention
+(the text model's attention kernels, given a bidirectional span over every patch), then Gemma 3's
+projector pools them 4 × 4 into 256 tokens. Its matmul weights load as q8; the MLP's width (4304) is
+padded with zeros to 4320 for the kernels. In the prompt each image becomes Gemma 3's `<start_of_image>`,
+256 soft tokens and `<end_of_image>`, with token ids past the vocabulary that the embedding reads from
+the image features; the 256 tokens attend to each other both ways, as Gemma 3 was trained, so they are
+prefilled together in one chunk. Kiln's image features, for a synthetic picture (a red disc and a blue
+square on white), matched an independent NumPy forward pass of the f32 weights to a cosine similarity
+of 0.9998 (at least 0.999 for every token), and 4B Q4_0 described it as "a red circle and a blue square
+arranged vertically on a white background". Through the API, a 448 × 448 PNG of a green triangle on
+yellow: "The image shows a green triangle on a yellow background." On the Intel Mac the vision tower
+takes about 90 s per image; the follow-up "And what color is the background?" reused the encoded image
+and 290 cached prompt tokens and answered "The background is yellow." in 6 s. An image's features stay
+on the GPU (`imageSlots`, 4 by default), keyed by its pixels, so a conversation that keeps the image
+does not run the tower again.
 
 Granite 4's dense models (`granitemoehybrid` with every layer "attention" and no experts: 350M and
 1B) are Llama with four multipliers, folded in at load: the residual multiplier into o_proj and
@@ -487,6 +510,8 @@ Known limits, roughly in roadmap order:
   constrains the `<tool_call>` format.
 - Single storage binding per tensor: very large f32 embeddings can exceed `maxStorageBufferBindingSize`
   (use q4 or q8).
+- Images: Gemma 3 only, from llama.cpp's mmproj GGUF (the vision weights inside safetensors
+  checkpoints are still skipped), one 896 × 896 crop per image (no pan-and-scan).
 - Without WebGPU, models run on the CPU in plain TypeScript: single-threaded, no WASM SIMD, about 0.5
   GMAC/s on the test Mac, so only small models are usable there. WebNN and Node/Dawn backends come later.
 

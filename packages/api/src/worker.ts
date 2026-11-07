@@ -32,11 +32,38 @@ const post = (msg: Response) => scope.postMessage(msg);
  */
 let queue: Promise<void> = Promise.resolve();
 
+/**
+ * An image part as the vision tower takes it: RGBA bytes at its size. Pixel data of that size passes
+ * through; anything else (Blob, File, ImageBitmap, ImageData of another size) is resized by the
+ * browser (high-quality resampling) through an OffscreenCanvas.
+ */
+async function toPixels(image: unknown, size: number): Promise<{ width: number; height: number; data: Uint8ClampedArray | Uint8Array }> {
+  const px = image as { width?: number; height?: number; data?: Uint8ClampedArray | Uint8Array };
+  if (px && px.width === size && px.height === size && (px.data instanceof Uint8ClampedArray || px.data instanceof Uint8Array)) {
+    return { width: size, height: size, data: px.data };
+  }
+  const source = px && px.data && !(image instanceof ImageData) ? new ImageData(new Uint8ClampedArray(px.data), px.width!, px.height!) : (image as ImageBitmapSource);
+  const bitmap = await createImageBitmap(source, { resizeWidth: size, resizeHeight: size, resizeQuality: "high" });
+  const ctx = new OffscreenCanvas(size, size).getContext("2d")!;
+  ctx.drawImage(bitmap, 0, 0);
+  bitmap.close();
+  return ctx.getImageData(0, 0, size, size);
+}
+
 async function generate(msg: Extract<Request, { type: "chat" | "complete" }>, ac: AbortController): Promise<void> {
   try {
     if (!engine) throw new Error("no model loaded");
     const opts = { ...msg.opts, signal: ac.signal };
-    const stream: AsyncGenerator<TextDelta> = msg.type === "chat" ? engine.chat(msg.messages, opts) : engine.complete(msg.prompt, opts);
+    let messages = msg.type === "chat" ? msg.messages : [];
+    const size = engine.vision?.cfg.imageSize;
+    if (size && messages.some((m) => typeof m.content !== "string")) {
+      messages = await Promise.all(
+        messages.map(async (m) =>
+          typeof m.content === "string" ? m : { ...m, content: await Promise.all(m.content.map(async (p) => (p.type === "image" ? { type: "image" as const, image: await toPixels(p.image, size) } : p))) },
+        ),
+      );
+    }
+    const stream: AsyncGenerator<TextDelta> = msg.type === "chat" ? engine.chat(messages, opts) : engine.complete(msg.prompt, opts);
     try {
       for await (const d of stream) post({ id: msg.id, type: "delta", text: d.text });
     } finally {
@@ -74,6 +101,7 @@ scope.onmessage = async (e: MessageEvent<Request>) => {
             model: msg.model,
             family: cfg.family,
             backend: engine.backend.name,
+            vision: !!engine.vision,
             layers: cfg.numLayers,
             hiddenSize: cfg.hiddenSize,
             vocabSize: cfg.vocabSize,

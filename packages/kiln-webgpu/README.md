@@ -39,10 +39,21 @@ interrupted download resumes. `listCache()` reports what is cached and `clearCac
 `load` asks the browser to keep the cache (`navigator.storage.persist()`) so it survives low disk
 space; `llm.info.persistent` says whether it agreed, and `load(id, { persist: false })` skips asking.
 
+Gemma 3 (4B and larger) also takes images, with llama.cpp's mmproj file from the same repo:
+
+```ts
+const llm = await load("unsloth/gemma-3-4b-it-GGUF/gemma-3-4b-it-Q4_0.gguf", { mmproj: "mmproj-F16.gguf" });
+const reply = llm.chat([{ role: "user", content: [{ type: "image", image: blob }, { type: "text", text: "What is in this picture?" }] }]);
+```
+
+An image may be a Blob, File, ImageBitmap or ImageData; it is resized to 896 × 896. Running the
+vision tower takes a while on integrated GPUs (about 90 s on an Intel Iris Plus 650); later turns that
+keep the image reuse its features and their cached tokens.
+
 ## Models
 
-Llama, Mistral, Qwen2, Qwen3, SmolLM, Granite 3 and 4 (350M to 2B) and Gemma 3 (270M to 4B and larger, text
-only) decoders, from
+Llama, Mistral, Qwen2, Qwen3, SmolLM, Granite 3 and 4 (350M to 2B) and Gemma 3 (270M to 4B and larger;
+images as above) decoders, from
 safetensors (F32/F16/BF16) or GGUF (F32/F16/BF16/Q4_0/Q4_1/Q5_0/Q5_1/Q8_0/Q4_K/Q5_K/Q6_K).
 Weights are held on the GPU as q4, q8 or f32. The default, `quant: "auto"`, stores float weights as q4
 and keeps a GGUF file's tensors at their own precision (exactly, except Q6_K, which becomes q8);

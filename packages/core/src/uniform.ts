@@ -38,10 +38,22 @@ export interface StepParams {
   topP?: number;
   /** Divide positive / multiply negative logits of already-seen tokens by this (1 = off). */
   repetitionPenalty?: number;
+  /**
+   * Bidirectional span [spanLo, spanHi) of positions: a query inside it sees every key of the span, not
+   * only earlier ones (Gemma 3's image tokens, a vision encoder). Default none.
+   */
+  spanLo?: number;
+  spanHi?: number;
 }
 
-export const STEP_WGSL = /* wgsl */ `struct Step { pos0: u32, lastRow: u32, seed: u32, temperature: f32, n: u32, topK: u32, topP: f32, repPenalty: f32 }`;
+export const STEP_WGSL = /* wgsl */ `struct Step { pos0: u32, lastRow: u32, seed: u32, temperature: f32, n: u32, topK: u32, topP: f32, repPenalty: f32, spanLo: u32, spanHi: u32, _a: u32, _b: u32 }`;
+
+/** Bytes of the step buffer. */
+export const STEP_BYTES = 48;
 
 export function packStep(s: StepParams): Uint8Array {
-  return packUniform([u32(s.pos0), u32(s.lastRow), u32(s.seed), f32(s.temperature), u32(s.n ?? 0), u32(s.topK ?? 0), f32(s.topP ?? 1), f32(s.repetitionPenalty ?? 1)]);
+  return packUniform([
+    u32(s.pos0), u32(s.lastRow), u32(s.seed), f32(s.temperature), u32(s.n ?? 0), u32(s.topK ?? 0), f32(s.topP ?? 1), f32(s.repetitionPenalty ?? 1),
+    u32(s.spanLo ?? 0), u32(s.spanHi ?? 0), u32(0), u32(0),
+  ]);
 }

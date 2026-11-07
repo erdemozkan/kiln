@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { ActivationPool, Ctx, f32, packStep, packUniform, u32, type Backend, type Buf, type KernelSpec, physical } from "../src";
+import { ActivationPool, Ctx, f32, packStep, packUniform, u32, type Backend, type Buf, type KernelSpec, physical, STEP_BYTES } from "../src";
 
 function fakeBackend() {
   const allocs: Buf[] = [];
@@ -33,7 +33,9 @@ describe("uniform packing", () => {
     const dv = new DataView(b.buffer);
     expect(dv.getUint32(0, true)).toBe(7);
     expect(dv.getFloat32(4, true)).toBe(0.5);
-    expect(packStep({ pos0: 1, lastRow: 2, seed: 3, temperature: 0.7 }).byteLength).toBe(32);
+    const st = packStep({ pos0: 1, lastRow: 2, seed: 3, temperature: 0.7, spanLo: 5, spanHi: 9 });
+    expect(st.byteLength).toBe(STEP_BYTES);
+    expect([new DataView(st.buffer).getUint32(32, true), new DataView(st.buffer).getUint32(36, true)]).toEqual([5, 9]);
   });
 });
 

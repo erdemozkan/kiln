@@ -13,7 +13,10 @@ import {
   attentionTile,
   attentionTiledSpec,
   copyRowSpec,
+  avgPoolSpec,
   embedSpec,
+  geluSpec,
+  layernormSpec,
   gatedActSpec,
   gemmSpec,
   GEMM_TILE,
@@ -309,13 +312,43 @@ export function addInPlace(ctx: Ctx, a: Tensor, b: Tensor): void {
   ctx.run(addSpec(), [ctx.uniform([u32(n), u32(numel(b.shape)), u32(0), u32(0)]), a.buf, b.buf], grid1d(n));
 }
 
-/** Rows of `table` for the token ids, times `scale` (Gemma scales embeddings by sqrt(hidden)). */
-export function embed(ctx: Ctx, table: Tensor, tokens: Buf, T: number, scale = 1): Tensor {
+/**
+ * Rows of `table` for the token ids, times `scale` (Gemma scales embeddings by sqrt(hidden)). With
+ * `features`, ids from `vocab` on take row id - vocab of the features instead, unscaled (image tokens).
+ */
+export function embed(ctx: Ctx, table: Tensor, tokens: Buf, T: number, scale = 1, features?: { buf: Buf; vocab: number }): Tensor {
   const D = lastDim(table);
   const o = ctx.alloc([T, D]);
-  const spec = embedSpec(weightDType(table), !!table.mins);
-  ctx.run(spec, [ctx.uniform([u32(T), u32(D), f32(scale), u32(0)]), tokens, ...weightBufs(table), o.buf], grid1d(T * D));
+  const spec = embedSpec(weightDType(table), !!table.mins, !!features);
+  const bufs = [ctx.uniform([u32(T), u32(D), f32(scale), u32(features?.vocab ?? 0)]), tokens, ...weightBufs(table)];
+  if (features) bufs.push(features.buf);
+  ctx.run(spec, [...bufs, o.buf], grid1d(T * D));
   return o;
+}
+
+/** LayerNorm over the last axis, with weight and bias. */
+export function layernorm(ctx: Ctx, x: Tensor, w: Tensor, b: Tensor, eps: number): Tensor {
+  const D = lastDim(x);
+  const rows = numel(x.shape) / D;
+  const y = ctx.alloc(x.shape);
+  ctx.run(layernormSpec(), [ctx.uniform([u32(rows), u32(D), f32(eps), u32(0)]), x.buf, w.buf, b.buf, y.buf], [Math.min(rows, MAX_X), Math.ceil(rows / MAX_X), 1]);
+  return y;
+}
+
+/** gelu_tanh in place. */
+export function gelu(ctx: Ctx, x: Tensor): void {
+  const n = numel(x.shape);
+  ctx.run(geluSpec(), [ctx.uniform([u32(n), u32(0), u32(0), u32(0)]), x.buf], grid1d(n));
+}
+
+/** k × k average pooling of a side × side token grid [side², C] → [(side / k)², C]. */
+export function avgPool(ctx: Ctx, x: Tensor, side: number, k: number): Tensor {
+  const C = lastDim(x);
+  if (side % k || numel(x.shape) !== side * side * C) throw new Error(`avgPool: [${x.shape}] is not a ${side}×${side} grid poolable by ${k}`);
+  const out = side / k;
+  const y = ctx.alloc([out * out, C]);
+  ctx.run(avgPoolSpec(), [ctx.uniform([u32(side), u32(k), u32(C), u32(0)]), x.buf, y.buf], grid1d(out * out * C));
+  return y;
 }
 
 /** Row `step.lastRow` of x [T, D] → [1, D]. */

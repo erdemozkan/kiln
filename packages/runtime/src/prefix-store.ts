@@ -78,6 +78,11 @@ export class PrefixStore<T> {
     return true;
   }
 
+  /** Drops every saved prefix whose tokens match. */
+  dropIf(match: (tokens: readonly number[]) => boolean): void {
+    for (let i = this.entries.length - 1; i >= 0; i--) if (match(this.entries[i]!.tokens)) this.drop(i);
+  }
+
   clear(): void {
     while (this.entries.length) this.drop(this.entries.length - 1);
   }

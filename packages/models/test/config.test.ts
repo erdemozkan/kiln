@@ -86,14 +86,14 @@ describe("configFromHF", () => {
     expect(c.embedScale).toBe(50.5); // sqrt(2560) = 50.596 in bf16
     expect(c.slidingLayers!.filter((s) => !s)).toHaveLength(5);
     // The trained context comes from Gemma3TextConfig's default. Sliding layers keep a ring of
-    // window + 128 slots, so 8192 tokens take 305 MB (1.1 GB with a full cache per layer).
+    // window + 256 slots, so 8192 tokens take 320 MB (1.1 GB with a full cache per layer).
     expect(c.contextLength).toBe(131072);
-    expect(ringSlots(c, 8192, 0)).toBe(1152);
+    expect(ringSlots(c, 8192, 0)).toBe(1280);
     expect(ringSlots(c, 8192, 5)).toBe(8192);
     expect(ringSlots(c, 1000, 0)).toBe(1000);
-    expect(kvCacheBytes(c, 8192)).toBe(2 * (5 * 8192 + 29 * 1152) * 4 * 256 * 2);
+    expect(kvCacheBytes(c, 8192)).toBe(2 * (5 * 8192 + 29 * 1280) * 4 * 256 * 2);
     expect(defaultMaxSeq(c)).toBe(8192);
-    expect(defaultMaxSeq(c, "f32")).toBe(6400);
+    expect(defaultMaxSeq(c, "f32")).toBe(5632);
     const global = ropeInvFreq(c);
     const local = ropeInvFreq({ headDim: 256, ropeTheta: 10000 });
     expect(global[1]).toBeCloseTo(1e6 ** (-2 / 256) / 8, 7);

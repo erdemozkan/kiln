@@ -1,6 +1,6 @@
 import type { Backend, Buf, Dispatch } from "@kiln/core";
 import { GrammarMatcher, TokenTrie, compileFormat, type ResponseFormat } from "@kiln/grammar";
-import { LlamaModel, MAX_VERIFY_ROWS, type ForwardPlan } from "@kiln/models";
+import { LlamaModel, MAX_VERIFY_ROWS, type ForwardPlan, type ImagePixels, type VisionTower } from "@kiln/models";
 import { detectChatFormat, type ChatDocument, type ChatFormat, type ChatMessage, type Tokenizer, type ToolSpec } from "@kiln/tokenizers";
 import { SubmitPacer } from "./pace";
 import { PrefixStore } from "./prefix-store";
@@ -107,6 +107,30 @@ export interface TextDelta {
   tokenId: number;
 }
 
+/** Runs of image token ids (from `vocab` on) in a prompt, as [start, end) positions. */
+export function imageSpans(ids: readonly number[], vocab: number): [number, number][] {
+  const spans: [number, number][] = [];
+  for (let i = 0; i < ids.length; i++) {
+    if (ids[i]! < vocab) continue;
+    const s = i;
+    while (i < ids.length && ids[i]! >= vocab) i++;
+    spans.push([s, i]);
+  }
+  return spans;
+}
+
+/** FNV-1a over an image's bytes and size: the same picture gets the same slot (and so the same ids). */
+function imageKey(img: ImagePixels): string {
+  let h1 = 0x811c9dc5;
+  let h2 = 0x01000193 ^ img.width;
+  const d = img.data;
+  for (let i = 0; i < d.length; i++) {
+    h1 = Math.imul(h1 ^ d[i]!, 16777619);
+    h2 = Math.imul(h2 ^ d[i]!, 2246822519);
+  }
+  return `${img.width}x${img.height}:${(h1 >>> 0).toString(16)}${(h2 >>> 0).toString(16)}`;
+}
+
 /** Shortest cached prefix worth saving before a call overwrites it. */
 const MIN_SAVED_TOKENS = 32;
 
@@ -159,10 +183,16 @@ export class Engine {
     return { count: this.prefixes.size, bytes: this.prefixes.bytes };
   }
 
+  /** Images whose features sit in `model.imageFeatures`, by slot (see `imageSlot`). */
+  private readonly imageSlots: ({ key: string; used: number } | undefined)[] = [];
+  private imageClock = 0;
+
   constructor(
     readonly backend: Backend,
     readonly model: LlamaModel,
     readonly tokenizer: Tokenizer,
+    /** Gemma 3's vision tower, when loaded with its mmproj file: chat messages may then hold images. */
+    readonly vision?: VisionTower,
   ) {
     try {
       this.chatFormat = detectChatFormat(tokenizer);
@@ -180,12 +210,75 @@ export class Engine {
     if (!this.chatFormat) throw new Error("this model has no supported chat format; use complete() instead");
     // Only reasoning models know <think>; injecting it elsewhere derails them.
     const thinks = this.tokenizer.tokenId("<think>") !== undefined;
-    const prompt = this.chatFormat.render(messages, {
+    const images = messages.flatMap((m) => (typeof m.content === "string" ? [] : m.content.flatMap((p) => (p.type === "image" ? [p.image as ImagePixels] : []))));
+    if (images.length && !this.vision) throw new Error("this model takes no images (load Gemma 3 with its mmproj file to give it images)");
+    // Templates see image parts without their pixels; Gemma's writes <start_of_image> for each.
+    const shown = messages.map((m) => (typeof m.content === "string" ? m : { ...m, content: m.content.map((p) => (p.type === "image" ? { type: "image" as const, image: null } : p)) }));
+    const prompt = this.chatFormat.render(shown, {
       enableThinking: thinks ? opts.enableThinking : undefined,
       tools: opts.tools,
       documents: opts.documents,
     });
-    yield* this.complete(prompt, this.forceToolCall(opts));
+    if (!images.length) {
+      yield* this.complete(prompt, this.forceToolCall(opts));
+      return;
+    }
+    const slots: number[] = [];
+    for (const img of images) slots.push(await this.imageSlot(img));
+    yield* this.decodeIds(this.withImages(prompt, slots), this.forceToolCall(opts));
+  }
+
+  /**
+   * Prompt ids with each image's tokens in place, as Gemma 3's processor expands them: every
+   * <start_of_image> the template wrote becomes "\n\n<start_of_image>", the image's 256 soft tokens
+   * and "<end_of_image>\n\n". The soft tokens get ids vocabSize + slot · 256 + i, which the embedding
+   * reads from the image features (and which differ between images, so cached prefixes never mix them).
+   */
+  private withImages(prompt: string, slots: readonly number[]): number[] {
+    const boi = "<start_of_image>";
+    const parts = prompt.split(boi);
+    if (parts.length - 1 !== slots.length) throw new Error(`the chat template wrote ${parts.length - 1} image markers for ${slots.length} images`);
+    const boiId = this.tokenizer.tokenId(boi)!;
+    const ids = this.tokenizer.encode(parts.join(`\n\n${boi}<end_of_image>\n\n`));
+    const out: number[] = [];
+    const per = this.vision!.tokens;
+    let k = 0;
+    for (const id of ids) {
+      out.push(id);
+      if (id !== boiId) continue;
+      const base = this.model.cfg.vocabSize + slots[k++]! * per;
+      for (let i = 0; i < per; i++) out.push(base + i);
+    }
+    return out;
+  }
+
+  /**
+   * The feature slot holding this image, running the vision tower if it is not there yet (the least
+   * recently used slot is reused; cached prefixes that saw its old image are forgotten).
+   */
+  private async imageSlot(img: ImagePixels): Promise<number> {
+    const vision = this.vision!;
+    const key = imageKey(img);
+    const cap = (this.model.imageFeatures!.size / 4 / this.model.cfg.hiddenSize / vision.tokens) | 0;
+    let slot = this.imageSlots.findIndex((s) => s?.key === key);
+    if (slot < 0) {
+      slot = this.imageSlots.length < cap ? this.imageSlots.length : this.imageSlots.reduce((lru, s, i) => (s!.used < this.imageSlots[lru]!.used ? i : lru), 0);
+      if (this.imageSlots[slot]) this.forgetImage(slot);
+      this.imageSlots[slot] = { key, used: 0 };
+      await vision.encode(img, this.model.imageFeatures!, slot * vision.tokens * this.model.cfg.hiddenSize * 4);
+    }
+    this.imageSlots[slot]!.used = ++this.imageClock;
+    return slot;
+  }
+
+  /** Drops every cached prefix that holds slot's image tokens, before the slot takes another image. */
+  private forgetImage(slot: number): void {
+    const per = this.vision!.tokens;
+    const lo = this.model.cfg.vocabSize + slot * per;
+    const holds = (ids: readonly number[]) => ids.findIndex((id) => id >= lo && id < lo + per);
+    const at = holds(this.cached);
+    if (at >= 0) this.cached = this.cached.slice(0, at);
+    this.prefixes.dropIf((tokens) => holds(tokens) >= 0);
   }
 
   /** `opts` with `toolChoice` turned into a `tool_call` format. */
@@ -201,7 +294,11 @@ export class Engine {
   }
 
   async *complete(prompt: string, opts: GenerateOptions = {}): AsyncGenerator<TextDelta> {
-    const ids = this.tokenizer.encode(prompt);
+    yield* this.decodeIds(this.tokenizer.encode(prompt), opts);
+  }
+
+  /** Generates from prompt ids, yielding text as it decodes. */
+  private async *decodeIds(ids: readonly number[], opts: GenerateOptions): AsyncGenerator<TextDelta> {
     const decoder = this.tokenizer.decoder();
     for await (const id of this.generateTokens(ids, opts)) {
       const text = decoder.push(id);
@@ -259,6 +356,9 @@ export class Engine {
       this.written = saved.entry.written;
       start = saved.length;
     }
+    // An image's tokens attend to each other both ways, so each image is prefilled whole, in one chunk.
+    const spans = imageSpans(promptIds, this.model.cfg.vocabSize);
+    for (const [lo, hi] of spans) if (start > lo && start < hi) start = lo;
     this.cached = [];
     const stats: GenerateStats = { promptTokens: promptIds.length, cachedTokens: start, generatedTokens: 0, prefillMs: 0, decodeMs: 0, ttftMs: 0 };
     this.submits = 0;
@@ -280,17 +380,27 @@ export class Engine {
       let out = this.plan(1).out;
       let prefillUnits = 0;
       while (pos < promptIds.length) {
-        const remaining = promptIds.length - pos;
-        const top = BUCKETS[BUCKETS.length - 1]!;
-        // Padding rows are nearly free on a GPU, which reuses a few plan sizes, but cost their full
-        // work on the CPU, which builds a plan of the exact size instead.
-        const T = this.backend.name === "cpu" ? Math.min(remaining, top) : (BUCKETS.find((b) => b >= remaining) ?? top);
-        const n = Math.min(T, remaining);
+        const span = spans.find(([, hi]) => hi > pos);
+        let T: number;
+        let n: number;
+        let bidi: { spanLo?: number; spanHi?: number } = {};
+        if (span && pos >= span[0]) {
+          // One image: exactly its tokens, attending to each other in both directions.
+          T = n = span[1] - pos;
+          bidi = { spanLo: span[0], spanHi: span[1] };
+        } else {
+          const remaining = (span ? span[0] : promptIds.length) - pos;
+          const top = BUCKETS[BUCKETS.length - 1]!;
+          // Padding rows are nearly free on a GPU, which reuses a few plan sizes, but cost their full
+          // work on the CPU, which builds a plan of the exact size instead.
+          T = this.backend.name === "cpu" ? Math.min(remaining, top) : (BUCKETS.find((b) => b >= remaining) ?? top);
+          n = Math.min(T, remaining);
+        }
         const plan = this.plan(T);
         const tokens = new Uint32Array(T);
         tokens.set(promptIds.slice(pos, pos + n));
         this.backend.write(plan.tokens, 0, tokens);
-        this.model.setStep({ pos0: pos, lastRow: n - 1, seed, temperature, ...sampling });
+        this.model.setStep({ pos0: pos, lastRow: n - 1, seed, temperature, ...sampling, ...bidi });
         // Only the last chunk's logits are read; earlier chunks skip the output head.
         prefillUnits += this.submit(pos + n < promptIds.length ? plan.body : plan.dispatches, T);
         pos += n;

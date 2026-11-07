@@ -47,7 +47,7 @@ export function attentionRef(
   q: Float32Array,
   kc: Float32Array,
   vc: Float32Array,
-  s: { T: number; H: number; Hkv: number; D: number; pos0: number; scale?: number; window?: number },
+  s: { T: number; H: number; Hkv: number; D: number; pos0: number; scale?: number; window?: number; span?: [number, number] },
 ): Float32Array {
   const { T, H, Hkv, D, pos0 } = s;
   const scale = s.scale ?? 1 / Math.sqrt(D);
@@ -56,7 +56,9 @@ export function attentionRef(
   for (let t = 0; t < T; t++)
     for (let h = 0; h < H; h++) {
       const kvh = Math.floor(h / group);
-      const n = pos0 + t + 1;
+      const pos = pos0 + t;
+      // Causal, or the whole span for a query inside a bidirectional span.
+      const n = s.span && pos >= s.span[0] && pos < s.span[1] ? s.span[1] : pos + 1;
       // Keys lo…n-1: all of them, or the last `window` (HF masks q - k >= window).
       const lo = s.window ? Math.max(0, n - s.window) : 0;
       const scores = new Float64Array(n);

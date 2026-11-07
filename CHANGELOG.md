@@ -6,11 +6,15 @@ First release of `kiln-webgpu`: LLM inference in the browser on WebGPU, loading 
 safetensors and GGUF files directly.
 
 **Models.** Llama (including Llama 3 rope scaling), Mistral, Qwen2, Qwen3, SmolLM, Granite 3 and 4
-(350M to 2B; for Granite 4, the attention-only models) and Gemma 3 (270M to 4B and larger, text
-only), from safetensors (F32/F16/BF16) or GGUF
+(350M to 2B; for Granite 4, the attention-only models) and Gemma 3 (270M to 4B and larger; images
+with the GGUF mmproj), from safetensors (F32/F16/BF16) or GGUF
 (F32/F16/BF16/Q4_0/Q4_1/Q5_0/Q5_1/Q8_0/Q4_K/Q5_K/Q6_K). Weights are held as q4, q8 or f32; the
 default `quant: "auto"` keeps each GGUF tensor at its own precision, every type but Q6_K exactly
 (affine q4/q8 planes for Q4_1, Q4_K, Q5_1 and Q5_K).
+
+**Images.** Gemma 3 4B and larger take images with llama.cpp's mmproj file (`load(id, { mmproj })`,
+then `{ type: "image", image }` message parts): SigLIP vision tower, 4 × 4 pooling projector, and
+bidirectional attention among each image's 256 tokens.
 
 **API.** `load(id)` runs the model in a module worker; `chat` and `complete` return async iterators
 of text, with `stats` (timings, token counts, `stopReason`). The model's own Jinja chat template,
@@ -32,8 +36,8 @@ calls queue.
 versions of every kernel; slow, for small models. `info.backend` reports which backend runs.
 
 **Context.** The default context is the model's trained context, up to 8192 tokens and 512 MiB of
-KV cache; sliding-window layers keep a ring of window + 128 slots, so Gemma 3 4B gets 8192 tokens in
-290 MB. Prompts that do not fit say how to make room.
+KV cache; sliding-window layers keep a ring of window + 256 slots, so Gemma 3 4B gets 8192 tokens in
+305 MiB. Prompts that do not fit say how to make room.
 
 **Speed** (Gemma 3 4B Q4_0). Intel Iris Plus 650: about 5.5 tok/s decode, a 1,138-token prompt in
 66 s, a cached load in about 10 s. Apple M3: 24.6 tok/s decode, about 179 tok/s prefill, a cached
@@ -41,5 +45,5 @@ load in 2.4 s. Decode uses a block-per-lane GEMV with several rows per thread on
 prefill a tiled GEMM and tiled attention, and GPU work is cut into short submits so the page stays
 responsive.
 
-**Checks.** 138 unit tests; a kernel check page (785 checks on the Intel GPU) compares every kernel with a CPU reference; Gemma 3 1B matches a NumPy reference token for
+**Checks.** 139 unit tests; a kernel check page (802 checks on the Intel GPU) compares every kernel with a CPU reference; Gemma 3 1B matches a NumPy reference token for
 token in q8 and q4.

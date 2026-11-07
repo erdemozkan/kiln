@@ -1,4 +1,4 @@
-import { ActivationPool, Ctx, byteSize, isBlockQuant, packStep, q4ScaleBytes, view, type Backend, type Buf, type Dispatch, type StepParams, type Tensor } from "@kiln/core";
+import { ActivationPool, Ctx, STEP_BYTES, byteSize, isBlockQuant, packStep, q4ScaleBytes, view, type Backend, type Buf, type Dispatch, type StepParams, type Tensor } from "@kiln/core";
 import { ATTN_WG, ops, type KvDtype } from "@kiln/kernels";
 import { ropeInvFreq, type LlamaConfig } from "./config";
 
@@ -29,6 +29,11 @@ export interface LlamaOptions {
    * object chooses each (missing parts default to true).
    */
   fuse?: boolean | { qkv?: boolean; mlp?: boolean };
+  /**
+   * Rows of image features to hold (Gemma 3 with its vision tower): token ids from vocabSize on read
+   * row id - vocabSize of `imageFeatures` instead of the embedding table. Default 0.
+   */
+  imageTokens?: number;
 }
 
 export class MissingWeightError extends Error {}
@@ -39,9 +44,10 @@ export const MAX_DEFAULT_SEQ = 8192;
 
 /**
  * Rows a sliding layer's ring holds beyond its window: keys written ahead of the oldest one a query
- * still needs, up to the largest prefill chunk (128) or verify pass (MAX_VERIFY_ROWS).
+ * still needs, up to the largest prefill chunk: 128 rows of text, or one image's 256 tokens, which
+ * are prefilled together for their bidirectional attention.
  */
-export const RING_SLACK = 128;
+export const RING_SLACK = 256;
 
 /**
  * Cache slots of layer l: maxSeq for full layers; for sliding layers a ring of window + RING_SLACK
@@ -63,7 +69,7 @@ export function kvCacheBytes(cfg: LlamaConfig, maxSeq: number, kvDtype: KvDtype 
 /**
  * Default context length: the model's trained context, at most MAX_DEFAULT_SEQ tokens, and no more
  * than fits KV_BUDGET_BYTES of cache (in multiples of 256, never under 2048 unless the model's own
- * context is shorter). Sliding layers count as their rings: Gemma 3 4B takes 305 MB at 8192 tokens,
+ * context is shorter). Sliding layers count as their rings: Gemma 3 4B takes 320 MB at 8192 tokens,
  * where a full cache per layer would take 1.1 GB.
  */
 export function defaultMaxSeq(cfg: LlamaConfig, kvDtype: KvDtype = "f16"): number {
@@ -101,6 +107,8 @@ export class LlamaModel {
   private readonly fusedQkv: boolean;
   /** gate/up stacked into one `gate_up` weight, consumed by the SiLU-gated matmul. */
   private readonly fusedMlp: boolean;
+  /** Image features [imageTokens, hidden], when the model takes images (see `LlamaOptions.imageTokens`). */
+  readonly imageFeatures: Buf | undefined;
 
   constructor(
     readonly backend: Backend,
@@ -109,9 +117,10 @@ export class LlamaModel {
     opts: LlamaOptions = {},
   ) {
     this.kvDtype = opts.kvDtype ?? "f16";
+    this.imageFeatures = opts.imageTokens ? backend.alloc(opts.imageTokens * cfg.hiddenSize * 4, "storage", "image/features") : undefined;
     this.maxSeq = opts.maxSeq ?? defaultMaxSeq(cfg, this.kvDtype);
     const kvBytes = this.kvDtype === "f16" ? 2 : 4;
-    this.step = backend.alloc(32, "storage", "step");
+    this.step = backend.alloc(STEP_BYTES, "storage", "step");
     this.history = backend.alloc(this.maxSeq * 4, "storage", "history");
     this.seen = backend.alloc(Math.ceil(cfg.vocabSize / 32) * 4, "storage", "seen");
     this.allowed = backend.alloc((1 + Math.ceil(cfg.vocabSize / 32)) * 4, "storage", "allowed");
@@ -336,7 +345,8 @@ export class LlamaModel {
     const gelu = c.activation === "gelu";
     const norm = (t: Tensor, name: string) => ops.rmsnorm(ctx, t, this.w(name), c.rmsEps);
 
-    const x = ops.embed(ctx, this.w("model.embed_tokens.weight"), tokens, T, c.embedScale ?? 1);
+    const features = this.imageFeatures && { buf: this.imageFeatures, vocab: c.vocabSize };
+    const x = ops.embed(ctx, this.w("model.embed_tokens.weight"), tokens, T, c.embedScale ?? 1, features);
     for (let l = 0; l < c.numLayers; l++) {
       const p = `model.layers.${l}`;
       const { k: kc, v: vc } = this.kv[l]!;
@@ -422,6 +432,7 @@ export class LlamaModel {
       if (t.scales) this.backend.free(t.scales);
       if (t.mins) this.backend.free(t.mins);
     }
+    if (this.imageFeatures) this.backend.free(this.imageFeatures);
     this.backend.free(this.invFreq.buf);
     if (this.localInvFreq !== this.invFreq) this.backend.free(this.localInvFreq.buf);
     this.backend.free(this.step);

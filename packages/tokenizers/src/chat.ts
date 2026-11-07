@@ -1,9 +1,13 @@
 import { Template, TemplateError } from "./jinja";
 import type { Tokenizer } from "./tokenizer";
 
+/** A piece of a message: text, or an image (for models that take images, such as Gemma 3 with its vision tower). */
+export type ContentPart = { type: "text"; text: string } | { type: "image"; image: unknown };
+
 export interface ChatMessage {
   role: "system" | "user" | "assistant" | "tool";
-  content: string;
+  /** Text, or a list of text and image parts (images where the model takes them). */
+  content: string | ContentPart[];
   /** Calls the assistant made in this turn (as `parseToolCalls` returns them). */
   tool_calls?: ToolCall[];
   /** For a `tool` message: the id of the call it answers (Mistral templates require one). */
@@ -56,12 +60,17 @@ function plainOnly(name: string, messages: readonly ChatMessage[], opts: RenderO
   }
 }
 
+/** A message's text: the string, or its text parts joined (image parts have no text). */
+export function textOf(content: ChatMessage["content"]): string {
+  return typeof content === "string" ? content : content.map((p) => (p.type === "text" ? p.text : "")).join("");
+}
+
 export const chatml: ChatFormat = {
   name: "chatml",
   stop: ["<|im_end|>", "<|endoftext|>"],
   render(messages, opts = {}) {
     plainOnly("chatml", messages, opts);
-    let s = messages.map((m) => `<|im_start|>${m.role}\n${m.content}<|im_end|>\n`).join("");
+    let s = messages.map((m) => `<|im_start|>${m.role}\n${textOf(m.content)}<|im_end|>\n`).join("");
     s += "<|im_start|>assistant\n";
     if (opts.enableThinking === false) s += "<think>\n\n</think>\n\n";
     return s;
@@ -74,7 +83,7 @@ export const llama3: ChatFormat = {
   render(messages, opts = {}) {
     plainOnly("llama3", messages, opts);
     let s = "<|begin_of_text|>";
-    for (const m of messages) s += `<|start_header_id|>${m.role}<|end_header_id|>\n\n${m.content.trim()}<|eot_id|>`;
+    for (const m of messages) s += `<|start_header_id|>${m.role}<|end_header_id|>\n\n${textOf(m.content).trim()}<|eot_id|>`;
     return s + "<|start_header_id|>assistant<|end_header_id|>\n\n";
   },
 };
