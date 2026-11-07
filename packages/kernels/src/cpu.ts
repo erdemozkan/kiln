@@ -420,6 +420,37 @@ export function cpuAttention(f16: boolean): CpuKernel {
     const scale = b[0]!.f32[5]!;
     const [win, cap] = [u[7]!, u[8]!];
     const { pos0, spanLo, spanHi } = step(b[1]!);
+    const heap = (b[2] as HeapView).heap;
+    if (heap && D % (f16 ? 8 : 4) === 0) {
+      // The per-key work in WASM SIMD, on the caches in place; masking and the softmax stay here.
+      const at = heap.scratch((2 * D + maxSeq) * 4); // before any view: growing detaches them
+      const k = heap.kernels;
+      const eb = f16 ? 2 : 4;
+      const stride = Hkv * D * eb;
+      const [kp, vp] = [(b[3] as HeapView).ptr, (b[4] as HeapView).ptr];
+      const scoresFn = f16 ? k.att_scores_f16 : k.att_scores_f32;
+      const wsumFn = f16 ? k.att_wsum_f16 : k.att_wsum_f32;
+      const mem = new Float32Array(heap.buffer);
+      const q = b[2]!.f32;
+      const o = b[5]!.f32;
+      const qs = at, acc = at + D * 4, sc = at + 2 * D * 4;
+      const [qi, ai, si] = [qs >>> 2, acc >>> 2, sc >>> 2];
+      for (let t = 0; t < T; t++)
+        for (let h = 0; h < H; h++) {
+          const kvh = Math.floor(h / (H / Hkv));
+          const pos = pos0 + t;
+          const n = Math.min(pos >= spanLo && pos < spanHi ? spanHi : pos + 1, maxSeq);
+          const first = win > 0 && n > win ? n - win : 0;
+          const qo = (t * H + h) * D;
+          for (let i = 0; i < D; i++) mem[qi + i] = q[qo + i]! * scale;
+          const mx = scoresFn(qs, kp + kvh * D * eb, stride, cap, first, n, D, sc);
+          let l = 0;
+          for (let j = si + first, end = si + n; j < end; j++) l += mem[j] = Math.exp(mem[j]! - mx);
+          wsumFn(sc, vp + kvh * D * eb, stride, cap, first, n, D, acc);
+          for (let i = 0; i < D; i++) o[qo + i] = mem[ai + i]! / l;
+        }
+      return;
+    }
     const q = b[2]!.f32;
     // Views taken once: a heap buffer's view getter is too slow for the inner loops.
     const [ku, kf, vu, vf] = [b[3]!.u32, b[3]!.f32, b[4]!.u32, b[4]!.f32];

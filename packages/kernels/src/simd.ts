@@ -5,6 +5,12 @@ export interface SimdKernels {
   gemv_f32(x: number, w: number, K: number, N: number, y: number): void;
   gemv_q8(x: number, q: number, s: number, mn: number, xsum: number, K: number, N: number, y: number): void;
   gemv_q4(x: number, q: number, s: number, mn: number, xsum: number, K: number, N: number, y: number): void;
+  /** out[j] = q · K_j for keys j in [first, n), key j at k + (j mod cap) · stride bytes; returns the largest. */
+  att_scores_f32(q: number, k: number, stride: number, cap: number, first: number, n: number, D: number, out: number): number;
+  att_scores_f16(q: number, k: number, stride: number, cap: number, first: number, n: number, D: number, out: number): number;
+  /** acc = Σ_j p[j] · V_j over the same keys. */
+  att_wsum_f32(p: number, v: number, stride: number, cap: number, first: number, n: number, D: number, acc: number): void;
+  att_wsum_f16(p: number, v: number, stride: number, cap: number, first: number, n: number, D: number, acc: number): void;
 }
 
 /** Which gemv a threaded job runs. */
