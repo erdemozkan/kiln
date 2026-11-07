@@ -149,3 +149,26 @@ describe("spanTile", () => {
     expect(spanTile(512, 16384)).toBeUndefined();
   });
 });
+
+describe("CPU profiling", () => {
+  it("times each kernel by label until stopProfile", async () => {
+    const be = new CpuBackend();
+    const step = be.alloc(STEP_BYTES);
+    be.write(step, 0, packStep({ pos0: 0, lastRow: 0, seed: 1, temperature: 0 }));
+    const x = be.alloc(64 * 4);
+    const w = be.alloc(64 * 4);
+    const ctx = new Ctx(be, step, "prof");
+    const t: Tensor = { shape: [1, 64], dtype: "f32", buf: x };
+    ops.rmsnorm(ctx, t, { shape: [64], dtype: "f32", buf: w }, 1e-6);
+    ops.rmsnorm(ctx, t, { shape: [64], dtype: "f32", buf: w }, 1e-6);
+    be.submit(ctx.dispatches);
+    be.startProfile();
+    be.submit(ctx.dispatches);
+    be.submit(ctx.dispatches);
+    const p = await be.stopProfile();
+    expect(p.entries).toHaveLength(1);
+    expect(p.entries[0]!.calls).toBe(4);
+    expect(p.totalMs).toBeCloseTo(p.entries[0]!.ms);
+    await expect(be.stopProfile()).rejects.toThrow();
+  });
+});

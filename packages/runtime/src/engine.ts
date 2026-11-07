@@ -1,4 +1,4 @@
-import type { Backend, Buf, Dispatch } from "@kiln/core";
+import type { Backend, Buf, Dispatch, Profile } from "@kiln/core";
 import { GrammarMatcher, TokenTrie, compileFormat, type ResponseFormat } from "@kiln/grammar";
 import { LlamaModel, MAX_VERIFY_ROWS, type ForwardPlan, type ImagePixels, type VisionTower } from "@kiln/models";
 import { detectChatFormat, type ChatDocument, type ChatFormat, type ChatMessage, type Tokenizer, type ToolSpec } from "@kiln/tokenizers";
@@ -761,6 +761,18 @@ export class Engine {
     const n = this.cached.length;
     if (n < MIN_SAVED_TOKENS || this.prefixes.budget <= 0) return;
     this.prefixes.add(this.cached, this.written, this.model.kvSnapshotBytes(n), () => this.model.saveKv(n));
+  }
+
+  /** Start timing every kernel the engine runs (GPU timestamps on WebGPU, wall clock on the CPU). */
+  startProfile(): void {
+    if (!this.backend.startProfile) throw new Error(`[kiln] the ${this.backend.name} backend cannot profile`);
+    this.backend.startProfile();
+  }
+
+  /** Stop timing; time per kernel and shape since `startProfile`, most expensive first. */
+  async stopProfile(): Promise<Profile> {
+    if (!this.backend.stopProfile) throw new Error(`[kiln] the ${this.backend.name} backend cannot profile`);
+    return this.backend.stopProfile();
   }
 
   destroy(): void {

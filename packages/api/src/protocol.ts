@@ -1,3 +1,4 @@
+import type { Profile } from "@kiln/core";
 import type { GenerateOptions, GenerateStats, LoadProgress, Quant } from "@kiln/runtime";
 import type { ChatMessage } from "@kiln/tokenizers";
 
@@ -59,6 +60,7 @@ export type Request =
   | { id: number; type: "chat"; messages: ChatMessage[]; opts: WireGenerateOptions }
   | { id: number; type: "complete"; prompt: string; opts: WireGenerateOptions }
   | { id: number; type: "abort"; target: number }
+  | { id: number; type: "profile"; on: boolean }
   | { id: number; type: "unload" };
 
 export type Response =
@@ -66,4 +68,5 @@ export type Response =
   | { id: number; type: "loaded"; info: ModelInfo }
   | { id: number; type: "delta"; text: string }
   | { id: number; type: "done"; stats: GenerateStats | undefined }
+  | { id: number; type: "profiled"; profile: Profile | undefined }
   | { id: number; type: "error"; message: string };

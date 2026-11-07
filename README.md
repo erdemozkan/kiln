@@ -127,6 +127,13 @@ Key ideas:
   attention takes 0.88 s, against 2.76 s with the tiled prefill kernel (2.05 s at its best tile), and
   an image encodes in about 46 s instead of 90; the features are unchanged (cosine 0.9998 to the
   reference). Eight rows per thread was slower (about 4 s: its registers spill on this GPU).
+- **A profiler.** `await llm.startProfile()`, any calls, then `await llm.stopProfile()` gives the
+  time per kernel and shape (`gemm/q4 3072x576`, `attention/split/f16`, ...), most expensive first.
+  On WebGPU each dispatch runs in a compute pass of its own with timestamp queries (the device must
+  offer `timestamp-query`); on the CPU backend each kernel is timed with the wall clock. The bench
+  page (`/bench.html`) shows one for an uncached call. SmolLM2-135M on the Intel Mac, a 39-token
+  prompt and 32 tokens: 601 ms of GPU time, led by the fused MLP GEMV (137 ms over 930 calls) and
+  decode attention (110 ms); on the CPU backend 3.4 s, led by attention in TypeScript (875 ms).
 - **A CPU fallback.** Every kernel the models use also exists in TypeScript, attached to its WGSL spec
   with the same bindings and uniform layout, and a `CpuBackend` runs them on the model's worker
   thread. `load` uses it when the browser has no WebGPU or no adapter (`device: "auto"`, the

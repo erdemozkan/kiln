@@ -1,5 +1,5 @@
 import type { WebGPUBackend } from "@kiln/backend-webgpu";
-import { Ctx, type Dispatch, type Tensor } from "@kiln/core";
+import { Ctx, type Dispatch, type Profile, type Tensor } from "@kiln/core";
 import { ops } from "@kiln/kernels";
 import { createEngine } from "@kiln/runtime";
 
@@ -63,6 +63,8 @@ export interface BenchResult {
   /** The same with `whitespace: "pretty"`. */
   grammarPretty?: GrammarRun;
   e2e: { promptTokens: number; generated: number; ttftMs: number; decodeTokS: number; text: string };
+  /** GPU time per kernel over one uncached call (timestamp queries; the top 25 labels). */
+  profile?: Profile & { promptTokens: number; generated: number };
 }
 
 const scope = self as unknown as {
@@ -247,6 +249,15 @@ scope.onmessage = async (e) => {
         text: text.slice(0, 300),
       },
     };
+    if (be.limits.features.has("timestamp-query")) {
+      // Where one call's GPU time goes: the story as a prompt, without the cache, and 32 greedy tokens.
+      const prompt = [...ids, ...base!];
+      engine.startProfile();
+      let generated = 0;
+      for await (const _ of engine.generateTokens(prompt, { temperature: 0, maxTokens: 32, stopTokenIds: [], reuseCache: false })) generated++;
+      const p = await engine.stopProfile();
+      result.profile = { ...p, entries: p.entries.slice(0, 25), promptTokens: prompt.length, generated };
+    }
     if (be.limits.subgroupMinSize) {
       const step = async (on: boolean) => {
         ops.setSubgroups(on);

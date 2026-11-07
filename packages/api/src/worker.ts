@@ -126,6 +126,18 @@ scope.onmessage = async (e: MessageEvent<Request>) => {
       case "abort":
         aborts.get(msg.target)?.abort();
         break;
+      case "profile": {
+        if (!engine) throw new Error("no model loaded");
+        if (msg.on) {
+          engine.startProfile();
+          post({ id: msg.id, type: "profiled", profile: undefined });
+        } else {
+          // After the calls already queued, so their kernels are counted.
+          await queue;
+          post({ id: msg.id, type: "profiled", profile: await engine.stopProfile() });
+        }
+        break;
+      }
       case "unload":
         await queue;
         await saving;

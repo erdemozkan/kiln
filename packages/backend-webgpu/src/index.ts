@@ -1,6 +1,7 @@
 import {
   physical,
   roundUp,
+  summarizeProfile,
   type Backend,
   type Binding,
   type Buf,
@@ -9,7 +10,11 @@ import {
   type Dispatch,
   type KernelSpec,
   type Pipeline,
+  type Profile,
 } from "@kiln/core";
+
+/** Timestamp queries per query set (WebGPU allows at most 4096). */
+const PROFILE_QUERIES = 4096;
 
 class GPUBuf implements Buf {
   constructor(
@@ -74,6 +79,8 @@ export class WebGPUBackend implements Backend {
 
   private readonly pipelines = new Map<string, GPUPipe>();
   private readonly staging = new Map<number, GPUBuffer[]>();
+  /** While profiling: the timings read so far and the reads still in flight. */
+  private profiling: { samples: { label: string; ms: number }[]; pending: Promise<void>[] } | undefined;
 
   constructor(
     readonly device: GPUDevice,
@@ -177,6 +184,10 @@ export class WebGPUBackend implements Backend {
 
   submit(dispatches: readonly Dispatch[]): void {
     this.checkAlive();
+    if (this.profiling) {
+      for (let i = 0; i < dispatches.length; i += PROFILE_QUERIES / 2) this.submitTimed(dispatches.slice(i, i + PROFILE_QUERIES / 2));
+      return;
+    }
     const enc = this.device.createCommandEncoder();
     const pass = enc.beginComputePass();
     let current: GPUPipe | undefined;
@@ -191,6 +202,55 @@ export class WebGPUBackend implements Backend {
     }
     pass.end();
     this.device.queue.submit([enc.finish()]);
+  }
+
+  /**
+   * Times every dispatch until `stopProfile`, with timestamp queries: each dispatch runs in a compute
+   * pass of its own, which adds a little overhead per dispatch. Browsers may coarsen timestamps (Chrome
+   * can round them to 100 µs), so one short dispatch is imprecise; totals over many calls are not.
+   */
+  startProfile(): void {
+    if (!this.limits.features.has("timestamp-query")) throw new Error("[kiln] profiling needs the timestamp-query feature, which this device does not offer");
+    this.profiling = { samples: [], pending: [] };
+  }
+
+  async stopProfile(): Promise<Profile> {
+    const p = this.profiling;
+    if (!p) throw new Error("[kiln] stopProfile without startProfile");
+    this.profiling = undefined;
+    await Promise.all(p.pending);
+    return summarizeProfile(p.samples, "GPU time per dispatch from timestamp queries (each dispatch in its own pass; a single short dispatch may be imprecise, totals over many calls are reliable)");
+  }
+
+  private submitTimed(dispatches: readonly Dispatch[]): void {
+    const p = this.profiling!;
+    const n = dispatches.length * 2;
+    const querySet = this.device.createQuerySet({ type: "timestamp", count: n, label: "profile" });
+    const resolve = this.device.createBuffer({ size: n * 8, usage: GPUBufferUsage.QUERY_RESOLVE | GPUBufferUsage.COPY_SRC, label: "profile" });
+    const read = this.device.createBuffer({ size: n * 8, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST, label: "profile" });
+    const enc = this.device.createCommandEncoder();
+    dispatches.forEach((d, i) => {
+      const b = d.binding as GPUBinding;
+      const pass = enc.beginComputePass({ timestampWrites: { querySet, beginningOfPassWriteIndex: 2 * i, endOfPassWriteIndex: 2 * i + 1 } });
+      pass.setPipeline(b.pipeline.gpu);
+      pass.setBindGroup(0, b.group);
+      pass.dispatchWorkgroups(d.grid[0], d.grid[1], d.grid[2]);
+      pass.end();
+    });
+    enc.resolveQuerySet(querySet, 0, n, resolve, 0);
+    enc.copyBufferToBuffer(resolve, 0, read, 0, n * 8);
+    this.device.queue.submit([enc.finish()]);
+    const labels = dispatches.map((d) => d.label);
+    p.pending.push(
+      read.mapAsync(GPUMapMode.READ).then(() => {
+        const t = new BigUint64Array(read.getMappedRange());
+        labels.forEach((label, i) => p.samples.push({ label, ms: t[2 * i + 1]! > t[2 * i]! ? Number(t[2 * i + 1]! - t[2 * i]!) / 1e6 : 0 }));
+        read.unmap();
+        read.destroy();
+        resolve.destroy();
+        querySet.destroy();
+      }),
+    );
   }
 
   async readback(buf: Buf, offset: number, bytes: number): Promise<ArrayBuffer> {

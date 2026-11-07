@@ -77,7 +77,41 @@ export interface Backend {
   submit(dispatches: readonly Dispatch[]): void;
   /** Enqueues the copy immediately (queue order) and resolves once the bytes are on the CPU. */
   readback(buf: Buf, offset: number, bytes: number): Promise<ArrayBuffer>;
+  /** Start timing every dispatch (where supported; see `Profile`). */
+  startProfile?(): void;
+  /** Stop timing and report what ran since `startProfile`. */
+  stopProfile?(): Promise<Profile>;
   destroy(): void;
+}
+
+/** Time spent in one dispatch label (a kernel and its shape) over a profiling window. */
+export interface ProfileEntry {
+  label: string;
+  calls: number;
+  ms: number;
+}
+
+/** Per-label totals, most expensive first. */
+export interface Profile {
+  /** Sum of every entry's time. */
+  totalMs: number;
+  entries: ProfileEntry[];
+  /** How the times were taken and what limits their precision. */
+  note: string;
+}
+
+/** Totals per label from individual timings. */
+export function summarizeProfile(samples: readonly { label: string; ms: number }[], note: string): Profile {
+  const by = new Map<string, ProfileEntry>();
+  let totalMs = 0;
+  for (const { label, ms } of samples) {
+    const e = by.get(label) ?? { label, calls: 0, ms: 0 };
+    e.calls++;
+    e.ms += ms;
+    totalMs += ms;
+    by.set(label, e);
+  }
+  return { totalMs, entries: [...by.values()].sort((a, b) => b.ms - a.ms), note };
 }
 
 export const roundUp = (n: number, multiple: number): number => Math.ceil(n / multiple) * multiple;

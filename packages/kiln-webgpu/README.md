@@ -39,6 +39,11 @@ Each stream's `stats` resolve when it ends, with token counts, timings and `stop
 (end of turn), `"maxTokens"`, `"context"` (the reply filled the context), `"format"` (the structured
 value is complete) or `"abort"`.
 
+To see where time goes, `await llm.startProfile()`, make calls, then `await llm.stopProfile()`: time
+per kernel and shape, most expensive first (GPU timestamp queries where the device offers
+`timestamp-query`, wall clock on the CPU fallback). Each GPU dispatch then runs in a pass of its own,
+which costs a little, so profile only when looking.
+
 Weights are cached in the browser (OPFS) as they download, so later loads skip the network, and an
 interrupted download resumes. `listCache()` reports what is cached and `clearCache()` deletes it.
 `load` asks the browser to keep the cache (`navigator.storage.persist()`) so it survives low disk

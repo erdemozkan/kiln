@@ -23,7 +23,8 @@ tools and documents, parsed tool calls (`<tool_call>`, Mistral's `[TOOL_CALLS]`,
 `<|tool_call|>`) and `toolChoice`. Structured output: JSON, JSON Schema (with
 `pattern`, common `format`s, numeric bounds and `multipleOf`), regular expressions, GBNF grammars or a fixed choice,
 enforced by a grammar mask at every token. Draft tokens (speculative decoding by
-prompt lookup) on by default, also under a grammar.
+prompt lookup) on by default, also under a grammar. `startProfile` / `stopProfile` report the time
+per kernel and shape (GPU timestamp queries on WebGPU, wall clock on the CPU).
 
 **Loading.** Weights stream into GPU buffers without holding the model in CPU memory. The download is
 the cache: files land in OPFS as 1 GiB segments, interrupted downloads resume, dropped connections

@@ -1,5 +1,5 @@
 import { WasmHeap } from "./simd";
-import { physical, type Backend, type Binding, type Buf, type BufUsage, type CpuKernel, type CpuView, type DeviceLimits, type Dispatch, type KernelSpec, type Pipeline } from "@kiln/core";
+import { physical, summarizeProfile, type Backend, type Binding, type Buf, type BufUsage, type CpuKernel, type CpuView, type DeviceLimits, type Dispatch, type KernelSpec, type Pipeline, type Profile } from "@kiln/core";
 
 /**
  * A buffer of the CPU backend, with the views kernels read it through: a region of the backend's
@@ -127,10 +127,27 @@ export class CpuBackend implements Backend {
   }
 
   submit(dispatches: readonly Dispatch[]): void {
+    const prof = this.profiling;
     for (const d of dispatches) {
       const b = d.binding as CpuBinding;
+      const t0 = prof ? performance.now() : 0;
       b.pipeline.run(b.bufs, d.grid);
+      if (prof) prof.push({ label: d.label, ms: performance.now() - t0 });
     }
+  }
+
+  private profiling: { label: string; ms: number }[] | undefined;
+
+  /** Times every kernel until `stopProfile` (wall clock around each one). */
+  startProfile(): void {
+    this.profiling = [];
+  }
+
+  async stopProfile(): Promise<Profile> {
+    const samples = this.profiling;
+    if (!samples) throw new Error("[kiln] stopProfile without startProfile");
+    this.profiling = undefined;
+    return summarizeProfile(samples, "wall-clock time per kernel on the CPU backend");
   }
 
   async readback(buf: Buf, offset: number, bytes: number): Promise<ArrayBuffer> {

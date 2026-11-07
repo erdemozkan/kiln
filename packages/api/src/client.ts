@@ -1,3 +1,4 @@
+import type { Profile } from "@kiln/core";
 import type { GenerateStats, LoadProgress } from "@kiln/runtime";
 import type { ChatMessage } from "@kiln/tokenizers";
 import type { ModelInfo, Request, Response, WireGenerateOptions, WireLoadOptions } from "./protocol";
@@ -82,6 +83,30 @@ export class KilnModel {
   complete(prompt: string, opts: GenerateOptions = {}): TextStream {
     const { signal, ...wire } = opts;
     return this.stream({ type: "complete", prompt, opts: wire }, signal);
+  }
+
+  /**
+   * Start timing every kernel the model runs: GPU time per dispatch from timestamp queries on WebGPU
+   * (where the device offers them), wall clock on the CPU backend. For finding where time goes, not for
+   * normal use: each GPU dispatch then runs in a pass of its own, which costs a little extra.
+   */
+  startProfile(): Promise<void> {
+    return this.profile(true).then(() => undefined);
+  }
+
+  /** Stop timing; time per kernel and shape since `startProfile` (after calls already made finish), most expensive first. */
+  async stopProfile(): Promise<Profile> {
+    return (await this.profile(false))!;
+  }
+
+  private profile(on: boolean): Promise<Profile | undefined> {
+    return new Promise((resolve, reject) =>
+      this.send({ type: "profile", on }, (msg) => {
+        if (msg.type === "profiled") resolve(msg.profile);
+        else if (msg.type === "error") reject(new Error(msg.message));
+        return msg.type === "profiled" || msg.type === "error";
+      }),
+    );
   }
 
   async unload(): Promise<void> {

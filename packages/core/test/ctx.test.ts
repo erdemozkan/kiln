@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { ActivationPool, Ctx, f32, packStep, packUniform, u32, type Backend, type Buf, type KernelSpec, physical, STEP_BYTES } from "../src";
+import { ActivationPool, Ctx, f32, packStep, packUniform, u32, type Backend, type Buf, type KernelSpec, physical, STEP_BYTES, summarizeProfile } from "../src";
 
 function fakeBackend() {
   const allocs: Buf[] = [];
@@ -128,5 +128,14 @@ describe("Ctx", () => {
     const out = ctx.alloc([4]);
     expect(() => ctx.run(SPEC, [out.buf], [1, 1, 1])).toThrow(/expected 2 buffers/);
     expect(() => ctx.run(SPEC, [out.buf, out.buf], [70000, 1, 1])).toThrow(/exceeds/);
+  });
+});
+
+describe("summarizeProfile", () => {
+  it("totals by label, most expensive first", () => {
+    const p = summarizeProfile([{ label: "a", ms: 1 }, { label: "b", ms: 5 }, { label: "a", ms: 2 }], "n");
+    expect(p.entries).toEqual([{ label: "b", calls: 1, ms: 5 }, { label: "a", calls: 2, ms: 3 }]);
+    expect(p.totalMs).toBe(8);
+    expect(p.note).toBe("n");
   });
 });
