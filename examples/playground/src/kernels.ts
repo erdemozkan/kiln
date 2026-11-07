@@ -424,6 +424,20 @@ async function main() {
     ops.setPrefillAttention("tiled");
   }
 
+  // Span attention (`span: true`, every row sees the same keys): the register-tiled kernel on the
+  // GPU, with partial row tiles, GQA, keys before the span, and a chunk starting inside it.
+  for (const [T, H, Hkv, D, pos0, lo, hi] of [[100, 16, 16, 72, 0, 0, 100], [70, 8, 2, 64, 0, 0, 70], [33, 4, 4, 72, 100, 100, 133], [130, 4, 4, 128, 0, 0, 130], [20, 4, 2, 64, 50, 40, 70], [300, 2, 2, 72, 0, 0, 300]] as const) {
+    const maxSeq = 1024;
+    const q = randn(T * H * D);
+    const kc = randn(maxSeq * Hkv * D);
+    const vc = randn(maxSeq * Hkv * D);
+    const scale = 1 / Math.sqrt(D);
+    const want = ref.attentionRef(q, kc, vc, { T, H, Hkv, D, pos0, scale, window: 0, span: [lo, hi] });
+    let o!: Tensor;
+    await run({ ...S0, pos0, spanLo: lo, spanHi: hi }, (ctx) => (o = ops.attention(ctx, upload(q, [T, H * D]), upload(kc, [0]).buf, upload(vc, [0]).buf, { T, H, Hkv, D, maxSeq, scale, span: true })));
+    check("attention/span/flash", `T${T} H${H}/${Hkv} D${D} pos${pos0} span ${lo}-${hi}`, await download(o.buf, q.length), want, 1e-4);
+  }
+
   // Ring caches (sliding layers keep window + slack slots, key j in slot j % slots): filled from the
   // same keys as a full cache at positions far past the ring size, they must give the same output.
   for (const [T, H, Hkv, D, pos0, maxSeq, window, slots] of [[1, 4, 1, 256, 1700, 2048, 512, 640], [1, 9, 3, 64, 3001, 4096, 300, 428], [64, 4, 1, 256, 1500, 2048, 512, 640], [33, 8, 2, 128, 900, 2048, 256, 384], [5, 9, 3, 64, 3000, 4096, 300, 428]] as const) {

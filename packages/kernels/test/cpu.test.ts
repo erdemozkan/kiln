@@ -140,12 +140,12 @@ describe("WasmHeap", () => {
   });
 });
 
-describe("attentionTile", () => {
-  it("takes a preferred tile only when it fits workgroup memory", async () => {
-    const { attentionTile } = await import("../src/wgsl");
-    expect(attentionTile(72, 16384)).toMatchObject({ R: 14, BK: 28 });
-    expect(attentionTile(72, 16384, { R: 32, BK: 8 })).toEqual({ R: 32, BK: 8, TPP: 1 });
-    // 64 rows of 72 floats alone are 18 KiB: back to the default.
-    expect(attentionTile(72, 16384, { R: 64, BK: 8 })).toMatchObject({ R: 14, BK: 28 });
+describe("spanTile", () => {
+  it("takes the largest head-dim chunk that fits workgroup memory", async () => {
+    const { spanTile } = await import("../src/wgsl");
+    expect(spanTile(72, 16384)).toEqual({ RT: 4, DC: 24 });
+    expect(spanTile(64, 16384)).toEqual({ RT: 4, DC: 32 });
+    // 16 value rows of 512 floats alone are 32 KiB: no tile fits 16 KiB.
+    expect(spanTile(512, 16384)).toBeUndefined();
   });
 });

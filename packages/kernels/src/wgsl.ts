@@ -857,12 +857,10 @@ export function attentionTileBytes(D: number, R: number, BK: number): number {
  * Query rows and keys per workgroup tile in tiled prefill attention, sized to fit workgroup memory.
  * Head dim 256 (Gemma 3) takes 8 rows of 4 keys, two output rows per thread: on Gemma 3 4B's shapes
  * (128-token chunk at position 1024, Intel Gen9) 29-31 ms against 35-42 for 4 rows of 8 keys, where
- * more rows (16, 32) or more keys per block (8, 16) were slower and fewer keys (2) too. `prefer` is
- * taken when it fits.
+ * more rows (16, 32) or more keys per block (8, 16) were slower and fewer keys (2) too.
  */
-export function attentionTile(D: number, wgBytes = 16384, prefer?: { R: number; BK: number }): AttentionTile {
+export function attentionTile(D: number, wgBytes = 16384): AttentionTile {
   const tpp = (R: number, BK: number) => Math.max(1, Math.floor(256 / (R * BK)));
-  if (prefer && !tileOverride && attentionTileBytes(D, prefer.R, prefer.BK) <= wgBytes - 256) return { ...prefer, TPP: tpp(prefer.R, prefer.BK) };
   if (tileOverride) {
     if (attentionTileBytes(D, tileOverride.R, tileOverride.BK) > wgBytes - 256) throw new Error(`attention tile ${tileOverride.R}x${tileOverride.BK} does not fit ${wgBytes} bytes of workgroup memory`);
     return { ...tileOverride, TPP: tpp(tileOverride.R, tileOverride.BK) };
@@ -871,6 +869,208 @@ export function attentionTile(D: number, wgBytes = 16384, prefer?: { R: number; 
   let R = D >= 256 ? 8 : Math.min(32, Math.floor(1024 / D));
   while (R > 1 && attentionTileBytes(D, R, BK) > wgBytes - 256) R = Math.floor(R / 2);
   return { R, BK, TPP: tpp(R, BK) };
+}
+
+/** Query rows per thread (4 or 8) and head-dim chunk of span attention, sized to workgroup memory. */
+export interface SpanTile {
+  RT: 4 | 8;
+  DC: number;
+}
+
+/** Workgroup vec4s span attention needs: the S-phase Q and K chunks, or the P and V sub-tiles. */
+const spanVec4s = (D: number, t: SpanTile) => Math.max(t.DC * (2 * t.RT) + t.DC * 16, 16 * (2 * t.RT) + 16 * (D / 4), 32 * t.RT);
+
+/**
+ * 4 rows per thread and the largest head-dim chunk that fits. On the Intel Mac (D = 72, 4096 × 4096
+ * span) RT 4 took 883 ms with DC 24 and 934 with DC 12; RT 8 took about 4 s (its 32 score and up to
+ * 64 output registers per thread spill).
+ */
+export function spanTile(D: number, wgBytes = 16384): SpanTile | undefined {
+  for (const DC of [32, 24, 16, 12, 8, 4]) {
+    if (D % DC !== 0) continue;
+    const t = { RT: 4 as const, DC };
+    if (spanVec4s(D, t) * 16 <= wgBytes - 256) return t;
+  }
+  return undefined;
+}
+
+/**
+ * Attention where every query row sees the same keys (a bidirectional span: the vision tower's 4096
+ * patches), as a register-tiled GEMM with the softmax folded in, f32 cache. A 128-thread workgroup
+ * takes R = 8·RT query rows of one head and walks the keys 64 at a time:
+ *
+ *  1. Scores: thread (tm, tn) = (li / 16, li % 16) holds rows tm·RT … + RT − 1 against keys
+ *     4·tn … + 3 in registers, accumulated over head-dim chunks of DC staged in workgroup memory
+ *     (Q and K transposed so each k step is one vec4 load per 4 rows or 4 keys), as gemm does.
+ *  2. Softmax: each thread's per-row block max goes to workgroup memory (whole vec4s, rows as
+ *     components); every thread of the row group reads the 16 and takes the same running max, so the
+ *     exps (one per score, no redundancy) and each thread's partial exp-sums are consistent, and the
+ *     partial sums are added up once at the end.
+ *  3. Values: 16 keys at a time, the probabilities (rows as vec4) and the value rows are staged and
+ *     thread (tm, tn) adds them into its RT rows × vec4 columns tn, tn + 16, ….
+ *
+ * Every key slot must be its position (no ring) and no window may cut the span; ops.attention picks
+ * it only then. Against the tiled kernel this reuses every staged K and V value across 32 or 64 rows
+ * and every staged Q value across 64 keys, with far fewer barriers per key.
+ */
+export function attentionSpanSpec(D: number, tile: SpanTile): KernelSpec {
+  const { RT, DC } = tile;
+  if (D % 4 !== 0 || D % DC !== 0 || DC % 4 !== 0) throw new Error(`span attention: head dim ${D} with chunk ${DC}`);
+  const D4 = D / 4;
+  const RV = RT / 4; // vec4s of rows per thread
+  const R = 8 * RT;
+  const RQ = R / 4; // vec4s of rows per tile
+  const NS = Math.ceil(D4 / 16); // vec4 output columns per thread
+  const QT = DC * RQ;
+  const PT = 16 * RQ;
+  const SMN = spanVec4s(D, tile);
+  const unroll = (n: number, f: (i: number) => string) => Array.from({ length: n }, (_, i) => f(i)).join("\n");
+  return spec(`attention/span/f32/D${D}/RT${RT}/DC${DC}`, ["uniform", "read", "read", "read", "read", "rw"], cpu.cpuAttention(false), () => /* wgsl */ `
+${STEP_WGSL}
+${ATTN_P("_a")}
+${FIRST_KEY_WGSL}
+@group(0) @binding(0) var<uniform> p: P;
+@group(0) @binding(1) var<storage, read> st: Step;
+@group(0) @binding(2) var<storage, read> q: array<vec4<f32>>;
+@group(0) @binding(3) var<storage, read> kc: array<vec4<f32>>;
+@group(0) @binding(4) var<storage, read> vc: array<vec4<f32>>;
+@group(0) @binding(5) var<storage, read_write> o: array<vec4<f32>>;
+const D4 = ${D4}u;
+const DC = ${DC}u;
+const DC4 = ${DC / 4}u;
+const RQ = ${RQ}u;
+const QT = ${QT}u;
+const PT = ${PT}u;
+var<workgroup> sm: array<vec4<f32>, ${SMN}>;
+
+@compute @workgroup_size(128)
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) li: u32) {
+  let h = wid.y;
+  let kvh = h / (p.H / p.Hkv);
+  let r0 = wid.x * ${R}u;
+  let tm = li / 16u;
+  let tn = li % 16u;
+  let stride4 = p.Hkv * D4;
+  let ko4 = kvh * D4;
+  let hq4 = p.H * D4;
+  // Every row sees the same keys: the first row's.
+  let n = keys(st.pos0 + r0);
+  let lo = firstKey(n, p.win);
+  var m: array<f32, ${RT}>;
+  var l: array<f32, ${RT}>;
+  var acc: array<vec4<f32>, ${RT * NS}>;
+  for (var r = 0u; r < ${RT}u; r++) { m[r] = -3.0e38; }
+
+  for (var b0 = lo; b0 < n; b0 += 64u) {
+    var s: array<vec4<f32>, ${RT}>;
+    for (var c0 = 0u; c0 < D4; c0 += DC4) {
+      workgroupBarrier();
+      // Q chunk, transposed: item (row group g of 4, vec4 dq) writes the 4 dims' row vec4s.
+      for (var it = li; it < RQ * DC4; it += 128u) {
+        let g = it / DC4;
+        let dq = it % DC4;
+        var r4: array<vec4<f32>, 4>;
+        for (var c = 0u; c < 4u; c++) {
+          let row = r0 + g * 4u + c;
+          r4[c] = select(vec4<f32>(0.0), q[min(row, p.T - 1u) * hq4 + h * D4 + c0 + dq] * p.scale, row < p.T);
+        }
+        for (var e = 0u; e < 4u; e++) { sm[(dq * 4u + e) * RQ + g] = vec4<f32>(r4[0][e], r4[1][e], r4[2][e], r4[3][e]); }
+      }
+      // K chunk likewise, key groups of 4.
+      for (var it = li; it < 16u * DC4; it += 128u) {
+        let g = it / DC4;
+        let dq = it % DC4;
+        var r4: array<vec4<f32>, 4>;
+        for (var c = 0u; c < 4u; c++) {
+          let j = b0 + g * 4u + c;
+          r4[c] = select(vec4<f32>(0.0), kc[min(j, n - 1u) * stride4 + ko4 + c0 + dq], j < n);
+        }
+        for (var e = 0u; e < 4u; e++) { sm[QT + (dq * 4u + e) * 16u + g] = vec4<f32>(r4[0][e], r4[1][e], r4[2][e], r4[3][e]); }
+      }
+      workgroupBarrier();
+      for (var k = 0u; k < DC; k++) {
+        let bv = sm[QT + k * 16u + tn];
+${unroll(RV, (v) => `        let a${v} = sm[k * RQ + tm * ${RV}u + ${v}u];
+        s[${v * 4}] += a${v}.x * bv;
+        s[${v * 4 + 1}] += a${v}.y * bv;
+        s[${v * 4 + 2}] += a${v}.z * bv;
+        s[${v * 4 + 3}] += a${v}.w * bv;`)}
+      }
+    }
+    // Keys past n score nothing; each row's max over this thread's 4 keys.
+    let kb = b0 + tn * 4u;
+    var pm: array<f32, ${RT}>;
+    for (var r = 0u; r < ${RT}u; r++) {
+      for (var c = 0u; c < 4u; c++) { if (kb + c >= n) { s[r][c] = -3.0e38; } }
+      pm[r] = max(max(s[r].x, s[r].y), max(s[r].z, s[r].w));
+    }
+    workgroupBarrier();
+${unroll(RV, (v) => `    sm[(tm * ${RV}u + ${v}u) * 16u + tn] = vec4<f32>(pm[${v * 4}], pm[${v * 4 + 1}], pm[${v * 4 + 2}], pm[${v * 4 + 3}]);`)}
+    workgroupBarrier();
+    var al: array<f32, ${RT}>;
+    for (var v = 0u; v < ${RV}u; v++) {
+      var mx = vec4<f32>(-3.0e38);
+      for (var t = 0u; t < 16u; t++) { mx = max(mx, sm[(tm * ${RV}u + v) * 16u + t]); }
+      for (var e = 0u; e < 4u; e++) {
+        let r = v * 4u + e;
+        let mn = max(m[r], mx[e]);
+        al[r] = exp(m[r] - mn);
+        m[r] = mn;
+      }
+    }
+    for (var r = 0u; r < ${RT}u; r++) {
+      s[r] = exp(s[r] - vec4<f32>(m[r]));
+      l[r] = l[r] * al[r] + (s[r].x + s[r].y) + (s[r].z + s[r].w);
+      for (var t = 0u; t < ${NS}u; t++) { acc[r * ${NS}u + t] *= al[r]; }
+    }
+    for (var ss = 0u; ss < 4u; ss++) {
+      workgroupBarrier();
+      // Probabilities of keys 16·ss … + 15, from the 4 threads that hold them, rows as vec4.
+      if (tn / 4u == ss) {
+        for (var c = 0u; c < 4u; c++) {
+          let kk = (tn % 4u) * 4u + c;
+${unroll(RV, (v) => `          sm[kk * RQ + tm * ${RV}u + ${v}u] = vec4<f32>(s[${v * 4}][c], s[${v * 4 + 1}][c], s[${v * 4 + 2}][c], s[${v * 4 + 3}][c]);`)}
+        }
+      }
+      for (var it = li; it < 16u * D4; it += 128u) {
+        let j = b0 + ss * 16u + it / D4;
+        sm[PT + it] = select(vec4<f32>(0.0), vc[min(j, n - 1u) * stride4 + ko4 + it % D4], j < n);
+      }
+      workgroupBarrier();
+      for (var kk = 0u; kk < 16u; kk++) {
+${unroll(RV, (v) => `        let a${v} = sm[kk * RQ + tm * ${RV}u + ${v}u];`)}
+        for (var t = 0u; t < ${NS}u; t++) {
+          let c = tn + 16u * t;
+          if (c < D4) {
+            let vv = sm[PT + kk * D4 + c];
+${unroll(RV, (v) => `            acc[${v * 4} * ${NS} + t] += a${v}.x * vv;
+            acc[${v * 4 + 1} * ${NS} + t] += a${v}.y * vv;
+            acc[${v * 4 + 2} * ${NS} + t] += a${v}.z * vv;
+            acc[${v * 4 + 3} * ${NS} + t] += a${v}.w * vv;`)}
+          }
+        }
+      }
+    }
+  }
+  // Rows' exp-sums: the 16 threads' partial sums added up.
+  workgroupBarrier();
+${unroll(RV, (v) => `  sm[(tm * ${RV}u + ${v}u) * 16u + tn] = vec4<f32>(l[${v * 4}], l[${v * 4 + 1}], l[${v * 4 + 2}], l[${v * 4 + 3}]);`)}
+  workgroupBarrier();
+  for (var v = 0u; v < ${RV}u; v++) {
+    var ls = vec4<f32>(0.0);
+    for (var t = 0u; t < 16u; t++) { ls += sm[(tm * ${RV}u + v) * 16u + t]; }
+    for (var e = 0u; e < 4u; e++) {
+      let r = v * 4u + e;
+      let row = r0 + tm * ${RT}u + r;
+      if (row < p.T) {
+        for (var t = 0u; t < ${NS}u; t++) {
+          let c = tn + 16u * t;
+          if (c < D4) { o[(row * p.H + h) * D4 + c] = acc[r * ${NS}u + t] / ls[e]; }
+        }
+      }
+    }
+  }
+}`);
 }
 
 /**

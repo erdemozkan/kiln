@@ -14,7 +14,8 @@ default `quant: "auto"` keeps each GGUF tensor at its own precision, every type 
 
 **Images.** Gemma 3 4B and larger take images with llama.cpp's mmproj file (`load(id, { mmproj })`,
 then `{ type: "image", image }` message parts): SigLIP vision tower, 4 × 4 pooling projector, and
-bidirectional attention among each image's 256 tokens.
+bidirectional attention among each image's 256 tokens. The tower's attention runs as a
+register-tiled kernel with the softmax folded in (about 46 s per image on an Intel Iris Plus 650).
 
 **API.** `load(id)` runs the model in a module worker; `chat` and `complete` return async iterators
 of text, with `stats` (timings, token counts, `stopReason`). The model's own Jinja chat template,

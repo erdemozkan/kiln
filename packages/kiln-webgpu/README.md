@@ -52,7 +52,7 @@ const reply = llm.chat([{ role: "user", content: [{ type: "image", image: blob }
 ```
 
 An image may be a Blob, File, ImageBitmap or ImageData; it is resized to 896 × 896. Running the
-vision tower takes a while on integrated GPUs (about 78 s on an Intel Iris Plus 650); later turns that
+vision tower takes a while on integrated GPUs (about 46 s on an Intel Iris Plus 650); later turns that
 keep the image reuse its features and their cached tokens.
 
 ## Models

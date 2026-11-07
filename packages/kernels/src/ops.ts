@@ -12,6 +12,9 @@ import {
   attentionSplitSpec,
   attentionTile,
   attentionTiledSpec,
+  attentionSpanSpec,
+  spanTile,
+  type SpanTile,
   copyRowSpec,
   avgPoolSpec,
   embedSpec,
@@ -256,11 +259,17 @@ export interface AttentionShape {
    */
   slots?: number;
   /**
-   * Query rows and keys per tile of tiled prefill attention, when it fits workgroup memory (else the
-   * default for the head dim). The defaults suit causal text prefill; long bidirectional spans
-   * (the vision tower's 4096 patches) gain from more rows sharing each key block.
+   * Every query row sees the same keys (a bidirectional span covering all of them, as in the vision
+   * tower): lets the GPU use span attention, a register-tiled kernel for that case, when the cache is
+   * f32 and not a ring.
    */
-  tile?: { R: number; BK: number };
+  span?: boolean;
+}
+
+let spanOverride: SpanTile | undefined;
+/** Forces the span attention tile (benchmarks and checks); undefined restores the default. */
+export function setSpanTile(t: SpanTile | undefined): void {
+  spanOverride = t;
 }
 
 export const cacheSlots = (s: Pick<AttentionShape, "maxSeq" | "slots">): number => s.slots ?? s.maxSeq;
@@ -295,8 +304,15 @@ export function attention(ctx: Ctx, q: Tensor, kc: Buf, vc: Buf, s: AttentionSha
     ctx.run(attentionCombineSpec(), [params, ctx.step, ml.buf, po.buf, out.buf], [s.H, 1, 1]);
     return out;
   }
+  if (s.span && (s.kv ?? "f32") === "f32" && slots === s.maxSeq && !s.window) {
+    const t = spanOverride ?? spanTile(s.D, ctx.backend.limits.maxWorkgroupStorage);
+    if (t) {
+      ctx.run(attentionSpanSpec(s.D, t), [params, ctx.step, q.buf, kc, vc, out.buf], [Math.ceil(s.T / (8 * t.RT)), s.H, 1]);
+      return out;
+    }
+  }
   if (prefillAttention === "tiled") {
-    const tile = attentionTile(s.D, ctx.backend.limits.maxWorkgroupStorage, s.tile);
+    const tile = attentionTile(s.D, ctx.backend.limits.maxWorkgroupStorage);
     ctx.run(attentionTiledSpec(s.kv ?? "f32", s.D, tile), [params, ctx.step, q.buf, kc, vc, out.buf], [s.Hkv, Math.ceil((s.T * (s.H / s.Hkv)) / tile.R), 1]);
     return out;
   }

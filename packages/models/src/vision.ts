@@ -137,9 +137,9 @@ export class VisionTower {
     const patches = ctx.buffer(n * patchK(c) * 4, "vision/patches");
     let x = ops.linear(ctx, { shape: [n, patchK(c)], dtype: "f32", buf: patches }, this.w("v.patch_embd.weight"), { bias: this.w("v.patch_embd.bias") });
     ops.addInPlace(ctx, x, this.w("v.position_embd.weight"));
-    // 32 query rows per tile, 8 keys per block: 2.05 s per layer against 2.76 s for the text prefill
-    // default (14 × 28 at D = 72) on the Intel Mac, with 4096 patches.
-    const shape = { T: n, H: c.heads, Hkv: c.heads, D, maxSeq: n, kv: "f32" as const, scale: D ** -0.5, tile: { R: 32, BK: 8 } };
+    // Every patch sees every patch: span attention, 0.88 s per layer on the Intel Mac against 2.76 s
+    // with the text prefill's tiled kernel.
+    const shape = { T: n, H: c.heads, Hkv: c.heads, D, maxSeq: n, kv: "f32" as const, scale: D ** -0.5, span: true };
     for (let l = 0; l < c.layers; l++) {
       const p = `v.blk.${l}.`;
       const h = ops.layernorm(ctx, x, this.w(p + "ln1.weight"), this.w(p + "ln1.bias"), c.eps);

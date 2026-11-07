@@ -117,12 +117,22 @@ Key ideas:
   the text model plus LayerNorm, GELU and 4 × 4 pooling, and attention takes a bidirectional span from
   the step buffer: queries inside it see every key of the span (all 4096 patches in the vision tower,
   each image's 256 tokens in the prompt). See Models for the check against a NumPy reference.
+- **Span attention.** When every query sees the same keys, as all 4096 patches of the vision tower
+  do, attention runs as a register-tiled GEMM with the softmax folded in: a 128-thread workgroup takes
+  32 query rows of one head and walks the keys 64 at a time, each thread holding a 4 × 4 block of
+  scores built from Q and K chunks staged in workgroup memory (as the matmul kernels do). Row maxima
+  go through workgroup memory so the threads of a row share one running max, each thread exponentiates
+  only its own scores, and the probabilities and values are staged 16 keys at a time for the weighted
+  sum. Nothing of the 4096 × 4096 score matrix reaches global memory. On the Intel Mac a vision layer's
+  attention takes 0.88 s, against 2.76 s with the tiled prefill kernel (2.05 s at its best tile), and
+  an image encodes in about 46 s instead of 90; the features are unchanged (cosine 0.9998 to the
+  reference). Eight rows per thread was slower (about 4 s: its registers spill on this GPU).
 - **A CPU fallback.** Every kernel the models use also exists in TypeScript, attached to its WGSL spec
   with the same bindings and uniform layout, and a `CpuBackend` runs them on the model's worker
   thread. `load` uses it when the browser has no WebGPU or no adapter (`device: "auto"`, the
   default), or when asked (`device: "cpu"`); `info.backend` says which ran. The whole engine works
   unchanged on it: grammars, saved prefixes, the prompt cache. The kernel check page runs every check
-  against it too (`/kernels.html?backend=cpu`, 757 of 757 passing; the f16 matmul variants need
+  against it too (`/kernels.html?backend=cpu`, 763 of 763 passing; the f16 matmul variants need
   shader-f16), and Node tests cover it in CI. Matmuls run in WASM SIMD (`packages/kernels/src/simd.wat`,
   1.4 KB compiled): every CPU buffer lives in one WebAssembly memory, so the kernels read weights,
   activations and scratch in place, taking f32x4 dot products straight from the 4- and 8-bit codes.
@@ -407,8 +417,7 @@ square on white), matched an independent NumPy forward pass of the f32 weights t
 of 0.9998 (at least 0.999 for every token), and 4B Q4_0 described it as "a red circle and a blue square
 arranged vertically on a white background". Through the API, a 448 × 448 PNG of a green triangle on
 yellow: "The image shows a green triangle on a yellow background." On the Intel Mac the vision tower
-takes about 78 s per image, nearly all of it attention over the 4096 patches (2.05 s per layer with
-32-row tiles, against 2.76 s with the text prefill's 14-row default; the matmuls take 0.85 s); the follow-up "And what color is the background?" reused the encoded image
+takes about 46 s per image (90 s before span attention, below); the follow-up "And what color is the background?" reused the encoded image
 and 290 cached prompt tokens and answered "The background is yellow." in 6 s. An image's features stay
 on the GPU (`imageSlots`, 4 by default), keyed by its pixels, so a conversation that keeps the image
 does not run the tower again.
@@ -531,9 +540,8 @@ Known limits, roughly in roadmap order:
 - Single storage binding per tensor: very large f32 embeddings can exceed `maxStorageBufferBindingSize`
   (use q4 or q8).
 - Images: Gemma 3 only, from llama.cpp's mmproj GGUF (the vision weights inside safetensors
-  checkpoints are still skipped), one 896 × 896 crop per image (no pan-and-scan). The vision tower
-  reuses the text model's tiled attention, which reaches about a fifth of the matmuls' throughput on
-  its 4096 × 4096 bidirectional span; a register-tiled kernel for long spans would roughly halve it.
+  checkpoints are still skipped), one 896 × 896 crop per image (no pan-and-scan). Span attention
+  covers f32 caches only, so the text model's image chunks (f16 cache) still use the tiled kernel.
 - Without WebGPU, models run on the CPU: single-threaded (no worker pool), matmuls in WASM SIMD at
   about 3.5 GMAC/s on the test Mac, attention and the rest in TypeScript, and every buffer in one
   wasm32 memory (4 GiB at most). Small models only. WebNN and Node/Dawn backends come later.
