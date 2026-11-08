@@ -1,25 +1,33 @@
 {
   "name": "kiln-webgpu",
   "version": "0.1.0",
-  "description": "Run LLMs in the browser on WebGPU, straight from Hugging Face safetensors or GGUF files",
+  "description": "Kiln.js: run LLMs in the browser on WebGPU (CPU fallback), straight from Hugging Face safetensors or GGUF files, with a transformers.js-style pipeline API",
   "license": "MIT",
   "author": "Erdem Ozkan",
   "repository": { "type": "git", "url": "git+https://github.com/erdemozkan/kiln.git" },
   "homepage": "https://github.com/erdemozkan/kiln#readme",
   "bugs": { "url": "https://github.com/erdemozkan/kiln/issues" },
-  "keywords": ["webgpu", "llm", "inference", "gguf", "safetensors", "browser", "transformer"],
+  "keywords": ["webgpu", "llm", "inference", "gguf", "safetensors", "browser", "transformer", "transformers.js", "pipeline", "text-generation", "wasm"],
   "type": "module",
   "sideEffects": false,
   "exports": {
     ".": {
       "types": "./dist/types/kiln-webgpu/src/index.d.ts",
       "import": "./dist/index.js"
+    },
+    "./engine": {
+      "types": "./dist/types/kiln-webgpu/src/engine.d.ts",
+      "import": "./dist/engine.js"
     }
   },
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "jsdelivr": "./dist/index.js",
+  "unpkg": "./dist/index.js",
   "types": "./dist/types/kiln-webgpu/src/index.d.ts",
   "files": ["dist", "README.md", "LICENSE"],
   "scripts": {
-    "build": "vite build && tsc -p tsconfig.build.json && node scripts/fix-dts.mjs && cp ../../LICENSE LICENSE",
+    "build": "vite build && KILN_ENTRY=engine vite build && tsc -p tsconfig.build.json && node scripts/fix-dts.mjs && cp ../../LICENSE LICENSE",
     "prepack": "npm run build"
   },
   "devDependencies": {

@@ -1,10 +1,20 @@
-# Kiln
+# Kiln.js
 
-WebGPU-native LLM inference for the browser. Loads Hugging Face safetensors or GGUF directly —
-no ONNX export, no ahead-of-time compile step.
+WebGPU-native LLM inference for the browser, with a CPU (WASM SIMD) fallback. Loads Hugging Face
+safetensors or GGUF directly — no ONNX export, no ahead-of-time compile step. Published as
+`kiln-webgpu`, one file that also works straight from a CDN, with a transformers.js-style pipeline:
 
 ```ts
-import { load } from "@kiln/api";
+import { pipeline } from "kiln-webgpu"; // or "https://cdn.jsdelivr.net/npm/kiln-webgpu"
+
+const generator = await pipeline("text-generation", "HuggingFaceTB/SmolLM2-135M-Instruct", { dtype: "q4" });
+const [out] = await generator([{ role: "user", content: "Hi!" }], { max_new_tokens: 128 });
+```
+
+Kiln's own API streams text:
+
+```ts
+import { load } from "kiln-webgpu";
 
 const llm = await load("HuggingFaceTB/SmolLM2-135M-Instruct", { quant: "q4", onProgress: console.log });
 for await (const text of llm.chat([{ role: "user", content: "Hi!" }], { temperature: 0.7 })) render(text);
@@ -24,7 +34,7 @@ const json = llm.chat(messages, { format: { type: "json", schema } }); // or { t
 
 | Package | Role |
 |---|---|
-| `@kiln/api` | Main-thread client, worker RPC, streaming `TextStream` |
+| `@kiln/api` | Main-thread client, worker RPC, streaming `TextStream`, transformers.js-style `pipeline` |
 | `@kiln/runtime` | `Engine`: chunked prefill, pipelined decode, weight streaming |
 | `@kiln/models` | Code-defined architectures (Llama / Mistral / Qwen2 / Qwen3 / SmolLM / Granite / Gemma 3), HF + GGUF config mapping |
 | `@kiln/tokenizers` | Byte-level and SentencePiece-style BPE from `tokenizer.json` or GGUF metadata, streaming UTF-8 decode, a Jinja interpreter for chat templates |

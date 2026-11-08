@@ -2,8 +2,18 @@
 
 ## 0.1.0 (2026-11-08)
 
-First release of `kiln-webgpu`: LLM inference in the browser on WebGPU, loading Hugging Face
-safetensors and GGUF files directly.
+First release of `kiln-webgpu` (Kiln.js): LLM inference in the browser on WebGPU, loading Hugging
+Face safetensors and GGUF files directly.
+
+**Packaging.** One ES module with the model worker's code inside (started from a blob URL), so it
+loads from a CDN with no bundler, and from any bundler or Vite's dev server with no worker file to
+serve; types need no `@webgpu/types` (TypeScript 5.4 to 7). The in-process engine is
+`kiln-webgpu/engine`.
+
+**transformers.js-style pipeline.** `pipeline("text-generation", id, { dtype, device,
+progress_callback })` and `TextStreamer`, taking transformers.js's option names (`max_new_tokens`,
+`do_sample`, `top_k`, `top_p`, `repetition_penalty`, `return_full_text`) and returning its output
+shapes (`[{ generated_text }]`, the messages with the reply appended for chats).
 
 **Models.** Llama (including Llama 3 rope scaling), Mistral, Qwen2, Qwen3, SmolLM, Granite 3 and 4
 (350M to 2B; for Granite 4, the attention-only models) and Gemma 3 (270M to 4B and larger; images
@@ -54,5 +64,5 @@ load in 2.4 s. Decode uses a block-per-lane GEMV with several rows per thread on
 prefill a tiled GEMM and tiled attention, and GPU work is cut into short submits so the page stays
 responsive.
 
-**Checks.** 154 unit tests; a kernel check page (808 checks on the Intel GPU, 763 on the CPU backend) compares every kernel with a CPU reference; Gemma 3 1B matches a NumPy reference token for
+**Checks.** 161 unit tests; a kernel check page (808 checks on the Intel GPU, 763 on the CPU backend) compares every kernel with a CPU reference; Gemma 3 1B matches a NumPy reference token for
 token in q8 and q4.

@@ -1,6 +1,7 @@
 import type { Profile } from "@kiln/core";
 import type { GenerateStats, LoadProgress } from "@kiln/runtime";
 import type { ChatMessage } from "@kiln/tokenizers";
+import { createWorker } from "./default-worker";
 import type { ModelInfo, Request, Response, WireGenerateOptions, WireLoadOptions } from "./protocol";
 
 type Listener = (msg: Response) => void;
@@ -52,17 +53,13 @@ export class KilnModel {
     // A worker that fails to start or crashes would otherwise leave every pending call hanging.
     worker.onerror = (e: ErrorEvent) => {
       e.preventDefault();
-      let message = `Kiln worker failed: ${e.message || "it could not start (see the browser console)"}`;
-      // Vite's dev server pre-bundles dependencies into .vite/deps, where the worker file is not.
-      if (import.meta.url.includes("/.vite/deps/")) {
-        message += '. Vite pre-bundled kiln-webgpu, so its worker file cannot be found: add optimizeDeps: { exclude: ["kiln-webgpu"] } to vite.config';
-      }
+      const message = `Kiln worker failed: ${e.message || "it could not start (see the browser console)"}`;
       for (const [id, listener] of [...this.listeners]) listener({ id, type: "error", message });
     };
   }
 
   static async load(model: string, opts: LoadOptions = {}): Promise<KilnModel> {
-    const worker = opts.worker ?? new Worker(new URL("./worker.ts", import.meta.url), { type: "module", name: "kiln" });
+    const worker = opts.worker ?? createWorker();
     const m = new KilnModel(worker, undefined as unknown as ModelInfo);
     const { onProgress, worker: _w, persist = true, ...wire } = opts;
     const persistent = persist ? requestPersistence() : Promise.resolve(undefined);

@@ -1,25 +1,58 @@
-# kiln-webgpu
+# Kiln.js (`kiln-webgpu`)
 
 Run LLMs in the browser on WebGPU, straight from Hugging Face safetensors or GGUF files: no ONNX
-export, no compile step, no server.
+export, no compile step, no server. Without WebGPU it runs on the CPU (WASM SIMD).
 
 ```bash
 npm install kiln-webgpu
 ```
+
+Or with no install and no bundler, from a CDN:
+
+```html
+<script type="module">
+  import { pipeline } from "https://cdn.jsdelivr.net/npm/kiln-webgpu";
+</script>
+```
+
+## transformers.js-style pipeline
+
+```js
+import { pipeline, TextStreamer } from "kiln-webgpu";
+
+const generator = await pipeline("text-generation", "HuggingFaceTB/SmolLM2-135M-Instruct", { dtype: "q4", device: "webgpu" });
+const streamer = new TextStreamer(generator.tokenizer, { skip_prompt: true, callback_function: (text) => render(text) });
+const output = await generator([{ role: "user", content: "Hi!" }], { max_new_tokens: 128, streamer });
+output[0].generated_text.at(-1).content; // the reply
+```
+
+Code written for transformers.js's text-generation pipeline should mostly need only the new import.
+A string input is completed (`generated_text` is the prompt plus the completion, or the completion
+alone with `return_full_text: false`); a list of messages is a chat (`generated_text` is the messages
+with the reply appended); an array of either runs them one after another. Options take
+transformers.js's names: `max_new_tokens`, `do_sample` (default false: greedy; when true,
+`temperature` 1, `top_k` 50 and `top_p` 1 unless given), `repetition_penalty`, `streamer`,
+`progress_callback` (`initiate` / `progress` / `done` per file, then `ready`). The differences:
+
+- Only `"text-generation"`, for the decoder families Kiln runs (Llama, Mistral, Qwen2/3, SmolLM,
+  Granite, Gemma 3).
+- `dtype` picks the format Kiln quantizes to at load: 4-bit names (`q4`, `q4f16`, `bnb4`, `int4`)
+  load as q4, 8-bit ones (`q8`, `int8`, `uint8`) as q8, `fp16` / `fp32` as f32.
+- `device` defaults to `"auto"` (WebGPU where there is one, else the CPU); `"wasm"` means the CPU.
+- The model's `generation_config.json` is not read, and without `max_new_tokens` a reply runs until the
+  model ends its turn (or the context fills).
+- Streamers receive text, not token ids (`TextStreamer`, or any object with `put(text)` and `end()`).
+- Kiln's own options can be passed alongside: `format` (JSON schema, regex, grammar), `tools`,
+  `signal`, and on load `maxSeq`, `cpuThreads`, `mmproj`. `generator.model` is the underlying
+  `KilnModel`, `generator.info` its details, `generator.dispose()` unloads it.
+
+## Kiln's own API
 
 ```ts
 import { load } from "kiln-webgpu";
 
 const llm = await load("HuggingFaceTB/SmolLM2-135M-Instruct", { quant: "q4", onProgress: console.log });
 for await (const text of llm.chat([{ role: "user", content: "Hi!" }], { temperature: 0.7 })) render(text);
-```
-
-With Vite, exclude the package from dependency pre-bundling, which would move it away from its
-worker file (production builds are unaffected):
-
-```ts
-// vite.config.ts
-export default defineConfig({ optimizeDeps: { exclude: ["kiln-webgpu"] } });
 ```
 
 The model runs in a module worker; the main thread only sees an async iterator. The context defaults
@@ -85,9 +118,13 @@ Without it, `load` falls back to running on the CPU (matmuls in WASM SIMD; much 
 on a cross-origin isolated page, with `Cross-Origin-Opener-Policy: same-origin` and
 `Cross-Origin-Embedder-Policy: require-corp`, large matmuls also use several threads, `cpuThreads`) and
 `llm.info.backend` is `"cpu"` (`llm.info.cpuThreads` says how many threads it got);
-`load(id, { device: "gpu" })` fails instead, and `device: "cpu"` uses the CPU even where WebGPU works. Use it from a bundler
-that understands `new URL("…", import.meta.url)` workers (Vite, webpack 5, Parcel, esbuild with
-a plugin). To host the worker yourself, pass `load(id, { worker })`.
+`load(id, { device: "gpu" })` fails instead, and `device: "cpu"` uses the CPU even where WebGPU works.
+
+The package is one file: the model worker's code is inside it and starts from a blob URL, so it works
+from a CDN, with any bundler and in Vite's dev server, with no worker file to serve. A page with a
+Content-Security-Policy needs `worker-src blob:`; to host the worker yourself, pass
+`load(id, { worker })`. The in-process engine, for code that already runs in a worker, is
+`import { createEngine } from "kiln-webgpu/engine"`.
 
 ## License
 
