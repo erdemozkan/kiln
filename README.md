@@ -168,7 +168,10 @@ Key ideas:
   SmolLM2-135M call. With these, SmolLM2-135M on the CPU backend: first token 0.76 s and 36.7 tok/s
   on one thread, 0.63 s and 37.7 tok/s on four, the GPU's 64 greedy tokens exactly. The CPU kernel
   checks allow the integer dot products an error of 2e-4 of the outputs' size (the worst check is at
-  43% of that).
+  43% of that). Sampling computes the adjusted logits once and runs the GPU kernel's 24-step top-k / top-p
+  bisection over only the ids still between its bounds: per token on SmolLM2-135M's 49,152 logits,
+  greedy 1.6 → 0.6 ms and top-k 40 with top-p 0.9 28 → 4.4 ms (decode 19.5 → 32 tok/s, same
+  tokens). Splitting decode's small matmuls across threads was measured too and made them slower.
 - **GGUF weights held exactly.** Q4_1 and Q4_K blocks are code·scale + min per 32 values with 4-bit
   codes, and Q5_x with 5-bit codes, so Kiln's q4 and q8 planes plus one f32 min per block hold them
   as llama.cpp dequantizes them, where they used to be dequantized and rounded a second time. The GPU

@@ -637,8 +637,16 @@ const pcg = (v: number): number => {
   return ((w >>> 22) ^ w) >>> 0;
 };
 
-/** The sample kernel's algorithm, sequentially: mask, penalty, temperature, top-k / top-p cut, Gumbel-max. */
+/**
+ * The sample kernel's algorithm, sequentially: mask, penalty, temperature, top-k / top-p cut, Gumbel-max.
+ * The adjusted logits are computed once (masked ids as -Infinity). The cut is the GPU kernel's 24-step
+ * bisection, but each step only scans the ids still between its bounds: the rest are known to be in
+ * (counted with their mass) or out.
+ */
 export function cpuSample(rows: boolean): CpuKernel {
+  let vals = new Float32Array(0);
+  let cand = new Int32Array(0);
+  let mass = new Float64Array(0);
   return (b, grid) => {
     const V = b[0]!.u32[0]!;
     const st = step(b[1]!);
@@ -648,35 +656,70 @@ export function cpuSample(rows: boolean): CpuKernel {
     const out = b[5]!.u32;
     const R = rows ? grid[1] : 1;
     const words = 1 + Math.ceil(V / 32);
+    if (vals.length < V) {
+      vals = new Float32Array(V);
+      cand = new Int32Array(V);
+      mass = new Float64Array(V);
+    }
+    const sampling = st.temperature > 0;
+    const truncate = sampling && (st.topK > 0 || st.topP < 1);
     for (let row = 0; row < R; row++) {
       const base = row * V;
       const abase = row * words;
       // Out-of-range words read as 0, as WebGPU's robust buffer access gives them: no mask.
-      const ok = (i: number) => (allowed[abase] ?? 0) === 0 || (((allowed[abase + 1 + (i >>> 5)] ?? 0) >>> (i & 31)) & 1) === 1;
-      const adj = (i: number) => {
+      const masked = (allowed[abase] ?? 0) !== 0;
+      let vmax = -3e38;
+      let vmin = 3e38;
+      for (let i = 0; i < V; i++) {
+        if (masked && (((allowed[abase + 1 + (i >>> 5)] ?? 0) >>> (i & 31)) & 1) === 0) {
+          vals[i] = -Infinity;
+          continue;
+        }
         let v = logits[base + i]!;
         if (st.rep !== 1 && ((seen[i >>> 5]! >>> (i & 31)) & 1) === 1) v = v > 0 ? v / st.rep : v * st.rep;
-        return st.temperature > 0 ? Math.fround(v / st.temperature) : v;
-      };
-      const sampling = st.temperature > 0;
-      const truncate = sampling && (st.topK > 0 || st.topP < 1);
+        if (sampling) v /= st.temperature;
+        vals[i] = v;
+        v = vals[i]!;
+        if (v > vmax) vmax = v;
+        if (v < vmin) vmin = v;
+      }
       let cut = -3e38;
       if (truncate) {
-        let vmax = -3e38;
-        let vmin = 3e38;
-        for (let i = 0; i < V; i++) if (ok(i)) { const v = adj(i); vmax = Math.max(vmax, v); vmin = Math.min(vmin, v); }
         let total = 0;
-        for (let i = 0; i < V; i++) if (ok(i)) total += Math.exp(adj(i) - vmax);
+        let nc = 0;
         let lo = st.topK === 0 ? Math.max(vmin, vmax - 40) : vmin;
         let hi = vmax;
+        for (let i = 0; i < V; i++) {
+          const v = vals[i]!;
+          if (v === -Infinity) continue;
+          const e = Math.exp(v - vmax);
+          total += e;
+          if (v >= lo) {
+            cand[nc] = i;
+            mass[nc++] = e;
+          }
+        }
+        // Ids at or above hi (always kept by later steps); candidates are those in [lo, hi).
+        let aboveC = 0;
+        let aboveM = 0;
         for (let it = 0; it < 24; it++) {
           const mid = Math.fround(0.5 * (lo + hi));
-          let c = 0;
-          let m = 0;
-          for (let i = 0; i < V; i++) if (ok(i)) { const v = adj(i); if (v >= mid) { c++; m += Math.exp(v - vmax); } }
+          let c = aboveC;
+          let m = aboveM;
+          for (let j = 0; j < nc; j++) if (vals[cand[j]!]! >= mid) { c++; m += mass[j]!; }
           const keep = (st.topK === 0 || c >= st.topK) && (st.topP >= 1 || m >= st.topP * total);
-          if (keep) lo = mid;
-          else hi = mid;
+          let k = 0;
+          if (keep) {
+            lo = mid;
+            for (let j = 0; j < nc; j++) if (vals[cand[j]!]! >= mid) { cand[k] = cand[j]!; mass[k++] = mass[j]!; }
+          } else {
+            hi = mid;
+            for (let j = 0; j < nc; j++) {
+              if (vals[cand[j]!]! >= mid) { aboveC++; aboveM += mass[j]!; }
+              else { cand[k] = cand[j]!; mass[k++] = mass[j]!; }
+            }
+          }
+          nc = k;
         }
         cut = lo;
       }
@@ -684,9 +727,8 @@ export function cpuSample(rows: boolean): CpuKernel {
       let best = -3e38;
       let bidx = 0;
       for (let i = 0; i < V; i++) {
-        if (!ok(i)) continue;
-        let v = adj(i);
-        if (v < cut) continue;
+        let v = vals[i]!;
+        if (v === -Infinity || v < cut) continue;
         if (sampling) {
           const uu = ((pcg((i ^ salt) >>> 0) >>> 8) + 0.5) / 16777216;
           v = v - Math.log(-Math.log(uu));
