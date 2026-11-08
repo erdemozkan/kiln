@@ -106,18 +106,13 @@ export class Seq2SeqEngine {
     await this.model.encode(source);
     const ids = [start];
     while (ids.length < maxLen) {
-      const logits = await this.model.step(ids.at(-1)!, ids.length - 1);
-      if (rep !== 1) for (const id of new Set(ids)) logits[id] = logits[id]! < 0 ? logits[id]! * rep : logits[id]! / rep;
-      for (const b of bad) logits[b] = -Infinity;
-      if (ids.length < minLen) for (const e of eos) logits[e] = -Infinity;
-      for (const b of bannedNgramTokens(ids, ngram)) logits[b] = -Infinity;
-      let next: number;
+      // transformers' logits processors as banned tokens for the backend's greedy choice.
+      const banned = new Set<number>(bad);
+      if (ids.length < minLen) for (const e of eos) banned.add(e);
+      for (const b of bannedNgramTokens(ids, ngram)) banned.add(b);
+      let next = await this.model.next(ids.at(-1)!, ids.length - 1, { banned, repetitionPenalty: rep, seen: ids });
       if (ids.length === 1 && forcedBos !== undefined && forcedBos !== null) next = forcedBos;
       else if (ids.length === maxLen - 1 && forcedEos !== undefined) next = forcedEos;
-      else {
-        next = 0;
-        for (let i = 1; i < logits.length; i++) if (logits[i]! > logits[next]!) next = i;
-      }
       ids.push(next);
       if (eos.has(next)) break;
     }
@@ -152,16 +147,13 @@ export class Seq2SeqEngine {
       const eos = Number(g.eos_token_id ?? this.cfg.eos);
       const maxLen = Math.min(this.model.maxTarget, options.max_new_tokens !== undefined ? init.length + options.max_new_tokens : Number(g.max_length ?? this.model.maxTarget));
       const ids = [...init];
-      let logits = new Float32Array(0);
-      for (let t = 0; t < init.length; t++) logits = await this.model.step(init[t]!, t);
+      // The prompt goes in a token at a time; only the last step's choice is kept.
+      for (let t = 0; t + 1 < init.length; t++) await this.model.next(init[t]!, t);
       while (ids.length < maxLen) {
-        for (const s of suppress) logits[s] = -Infinity;
-        if (ids.length === init.length) for (const s of begin) logits[s] = -Infinity;
-        let next = 0;
-        for (let i = 1; i < logits.length; i++) if (logits[i]! > logits[next]!) next = i;
+        const banned = ids.length === init.length ? new Set([...suppress, ...begin]) : suppress;
+        const next = await this.model.next(ids.at(-1)!, ids.length - 1, { banned });
         ids.push(next);
         if (next === eos) break;
-        logits = await this.model.step(next, ids.length - 1);
       }
       texts.push(this.tokenizer.decode(ids.slice(init.length), true));
     }

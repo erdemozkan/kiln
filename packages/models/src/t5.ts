@@ -1,7 +1,7 @@
 import { ActivationPool, Ctx, STEP_BYTES, packStep, physical, type Backend, type Buf, type Dispatch, type Tensor } from "@kiln/core";
 import { ops } from "@kiln/kernels";
 import { UnsupportedModelError } from "./config";
-import type { Seq2SeqConfig } from "./seq2seq";
+import { DecoderSampler, type Seq2SeqConfig, type StepOptions } from "./seq2seq";
 
 /** T5 / Flan-T5 / mT5 specifics beside the shared encoder-decoder fields. */
 export interface T5Config extends Seq2SeqConfig {
@@ -112,6 +112,7 @@ export class T5Model {
   private readonly selfK: Buf[] = [];
   private readonly selfV: Buf[] = [];
   private current: Pair | undefined;
+  private readonly sampler: DecoderSampler;
   readonly maxTarget: number;
 
   constructor(
@@ -126,6 +127,7 @@ export class T5Model {
     this.crossStep = backend.alloc(STEP_BYTES, "storage", "t5/cross-step");
     backend.write(this.crossStep, 0, packStep({ pos0: 0, lastRow: 0, seed: 0, temperature: 0, spanLo: 0, spanHi: 0x7fffffff }));
     this.tok = backend.alloc(16, "storage", "t5/token");
+    this.sampler = new DecoderSampler(backend, cfg.vocab);
     const inner = cfg.decHeads * cfg.dKv;
     for (let l = 0; l < cfg.decLayers; l++) {
       this.selfK.push(backend.alloc(this.maxTarget * inner * 4, "storage", "t5/self-k"));
@@ -207,6 +209,7 @@ export class T5Model {
     const out = this.rms(dctx, y, "dec.lnF.weight");
     const head = c.tied ? this.w("shared.weight") : this.w("lm_head.weight");
     const logits = ops.linear(dctx, out, head);
+    ops.sample(dctx, logits, this.sampler.out, this.sampler.seen, this.sampler.allowed);
     return { S, enc: { ctx: ectx, dispatches: ectx.dispatches, step, ids, kc, vc }, dec: { ctx: dctx, dispatches: dctx.dispatches, logits }, crossK, crossV };
   }
 
@@ -239,6 +242,20 @@ export class T5Model {
     return new Float32Array(await be.readback(physical(pair.dec.logits.buf), 0, this.cfg.vocab * 4));
   }
 
+  /** Feeds the token at position t and returns the greedy next token, chosen on the backend under `opts`. */
+  async next(token: number, t: number, opts: StepOptions = {}): Promise<number> {
+    const pair = this.current;
+    if (!pair) throw new Error("T5: encode a source first");
+    if (t >= this.maxTarget) throw new Error(`T5: target longer than ${this.maxTarget} tokens`);
+    const be = this.backend;
+    const rep = opts.repetitionPenalty ?? 1;
+    this.sampler.prepare(opts.banned ?? [], rep !== 1 ? opts.seen : undefined);
+    be.write(this.tok, 0, Uint32Array.of(token));
+    be.write(this.decStep, 0, packStep({ pos0: t, lastRow: 0, seed: 0, temperature: 0, repetitionPenalty: rep }));
+    be.submit(pair.dec.dispatches);
+    return this.sampler.read();
+  }
+
   private dropPair(p: Pair): void {
     p.enc.ctx.destroy();
     p.dec.ctx.destroy();
@@ -255,6 +272,7 @@ export class T5Model {
       if (t.mins) this.backend.free(t.mins);
     }
     this.pool.destroy();
+    this.sampler.destroy();
     for (const b of [this.decStep, this.crossStep, this.tok, ...this.selfK, ...this.selfV]) this.backend.free(b);
   }
 }

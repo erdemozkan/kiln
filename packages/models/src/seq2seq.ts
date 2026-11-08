@@ -174,6 +174,75 @@ export function seq2seqName(name: string): string | undefined {
   return p ? `${m[1] === "encoder" ? "enc" : "dec"}.l${m[2]}.${p}.${m[4]}` : undefined;
 }
 
+/**
+ * Greedy token choice on the backend for encoder-decoder decoders: the shared sampling kernel at
+ * temperature 0 over the step's logits, under an allowed-token mask (processors such as suppressed
+ * tokens, min_length's end-of-sequence ban and no-repeat n-grams become banned bits) and the
+ * repetition penalty's seen-token bits. Each step reads back 4 bytes instead of the vocabulary.
+ */
+export class DecoderSampler {
+  readonly seen: Buf;
+  readonly allowed: Buf;
+  readonly out: Buf;
+  private readonly words: number;
+  private maskKey = "";
+  private seenKey = "";
+
+  constructor(
+    private readonly backend: Backend,
+    readonly vocab: number,
+  ) {
+    this.words = Math.ceil(vocab / 32);
+    this.seen = backend.alloc(this.words * 4, "storage", "seq2seq/seen");
+    this.allowed = backend.alloc((1 + this.words) * 4, "storage", "seq2seq/allowed");
+    this.out = backend.alloc(16, "storage", "seq2seq/sampled");
+    backend.write(this.allowed, 0, new Uint32Array(1 + this.words));
+    backend.write(this.seen, 0, new Uint32Array(this.words));
+  }
+
+  /** Writes the masks for the next sampling: `banned` token ids, and the ids the penalty applies to. */
+  prepare(banned: Iterable<number>, seenIds?: readonly number[]): void {
+    const ban = [...new Set(banned)].filter((i) => i >= 0 && i < this.vocab).sort((a, b) => a - b);
+    const key = ban.join(",");
+    if (key !== this.maskKey) {
+      const m = new Uint32Array(1 + this.words);
+      if (ban.length) {
+        m.fill(0xffffffff);
+        m[0] = 1;
+        for (const i of ban) m[1 + (i >>> 5)]! &= ~(1 << (i & 31));
+      }
+      this.backend.write(this.allowed, 0, m);
+      this.maskKey = key;
+    }
+    if (seenIds) {
+      const k = seenIds.join(",");
+      if (k !== this.seenKey) {
+        const m = new Uint32Array(this.words);
+        for (const i of seenIds) if (i >= 0 && i < this.vocab) m[i >>> 5]! |= 1 << (i & 31);
+        this.backend.write(this.seen, 0, m);
+        this.seenKey = k;
+      }
+    }
+  }
+
+  async read(): Promise<number> {
+    return new Uint32Array(await this.backend.readback(this.out, 0, 4))[0]!;
+  }
+
+  destroy(): void {
+    for (const b of [this.seen, this.allowed, this.out]) this.backend.free(b);
+  }
+}
+
+/** What a decoding step of either encoder-decoder model takes besides the token and its position. */
+export interface StepOptions {
+  /** Token ids that must not be chosen. */
+  banned?: Iterable<number>;
+  /** HF-style repetition penalty over `seen` (1 = off). */
+  repetitionPenalty?: number;
+  seen?: readonly number[];
+}
+
 interface Pair {
   /** Source length these plans are recorded for. */
   S: number;
@@ -201,6 +270,7 @@ export class Seq2SeqModel {
   private readonly posBuf: Buf;
   private readonly selfK: Buf[] = [];
   private readonly selfV: Buf[] = [];
+  private readonly sampler: DecoderSampler;
   /** Longest target, in tokens. */
   readonly maxTarget: number;
 
@@ -221,6 +291,7 @@ export class Seq2SeqModel {
     backend.write(this.crossStep, 0, packStep({ pos0: 0, lastRow: 0, seed: 0, temperature: 0, spanLo: 0, spanHi: 0x7fffffff }));
     this.tok = backend.alloc(16, "storage", "seq2seq/token");
     this.posBuf = backend.alloc(16, "storage", "seq2seq/pos");
+    this.sampler = new DecoderSampler(backend, cfg.vocab);
     for (let l = 0; l < cfg.decLayers; l++) {
       this.selfK.push(backend.alloc(this.maxTarget * cfg.dModel * 4, "storage", "seq2seq/self-k"));
       this.selfV.push(backend.alloc(this.maxTarget * cfg.dModel * 4, "storage", "seq2seq/self-v"));
@@ -335,6 +406,7 @@ export class Seq2SeqModel {
     if (c.preNorm) y = this.ln(dctx, y, "dec.lnF");
     const head = this.weights.get("lm_head.weight") ?? this.w("shared.weight");
     const logits = ops.linear(dctx, y, head, { bias: this.weights.get("flb") });
+    ops.sample(dctx, logits, this.sampler.out, this.sampler.seen, this.sampler.allowed);
     return {
       S,
       feats,
@@ -398,6 +470,21 @@ export class Seq2SeqModel {
     return new Float32Array(await be.readback(physical(pair.dec.logits.buf), 0, this.cfg.vocab * 4));
   }
 
+  /** Feeds the token at position t and returns the greedy next token, chosen on the backend under `opts`. */
+  async next(token: number, t: number, opts: StepOptions = {}): Promise<number> {
+    const pair = this.current;
+    if (!pair) throw new Error("seq2seq: encode a source first");
+    if (t >= this.maxTarget) throw new Error(`seq2seq: target longer than ${this.maxTarget} tokens`);
+    const be = this.backend;
+    const rep = opts.repetitionPenalty ?? 1;
+    this.sampler.prepare(opts.banned ?? [], rep !== 1 ? opts.seen : undefined);
+    be.write(this.tok, 0, Uint32Array.of(token));
+    be.write(this.posBuf, 0, Uint32Array.of(t + this.cfg.posOffset));
+    be.write(this.decStep, 0, packStep({ pos0: t, lastRow: 0, seed: 0, temperature: 0, repetitionPenalty: rep }));
+    be.submit(pair.dec.dispatches);
+    return this.sampler.read();
+  }
+
   private dropPair(p: Pair): void {
     p.enc.ctx.destroy();
     p.dec.ctx.destroy();
@@ -414,6 +501,7 @@ export class Seq2SeqModel {
       if (t.mins) this.backend.free(t.mins);
     }
     this.pool.destroy();
+    this.sampler.destroy();
     for (const b of [this.decStep, this.crossStep, this.tok, this.posBuf, ...this.selfK, ...this.selfV]) this.backend.free(b);
   }
 }

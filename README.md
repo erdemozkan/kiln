@@ -529,7 +529,12 @@ transformers.js's prompt (start, language and task for multilingual models, no-t
 model's suppressed tokens. Audio past 30 s is transcribed window by window (transformers.js keeps
 only the first window unless `chunk_length_s` is set). Not yet: timestamps, overlapping chunk
 merging, and a stable speed measurement (runs in a backgrounded browser pane varied 5× between
-calls; Kiln took 6.6–7.3 s for the 11 s clip against 10.5–18 s for transformers.js there).
+calls; Kiln took 6.6–7.3 s for the 11 s clip against 10.5–18 s for transformers.js there). Encoder-
+decoder decoding picks each token on the backend with the LLM engine's sampling kernel (greedy,
+under a banned-token mask built from the logits processors), so a step reads back 4 bytes instead
+of the whole vocabulary: Whisper's per-token cost in that pane went from about 120 ms to too small to
+measure (1, 8, 16 and 24 new tokens took the same time), with identical outputs for BART, T5,
+Marian and Whisper.
 
 T5's learned relative position bias is added to each score by the per-row attention kernels (GPU
 and CPU, buckets computed in the kernel; bucket function equal to transformers' over ±300
