@@ -599,6 +599,20 @@ export const cpuGelu: CpuKernel = (b) => {
   for (let i = 0; i < n; i++) x[i] = geluTanh(x[i]!);
 };
 
+/** erf by Abramowitz & Stegun 7.1.26 (absolute error under 1.5e-7), as the WGSL kernel computes it. */
+export function erfAS(v: number): number {
+  const z = Math.abs(v);
+  const t = 1 / (1 + 0.3275911 * z);
+  const y = 1 - (((((1.061405429 * t - 1.453152027) * t + 1.421413741) * t - 0.284496736) * t + 0.254829592) * t) * Math.exp(-z * z);
+  return v >= 0 ? y : -y;
+}
+
+export const cpuGeluErf: CpuKernel = (b) => {
+  const n = b[0]!.u32[0]!;
+  const x = b[1]!.f32;
+  for (let i = 0; i < n; i++) x[i] = 0.5 * x[i]! * (1 + erfAS(x[i]! * Math.SQRT1_2));
+};
+
 export const cpuAvgPool: CpuKernel = (b) => {
   const [side, k, C] = [b[0]!.u32[0]!, b[0]!.u32[1]!, b[0]!.u32[2]!];
   const x = b[1]!.f32;

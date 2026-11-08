@@ -357,10 +357,10 @@ export function layernorm(ctx: Ctx, x: Tensor, w: Tensor, b: Tensor, eps: number
   return y;
 }
 
-/** gelu_tanh in place. */
-export function gelu(ctx: Ctx, x: Tensor): void {
+/** GELU in place: the tanh approximation, or the exact erf form (BERT's) with `exact`. */
+export function gelu(ctx: Ctx, x: Tensor, exact = false): void {
   const n = numel(x.shape);
-  ctx.run(geluSpec(), [ctx.uniform([u32(n), u32(0), u32(0), u32(0)]), x.buf], grid1d(n));
+  ctx.run(geluSpec(exact), [ctx.uniform([u32(n), u32(0), u32(0), u32(0)]), x.buf], grid1d(n));
 }
 
 /** k × k average pooling of a side × side token grid [side², C] → [(side / k)², C]. */

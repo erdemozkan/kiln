@@ -599,6 +599,9 @@ async function main() {
     const t = upload(x, [1000]);
     await run(S0, (ctx) => ops.gelu(ctx, t));
     check("gelu", "n1000", await download(t.buf, 1000), x.map(ref.geluTanh), 1e-5);
+    const te = upload(x, [1000]);
+    await run(S0, (ctx) => ops.gelu(ctx, te, true));
+    check("gelu", "erf n1000", await download(te.buf, 1000), x.map(ref.geluErf), 1e-5);
     for (const [side, k, C] of [[64, 4, 24], [8, 2, 1152]] as const) {
       const g = randn(side * side * C);
       const out = side / k;

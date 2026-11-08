@@ -1,5 +1,5 @@
-import { createEngine, loadPromptCache, promptCacheName, savePromptCache, type Engine, type TextDelta } from "@kiln/runtime";
-import type { Request, Response } from "./protocol";
+import { createEncoder, createEngine, loadPromptCache, promptCacheName, savePromptCache, type EncoderEngine, type Engine, type TextDelta } from "@kiln/runtime";
+import type { EncoderTask, Request, Response } from "./protocol";
 
 /** The slice of DedicatedWorkerGlobalScope we use (lib.webworker conflicts with lib.dom in one program). */
 const scope = self as unknown as {
@@ -7,6 +7,26 @@ const scope = self as unknown as {
   onmessage: ((e: MessageEvent<Request>) => void) | null;
 };
 let engine: Engine | undefined;
+let encoder: EncoderEngine | undefined;
+
+/** Runs an encoder task with transformers.js's arguments. */
+function runTask(e: EncoderEngine, task: EncoderTask, args: unknown[]): Promise<unknown> {
+  const a = args as never[];
+  switch (task) {
+    case "feature-extraction":
+      return e.featureExtraction(a[0], a[1]);
+    case "text-classification":
+      return e.textClassification(a[0], a[1]);
+    case "token-classification":
+      return e.tokenClassification(a[0], a[1]);
+    case "question-answering":
+      return e.questionAnswering(a[0], a[1], a[2]);
+    case "fill-mask":
+      return e.fillMask(a[0], a[1]);
+    case "zero-shot-classification":
+      return e.zeroShotClassification(a[0], a[1], a[2]);
+  }
+}
 const aborts = new Map<number, AbortController>();
 /** Prompt cache file of the loaded model (undefined when off), and the tokens last written to it. */
 let cacheName: string | undefined;
@@ -115,6 +135,42 @@ scope.onmessage = async (e: MessageEvent<Request>) => {
         });
         break;
       }
+      case "loadEncoder": {
+        await queue;
+        encoder?.destroy();
+        encoder = undefined;
+        const enc = await createEncoder(msg.model, { ...msg.opts, onProgress: (progress) => post({ id: msg.id, type: "progress", progress }) });
+        encoder = enc;
+        post({
+          id: msg.id,
+          type: "encoderLoaded",
+          info: {
+            model: msg.model,
+            family: enc.cfg.family,
+            layers: enc.cfg.layers,
+            hiddenSize: enc.cfg.hidden,
+            vocabSize: enc.cfg.vocab,
+            maxLength: enc.maxLength,
+            backend: enc.backend.name,
+            cpuThreads: enc.backend.name === "cpu" ? (enc.backend as { threads?: number }).threads : undefined,
+            labels: enc.cfg.id2label,
+          },
+        });
+        break;
+      }
+      case "task": {
+        const enc = encoder;
+        if (!enc) throw new Error("no encoder model loaded");
+        // One call at a time, like generation.
+        queue = queue.then(async () => {
+          try {
+            post({ id: msg.id, type: "result", result: await runTask(enc, msg.task, msg.args) });
+          } catch (err) {
+            post({ id: msg.id, type: "error", message: err instanceof Error ? err.message : String(err) });
+          }
+        });
+        break;
+      }
       case "chat":
       case "complete": {
         if (!engine) throw new Error("no model loaded");
@@ -144,6 +200,8 @@ scope.onmessage = async (e: MessageEvent<Request>) => {
         await saving;
         engine?.destroy();
         engine = undefined;
+        encoder?.destroy();
+        encoder = undefined;
         post({ id: msg.id, type: "done", stats: undefined });
         break;
     }

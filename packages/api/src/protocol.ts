@@ -59,8 +59,37 @@ export interface ModelInfo {
   persistent?: boolean;
 }
 
+/** Load options of an encoder model (feature extraction, classification, NER, QA, fill-mask, zero-shot). */
+export interface WireEncoderOptions {
+  /** Matrix storage: "f32" (default), "q8" or "q4". */
+  quant?: "f32" | "q8" | "q4";
+  device?: "auto" | "gpu" | "cpu";
+  cpuThreads?: number;
+  revision?: string;
+  endpoint?: string;
+}
+
+export type EncoderTask = "feature-extraction" | "text-classification" | "token-classification" | "question-answering" | "fill-mask" | "zero-shot-classification";
+
+export interface EncoderInfo {
+  model: string;
+  /** "bert", "distilbert" or "roberta". */
+  family: string;
+  layers: number;
+  hiddenSize: number;
+  vocabSize: number;
+  /** Longest input in tokens; longer inputs are truncated. */
+  maxLength: number;
+  backend: string;
+  cpuThreads?: number;
+  /** Class labels of a fine-tuned head, by id. */
+  labels?: Record<number, string>;
+}
+
 export type Request =
   | { id: number; type: "load"; model: string; opts: WireLoadOptions }
+  | { id: number; type: "loadEncoder"; model: string; opts: WireEncoderOptions }
+  | { id: number; type: "task"; task: EncoderTask; args: unknown[] }
   | { id: number; type: "chat"; messages: ChatMessage[]; opts: WireGenerateOptions }
   | { id: number; type: "complete"; prompt: string; opts: WireGenerateOptions }
   | { id: number; type: "abort"; target: number }
@@ -70,6 +99,8 @@ export type Request =
 export type Response =
   | { id: number; type: "progress"; progress: LoadProgress }
   | { id: number; type: "loaded"; info: ModelInfo }
+  | { id: number; type: "encoderLoaded"; info: EncoderInfo }
+  | { id: number; type: "result"; result: unknown }
   | { id: number; type: "delta"; text: string }
   | { id: number; type: "done"; stats: GenerateStats | undefined }
   | { id: number; type: "profiled"; profile: Profile | undefined }

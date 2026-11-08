@@ -170,6 +170,11 @@ export class Tokenizer {
     return this.added.get(token)?.id ?? this.vocab.get(token);
   }
 
+  /** The vocabulary string of an id ("Ġthe" in byte-level vocabularies), or "" if there is none. */
+  tokenString(id: number): string {
+    return this.idToToken[id] ?? "";
+  }
+
   /**
    * The bytes a token decodes to, or undefined for added tokens (`<|im_end|>` and the like), which
    * text never produces.

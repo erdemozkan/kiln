@@ -2,7 +2,7 @@ import type { Profile } from "@kiln/core";
 import type { GenerateStats, LoadProgress } from "@kiln/runtime";
 import type { ChatMessage } from "@kiln/tokenizers";
 import { createWorker } from "./default-worker";
-import type { ModelInfo, Request, Response, WireGenerateOptions, WireLoadOptions } from "./protocol";
+import type { EncoderInfo, EncoderTask, ModelInfo, Request, Response, WireEncoderOptions, WireGenerateOptions, WireLoadOptions } from "./protocol";
 
 type Listener = (msg: Response) => void;
 type RequestBody = Request extends infer R ? (R extends Request ? Omit<R, "id"> : never) : never;
@@ -40,15 +40,12 @@ export interface TextStream extends AsyncIterable<string> {
   readonly stats: Promise<GenerateStats | undefined>;
 }
 
-/** Main-thread handle to a model running in a worker. */
-export class KilnModel {
-  private nextId = 1;
+/** Request/response plumbing to a Kiln worker, shared by language models and encoders. */
+abstract class WorkerChannel {
+  protected nextId = 1;
   private readonly listeners = new Map<number, Listener>();
 
-  private constructor(
-    private readonly worker: Worker,
-    public info: ModelInfo,
-  ) {
+  protected constructor(protected readonly worker: Worker) {
     worker.onmessage = (e: MessageEvent<Response>) => this.listeners.get(e.data.id)?.(e.data);
     // A worker that fails to start or crashes would otherwise leave every pending call hanging.
     worker.onerror = (e: ErrorEvent) => {
@@ -56,6 +53,36 @@ export class KilnModel {
       const message = `Kiln worker failed: ${e.message || "it could not start (see the browser console)"}`;
       for (const [id, listener] of [...this.listeners]) listener({ id, type: "error", message });
     };
+  }
+
+  /** Sends a request; `onMsg` returns true when the exchange is complete. */
+  protected send(body: RequestBody, onMsg: (msg: Response) => boolean): number {
+    const id = this.nextId++;
+    this.listeners.set(id, (msg) => {
+      if (onMsg(msg)) this.listeners.delete(id);
+    });
+    this.post({ ...body, id } as Request);
+    return id;
+  }
+
+  protected post(msg: Request): void {
+    this.worker.postMessage(msg);
+  }
+
+  /** Unloads the model and stops the worker. */
+  async unload(): Promise<void> {
+    await new Promise<void>((resolve) => this.send({ type: "unload" }, () => (resolve(), true)));
+    this.worker.terminate();
+  }
+}
+
+/** Main-thread handle to a model running in a worker. */
+export class KilnModel extends WorkerChannel {
+  private constructor(
+    worker: Worker,
+    public info: ModelInfo,
+  ) {
+    super(worker);
   }
 
   static async load(model: string, opts: LoadOptions = {}): Promise<KilnModel> {
@@ -110,11 +137,6 @@ export class KilnModel {
     );
   }
 
-  async unload(): Promise<void> {
-    await new Promise<void>((resolve) => this.send({ type: "unload" }, () => (resolve(), true)));
-    this.worker.terminate();
-  }
-
   private stream(body: RequestBody, signal?: AbortSignal): TextStream {
     const queue: string[] = [];
     let wake: (() => void) | undefined;
@@ -150,20 +172,55 @@ export class KilnModel {
       },
     };
   }
-
-  /** Sends a request; `onMsg` returns true when the exchange is complete. */
-  private send(body: RequestBody, onMsg: (msg: Response) => boolean): number {
-    const id = this.nextId++;
-    this.listeners.set(id, (msg) => {
-      if (onMsg(msg)) this.listeners.delete(id);
-    });
-    this.post({ ...body, id } as Request);
-    return id;
-  }
-
-  private post(msg: Request): void {
-    this.worker.postMessage(msg);
-  }
 }
 
 export const load = KilnModel.load;
+
+export interface EncoderLoadOptions extends WireEncoderOptions {
+  onProgress?: (p: LoadProgress) => void;
+  /** Supply your own worker. Defaults to Kiln's module worker. */
+  worker?: Worker;
+}
+
+/** Main-thread handle to an encoder model (BERT, DistilBERT, RoBERTa) running in a worker. */
+export class KilnEncoder extends WorkerChannel {
+  private constructor(
+    worker: Worker,
+    public info: EncoderInfo,
+  ) {
+    super(worker);
+  }
+
+  static async load(model: string, opts: EncoderLoadOptions = {}): Promise<KilnEncoder> {
+    const worker = opts.worker ?? createWorker();
+    const m = new KilnEncoder(worker, undefined as unknown as EncoderInfo);
+    const { onProgress, worker: _w, ...wire } = opts;
+    try {
+      m.info = await new Promise<EncoderInfo>((resolve, reject) => {
+        m.send({ type: "loadEncoder", model, opts: wire }, (msg) => {
+          if (msg.type === "progress") onProgress?.(msg.progress);
+          else if (msg.type === "encoderLoaded") resolve(msg.info);
+          else if (msg.type === "error") reject(new Error(msg.message));
+          return msg.type === "encoderLoaded" || msg.type === "error";
+        });
+      });
+    } catch (err) {
+      if (!opts.worker) worker.terminate();
+      throw err;
+    }
+    return m;
+  }
+
+  /** Runs a task with transformers.js's arguments; resolves to its output. */
+  run<T>(task: EncoderTask, ...args: unknown[]): Promise<T> {
+    return new Promise((resolve, reject) =>
+      this.send({ type: "task", task, args }, (msg) => {
+        if (msg.type === "result") resolve(msg.result as T);
+        else if (msg.type === "error") reject(new Error(msg.message));
+        return msg.type === "result" || msg.type === "error";
+      }),
+    );
+  }
+}
+
+export const loadEncoder = KilnEncoder.load;

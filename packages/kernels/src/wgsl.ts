@@ -1541,18 +1541,29 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
 }
 
 /** x = gelu_tanh(x) in place. */
-export function geluSpec(): KernelSpec {
-  return spec("gelu", ["uniform", "rw"], cpu.cpuGelu, () => /* wgsl */ `
+/**
+ * GELU in place: the tanh approximation, or with `exact` the erf form (BERT's "gelu"), erf from
+ * Abramowitz & Stegun 7.1.26 (absolute error under 1.5e-7), the same formula as the CPU kernel.
+ */
+export function geluSpec(exact = false): KernelSpec {
+  return spec(exact ? "gelu/erf" : "gelu", ["uniform", "rw"], exact ? cpu.cpuGeluErf : cpu.cpuGelu, () => /* wgsl */ `
 struct P { n: u32, _a: u32, _b: u32, _c: u32 }
 @group(0) @binding(0) var<uniform> p: P;
 @group(0) @binding(1) var<storage, read_write> x: array<f32>;
-
+${exact ? `
+fn erf_as(v: f32) -> f32 {
+  let z = abs(v);
+  let t = 1.0 / (1.0 + 0.3275911 * z);
+  let y = 1.0 - (((((1.061405429 * t - 1.453152027) * t) + 1.421413741) * t - 0.284496736) * t + 0.254829592) * t * exp(-z * z);
+  return select(-y, y, v >= 0.0);
+}
+` : ""}
 @compute @workgroup_size(${EW})
 fn main(${EW_ARGS}) {
   ${FLAT}
   if (idx >= p.n) { return; }
   let a = x[idx];
-  x[idx] = ${GELU_WGSL("a")};
+  x[idx] = ${exact ? "0.5 * a * (1.0 + erf_as(a * 0.70710678118654752))" : GELU_WGSL("a")};
 }`);
 }
 

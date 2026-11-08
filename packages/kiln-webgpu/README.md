@@ -34,8 +34,8 @@ transformers.js's names: `max_new_tokens`, `do_sample` (default false: greedy; w
 `temperature` 1, `top_k` 50 and `top_p` 1 unless given), `repetition_penalty`, `streamer`,
 `progress_callback` (`initiate` / `progress` / `done` per file, then `ready`). The differences:
 
-- Only `"text-generation"`, for the decoder families Kiln runs (Llama, Mistral, Qwen2/3, SmolLM,
-  Granite, Gemma 3).
+- Text tasks only: `"text-generation"` for the decoder families Kiln runs (Llama, Mistral, Qwen2/3,
+  SmolLM, Granite, Gemma 3), and the encoder tasks below for BERT, DistilBERT and RoBERTa models.
 - `dtype` picks the format Kiln quantizes to at load: 4-bit names (`q4`, `q4f16`, `bnb4`, `int4`)
   load as q4, 8-bit ones (`q8`, `int8`, `uint8`) as q8, `fp16` / `fp32` as f32.
 - `device` defaults to `"auto"` (WebGPU where there is one, else the CPU); `"wasm"` means the CPU.
@@ -45,6 +45,33 @@ transformers.js's names: `max_new_tokens`, `do_sample` (default false: greedy; w
 - Kiln's own options can be passed alongside: `format` (JSON schema, regex, grammar), `tools`,
   `signal`, and on load `maxSeq`, `cpuThreads`, `mmproj`. `generator.model` is the underlying
   `KilnModel`, `generator.info` its details, `generator.dispose()` unloads it.
+
+## Encoder tasks
+
+BERT, DistilBERT and RoBERTa models (and those built on them: MiniLM, BGE, GTE…) load from their
+original safetensors repos, with transformers.js's task names and output shapes:
+
+```js
+import { pipeline, cos_sim } from "kiln-webgpu";
+
+const extractor = await pipeline("feature-extraction", "sentence-transformers/all-MiniLM-L6-v2");
+const emb = await extractor(["A man is eating.", "Someone is having a meal."], { pooling: "mean", normalize: true });
+const [a, b] = emb.tolist();
+cos_sim(a, b);
+
+const classifier = await pipeline("sentiment-analysis"); // [{ label: "POSITIVE", score: 0.9998 }]
+const ner = await pipeline("ner");                       // [{ entity: "B-PER", score, index, word: "Wolfgang" }, …]
+const qa = await pipeline("question-answering");          // { answer: "a nice puppet", score }
+const unmasker = await pipeline("fill-mask");             // [{ score, token, token_str: "life", sequence }, …]
+const zeroShot = await pipeline("zero-shot-classification"); // { sequence, labels, scores }
+```
+
+Without a model id, each task loads the repo in `DEFAULT_MODELS`. Options follow transformers.js:
+`pooling` ("none", "mean", "cls") and `normalize`; `top_k`; `ignore_labels` and
+`aggregation_strategy` ("none", "simple"); `hypothesis_template` and `multi_label`. Encoders load
+in f32 by default (`dtype: "q8"` or `"q4"` to quantize their matrices). Inputs longer than the model
+takes are truncated. Each input runs on its own (no padding), so feature extraction without pooling
+returns zeros past a shorter input's last token.
 
 ## Kiln's own API
 

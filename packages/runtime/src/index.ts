@@ -4,3 +4,4 @@ export * from "./weights";
 export * from "./tune";
 export * from "./prompt-cache";
 export * from "./prefix-store";
+export * from "./encoder";

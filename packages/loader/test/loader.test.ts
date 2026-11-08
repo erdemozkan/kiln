@@ -70,9 +70,17 @@ describe("safetensors", () => {
     ]);
   });
 
-  it("rejects unsupported dtypes with a clear error", async () => {
-    const bytes = safetensors({ x: { dtype: "I64", shape: [1], data_offsets: [0, 8] } }, new Uint8Array(8));
-    await expect(readSafetensorsHeader(new MemorySource(bytes))).rejects.toThrow(/I64 is not supported/);
+  it("rejects unsupported float dtypes with a clear error", async () => {
+    const bytes = safetensors({ x: { dtype: "F64", shape: [1], data_offsets: [0, 8] } }, new Uint8Array(8));
+    await expect(readSafetensorsHeader(new MemorySource(bytes))).rejects.toThrow(/F64 is not supported/);
+  });
+
+  it("skips integer buffers such as BERT's position_ids", async () => {
+    const bytes = safetensors(
+      { position_ids: { dtype: "I64", shape: [1, 1], data_offsets: [0, 8] }, w: { dtype: "F32", shape: [1], data_offsets: [8, 12] } },
+      new Uint8Array(12),
+    );
+    expect((await readSafetensorsHeader(new MemorySource(bytes))).tensors.map((t) => t.name)).toEqual(["w"]);
   });
 });
 

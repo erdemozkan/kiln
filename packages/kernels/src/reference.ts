@@ -88,6 +88,22 @@ export function geluTanh(a: number): number {
   return 0.5 * a * (1 + Math.tanh(Math.sqrt(2 / Math.PI) * (a + 0.044715 * a ** 3)));
 }
 
+/** erf by its Taylor series (to double precision for |x| <= 5; ±1 beyond). */
+export function erf(x: number): number {
+  if (Math.abs(x) > 5) return Math.sign(x);
+  let term = x, sum = x;
+  for (let n = 1; n < 200 && Math.abs(term) > 1e-17 * Math.abs(sum); n++) {
+    term *= (-x * x) / n;
+    sum += term / (2 * n + 1);
+  }
+  return (2 / Math.sqrt(Math.PI)) * sum;
+}
+
+/** GELU in its exact form, x · Φ(x). */
+export function geluErf(a: number): number {
+  return 0.5 * a * (1 + erf(a / Math.SQRT2));
+}
+
 export function geluMulRef(g: Float32Array, u: Float32Array): Float32Array {
   return g.map((a, i) => geluTanh(a) * u[i]!);
 }

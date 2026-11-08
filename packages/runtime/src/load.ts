@@ -194,7 +194,7 @@ async function openVision(backend: Backend, ref: ModelRef, opts: LoadOptions): P
 }
 
 /** WebGPU, or the CPU backend when asked for or (for "auto") when WebGPU is missing or has no adapter. */
-async function openBackend(device: "auto" | "gpu" | "cpu", cpuThreads?: number): Promise<Backend> {
+export async function openBackend(device: "auto" | "gpu" | "cpu", cpuThreads?: number): Promise<Backend> {
   const threads = cpuThreads ?? Math.min(4, globalThis.navigator?.hardwareConcurrency ?? 1);
   if (device === "cpu") return new CpuBackend({ threads });
   try {
@@ -215,7 +215,7 @@ async function open(ref: ModelRef, file: string, endpoint?: string, fresh = fals
  * is treated as corrupt (an old cache written before flush watermarks, or damaged storage) and
  * downloaded once more over the same file. Network failures are not retried.
  */
-async function openParsed<H>(ref: ModelRef, file: string, endpoint: string | undefined, parse: (s: ByteSource) => Promise<H>): Promise<{ source: ByteSource; header: H }> {
+export async function openParsed<H>(ref: ModelRef, file: string, endpoint: string | undefined, parse: (s: ByteSource) => Promise<H>): Promise<{ source: ByteSource; header: H }> {
   const source = await open(ref, file, endpoint);
   try {
     return { source, header: await parse(source) };

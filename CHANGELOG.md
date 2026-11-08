@@ -15,6 +15,12 @@ progress_callback })` and `TextStreamer`, taking transformers.js's option names 
 `do_sample`, `top_k`, `top_p`, `repetition_penalty`, `return_full_text`) and returning its output
 shapes (`[{ generated_text }]`, the messages with the reply appended for chats).
 
+**Encoder tasks.** BERT, DistilBERT and RoBERTa models from safetensors (WordPiece tokenizers from
+tokenizer.json or vocab.txt, RoBERTa's byte-level BPE) for `feature-extraction`,
+`text-classification`, `token-classification`, `question-answering`, `fill-mask` and
+`zero-shot-classification`, with transformers.js's output shapes, `Tensor` and `cos_sim`; scores
+equal to Python transformers' to six decimals.
+
 **Models.** Llama (including Llama 3 rope scaling), Mistral, Qwen2, Qwen3, SmolLM, Granite 3 and 4
 (350M to 2B; for Granite 4, the attention-only models) and Gemma 3 (270M to 4B and larger; images
 with the GGUF mmproj), from safetensors (F32/F16/BF16) or GGUF
@@ -64,5 +70,5 @@ load in 2.4 s. Decode uses a block-per-lane GEMV with several rows per thread on
 prefill a tiled GEMM and tiled attention, and GPU work is cut into short submits so the page stays
 responsive.
 
-**Checks.** 165 unit tests; a kernel check page (808 checks on the Intel GPU, 763 on the CPU backend) compares every kernel with a CPU reference; Gemma 3 1B matches a NumPy reference token for
+**Checks.** 173 unit tests; a kernel check page (809 checks on the Intel GPU, 763 on the CPU backend) compares every kernel with a CPU reference; Gemma 3 1B matches a NumPy reference token for
 token in q8 and q4.

@@ -30,6 +30,8 @@ export async function readSafetensorsHeader(src: ByteSource): Promise<Safetensor
     }
     const e = value as RawEntry;
     const type = DTYPES[e.dtype];
+    // Integer and boolean tensors are buffers (BERT's position_ids, attention masks), never weights.
+    if (!type && /^(I|U)(8|16|32|64)$|^BOOL$/.test(e.dtype)) continue;
     if (!type) throw new UnsupportedTensorError(`${name}: safetensors dtype ${e.dtype} is not supported (F32, F16, BF16)`);
     const [start, end] = e.data_offsets;
     tensors.push({ name, shape: e.shape, type, offset: base + start, byteLength: end - start });

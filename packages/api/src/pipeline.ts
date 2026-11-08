@@ -2,10 +2,34 @@
 // transformers.js's text-generation pipeline runs on Kiln with little more than a new import.
 import type { LoadProgress } from "@kiln/runtime";
 import type { ChatMessage } from "@kiln/tokenizers";
-import { KilnModel, type GenerateOptions, type LoadOptions, type TextStream } from "./client";
-import type { ModelInfo } from "./protocol";
+import { KilnEncoder, KilnModel, type GenerateOptions, type LoadOptions, type TextStream } from "./client";
+import type { EncoderInfo, EncoderTask, ModelInfo } from "./protocol";
 
-export type PipelineTask = "text-generation";
+/** Task names, with transformers.js's aliases. */
+export type PipelineTask =
+  | "text-generation"
+  | "feature-extraction"
+  | "embeddings"
+  | "text-classification"
+  | "sentiment-analysis"
+  | "token-classification"
+  | "ner"
+  | "question-answering"
+  | "fill-mask"
+  | "zero-shot-classification";
+
+const ALIASES: Partial<Record<PipelineTask, PipelineTask>> = { embeddings: "feature-extraction", "sentiment-analysis": "text-classification", ner: "token-classification" };
+
+/** Models used when `pipeline(task)` is given none (original Hub repos, not ONNX exports). */
+export const DEFAULT_MODELS: Record<string, string> = {
+  "text-generation": "HuggingFaceTB/SmolLM2-135M-Instruct",
+  "feature-extraction": "sentence-transformers/all-MiniLM-L6-v2",
+  "text-classification": "distilbert/distilbert-base-uncased-finetuned-sst-2-english",
+  "token-classification": "dslim/bert-base-NER",
+  "question-answering": "distilbert/distilbert-base-cased-distilled-squad",
+  "fill-mask": "google-bert/bert-base-uncased",
+  "zero-shot-classification": "typeform/distilbert-base-uncased-mnli",
+};
 
 /** transformers.js's names, plus any of Kiln's own load options. */
 export interface PipelineOptions extends Omit<LoadOptions, "device" | "onProgress" | "quant"> {
@@ -185,23 +209,153 @@ export async function runTextGeneration(
   return out;
 }
 
+/** A float tensor, as transformers.js returns embeddings: row-major `data` of shape `dims`. */
+export class Tensor {
+  constructor(
+    readonly type: "float32",
+    readonly data: Float32Array,
+    readonly dims: number[],
+  ) {}
+
+  get size(): number {
+    return this.data.length;
+  }
+
+  /** Nested arrays of numbers, outermost dimension first. */
+  tolist(): unknown[] {
+    const rec = (offset: number, d: number): unknown[] => {
+      const n = this.dims[d]!;
+      if (d === this.dims.length - 1) return Array.from(this.data.subarray(offset, offset + n));
+      const stride = this.dims.slice(d + 1).reduce((a, b) => a * b, 1);
+      return Array.from({ length: n }, (_, i) => rec(offset + i * stride, d + 1));
+    };
+    return rec(0, 0);
+  }
+}
+
+/** Cosine similarity of two vectors (transformers.js's `cos_sim`). */
+export function cos_sim(a: ArrayLike<number>, b: ArrayLike<number>): number {
+  let dot = 0, na = 0, nb = 0;
+  for (let i = 0; i < a.length; i++) {
+    dot += a[i]! * b[i]!;
+    na += a[i]! * a[i]!;
+    nb += b[i]! * b[i]!;
+  }
+  return dot / (Math.sqrt(na) * Math.sqrt(nb));
+}
+
+/** What every encoder pipeline carries besides being callable. */
+interface EncoderPipelineBase {
+  readonly task: PipelineTask;
+  readonly model: KilnEncoder;
+  readonly info: EncoderInfo;
+  /** Placeholder, as for text generation: the tokenizer runs in Kiln's worker. */
+  readonly tokenizer: object;
+  dispose(): Promise<void>;
+}
+
+export interface Label {
+  label: string;
+  score: number;
+}
+export interface TokenEntity {
+  entity: string;
+  score: number;
+  index: number;
+  word: string;
+}
+export interface EntityGroup {
+  entity_group: string;
+  score: number;
+  word: string;
+}
+export interface Answer {
+  answer: string;
+  score: number;
+}
+export interface MaskFill {
+  score: number;
+  token: number;
+  token_str: string;
+  sequence: string;
+}
+export interface ZeroShotResult {
+  sequence: string;
+  labels: string[];
+  scores: number[];
+}
+
+export interface FeatureExtractionPipeline extends EncoderPipelineBase {
+  /** Last hidden states [batch, tokens, hidden], or [batch, hidden] with pooling "mean" or "cls". */
+  (texts: string | string[], options?: { pooling?: "none" | "mean" | "cls" | "first_token"; normalize?: boolean }): Promise<Tensor>;
+}
+export interface TextClassificationPipeline extends EncoderPipelineBase {
+  (texts: string | string[], options?: { top_k?: number | null }): Promise<Label[] | Label[][]>;
+}
+export interface TokenClassificationPipeline extends EncoderPipelineBase {
+  (texts: string | string[], options?: { ignore_labels?: string[]; aggregation_strategy?: "none" | "simple" }): Promise<(TokenEntity | EntityGroup)[] | (TokenEntity | EntityGroup)[][]>;
+}
+export interface QuestionAnsweringPipeline extends EncoderPipelineBase {
+  (question: string | string[], context: string | string[], options?: { top_k?: number }): Promise<Answer | Answer[] | (Answer | Answer[])[]>;
+}
+export interface FillMaskPipeline extends EncoderPipelineBase {
+  (texts: string | string[], options?: { top_k?: number }): Promise<MaskFill[] | MaskFill[][]>;
+}
+export interface ZeroShotClassificationPipeline extends EncoderPipelineBase {
+  (texts: string | string[], candidate_labels: string | string[], options?: { hypothesis_template?: string; multi_label?: boolean }): Promise<ZeroShotResult | ZeroShotResult[]>;
+}
+
+/** Encoder dtypes: 8-bit names load as q8, 4-bit as q4, float and "auto" as f32 (encoders are small). */
+function encoderQuant(dtype: string | undefined): "f32" | "q8" | "q4" {
+  if (dtype === undefined || dtype === "auto" || dtype === "fp32" || dtype === "fp16" || dtype === "f32") return "f32";
+  const q = DTYPES[dtype];
+  if (!q) throw new Error(`Kiln: unsupported dtype "${dtype}" (use ${Object.keys(DTYPES).join(", ")})`);
+  return q === "q4" ? "q4" : "q8";
+}
+
 /**
- * transformers.js-style entry point. Only "text-generation" (decoder LLMs from safetensors or GGUF):
+ * transformers.js-style entry point: "text-generation" for decoder LLMs (safetensors or GGUF), and for
+ * encoder models (BERT, DistilBERT, RoBERTa from safetensors) "feature-extraction" ("embeddings"),
+ * "text-classification" ("sentiment-analysis"), "token-classification" ("ner"),
+ * "question-answering", "fill-mask" and "zero-shot-classification". Without a model id, the task's
+ * entry in `DEFAULT_MODELS` loads.
  *
  *   const generator = await pipeline("text-generation", "HuggingFaceTB/SmolLM2-135M-Instruct", { dtype: "q4" });
- *   const [out] = await generator([{ role: "user", content: "Hi!" }], { max_new_tokens: 64 });
- *   out.generated_text.at(-1).content;
+ *   const extractor = await pipeline("feature-extraction", "sentence-transformers/all-MiniLM-L6-v2");
+ *   const output = await extractor(["Hello", "World"], { pooling: "mean", normalize: true });
  */
-export async function pipeline(task: PipelineTask, model: string, options: PipelineOptions = {}): Promise<TextGenerationPipeline> {
-  if (task !== "text-generation") throw new Error(`Kiln: unsupported pipeline task "${task}" (Kiln runs "text-generation")`);
-  const m = await KilnModel.load(model, toLoadOptions(model, options));
-  options.progress_callback?.({ status: "ready", task, model });
-  const call = (input: Input | Input[], opts?: TextGenerationOptions) => runTextGeneration(m, input, opts);
-  return Object.assign(call, {
-    task,
-    model: m,
-    info: m.info,
-    tokenizer: {},
-    dispose: () => m.unload(),
-  }) as unknown as TextGenerationPipeline;
+export async function pipeline(task: "text-generation", model?: string, options?: PipelineOptions): Promise<TextGenerationPipeline>;
+export async function pipeline(task: "feature-extraction" | "embeddings", model?: string, options?: PipelineOptions): Promise<FeatureExtractionPipeline>;
+export async function pipeline(task: "text-classification" | "sentiment-analysis", model?: string, options?: PipelineOptions): Promise<TextClassificationPipeline>;
+export async function pipeline(task: "token-classification" | "ner", model?: string, options?: PipelineOptions): Promise<TokenClassificationPipeline>;
+export async function pipeline(task: "question-answering", model?: string, options?: PipelineOptions): Promise<QuestionAnsweringPipeline>;
+export async function pipeline(task: "fill-mask", model?: string, options?: PipelineOptions): Promise<FillMaskPipeline>;
+export async function pipeline(task: "zero-shot-classification", model?: string, options?: PipelineOptions): Promise<ZeroShotClassificationPipeline>;
+export async function pipeline(task: PipelineTask, model?: string, options: PipelineOptions = {}): Promise<unknown> {
+  const t = ALIASES[task] ?? task;
+  const id = model ?? DEFAULT_MODELS[t];
+  if (!id) {
+    throw new Error(`Kiln: unsupported pipeline task "${task}" (Kiln runs ${Object.keys(DEFAULT_MODELS).map((k) => `"${k}"`).join(", ")})`);
+  }
+  if (t === "text-generation") {
+    const m = await KilnModel.load(id, toLoadOptions(id, options));
+    options.progress_callback?.({ status: "ready", task, model: id });
+    const call = (input: Input | Input[], opts?: TextGenerationOptions) => runTextGeneration(m, input, opts);
+    return Object.assign(call, { task, model: m, info: m.info, tokenizer: {}, dispose: () => m.unload() });
+  }
+  const { progress_callback, dtype, quant, device, cpuThreads, revision, endpoint, worker } = options;
+  const progress = progress_callback ? toLoadOptions(id, { progress_callback }).onProgress : undefined;
+  const dev = device === "webgpu" || device === "gpu" ? "gpu" : device === "wasm" || device === "cpu" ? "cpu" : "auto";
+  const q = quant === "q4" || quant === "q8" || quant === "f32" ? quant : encoderQuant(dtype);
+  const m = await KilnEncoder.load(id, { quant: q, device: dev, cpuThreads, revision, endpoint, worker, onProgress: progress });
+  progress_callback?.({ status: "ready", task, model: id });
+  const run = (...args: unknown[]) => m.run(t as EncoderTask, ...args);
+  const call =
+    t === "feature-extraction"
+      ? async (...args: unknown[]) => {
+          const r = (await run(...args)) as { data: Float32Array; dims: number[] };
+          return new Tensor("float32", r.data, r.dims);
+        }
+      : run;
+  return Object.assign(call, { task, model: m, info: m.info, tokenizer: {}, dispose: () => m.unload() });
 }

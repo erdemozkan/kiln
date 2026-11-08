@@ -84,3 +84,20 @@ describe("text-generation calls", () => {
     expect(pieces).toEqual(["Par", "is."]);
   });
 });
+
+describe("encoder pipeline helpers", () => {
+  it("Tensor.tolist nests by dims", async () => {
+    const { Tensor } = await import("../src/pipeline");
+    const t = new Tensor("float32", Float32Array.from([1, 2, 3, 4, 5, 6]), [2, 3]);
+    expect(t.tolist()).toEqual([[1, 2, 3], [4, 5, 6]]);
+    expect(new Tensor("float32", Float32Array.from([1, 2, 3, 4]), [1, 2, 2]).tolist()).toEqual([[[1, 2], [3, 4]]]);
+    expect(t.size).toBe(6);
+  });
+
+  it("cos_sim", async () => {
+    const { cos_sim } = await import("../src/pipeline");
+    expect(cos_sim([1, 0], [1, 0])).toBeCloseTo(1);
+    expect(cos_sim([1, 0], [0, 1])).toBeCloseTo(0);
+    expect(cos_sim([1, 2], [-1, -2])).toBeCloseTo(-1);
+  });
+});

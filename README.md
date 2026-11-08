@@ -433,7 +433,7 @@ cost.
 
 ## Status
 
-Verified on this GPU: all kernel checks pass (808 now that Chrome exposes shader-f16 on it, including q4 and q8 weights, symmetric and affine, in every matmul variant, bidirectional-span attention, LayerNorm and pooling, the decode GEMV and the prefill GEMM, both prefill attention kernels, fused variants, f16 cache paths,
+Verified on this GPU: all kernel checks pass (809 now that Chrome exposes shader-f16 on it, including q4 and q8 weights, symmetric and affine, in every matmul variant, bidirectional-span attention, LayerNorm and pooling, the decode GEMV and the prefill GEMM, both prefill attention kernels, fused variants, f16 cache paths,
 sliding-window attention, GELU gating, grammar masks and sampling distributions). SmolLM2-135M-Instruct chats from Hub safetensors (q4, f32) and from a GGUF
 Q4_K_M file.
 
@@ -454,6 +454,27 @@ Models run end to end (greedy answers to fixed questions checked by hand; tool c
 | `granitemoehybrid` | granite-4.0-350m (tool calls), with `quant: "q8"` | safetensors, GGUF Q8_0 | 26 tok/s; 38.7 tok/s (Q8_0) |
 | `granitemoehybrid` | granite-4.0-1b (tool calls) | safetensors (3.3 GB) | 11.5 tok/s (q4) |
 | `gemma3` | Gemma 3 4B-it (recalls a fact 1,100 and 3,000 tokens back; images with `mmproj`) | GGUF Q4_0 (2.4 GB) + mmproj-F16 | 177–180 ms GPU per step (about 5.5 tok/s); 24.6 tok/s on an M3 |
+
+Encoder models (BERT, DistilBERT, RoBERTa, from safetensors) run the six text tasks transformers.js
+runs on them, with its task names and output shapes. Checked against Python transformers (4.1.1,
+PyTorch 1.7) on the CPU backend: identical token ids, final hidden states within 8e-6, and task
+scores equal to six decimals; the same outputs on WebGPU through `pipeline()`:
+
+| Task | Model | Kiln | Python transformers |
+|---|---|---|---|
+| `feature-extraction` (mean, normalized) | all-MiniLM-L6-v2 | max difference 1.3e-7 | |
+| `text-classification` | distilbert-base-uncased-finetuned-sst-2-english | POSITIVE 0.999807 | POSITIVE 0.999807 |
+| `token-classification` | dslim/bert-base-NER | Wolfgang B-PER 0.999131, Berlin B-LOC 0.999534 | same |
+| `question-answering` | distilbert-base-cased-distilled-squad | "a nice puppet" | hidden states within 4e-6 |
+| `zero-shot-classification` | typeform/distilbert-base-uncased-mnli | phone 0.870278, computer 0.095473 … | same |
+| `fill-mask` | bert-base-uncased | life 0.109333, survival 0.039419 … | same |
+| `fill-mask` | roberta-base | Paris 0.903619, Lyon 0.080292 … | Paris 0.903627, Lyon 0.080292 … |
+
+The encoder reuses the vision tower's pieces (biased matmuls, LayerNorm, attention over a
+bidirectional span) plus an exact erf GELU kernel; heads (pooler, classifier, QA span, masked-LM)
+run in TypeScript on the final hidden states. Tokenizers: WordPiece from tokenizer.json or vocab.txt,
+and RoBERTa's byte-level BPE, both matching Python tokenizers on 56 test encodings. Not yet: Unigram
+tokenizers (XLM-R), ModernBERT, MPNet, DeBERTa, and batching several inputs into one forward pass.
 
 Gemma 3 was checked token by token against an independent NumPy forward pass written from
 transformers' `modeling_gemma3`: greedy output matched on every prompt tried, for 1B in q4 and q8 and 270M
