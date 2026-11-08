@@ -249,6 +249,10 @@ npm publish -w kiln-webgpu
 
 The playground build uses relative URLs, so it can be served from a subpath such as a GitHub Pages
 project site; served from `/kiln/`, it loads and chats and its kernel-check page passes.
+Pages cannot send the COOP/COEP headers the dev server does, so the pages register a service worker
+(`public/coi-sw.js`) that adds them to the site's own responses and reload once; served by a plain
+static server, the built demo is then cross-origin isolated (its workers too) and still downloads,
+caches and chats.
 
 The kernel-check page runs every WGSL kernel against `@kiln/kernels` reference code on the current GPU.
 The bench page reports GPU time per step and per kernel (matmuls are labelled with their shape) plus
