@@ -663,6 +663,57 @@ export const cpuIm2col1d: CpuKernel = (b) => {
   }
 };
 
+export const cpuChannelNorm: CpuKernel = (b) => {
+  const [T, C] = [b[0]!.u32[0]!, b[0]!.u32[1]!];
+  const eps = b[0]!.f32[2]!;
+  const x = b[1]!.f32;
+  const w = b[2]!.f32;
+  const bias = b[3]!.f32;
+  const y = b[4]!.f32;
+  const mean = new Float64Array(C);
+  const sq = new Float64Array(C);
+  for (let t = 0; t < T; t++) for (let c = 0; c < C; c++) mean[c] += x[t * C + c]!;
+  for (let c = 0; c < C; c++) mean[c] /= T;
+  for (let t = 0; t < T; t++) for (let c = 0; c < C; c++) sq[c] += (x[t * C + c]! - mean[c]!) ** 2;
+  const scale = new Float64Array(C);
+  for (let c = 0; c < C; c++) scale[c] = w[c]! / Math.sqrt(sq[c]! / T + eps);
+  for (let t = 0; t < T; t++) for (let c = 0; c < C; c++) y[t * C + c] = (x[t * C + c]! - mean[c]!) * scale[c]! + bias[c]!;
+};
+
+export const cpuGroupConv1d: CpuKernel = (b) => {
+  const [tin, tout, C, O, k, pad, groups] = Array.from(b[0]!.u32.subarray(0, 7)) as number[];
+  const x = b[1]!.f32;
+  const w = b[2]!.f32;
+  const bias = b[3]!.f32;
+  const y = b[4]!.f32;
+  const cg = C! / groups!;
+  const og = O! / groups!;
+  const acc = new Float32Array(O!);
+  for (let t = 0; t < tout!; t++) {
+    acc.set(bias.subarray(0, O!));
+    for (let j = 0; j < k!; j++) {
+      const src = t + j - pad!;
+      if (src < 0 || src >= tin!) continue;
+      for (let g = 0; g < groups!; g++) {
+        for (let c = 0; c < cg; c++) {
+          const xv = x[src * C! + g * cg + c]!;
+          const wo = (j * cg + c) * O! + g * og;
+          for (let o = 0; o < og; o++) acc[g * og + o] += xv * w[wo + o]!;
+        }
+      }
+    }
+    y.set(acc, t * O!);
+  }
+};
+
+export const cpuScaleAdd: CpuKernel = (b) => {
+  const [n, accumulate] = [b[0]!.u32[0]!, b[0]!.u32[1]!];
+  const a = b[0]!.f32[2]!;
+  const x = b[1]!.f32;
+  const y = b[2]!.f32;
+  for (let i = 0; i < n; i++) y[i] = (accumulate ? y[i]! : 0) + a * x[i]!;
+};
+
 export const cpuAvgPool: CpuKernel = (b) => {
   const [side, k, C] = [b[0]!.u32[0]!, b[0]!.u32[1]!, b[0]!.u32[2]!];
   const x = b[1]!.f32;

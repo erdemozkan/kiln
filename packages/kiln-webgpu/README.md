@@ -109,6 +109,17 @@ Blob / File, or encoded bytes: WAV is parsed directly, other formats are decoded
 Web Audio API on the page's main thread (`readAudio` is exported for doing it yourself). Audio
 longer than 30 s is transcribed in consecutive 30 s windows. Timestamps are not supported yet.
 
+wav2vec2 and HuBERT CTC models work in the same pipeline (Kiln reads the model's config to tell them
+from Whisper), and their sequence classifiers run `audio-classification`:
+
+```js
+const ctc = await pipeline("automatic-speech-recognition", "facebook/wav2vec2-base-960h");
+await ctc(samples); // { text: "AND SO MY FELLOW AMERICANS ..." }
+
+const keywords = await pipeline("audio-classification"); // superb/wav2vec2-base-superb-ks
+await keywords(samples, { top_k: 3 }); // [{ label: "yes", score: 0.98 }, ...]
+```
+
 ## Kiln's own API
 
 ```ts

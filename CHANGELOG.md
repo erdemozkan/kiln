@@ -34,6 +34,12 @@ features as transformers computes them, convolutions as matmuls, transformers.js
 and token suppression, `language` / `task` options, audio from samples, URLs, Blobs or bytes, long
 audio in 30 s windows.
 
+**Speech encoders.** wav2vec2 and HuBERT from safetensors or `pytorch_model.bin`: CTC
+`automatic-speech-recognition` (the pipeline picks Whisper or CTC from the config) and
+`audio-classification` (sequence classifiers, including the weighted sum over layers), both
+front-end variants (GroupNorm, post-LayerNorm base models; LayerNorm, pre-LayerNorm large models),
+the grouped positional convolution as one kernel.
+
 **Models.** Llama (including Llama 3 rope scaling), Mistral, Qwen2, Qwen3, SmolLM, Granite 3 and 4
 (350M to 2B; for Granite 4, the attention-only models) and Gemma 3 (270M to 4B and larger; images
 with the GGUF mmproj), from safetensors (F32/F16/BF16) or GGUF

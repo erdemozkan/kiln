@@ -1,5 +1,5 @@
-import { createEncoder, createEngine, createSeq2Seq, loadPromptCache, promptCacheName, savePromptCache, type EncoderEngine, type Engine, type Seq2SeqEngine, type Seq2SeqGenerateOptions, type TextDelta } from "@kiln/runtime";
-import type { EncoderTask, Request, Response, Seq2SeqTask } from "./protocol";
+import { createAudio, createEncoder, createEngine, createSeq2Seq, type AudioEngine, loadPromptCache, promptCacheName, savePromptCache, type EncoderEngine, type Engine, type Seq2SeqEngine, type Seq2SeqGenerateOptions, type TextDelta } from "@kiln/runtime";
+import type { AudioTask, EncoderTask, Request, Response, Seq2SeqTask } from "./protocol";
 
 /** The slice of DedicatedWorkerGlobalScope we use (lib.webworker conflicts with lib.dom in one program). */
 const scope = self as unknown as {
@@ -9,6 +9,7 @@ const scope = self as unknown as {
 let engine: Engine | undefined;
 let encoder: EncoderEngine | undefined;
 let seq2seq: Seq2SeqEngine | undefined;
+let audio: AudioEngine | undefined;
 
 const OUTPUT_KEY: Record<Seq2SeqTask, string> = { summarization: "summary_text", translation: "translation_text", "text2text-generation": "generated_text", "automatic-speech-recognition": "text" };
 
@@ -199,6 +200,42 @@ scope.onmessage = async (e: MessageEvent<Request>) => {
         });
         break;
       }
+      case "loadAudio": {
+        await queue;
+        audio?.destroy();
+        audio = undefined;
+        const a = await createAudio(msg.model, { ...msg.opts, onProgress: (progress) => post({ id: msg.id, type: "progress", progress }) });
+        audio = a;
+        post({
+          id: msg.id,
+          type: "audioLoaded",
+          info: {
+            model: msg.model,
+            family: a.cfg.modelType,
+            head: a.classifier ? "classification" : "ctc",
+            layers: a.cfg.layers,
+            hiddenSize: a.cfg.hidden,
+            backend: a.backend.name,
+            cpuThreads: a.backend.name === "cpu" ? (a.backend as { threads?: number }).threads : undefined,
+            labels: a.cfg.id2label,
+          },
+        });
+        break;
+      }
+      case "audioTask": {
+        const a = audio;
+        if (!a) throw new Error("no speech model loaded");
+        queue = queue.then(async () => {
+          try {
+            const [samples, opts] = msg.args as [Float32Array, Record<string, unknown> | undefined];
+            const result = (msg.task as AudioTask) === "audio-classification" ? await a.classify(samples, opts) : await a.transcribe(samples);
+            post({ id: msg.id, type: "result", result });
+          } catch (err) {
+            post({ id: msg.id, type: "error", message: err instanceof Error ? err.message : String(err) });
+          }
+        });
+        break;
+      }
       case "task": {
         const isS2S = msg.task in OUTPUT_KEY;
         const enc = encoder;
@@ -254,6 +291,8 @@ scope.onmessage = async (e: MessageEvent<Request>) => {
         encoder = undefined;
         seq2seq?.destroy();
         seq2seq = undefined;
+        audio?.destroy();
+        audio = undefined;
         post({ id: msg.id, type: "done", stats: undefined });
         break;
     }

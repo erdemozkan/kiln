@@ -152,7 +152,7 @@ export class WordPieceTokenizer extends TemplatedTokenizer {
 }
 
 /** transformers' clean_up_tokenization: no space before punctuation and English contractions. */
-function cleanup(s: string): string {
+export function cleanup(s: string): string {
   return s
     .replaceAll(" .", ".")
     .replaceAll(" ?", "?")

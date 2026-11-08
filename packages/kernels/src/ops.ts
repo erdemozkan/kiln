@@ -20,6 +20,9 @@ import {
   embedSpec,
   actSpec,
   im2col1dSpec,
+  channelNormSpec,
+  groupConv1dSpec,
+  scaleAddSpec,
   type Activation,
   layernormSpec,
   gatedActSpec,
@@ -400,6 +403,33 @@ export function im2col1d(ctx: Ctx, x: Tensor, k: number, stride: number, pad: nu
 }
 
 /** k × k average pooling of a side × side token grid [side², C] → [(side / k)², C]. */
+/** GroupNorm with one group per channel: each column of x [T, C] normalized over time, then scaled by w and shifted by b. */
+export function channelNorm(ctx: Ctx, x: Tensor, w: Tensor, b: Tensor, eps: number): Tensor {
+  const [T, C] = x.shape as [number, number];
+  const y = ctx.alloc([T, C]);
+  ctx.run(channelNormSpec(), [ctx.uniform([u32(T), u32(C), f32(eps), u32(0)]), x.buf, w.buf, b.buf, y.buf], [C, 1, 1]);
+  return y;
+}
+
+/**
+ * Grouped 1-D convolution of x [Tin, C] with w stored [k, C / groups, O] (see groupConv1dSpec):
+ * `tout` output frames (default Tin + 2·pad − k + 1).
+ */
+export function groupConv1d(ctx: Ctx, x: Tensor, w: Tensor, bias: Tensor, o: { k: number; pad: number; groups: number; tout?: number }): Tensor {
+  const [tin, C] = x.shape as [number, number];
+  const O = w.shape[w.shape.length - 1]!;
+  const tout = o.tout ?? tin + 2 * o.pad - o.k + 1;
+  const y = ctx.alloc([tout, O]);
+  ctx.run(groupConv1dSpec(), [ctx.uniform([u32(tin), u32(tout), u32(C), u32(O), u32(o.k), u32(o.pad), u32(o.groups), u32(0)]), x.buf, w.buf, bias.buf, y.buf], grid1d(tout * O));
+  return y;
+}
+
+/** y = a·x, or y += a·x when accumulating (same element count). */
+export function scaleAdd(ctx: Ctx, y: Tensor, x: Tensor, a: number, accumulate: boolean): void {
+  const n = numel(x.shape);
+  ctx.run(scaleAddSpec(), [ctx.uniform([u32(n), u32(accumulate ? 1 : 0), f32(a), u32(0)]), x.buf, y.buf], grid1d(n));
+}
+
 export function avgPool(ctx: Ctx, x: Tensor, side: number, k: number): Tensor {
   const C = lastDim(x);
   if (side % k || numel(x.shape) !== side * side * C) throw new Error(`avgPool: [${x.shape}] is not a ${side}×${side} grid poolable by ${k}`);

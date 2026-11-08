@@ -2,7 +2,7 @@ import type { Profile } from "@kiln/core";
 import type { GenerateStats, LoadProgress } from "@kiln/runtime";
 import type { ChatMessage } from "@kiln/tokenizers";
 import { createWorker } from "./default-worker";
-import type { EncoderInfo, EncoderTask, ModelInfo, Request, Response, Seq2SeqInfo, Seq2SeqTask, WireEncoderOptions, WireGenerateOptions, WireLoadOptions, WireSeq2SeqOptions } from "./protocol";
+import type { AudioInfo, AudioTask, EncoderInfo, EncoderTask, ModelInfo, Request, Response, Seq2SeqInfo, Seq2SeqTask, WireEncoderOptions, WireGenerateOptions, WireLoadOptions, WireSeq2SeqOptions } from "./protocol";
 
 type Listener = (msg: Response) => void;
 type RequestBody = Request extends infer R ? (R extends Request ? Omit<R, "id"> : never) : never;
@@ -273,3 +273,52 @@ export class KilnSeq2Seq extends WorkerChannel {
 }
 
 export const loadSeq2Seq = KilnSeq2Seq.load;
+
+export interface AudioLoadOptions extends WireEncoderOptions {
+  onProgress?: (p: LoadProgress) => void;
+  /** Supply your own worker. Defaults to Kiln's module worker. */
+  worker?: Worker;
+}
+
+/** Main-thread handle to a speech encoder (wav2vec2, HuBERT) running in a worker. */
+export class KilnAudio extends WorkerChannel {
+  private constructor(
+    worker: Worker,
+    public info: AudioInfo,
+  ) {
+    super(worker);
+  }
+
+  static async load(model: string, opts: AudioLoadOptions = {}): Promise<KilnAudio> {
+    const worker = opts.worker ?? createWorker();
+    const m = new KilnAudio(worker, undefined as unknown as AudioInfo);
+    const { onProgress, worker: _w, ...wire } = opts;
+    try {
+      m.info = await new Promise<AudioInfo>((resolve, reject) => {
+        m.send({ type: "loadAudio", model, opts: wire }, (msg) => {
+          if (msg.type === "progress") onProgress?.(msg.progress);
+          else if (msg.type === "audioLoaded") resolve(msg.info);
+          else if (msg.type === "error") reject(new Error(msg.message));
+          return msg.type === "audioLoaded" || msg.type === "error";
+        });
+      });
+    } catch (err) {
+      if (!opts.worker) worker.terminate();
+      throw err;
+    }
+    return m;
+  }
+
+  /** CTC speech recognition ({ text }) or audio classification ([{ label, score }]) on 16 kHz mono samples. */
+  run<T>(task: AudioTask, samples: Float32Array, options: Record<string, unknown> = {}): Promise<T> {
+    return new Promise((resolve, reject) =>
+      this.send({ type: "audioTask", task, args: [samples, options] }, (msg) => {
+        if (msg.type === "result") resolve(msg.result as T);
+        else if (msg.type === "error") reject(new Error(msg.message));
+        return msg.type === "result" || msg.type === "error";
+      }),
+    );
+  }
+}
+
+export const loadAudio = KilnAudio.load;

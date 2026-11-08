@@ -90,6 +90,22 @@ export interface Seq2SeqInfo {
   cpuThreads?: number;
 }
 
+/** Tasks of speech encoders on raw audio (wav2vec2, HuBERT). */
+export type AudioTask = "automatic-speech-recognition" | "audio-classification";
+
+export interface AudioInfo {
+  model: string;
+  /** "wav2vec2" or "hubert". */
+  family: string;
+  /** "ctc" (speech recognition) or "classification". */
+  head: "ctc" | "classification";
+  layers: number;
+  hiddenSize: number;
+  backend: string;
+  cpuThreads?: number;
+  labels?: Record<number, string>;
+}
+
 export interface EncoderInfo {
   model: string;
   /** "bert", "distilbert" or "roberta". */
@@ -109,7 +125,9 @@ export type Request =
   | { id: number; type: "load"; model: string; opts: WireLoadOptions }
   | { id: number; type: "loadEncoder"; model: string; opts: WireEncoderOptions }
   | { id: number; type: "loadSeq2Seq"; model: string; opts: WireSeq2SeqOptions }
+  | { id: number; type: "loadAudio"; model: string; opts: WireEncoderOptions }
   | { id: number; type: "task"; task: EncoderTask | Seq2SeqTask; args: unknown[] }
+  | { id: number; type: "audioTask"; task: AudioTask; args: unknown[] }
   | { id: number; type: "chat"; messages: ChatMessage[]; opts: WireGenerateOptions }
   | { id: number; type: "complete"; prompt: string; opts: WireGenerateOptions }
   | { id: number; type: "abort"; target: number }
@@ -121,6 +139,7 @@ export type Response =
   | { id: number; type: "loaded"; info: ModelInfo }
   | { id: number; type: "encoderLoaded"; info: EncoderInfo }
   | { id: number; type: "seq2seqLoaded"; info: Seq2SeqInfo }
+  | { id: number; type: "audioLoaded"; info: AudioInfo }
   | { id: number; type: "result"; result: unknown }
   | { id: number; type: "delta"; text: string }
   | { id: number; type: "done"; stats: GenerateStats | undefined }

@@ -1655,6 +1655,96 @@ fn main(${EW_ARGS}) {
 }`);
 }
 
+/**
+ * Per-channel normalization over time (GroupNorm with one group per channel): x [T, C] → y, each
+ * column scaled to zero mean and unit variance, then by w[c] and b[c]. One workgroup per channel.
+ */
+export function channelNormSpec(): KernelSpec {
+  return spec("channel_norm", ["uniform", "read", "read", "read", "rw"], cpu.cpuChannelNorm, () => /* wgsl */ `
+struct P { T: u32, C: u32, eps: f32, _p: u32 }
+@group(0) @binding(0) var<uniform> p: P;
+@group(0) @binding(1) var<storage, read> x: array<f32>;
+@group(0) @binding(2) var<storage, read> w: array<f32>;
+@group(0) @binding(3) var<storage, read> b: array<f32>;
+@group(0) @binding(4) var<storage, read_write> y: array<f32>;
+var<workgroup> red: array<f32, 256>;
+
+fn total(li: u32, v: f32) -> f32 {
+  red[li] = v;
+  workgroupBarrier();
+  for (var s = 128u; s > 0u; s >>= 1u) {
+    if (li < s) { red[li] += red[li + s]; }
+    workgroupBarrier();
+  }
+  let t = red[0];
+  workgroupBarrier();
+  return t;
+}
+
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) li: u32) {
+  let c = wid.x;
+  var s = 0.0;
+  for (var t = li; t < p.T; t += 256u) { s += x[t * p.C + c]; }
+  let mean = total(li, s) / f32(p.T);
+  var v = 0.0;
+  for (var t = li; t < p.T; t += 256u) { let d = x[t * p.C + c] - mean; v += d * d; }
+  let inv = inverseSqrt(total(li, v) / f32(p.T) + p.eps);
+  for (var t = li; t < p.T; t += 256u) { y[t * p.C + c] = (x[t * p.C + c] - mean) * inv * w[c] + b[c]; }
+}`);
+}
+
+/**
+ * Grouped 1-D convolution: x [Tin, C] → y [Tout, O], y[t, o] = bias[o] + Σ_j Σ_c x[t + j − pad, g·Cg + c] ·
+ * w[(j·Cg + c)·O + o] for o's group g (Cg = C / groups input channels per group), zero outside the input.
+ * The weight is stored [k, Cg, O] so neighbouring outputs read neighbouring weights.
+ */
+export function groupConv1dSpec(): KernelSpec {
+  return spec("group_conv1d", ["uniform", "read", "read", "read", "rw"], cpu.cpuGroupConv1d, () => /* wgsl */ `
+struct P { tin: u32, tout: u32, C: u32, O: u32, k: u32, pad: u32, groups: u32, _p: u32 }
+@group(0) @binding(0) var<uniform> p: P;
+@group(0) @binding(1) var<storage, read> x: array<f32>;
+@group(0) @binding(2) var<storage, read> w: array<f32>;
+@group(0) @binding(3) var<storage, read> bias: array<f32>;
+@group(0) @binding(4) var<storage, read_write> y: array<f32>;
+
+@compute @workgroup_size(${EW})
+fn main(${EW_ARGS}) {
+  ${FLAT}
+  if (idx >= p.tout * p.O) { return; }
+  let t = idx / p.O;
+  let o = idx % p.O;
+  let cg = p.C / p.groups;
+  let c0 = (o / (p.O / p.groups)) * cg;
+  var s = bias[o];
+  for (var j = 0u; j < p.k; j++) {
+    let src = i32(t + j) - i32(p.pad);
+    if (src < 0 || u32(src) >= p.tin) { continue; }
+    let xo = u32(src) * p.C + c0;
+    let wo = j * cg * p.O + o;
+    for (var c = 0u; c < cg; c++) { s += x[xo + c] * w[wo + c * p.O]; }
+  }
+  y[idx] = s;
+}`);
+}
+
+/** y = a·x (accumulate 0) or y += a·x (accumulate 1), elementwise. */
+export function scaleAddSpec(): KernelSpec {
+  return spec("scale_add", ["uniform", "read", "rw"], cpu.cpuScaleAdd, () => /* wgsl */ `
+struct P { n: u32, accumulate: u32, a: f32, _p: u32 }
+@group(0) @binding(0) var<uniform> p: P;
+@group(0) @binding(1) var<storage, read> x: array<f32>;
+@group(0) @binding(2) var<storage, read_write> y: array<f32>;
+
+@compute @workgroup_size(${EW})
+fn main(${EW_ARGS}) {
+  ${FLAT}
+  if (idx >= p.n) { return; }
+  let v = p.a * x[idx];
+  if (p.accumulate == 1u) { y[idx] += v; } else { y[idx] = v; }
+}`);
+}
+
 /** Copies row `st.lastRow` of x [T, D] into out [1, D]. */
 export function copyRowSpec(): KernelSpec {
   return spec("copy_row", ["uniform", "read", "read", "rw"], cpu.cpuCopyRow, () => /* wgsl */ `

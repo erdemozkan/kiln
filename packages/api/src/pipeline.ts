@@ -2,9 +2,9 @@
 // transformers.js's text-generation pipeline runs on Kiln with little more than a new import.
 import type { LoadProgress } from "@kiln/runtime";
 import type { ChatMessage } from "@kiln/tokenizers";
-import { KilnEncoder, KilnModel, KilnSeq2Seq, type GenerateOptions, type LoadOptions, type TextStream } from "./client";
-import { readAudio, type AudioInput } from "@kiln/loader";
-import type { EncoderInfo, EncoderTask, ModelInfo, Seq2SeqInfo, Seq2SeqTask } from "./protocol";
+import { KilnAudio, KilnEncoder, KilnModel, KilnSeq2Seq, type GenerateOptions, type LoadOptions, type TextStream } from "./client";
+import { fetchJSON, fileUrl, parseModelId, readAudio, type AudioInput } from "@kiln/loader";
+import type { AudioInfo, EncoderInfo, EncoderTask, ModelInfo, Seq2SeqInfo, Seq2SeqTask } from "./protocol";
 
 /** Task names, with transformers.js's aliases. */
 export type PipelineTask =
@@ -21,7 +21,8 @@ export type PipelineTask =
   | "summarization"
   | "translation"
   | "text2text-generation"
-  | "automatic-speech-recognition";
+  | "automatic-speech-recognition"
+  | "audio-classification";
 
 const SEQ2SEQ = new Set<string>(["summarization", "translation", "text2text-generation", "automatic-speech-recognition"]);
 
@@ -40,7 +41,11 @@ export const DEFAULT_MODELS: Record<string, string> = {
   translation: "Helsinki-NLP/opus-mt-en-de",
   "text2text-generation": "google/flan-t5-small",
   "automatic-speech-recognition": "openai/whisper-tiny.en",
+  "audio-classification": "superb/wav2vec2-base-superb-ks",
 };
+
+/** Speech encoders run on raw samples (CTC or a classifier) rather than as encoder-decoders. */
+const AUDIO_ENCODERS = new Set(["wav2vec2", "hubert"]);
 
 /** transformers.js's names, plus any of Kiln's own load options. */
 export interface PipelineOptions extends Omit<LoadOptions, "device" | "onProgress" | "quant"> {
@@ -353,10 +358,28 @@ export interface SpeechRecognitionOptions {
   /** Window length in seconds (default 30). Longer audio is transcribed window by window. */
   chunk_length_s?: number;
 }
-export interface SpeechRecognitionPipeline extends Seq2SeqPipelineBase {
+export interface SpeechRecognitionPipeline {
+  readonly task: PipelineTask;
+  /** Whisper runs as an encoder-decoder, wav2vec2 / HuBERT (CTC) as a speech encoder. */
+  readonly model: KilnSeq2Seq | KilnAudio;
+  readonly info: Seq2SeqInfo | AudioInfo;
+  readonly tokenizer: object;
+  dispose(): Promise<void>;
   /** 16 kHz samples, a URL, a Blob / File, or encoded audio bytes (WAV anywhere; other formats on a page's main thread). */
   (audio: AudioInput, options?: SpeechRecognitionOptions): Promise<{ text: string }>;
   (audio: AudioInput[], options?: SpeechRecognitionOptions): Promise<{ text: string }[]>;
+}
+export interface AudioClassificationOptions {
+  /** Labels returned, best first (default 5). */
+  top_k?: number;
+}
+export interface AudioClassificationPipeline {
+  readonly task: PipelineTask;
+  readonly model: KilnAudio;
+  readonly info: AudioInfo;
+  dispose(): Promise<void>;
+  (audio: AudioInput, options?: AudioClassificationOptions): Promise<{ label: string; score: number }[]>;
+  (audio: AudioInput[], options?: AudioClassificationOptions): Promise<{ label: string; score: number }[][]>;
 }
 export interface Text2TextGenerationPipeline extends Seq2SeqPipelineBase {
   (texts: string | string[], options?: Text2TextOptions): Promise<{ generated_text: string }[]>;
@@ -392,6 +415,7 @@ export async function pipeline(task: "summarization", model?: string, options?: 
 export async function pipeline(task: "translation", model?: string, options?: PipelineOptions): Promise<TranslationPipeline>;
 export async function pipeline(task: "text2text-generation", model?: string, options?: PipelineOptions): Promise<Text2TextGenerationPipeline>;
 export async function pipeline(task: "automatic-speech-recognition", model?: string, options?: PipelineOptions): Promise<SpeechRecognitionPipeline>;
+export async function pipeline(task: "audio-classification", model?: string, options?: PipelineOptions): Promise<AudioClassificationPipeline>;
 export async function pipeline(task: PipelineTask, model?: string, options: PipelineOptions = {}): Promise<unknown> {
   const t = ALIASES[task] ?? task;
   const id = model ?? DEFAULT_MODELS[t];
@@ -408,6 +432,25 @@ export async function pipeline(task: PipelineTask, model?: string, options: Pipe
   const progress = progress_callback ? toLoadOptions(id, { progress_callback }).onProgress : undefined;
   const dev = device === "webgpu" || device === "gpu" ? "gpu" : device === "wasm" || device === "cpu" ? "cpu" : "auto";
   const q = quant === "q4" || quant === "q8" || quant === "f32" ? quant : encoderQuant(dtype);
+  // Whisper or a CTC model? The config says.
+  const speechEncoder =
+    t === "audio-classification" ||
+    (t === "automatic-speech-recognition" &&
+      AUDIO_ENCODERS.has(String((await fetchJSON<Record<string, unknown>>(fileUrl(parseModelId(id, revision), "config.json", endpoint)))?.model_type)));
+  if (speechEncoder) {
+    const m = await KilnAudio.load(id, { quant: q, device: dev, cpuThreads, revision, endpoint, worker, onProgress: progress });
+    progress_callback?.({ status: "ready", task, model: id });
+    const audioTask = t as "automatic-speech-recognition" | "audio-classification";
+    // Decoded here: the Web Audio API is on the main thread, not in the worker.
+    const one = async (x: AudioInput, opts?: object) => m.run(audioTask, await readAudio(x, 16000), { ...opts });
+    const call = async (audio: AudioInput | AudioInput[], opts?: object) => {
+      if (!Array.isArray(audio)) return one(audio, opts);
+      const out: unknown[] = [];
+      for (const x of audio) out.push(await one(x, opts));
+      return out;
+    };
+    return Object.assign(call, { task, model: m, info: m.info, tokenizer: {}, dispose: () => m.unload() });
+  }
   if (SEQ2SEQ.has(t)) {
     const m = await KilnSeq2Seq.load(id, { quant: q, device: dev, cpuThreads, revision, endpoint, worker, onProgress: progress });
     progress_callback?.({ status: "ready", task, model: id });

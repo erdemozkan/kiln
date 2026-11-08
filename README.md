@@ -520,6 +520,9 @@ K/V; each decoder step reads them through a step block whose span covers every p
 | T5 (`google/flan-t5-small`) | an independent NumPy forward pass over the safetensors; transformers.js | logits within 7.8e-6 over 9 steps, outputs identical to both |
 | NLLB (`facebook/nllb-200-distilled-600M`, q8) | by hand | "La maison est merveilleuse. J'aimerais l'acheter, mais elle est trop chère." |
 | Whisper (`openai/whisper-tiny.en`, `whisper-tiny`, `whisper-base`) | transformers.js (`Xenova/whisper-*`, fp32) | the JFK clip transcribed to the same text by all three; log-mel features within 1.2e-7 of transformers.js's |
+| wav2vec2 CTC (`facebook/wav2vec2-base-960h`) | an independent NumPy (float64) forward pass over the safetensors; transformers.js | logits within 6.3e-4 on all 549 frames of the JFK clip, the same token in every frame; transformers.js (fp32 WebGPU) printed "FELOW" for "FELLOW" (two L frames three blank frames apart) |
+| wav2vec2 large (`facebook/wav2vec2-large-robust-ft-libri-960h`: LayerNorm front end, pre-LayerNorm layers) | the NumPy forward pass | logits within 3.1e-4 over 149 frames, the same token in every frame |
+| wav2vec2 classifier (`superb/wav2vec2-base-superb-ks`, weighted layer sum) | transformers.js (`Xenova/wav2vec2-base-superb-ks`, fp32) | the same five labels, scores within 2e-7 |
 
 Whisper (`automatic-speech-recognition`) takes 16 kHz samples, a URL, a Blob or encoded bytes (WAV
 parsed directly; other formats decoded and resampled by the page's Web Audio API). Its log-mel
@@ -535,6 +538,18 @@ under a banned-token mask built from the logits processors), so a step reads bac
 of the whole vocabulary: Whisper's per-token cost in that pane went from about 120 ms to too small to
 measure (1, 8, 16 and 24 new tokens took the same time), with identical outputs for BART, T5,
 Marian and Whisper.
+
+wav2vec2 and HuBERT run on raw samples (normalized when the preprocessor says so). The conv front
+end is im2col rows times the tuned matmul per layer, with GroupNorm (a per-channel kernel) after the
+first layer or LayerNorm after each; the grouped positional convolution (128 taps, 16 groups) is one
+kernel over weights stored tap-major, with weight norm folded in at load. CTC decoding takes each
+frame's best token and decodes as transformers.js's CTC decoder does; classifiers average the
+frames, then project and classify in TypeScript (the projector is affine, so averaging first is
+exact), over a weighted sum of every layer's output accumulated on the GPU when the model uses one.
+On WebGPU in the backgrounded pane (one warm call each, so rough): the 11 s clip in 1.7 s against
+6.3 s for transformers.js, and keyword spotting on 1 s in 238 ms against 482 ms. On the CPU backend
+the clip takes 33 s, mostly in the front end's convolutions. HuBERT shares wav2vec2's layers and tensor names and loads
+through the same code, but has not been checked against a reference yet.
 
 T5's learned relative position bias is added to each score by the per-row attention kernels (GPU
 and CPU, buckets computed in the kernel; bucket function equal to transformers' over ±300
