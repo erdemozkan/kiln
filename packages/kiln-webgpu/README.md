@@ -84,7 +84,8 @@ A browser with WebGPU (Chrome or Edge 113+, Safari 26+, Firefox 141+ on Windows)
 Without it, `load` falls back to running on the CPU (matmuls in WASM SIMD; much slower than a GPU, fine for models around 135M;
 on a cross-origin isolated page, with `Cross-Origin-Opener-Policy: same-origin` and
 `Cross-Origin-Embedder-Policy: require-corp`, large matmuls also use several threads, `cpuThreads`) and
-`llm.info.backend` is `"cpu"`; `load(id, { device: "gpu" })` fails instead. Use it from a bundler
+`llm.info.backend` is `"cpu"` (`llm.info.cpuThreads` says how many threads it got);
+`load(id, { device: "gpu" })` fails instead, and `device: "cpu"` uses the CPU even where WebGPU works. Use it from a bundler
 that understands `new URL("…", import.meta.url)` workers (Vite, webpack 5, Parcel, esbuild with
 a plugin). To host the worker yourself, pass `load(id, { worker })`.
 

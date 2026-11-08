@@ -4,6 +4,7 @@ import { clearCache, listCache } from "@kiln/loader";
 const $ = <T extends HTMLElement>(id: string) => document.getElementById(id) as T;
 const modelInput = $<HTMLInputElement>("model");
 const quant = $<HTMLSelectElement>("quant");
+const device = $<HTMLSelectElement>("device");
 const loadBtn = $<HTMLButtonElement>("load");
 const progress = $<HTMLProgressElement>("progress");
 const status = $("status");
@@ -82,6 +83,7 @@ loadBtn.onclick = async () => {
     await model?.unload();
     model = await load(modelInput.value.trim(), {
       quant: quant.value as "auto" | "q4" | "q8" | "f32",
+      device: device.value as "auto" | "gpu" | "cpu",
       onProgress: (p) => {
         progress.value = p.total ? p.loaded / p.total : 0;
         status.textContent = `${p.file}: ${(p.loaded / 2 ** 20).toFixed(0)} / ${(p.total / 2 ** 20).toFixed(0)} MiB`;
@@ -89,7 +91,8 @@ loadBtn.onclick = async () => {
     });
     progress.value = 1;
     const i = model.info;
-    status.textContent = `Loaded ${i.model} (${i.family}, ${i.layers} layers, ctx ${i.maxSeq}, ${i.chatFormat ?? "no chat format"}) in ${((performance.now() - t0) / 1000).toFixed(1)} s${i.restoredTokens ? ` · ${i.restoredTokens} prompt tokens restored from cache` : ""}`;
+    const where = i.backend === "cpu" ? `CPU, ${i.cpuThreads ?? 1} thread${i.cpuThreads === 1 ? "" : "s"}` : "GPU";
+    status.textContent = `Loaded ${i.model} on the ${where} (${i.family}, ${i.layers} layers, ctx ${i.maxSeq}, ${i.chatFormat ?? "no chat format"}) in ${((performance.now() - t0) / 1000).toFixed(1)} s${i.restoredTokens ? ` · ${i.restoredTokens} prompt tokens restored from cache` : ""}`;
     prompt.disabled = send.disabled = false;
     history.length = 0;
     log.textContent = "";

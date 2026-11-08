@@ -101,6 +101,7 @@ scope.onmessage = async (e: MessageEvent<Request>) => {
             model: msg.model,
             family: cfg.family,
             backend: engine.backend.name,
+            cpuThreads: engine.backend.name === "cpu" ? (engine.backend as { threads?: number }).threads : undefined,
             vision: !!engine.vision,
             layers: cfg.numLayers,
             hiddenSize: cfg.hiddenSize,

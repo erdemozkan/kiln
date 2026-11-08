@@ -43,6 +43,8 @@ export interface ModelInfo {
   vocabSize: number;
   /** Where the model runs: "webgpu", or "cpu" (the fallback without WebGPU, or `device: "cpu"`). */
   backend: string;
+  /** On the CPU backend, the threads large matmuls are split across (1 without cross-origin isolation). */
+  cpuThreads?: number;
   /** True when chat messages may hold images (Gemma 3 loaded with `mmproj`). */
   vision: boolean;
   /** Context length this load allocated, in tokens. */
