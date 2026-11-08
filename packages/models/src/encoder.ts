@@ -132,6 +132,21 @@ export function encoderName(name: string): string | undefined {
   return undefined;
 }
 
+/** A masked-LM head's weights (decoder undefined: tied to the word embeddings). */
+export interface MlmHead {
+  dense: Float32Array;
+  denseBias?: Float32Array;
+  lnW: Float32Array;
+  lnB: Float32Array;
+  eps: number;
+  /** Exact (erf) GELU, else tanh-approximated. */
+  exact: boolean;
+  decoder?: Float32Array;
+  bias?: Float32Array;
+}
+
+const numelOf = (t: Tensor) => t.shape.reduce((a, b) => a * b, 1);
+
 /** Body matrices that may be stored quantized (embedding tables, norms and biases stay f32). */
 export const isEncoderMatrix = (name: string): boolean => /^l\d+\.(q|k|v|o|up|down)\.weight$/.test(name);
 
@@ -212,26 +227,88 @@ export class EncoderModel {
 
   /** Final hidden states [T, hidden] of one sequence (token ids and, for BERT pairs, segment ids). */
   async forward(ids: readonly number[], typeIds?: readonly number[]): Promise<Float32Array> {
-    const T = ids.length;
-    if (!T) throw new Error("encoder: empty input");
-    if (T > this.maxLength) throw new Error(`encoder: ${T} tokens; the model takes at most ${this.maxLength}`);
-    let plan = this.plans.get(T);
-    if (!plan) {
-      // A few lengths stay recorded; the oldest goes first.
-      if (this.plans.size >= 8) {
+    return (await this.forwardMany([{ ids, typeIds }]))[0]!;
+  }
+
+  /**
+   * Final hidden states of several sequences. Every forward pass is queued before any result is read:
+   * each one's output is copied aside as it finishes, so the GPU runs them back to back instead of
+   * waiting on a readback between inputs (16 short sentences: one wait instead of sixteen).
+   */
+  async forwardMany(items: readonly { ids: readonly number[]; typeIds?: readonly number[] }[]): Promise<Float32Array[]> {
+    const be = this.backend;
+    const H = this.cfg.hidden;
+    const outs: { buf: Buf; bytes: number }[] = [];
+    try {
+      for (const { ids, typeIds } of items) {
+        const T = ids.length;
+        if (!T) throw new Error("encoder: empty input");
+        if (T > this.maxLength) throw new Error(`encoder: ${T} tokens; the model takes at most ${this.maxLength}`);
+        let plan = this.plans.get(T);
+        if (!plan) {
+          plan = this.build(T);
+          this.plans.set(T, plan);
+        } else {
+          // Most recently used last, for the trim below.
+          this.plans.delete(T);
+          this.plans.set(T, plan);
+        }
+        be.write(plan.ids, 0, Uint32Array.from(ids));
+        be.write(plan.pos, 0, Uint32Array.from({ length: T }, (_, i) => i + this.cfg.posOffset));
+        if (plan.types) be.write(plan.types, 0, Uint32Array.from(typeIds ?? new Array<number>(T).fill(0)));
+        be.submit(plan.dispatches);
+        const bytes = T * H * 4;
+        const buf = be.alloc(bytes, "storage", "encoder/out");
+        be.copy(physical(plan.out.buf), 0, buf, 0, bytes);
+        outs.push({ buf, bytes });
+      }
+      const res: Float32Array[] = [];
+      for (const o of outs) res.push(new Float32Array(await be.readback(o.buf, 0, o.bytes)));
+      return res;
+    } finally {
+      for (const o of outs) be.free(o.buf);
+      // A few lengths stay recorded, trimmed only once nothing queued still uses them.
+      while (this.plans.size > 8) {
         const [k, old] = this.plans.entries().next().value!;
         this.dropPlan(old);
         this.plans.delete(k);
       }
-      plan = this.build(T);
-      this.plans.set(T, plan);
     }
+  }
+
+  private mlm: { ctx: Ctx; step: Buf; x: Buf; logits: Tensor; dispatches: readonly Dispatch[]; owned: Tensor[] } | undefined;
+
+  /**
+   * A masked-LM head on one hidden row, on the backend: dense → GELU → LayerNorm → vocabulary logits
+   * through the decoder (the word embedding table when tied). Weights are uploaded on first use.
+   */
+  async maskLogits(x: Float32Array, head: MlmHead): Promise<Float32Array> {
     const be = this.backend;
-    be.write(plan.ids, 0, Uint32Array.from(ids));
-    be.write(plan.pos, 0, Uint32Array.from({ length: T }, (_, i) => i + this.cfg.posOffset));
-    if (plan.types) be.write(plan.types, 0, Uint32Array.from(typeIds ?? new Array<number>(T).fill(0)));
-    be.submit(plan.dispatches);
-    return new Float32Array(await be.readback(physical(plan.out.buf), 0, T * this.cfg.hidden * 4));
+    const H = this.cfg.hidden;
+    if (!this.mlm) {
+      const owned: Tensor[] = [];
+      const up = (v: Float32Array, shape: number[]): Tensor => {
+        const buf = be.alloc(v.byteLength, "storage", "encoder/mlm");
+        be.write(buf, 0, v);
+        const t = { shape, dtype: "f32" as const, buf };
+        owned.push(t);
+        return t;
+      };
+      const V = head.bias?.length ?? (head.decoder ? head.decoder.length / H : this.cfg.vocab);
+      const step = be.alloc(STEP_BYTES, "storage", "encoder/mlm-step");
+      be.write(step, 0, packStep({ pos0: 0, lastRow: 0, seed: 0, temperature: 0 }));
+      const ctx = new Ctx(be, step, "encoder/mlm", this.pool);
+      const xb = ctx.buffer(H * 4, "encoder/mlm-x");
+      const h = ops.linear(ctx, { shape: [1, H], dtype: "f32", buf: xb }, up(head.dense, [H, H]), { bias: head.denseBias ? up(head.denseBias, [H]) : undefined });
+      ops.gelu(ctx, h, head.exact);
+      const n = ops.layernorm(ctx, h, up(head.lnW, [H]), up(head.lnB, [H]), head.eps);
+      const dec = head.decoder ? up(head.decoder, [V, H]) : this.w("emb.word");
+      const logits = ops.linear(ctx, n, dec, { bias: head.bias ? up(head.bias, [V]) : undefined });
+      this.mlm = { ctx, step, x: xb, logits, dispatches: ctx.dispatches, owned };
+    }
+    be.write(this.mlm.x, 0, x);
+    be.submit(this.mlm.dispatches);
+    return new Float32Array(await be.readback(physical(this.mlm.logits.buf), 0, numelOf(this.mlm.logits) * 4));
   }
 
   private dropPlan(p: Plan): void {
@@ -249,6 +326,12 @@ export class EncoderModel {
   destroy(): void {
     for (const p of this.plans.values()) this.dropPlan(p);
     this.plans.clear();
+    if (this.mlm) {
+      this.mlm.ctx.destroy();
+      this.backend.free(this.mlm.step);
+      for (const t of this.mlm.owned) this.backend.free(t.buf);
+      this.mlm = undefined;
+    }
     for (const t of this.weights.values()) {
       this.backend.free(t.buf);
       if (t.scales) this.backend.free(t.scales);

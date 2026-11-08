@@ -19,7 +19,8 @@ shapes (`[{ generated_text }]`, the messages with the reply appended for chats).
 tokenizer.json or vocab.txt, RoBERTa's byte-level BPE) for `feature-extraction`,
 `text-classification`, `token-classification`, `question-answering`, `fill-mask` and
 `zero-shot-classification`, with transformers.js's output shapes, `Tensor` and `cos_sim`; scores
-equal to Python transformers' to six decimals.
+equal to Python transformers' to six decimals. Several inputs (a batch of sentences, zero-shot
+labels) run back to back with one wait; the masked-LM head runs on the GPU.
 
 **Summarization, translation and text2text.** BART / DistilBART, Marian (OPUS-MT), M2M100 /
 NLLB and T5 / Flan-T5 encoder-decoders for `summarization`, `translation` and

@@ -276,6 +276,36 @@ load in progress.
 
 ## Performance
 
+### Against transformers.js
+
+transformers.js 4.3.2 and Kiln in the same browser on the Intel Mac (Iris Plus 650), the same
+inputs, both on WebGPU in fp32 unless noted (transformers.js runs the repos' ONNX exports, Kiln the
+original weights). Median of three warm calls after one warm-up; every pair of outputs is identical
+unless noted.
+
+| Task | Model | Kiln | transformers.js | |
+|---|---|---|---|---|
+| text-generation, decode | SmolLM2-135M, q4 | 64 tok/s (74 with draft tokens) | 13.4 tok/s (q4), 14.5 (q4f16) | 4.8× |
+| text-generation, decode | Qwen2.5-0.5B, q4 | 31 tok/s | 4.9 tok/s (q4; q4f16 gave "---" repeated) | 6.4× |
+| text-generation, decode, CPU | SmolLM2-135M, q8 | 57 tok/s | 24 tok/s (WASM, 2 threads) | 2.4× |
+| feature-extraction, 16 sentences | all-MiniLM-L6-v2 | 209 ms | 298 ms | 1.4× |
+| sentiment-analysis | DistilBERT SST-2 | 51 ms | 101 ms | 2.0× |
+| ner | bert-base-NER | 100 ms | 184 ms | 1.8× |
+| question-answering | DistilBERT SQuAD | 63 ms | 99 ms | 1.6× |
+| fill-mask | bert-base-uncased | 149 ms | 300 ms | 2.0× |
+| zero-shot-classification, 5 labels | DistilBERT MNLI | 260–306 ms | 711 ms | 2.3–2.7× |
+| summarization, 64 tokens | DistilBART-CNN-6-6 | 3.4 s | 9.95 s | 2.9× |
+| translation | opus-mt-en-de | 1.02 s | 2.85 s | 2.8× |
+| text2text-generation | flan-t5-small | 331 ms | 1,198 ms | 3.6× |
+
+LLM outputs differ in q4 (the two 4-bit schemes round differently) and agree in f32. Two of these
+rows came out of this comparison: feature extraction was 400 ms (each sentence's forward pass
+waited on the previous one's readback; now they are queued back to back and read once), and
+fill-mask was 851 ms (the 30k-word output layer ran in TypeScript; now on the GPU). transformers.js
+loads faster from its cache (0.9 s against 1.8 s for SmolLM2: Kiln converts weights at load) and
+downloads less (its files are pre-quantized), and its runtime adds 6.7 MB (gzipped) of WASM to
+Kiln's 120 KB.
+
 SmolLM2-135M-Instruct, q4, Intel Gen-9 integrated GPU (Intel Mac), Chrome/Dawn. GPU clocks on this
 machine drift 10–15% between runs, so comparisons below are always from one session.
 

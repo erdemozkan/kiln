@@ -3,7 +3,6 @@
 // token-classification, question-answering, fill-mask and zero-shot-classification. The body runs on
 // the backend (GPU or CPU); the small task heads run here in TypeScript on the final hidden states.
 import type { Backend } from "@kiln/core";
-import { ref as kref } from "@kiln/kernels";
 import { fetchJSON, fetchText, fileUrl, listRepoFiles, parseModelId, readPytorchHeader, readSafetensorsHeader, toF32, weightFiles, type ByteSource, type TensorEntry } from "@kiln/loader";
 import { EncoderModel, encoderConfigFromHF, encoderName, type EncoderConfig } from "@kiln/models";
 import { encoderTokenizerFromJSON, wordPieceFromVocab, type EncoderTokenizer, type EncoderTokenizerJSON, type Encoding } from "@kiln/tokenizers";
@@ -93,19 +92,9 @@ function matvec(w: Float32Array, b: Float32Array | undefined, x: Float32Array, N
   return y;
 }
 
-function layerNorm(x: Float32Array, w: Float32Array, b: Float32Array, eps: number): Float32Array {
-  let mean = 0;
-  for (const v of x) mean += v;
-  mean /= x.length;
-  let vari = 0;
-  for (const v of x) vari += (v - mean) ** 2;
-  const inv = 1 / Math.sqrt(vari / x.length + eps);
-  return x.map((v, i) => (v - mean) * inv * w[i]! + b[i]!);
-}
 
 const tanhInPlace = (x: Float32Array) => x.forEach((v, i) => (x[i] = Math.tanh(v)));
 const reluInPlace = (x: Float32Array) => x.forEach((v, i) => (x[i] = Math.max(0, v)));
-const geluInPlace = (x: Float32Array, exact: boolean) => x.forEach((v, i) => (x[i] = exact ? kref.geluErf(v) : kref.geluTanh(v)));
 
 interface Located {
   source: ByteSource;
@@ -155,8 +144,14 @@ export class EncoderEngine {
 
   /** Token ids and final hidden states of a text or a pair of texts. */
   async encode(a: string, b?: string): Promise<{ enc: Encoding; h: Float32Array }> {
-    const enc = this.tokenizer.encode(a, b, this.maxLength);
-    return { enc, h: await this.model.forward(enc.ids, enc.typeIds) };
+    return (await this.encodeMany([[a, b]]))[0]!;
+  }
+
+  /** The same for several inputs, their forward passes queued back to back (see forwardMany). */
+  async encodeMany(inputs: readonly (readonly [string, string?])[]): Promise<{ enc: Encoding; h: Float32Array }[]> {
+    const encs = inputs.map(([a, b]) => this.tokenizer.encode(a, b, this.maxLength));
+    const hs = await this.model.forwardMany(encs.map((e) => ({ ids: e.ids, typeIds: e.typeIds })));
+    return encs.map((enc, i) => ({ enc, h: hs[i]! }));
   }
 
   private row(h: Float32Array, t: number): Float32Array {
@@ -193,8 +188,7 @@ export class EncoderEngine {
     const pooling = opts.pooling ?? "none";
     const outs: Float32Array[] = [];
     let longest = 0;
-    for (const t of many(texts)) {
-      const { enc, h } = await this.encode(t);
+    for (const { enc, h } of await this.encodeMany(many(texts).map((t) => [t] as const))) {
       longest = Math.max(longest, enc.ids.length);
       if (pooling === "none") outs.push(h);
       else if (pooling === "mean") {
@@ -229,8 +223,8 @@ export class EncoderEngine {
   async textClassification(texts: Batch, opts: { top_k?: number | null } = {}): Promise<Label[] | Label[][]> {
     const k = opts.top_k === undefined ? 1 : opts.top_k;
     const out: (Label | Label[])[] = [];
-    for (const t of many(texts)) {
-      const logits = await this.classify((await this.encode(t)).h);
+    for (const { h } of await this.encodeMany(many(texts).map((t) => [t] as const))) {
+      const logits = await this.classify(h);
       const probs = this.cfg.multiLabel ? Array.from(logits, (v) => 1 / (1 + Math.exp(-v))) : softmax(logits);
       const vals = topk(probs, k).map((i) => ({ label: this.label(i), score: probs[i]! }));
       if (k === 1) out.push(...vals);
@@ -248,8 +242,7 @@ export class EncoderEngine {
     const b = await this.read("classifier.bias");
     const L = w.length / H;
     const out: (TokenEntity | EntityGroup)[][] = [];
-    for (const t of many(texts)) {
-      const { enc, h } = await this.encode(t);
+    for (const { enc, h } of await this.encodeMany(many(texts).map((t) => [t] as const))) {
       const tokens: TokenEntity[] = [];
       for (let j = 0; j < enc.ids.length; j++) {
         const probs = softmax(matvec(w, b, this.row(h, j), L, H));
@@ -298,8 +291,9 @@ export class EncoderEngine {
     const qs = many(question);
     const cs = Array.isArray(context) ? context : qs.map(() => context);
     const out: (Answer | Answer[])[] = [];
+    const encoded = await this.encodeMany(qs.map((q, i) => [q, cs[i]] as const));
     for (let q = 0; q < qs.length; q++) {
-      const { enc, h } = await this.encode(qs[q]!, cs[q]);
+      const { enc, h } = encoded[q]!;
       const T = enc.ids.length;
       const start = new Array<number>(T);
       const end = new Array<number>(T);
@@ -326,8 +320,6 @@ export class EncoderEngine {
 
   /** Vocabulary logits at one position through the family's masked-LM head (output layer tied to the embeddings unless stored). */
   private async maskLogits(x: Float32Array): Promise<Float32Array> {
-    const H = this.cfg.hidden;
-    const V = this.cfg.vocab;
     const f = this.cfg.family;
     const [dense, ln, bias, decoder] =
       f === "distilbert"
@@ -335,11 +327,18 @@ export class EncoderEngine {
         : f === "roberta"
           ? ["lm_head.dense", "lm_head.layer_norm", "lm_head.bias", "lm_head.decoder.weight"]
           : ["cls.predictions.transform.dense", "cls.predictions.transform.LayerNorm", "cls.predictions.bias", "cls.predictions.decoder.weight"];
-    let t = matvec(await this.need(`${dense}.weight`), await this.read(`${dense}.bias`), x, H, H);
-    geluInPlace(t, this.cfg.act === "gelu");
-    t = layerNorm(t, await this.need(`${ln}.weight`), await this.need(`${ln}.bias`), f === "distilbert" ? 1e-12 : this.cfg.eps);
-    const W = (await this.read(decoder)) ?? (await this.need("embeddings.word_embeddings.weight"));
-    return matvec(W, await this.read(bias), t, V, H);
+    // On the backend: the vocabulary matmul (30k × 768 for BERT) is most of the work. A decoder that
+    // is not stored is the word embedding table, already there.
+    return this.model.maskLogits(x, {
+      dense: await this.need(`${dense}.weight`),
+      denseBias: await this.read(`${dense}.bias`),
+      lnW: await this.need(`${ln}.weight`),
+      lnB: await this.need(`${ln}.bias`),
+      eps: f === "distilbert" ? 1e-12 : this.cfg.eps,
+      exact: this.cfg.act === "gelu",
+      decoder: await this.read(decoder),
+      bias: await this.read(bias),
+    });
   }
 
   async fillMask(texts: Batch, opts: { top_k?: number } = {}): Promise<MaskFill[] | MaskFill[][]> {
@@ -348,8 +347,7 @@ export class EncoderEngine {
     const maskId = mask === undefined ? undefined : this.tokenizer.tokenId(mask);
     if (maskId === undefined) throw new Error("this tokenizer has no mask token");
     const out: MaskFill[][] = [];
-    for (const t of many(texts)) {
-      const { enc, h } = await this.encode(t);
+    for (const { enc, h } of await this.encodeMany(many(texts).map((t) => [t] as const))) {
       const at = enc.ids.indexOf(maskId);
       if (at < 0) throw new Error(`Mask token (${mask}) not found in text.`);
       const probs = softmax(await this.maskLogits(this.row(h, at)));
@@ -378,7 +376,7 @@ export class EncoderEngine {
     const out: ZeroShotResult[] = [];
     for (const premise of many(texts)) {
       const logits: Float32Array[] = [];
-      for (const c of cands) logits.push(await this.classify((await this.encode(premise, template.replace("{}", c))).h));
+      for (const { h } of await this.encodeMany(cands.map((c) => [premise, template.replace("{}", c)] as const))) logits.push(await this.classify(h));
       const scores = each ? logits.map((l) => softmax([l[contra]!, l[entail]!])[1]!) : softmax(logits.map((l) => l[entail]!));
       const order = topk(scores);
       out.push({ sequence: premise, labels: order.map((i) => cands[i]!), scores: order.map((i) => scores[i]!) });
