@@ -299,7 +299,7 @@
 
   ;; ---- Attention (one query row against a run of cached keys) ----
   ;; Key j is the row at k + (j mod cap) · stride bytes (a ring when cap < the keys seen). D is a
-  ;; multiple of 4 (f32 caches) or 8 (f16 caches, two halves per u32 word). q is the query, scaled.
+  ;; multiple of 4 (f32 caches) or 8 (f16 caches, two halves per u32 word). Queries come scaled.
 
   ;; Four f16 values (zero-extended into i32 lanes) as f32: the magnitude bits moved into an f32's
   ;; exponent/mantissa and rescaled by 2^112, which is exact for normals, subnormals and zero.
@@ -311,95 +311,69 @@
       (i32x4.shl (v128.and (local.get $h) (v128.const i32x4 0x8000 0x8000 0x8000 0x8000)) (i32.const 16))))
 
   ;; out[j] = q · K_j for j in [first, n); returns the largest.
-  (func (export "att_scores_f32") (param $q i32) (param $k i32) (param $stride i32) (param $cap i32)
-    (param $first i32) (param $n i32) (param $D i32) (param $out i32) (result f32)
-    (local $j i32) (local $i i32) (local $row i32) (local $acc v128) (local $d f32) (local $mx f32)
-    (local.set $mx (f32.const -inf))
-    (local.set $j (local.get $first))
-    (block $done
-      (loop $keys
-        (br_if $done (i32.ge_u (local.get $j) (local.get $n)))
-        (local.set $row (i32.add (local.get $k) (i32.mul (i32.rem_u (local.get $j) (local.get $cap)) (local.get $stride))))
-        (local.set $acc (v128.const i32x4 0 0 0 0))
-        (local.set $i (i32.const 0))
-        (block $rd
-          (loop $r
-            (br_if $rd (i32.ge_u (local.get $i) (local.get $D)))
-            (local.set $acc (f32x4.add (local.get $acc)
-              (f32x4.mul (v128.load (i32.add (local.get $q) (i32.shl (local.get $i) (i32.const 2))))
-                         (v128.load (i32.add (local.get $row) (i32.shl (local.get $i) (i32.const 2)))))))
-            (local.set $i (i32.add (local.get $i) (i32.const 4)))
-            (br $r)))
-        (local.set $d (call $hsum (local.get $acc)))
-        (f32.store (i32.add (local.get $out) (i32.shl (local.get $j) (i32.const 2))) (local.get $d))
-        (local.set $mx (f32.max (local.get $mx) (local.get $d)))
-        (local.set $j (i32.add (local.get $j) (i32.const 1)))
-        (br $keys)))
-    (local.get $mx))
+  ;; Key / value row j of the cache as floats: the row itself (f32 caches) or widened into tmp (f16).
+  (func $kvrow (param $base i32) (param $j i32) (param $cap i32) (param $stride i32) (param $D i32) (param $f16 i32) (param $tmp i32) (result i32)
+    (local $row i32) (local $i i32) (local $hv v128)
+    (local.set $row (i32.add (local.get $base) (i32.mul (i32.rem_u (local.get $j) (local.get $cap)) (local.get $stride))))
+    (if (i32.eqz (local.get $f16)) (then (return (local.get $row))))
+    (block $d (loop $l
+      (br_if $d (i32.ge_u (local.get $i) (local.get $D)))
+      (local.set $hv (v128.load (i32.add (local.get $row) (i32.shl (local.get $i) (i32.const 1)))))
+      (v128.store (i32.add (local.get $tmp) (i32.shl (local.get $i) (i32.const 2))) (call $h2f (i32x4.extend_low_i16x8_u (local.get $hv))))
+      (v128.store offset=16 (i32.add (local.get $tmp) (i32.shl (local.get $i) (i32.const 2))) (call $h2f (i32x4.extend_high_i16x8_u (local.get $hv))))
+      (local.set $i (i32.add (local.get $i) (i32.const 8)))
+      (br $l)))
+    (local.get $tmp))
 
-  (func (export "att_scores_f16") (param $q i32) (param $k i32) (param $stride i32) (param $cap i32)
-    (param $first i32) (param $n i32) (param $D i32) (param $out i32) (result f32)
-    (local $j i32) (local $i i32) (local $row i32) (local $acc v128) (local $hv v128) (local $qp i32) (local $d f32) (local $mx f32)
-    (local.set $mx (f32.const -inf))
-    (local.set $j (local.get $first))
-    (block $done
-      (loop $keys
-        (br_if $done (i32.ge_u (local.get $j) (local.get $n)))
-        (local.set $row (i32.add (local.get $k) (i32.mul (i32.rem_u (local.get $j) (local.get $cap)) (local.get $stride))))
-        (local.set $acc (v128.const i32x4 0 0 0 0))
-        (local.set $i (i32.const 0))
-        (block $rd
-          (loop $r
-            (br_if $rd (i32.ge_u (local.get $i) (local.get $D)))
-            (local.set $hv (v128.load (i32.add (local.get $row) (i32.shl (local.get $i) (i32.const 1)))))
-            (local.set $qp (i32.add (local.get $q) (i32.shl (local.get $i) (i32.const 2))))
-            (local.set $acc (f32x4.add (local.get $acc)
-              (f32x4.add
-                (f32x4.mul (v128.load (local.get $qp)) (call $h2f (i32x4.extend_low_i16x8_u (local.get $hv))))
-                (f32x4.mul (v128.load offset=16 (local.get $qp)) (call $h2f (i32x4.extend_high_i16x8_u (local.get $hv)))))))
-            (local.set $i (i32.add (local.get $i) (i32.const 8)))
-            (br $r)))
-        (local.set $d (call $hsum (local.get $acc)))
-        (f32.store (i32.add (local.get $out) (i32.shl (local.get $j) (i32.const 2))) (local.get $d))
-        (local.set $mx (f32.max (local.get $mx) (local.get $d)))
-        (local.set $j (i32.add (local.get $j) (i32.const 1)))
-        (br $keys)))
-    (local.get $mx))
-
-  ;; acc = Σ_j p[j] · V_j for j in [first, n) (acc is overwritten).
-  (func (export "att_wsum_f32") (param $p i32) (param $v i32) (param $stride i32) (param $cap i32)
-    (param $first i32) (param $n i32) (param $D i32) (param $acc i32)
-    (local $j i32) (local $i i32) (local $row i32) (local $pj v128) (local $a i32)
-    (local.set $i (i32.const 0))
+  ;; For the G query heads sharing a KV head (queries D floats apart at q): out[g][j] = q_g · K_j for
+  ;; j in [first, n), score rows os floats apart, and each head's largest score at mx[g]. Each key row
+  ;; is read (and widened, for f16) once for the G heads.
+  (func (export "att_scores") (param $q i32) (param $k i32) (param $stride i32) (param $cap i32)
+    (param $first i32) (param $n i32) (param $D i32) (param $out i32) (param $G i32) (param $os i32) (param $mx i32)
+    (param $f16 i32) (param $tmp i32)
+    (local $j i32) (local $g i32) (local $i i32) (local $row i32) (local $qg i32) (local $acc v128) (local $d f32) (local $m i32)
     (block $z (loop $zl
-      (br_if $z (i32.ge_u (local.get $i) (local.get $D)))
-      (v128.store (i32.add (local.get $acc) (i32.shl (local.get $i) (i32.const 2))) (v128.const i32x4 0 0 0 0))
-      (local.set $i (i32.add (local.get $i) (i32.const 4)))
+      (br_if $z (i32.ge_u (local.get $g) (local.get $G)))
+      (f32.store (i32.add (local.get $mx) (i32.shl (local.get $g) (i32.const 2))) (f32.const -inf))
+      (local.set $g (i32.add (local.get $g) (i32.const 1)))
       (br $zl)))
     (local.set $j (local.get $first))
     (block $done
       (loop $keys
         (br_if $done (i32.ge_u (local.get $j) (local.get $n)))
-        (local.set $row (i32.add (local.get $v) (i32.mul (i32.rem_u (local.get $j) (local.get $cap)) (local.get $stride))))
-        (local.set $pj (f32x4.splat (f32.load (i32.add (local.get $p) (i32.shl (local.get $j) (i32.const 2))))))
-        (local.set $i (i32.const 0))
-        (block $rd
-          (loop $r
-            (br_if $rd (i32.ge_u (local.get $i) (local.get $D)))
-            (local.set $a (i32.add (local.get $acc) (i32.shl (local.get $i) (i32.const 2))))
-            (v128.store (local.get $a) (f32x4.add (v128.load (local.get $a))
-              (f32x4.mul (local.get $pj) (v128.load (i32.add (local.get $row) (i32.shl (local.get $i) (i32.const 2)))))))
-            (local.set $i (i32.add (local.get $i) (i32.const 4)))
-            (br $r)))
+        (local.set $row (call $kvrow (local.get $k) (local.get $j) (local.get $cap) (local.get $stride) (local.get $D) (local.get $f16) (local.get $tmp)))
+        (local.set $g (i32.const 0))
+        (block $gd
+          (loop $gl
+            (br_if $gd (i32.ge_u (local.get $g) (local.get $G)))
+            (local.set $qg (i32.add (local.get $q) (i32.shl (i32.mul (local.get $g) (local.get $D)) (i32.const 2))))
+            (local.set $acc (v128.const i32x4 0 0 0 0))
+            (local.set $i (i32.const 0))
+            (block $rd
+              (loop $r
+                (br_if $rd (i32.ge_u (local.get $i) (local.get $D)))
+                (local.set $acc (f32x4.add (local.get $acc)
+                  (f32x4.mul (v128.load (i32.add (local.get $qg) (i32.shl (local.get $i) (i32.const 2))))
+                             (v128.load (i32.add (local.get $row) (i32.shl (local.get $i) (i32.const 2)))))))
+                (local.set $i (i32.add (local.get $i) (i32.const 4)))
+                (br $r)))
+            (local.set $d (call $hsum (local.get $acc)))
+            (f32.store (i32.add (local.get $out) (i32.shl (i32.add (i32.mul (local.get $g) (local.get $os)) (local.get $j)) (i32.const 2))) (local.get $d))
+            (local.set $m (i32.add (local.get $mx) (i32.shl (local.get $g) (i32.const 2))))
+            (f32.store (local.get $m) (f32.max (f32.load (local.get $m)) (local.get $d)))
+            (local.set $g (i32.add (local.get $g) (i32.const 1)))
+            (br $gl)))
         (local.set $j (i32.add (local.get $j) (i32.const 1)))
         (br $keys))))
 
-  (func (export "att_wsum_f16") (param $p i32) (param $v i32) (param $stride i32) (param $cap i32)
-    (param $first i32) (param $n i32) (param $D i32) (param $acc i32)
-    (local $j i32) (local $i i32) (local $row i32) (local $pj v128) (local $a i32) (local $hv v128)
-    (local.set $i (i32.const 0))
+  ;; acc[g] = Σ_j p[g][j] · V_j for j in [first, n), for the same G heads (weight rows ps floats apart,
+  ;; accumulators D floats apart, overwritten).
+  (func (export "att_wsum") (param $p i32) (param $v i32) (param $stride i32) (param $cap i32)
+    (param $first i32) (param $n i32) (param $D i32) (param $acc i32) (param $G i32) (param $ps i32)
+    (param $f16 i32) (param $tmp i32)
+    (local $j i32) (local $g i32) (local $i i32) (local $row i32) (local $pj v128) (local $a i32) (local $ag i32)
     (block $z (loop $zl
-      (br_if $z (i32.ge_u (local.get $i) (local.get $D)))
+      (br_if $z (i32.ge_u (local.get $i) (i32.mul (local.get $G) (local.get $D))))
       (v128.store (i32.add (local.get $acc) (i32.shl (local.get $i) (i32.const 2))) (v128.const i32x4 0 0 0 0))
       (local.set $i (i32.add (local.get $i) (i32.const 4)))
       (br $zl)))
@@ -407,20 +381,24 @@
     (block $done
       (loop $keys
         (br_if $done (i32.ge_u (local.get $j) (local.get $n)))
-        (local.set $row (i32.add (local.get $v) (i32.mul (i32.rem_u (local.get $j) (local.get $cap)) (local.get $stride))))
-        (local.set $pj (f32x4.splat (f32.load (i32.add (local.get $p) (i32.shl (local.get $j) (i32.const 2))))))
-        (local.set $i (i32.const 0))
-        (block $rd
-          (loop $r
-            (br_if $rd (i32.ge_u (local.get $i) (local.get $D)))
-            (local.set $hv (v128.load (i32.add (local.get $row) (i32.shl (local.get $i) (i32.const 1)))))
-            (local.set $a (i32.add (local.get $acc) (i32.shl (local.get $i) (i32.const 2))))
-            (v128.store (local.get $a) (f32x4.add (v128.load (local.get $a))
-              (f32x4.mul (local.get $pj) (call $h2f (i32x4.extend_low_i16x8_u (local.get $hv))))))
-            (v128.store offset=16 (local.get $a) (f32x4.add (v128.load offset=16 (local.get $a))
-              (f32x4.mul (local.get $pj) (call $h2f (i32x4.extend_high_i16x8_u (local.get $hv))))))
-            (local.set $i (i32.add (local.get $i) (i32.const 8)))
-            (br $r)))
+        (local.set $row (call $kvrow (local.get $v) (local.get $j) (local.get $cap) (local.get $stride) (local.get $D) (local.get $f16) (local.get $tmp)))
+        (local.set $g (i32.const 0))
+        (block $gd
+          (loop $gl
+            (br_if $gd (i32.ge_u (local.get $g) (local.get $G)))
+            (local.set $pj (f32x4.splat (f32.load (i32.add (local.get $p) (i32.shl (i32.add (i32.mul (local.get $g) (local.get $ps)) (local.get $j)) (i32.const 2))))))
+            (local.set $ag (i32.add (local.get $acc) (i32.shl (i32.mul (local.get $g) (local.get $D)) (i32.const 2))))
+            (local.set $i (i32.const 0))
+            (block $rd
+              (loop $r
+                (br_if $rd (i32.ge_u (local.get $i) (local.get $D)))
+                (local.set $a (i32.add (local.get $ag) (i32.shl (local.get $i) (i32.const 2))))
+                (v128.store (local.get $a) (f32x4.add (v128.load (local.get $a))
+                  (f32x4.mul (local.get $pj) (v128.load (i32.add (local.get $row) (i32.shl (local.get $i) (i32.const 2)))))))
+                (local.set $i (i32.add (local.get $i) (i32.const 4)))
+                (br $r)))
+            (local.set $g (i32.add (local.get $g) (i32.const 1)))
+            (br $gl)))
         (local.set $j (i32.add (local.get $j) (i32.const 1)))
         (br $keys))))
 

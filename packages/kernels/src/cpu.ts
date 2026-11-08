@@ -446,33 +446,38 @@ export function cpuAttention(f16: boolean): CpuKernel {
     const { pos0, spanLo, spanHi } = step(b[1]!);
     const heap = (b[2] as HeapView).heap;
     if (heap && D % (f16 ? 8 : 4) === 0) {
-      // The per-key work in WASM SIMD, on the caches in place; masking and the softmax stay here.
-      const at = heap.scratch((2 * D + maxSeq) * 4); // before any view: growing detaches them
+      // The per-key work in WASM SIMD, on the caches in place, for all the query heads of a KV head at
+      // once (each cache row read and widened once); masking and the softmax stay here.
+      const G = H / Hkv;
+      const at = heap.scratch((2 * G * D + G * maxSeq + G + D) * 4); // before any view: growing detaches them
       const k = heap.kernels;
       const eb = f16 ? 2 : 4;
       const stride = Hkv * D * eb;
       const [kp, vp] = [(b[3] as HeapView).ptr, (b[4] as HeapView).ptr];
-      const scoresFn = f16 ? k.att_scores_f16 : k.att_scores_f32;
-      const wsumFn = f16 ? k.att_wsum_f16 : k.att_wsum_f32;
       const mem = new Float32Array(heap.buffer);
       const q = b[2]!.f32;
       const o = b[5]!.f32;
-      const qs = at, acc = at + D * 4, sc = at + 2 * D * 4;
-      const [qi, ai, si] = [qs >>> 2, acc >>> 2, sc >>> 2];
-      for (let t = 0; t < T; t++)
-        for (let h = 0; h < H; h++) {
-          const kvh = Math.floor(h / (H / Hkv));
-          const pos = pos0 + t;
-          const n = Math.min(pos >= spanLo && pos < spanHi ? spanHi : pos + 1, maxSeq);
-          const first = win > 0 && n > win ? n - win : 0;
-          const qo = (t * H + h) * D;
-          for (let i = 0; i < D; i++) mem[qi + i] = q[qo + i]! * scale;
-          const mx = scoresFn(qs, kp + kvh * D * eb, stride, cap, first, n, D, sc);
-          let l = 0;
-          for (let j = si + first, end = si + n; j < end; j++) l += mem[j] = Math.exp(mem[j]! - mx);
-          wsumFn(sc, vp + kvh * D * eb, stride, cap, first, n, D, acc);
-          for (let i = 0; i < D; i++) o[qo + i] = mem[ai + i]! / l;
+      const qs = at, acc = qs + G * D * 4, sc = acc + G * D * 4, mx = sc + G * maxSeq * 4, tmp = mx + G * 4;
+      const [qi, ai, si, mi] = [qs >>> 2, acc >>> 2, sc >>> 2, mx >>> 2];
+      const ls = new Float64Array(G);
+      for (let t = 0; t < T; t++) {
+        const pos = pos0 + t;
+        const n = Math.min(pos >= spanLo && pos < spanHi ? spanHi : pos + 1, maxSeq);
+        const first = win > 0 && n > win ? n - win : 0;
+        for (let kvh = 0; kvh < Hkv; kvh++) {
+          const qo = (t * H + kvh * G) * D;
+          for (let i = 0; i < G * D; i++) mem[qi + i] = q[qo + i]! * scale;
+          k.att_scores(qs, kp + kvh * D * eb, stride, cap, first, n, D, sc, G, maxSeq, mx, f16 ? 1 : 0, tmp);
+          for (let g = 0; g < G; g++) {
+            const m = mem[mi + g]!;
+            let l = 0;
+            for (let j = si + g * maxSeq + first, end = si + g * maxSeq + n; j < end; j++) l += mem[j] = Math.exp(mem[j]! - m);
+            ls[g] = l;
+          }
+          k.att_wsum(sc, vp + kvh * D * eb, stride, cap, first, n, D, acc, G, maxSeq, f16 ? 1 : 0, tmp);
+          for (let g = 0; g < G; g++) for (let i = 0; i < D; i++) o[qo + g * D + i] = mem[ai + g * D + i]! / ls[g]!;
         }
+      }
       return;
     }
     const q = b[2]!.f32;

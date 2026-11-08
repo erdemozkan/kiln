@@ -162,7 +162,7 @@ Key ideas:
   stays on one thread. Prefill matmuls take four x rows per pass over a q4 or q8 weight block
   (`gemm4_q4i`, `gemm4_q8i`: each block's codes widened once for the four, the same operations per
   row as one at a time): the 64 × 3072 × 576 matmul takes 11.6 ms in q4 and 13.0 ms in q8 on one
-  thread, against 25 and 24 ms with one row at a time in f32x4. Attention runs in WASM too (`att_scores`, `att_wsum` for f32 and f16 caches: one query
+  thread, against 25 and 24 ms with one row at a time in f32x4. Attention runs in WASM too (`att_scores`, `att_wsum` for f32 and f16 caches: queries
   against a run of cached keys, ring wraparound included, f16 widened by an exact
   shift-and-rescale), with masking and the softmax in TypeScript: 875 → 139 ms of a profiled
   SmolLM2-135M call. With these, SmolLM2-135M on the CPU backend: first token 0.76 s and 36.7 tok/s
@@ -175,7 +175,10 @@ Key ideas:
   The RMS norm in front of a q4/q8 matmul and the int16 quantization of its x rows run in WASM
   (`quant_x`), and a matmul with no epilogue writes y in place: that TypeScript was 5 ms of every
   25 ms forward pass, and decode over 96 tokens went from 32–35 to 35–38.5 tok/s (first token
-  0.76–0.89 → 0.67–0.75 s, same 64 greedy tokens as the GPU).
+  0.76–0.89 → 0.67–0.75 s, same 64 greedy tokens as the GPU). Attention takes all the query heads of a KV head per call
+  (`att_scores`, `att_wsum`), so each cache row is read and widened from f16 once per group instead
+  of once per head: for SmolLM2-135M's 9 heads over 3 KV heads, 196 → 91 µs per layer at 100
+  positions and 1078 → 468 µs at 500.
 - **GGUF weights held exactly.** Q4_1 and Q4_K blocks are code·scale + min per 32 values with 4-bit
   codes, and Q5_x with 5-bit codes, so Kiln's q4 and q8 planes plus one f32 min per block hold them
   as llama.cpp dequantizes them, where they used to be dequantized and rounded a second time. The GPU

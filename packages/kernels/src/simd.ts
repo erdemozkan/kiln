@@ -15,12 +15,14 @@ export interface SimdKernels {
    * and float sums xsum; RMS-normalised first with weights nw and eps when nw is not 0.
    */
   quant_x(x: number, K: number, rows: number, nw: number, eps: number, xq: number, xs: number, xsum: number, q4: number): void;
-  /** out[j] = q · K_j for keys j in [first, n), key j at k + (j mod cap) · stride bytes; returns the largest. */
-  att_scores_f32(q: number, k: number, stride: number, cap: number, first: number, n: number, D: number, out: number): number;
-  att_scores_f16(q: number, k: number, stride: number, cap: number, first: number, n: number, D: number, out: number): number;
-  /** acc = Σ_j p[j] · V_j over the same keys. */
-  att_wsum_f32(p: number, v: number, stride: number, cap: number, first: number, n: number, D: number, acc: number): void;
-  att_wsum_f16(p: number, v: number, stride: number, cap: number, first: number, n: number, D: number, acc: number): void;
+  /**
+   * For G query heads sharing a KV head (queries D floats apart): out[g · os + j] = q_g · K_j for keys j
+   * in [first, n), key j at k + (j mod cap) · stride bytes, and each head's largest score at mx[g].
+   * f16: the cache holds halves (widened through tmp, D floats).
+   */
+  att_scores(q: number, k: number, stride: number, cap: number, first: number, n: number, D: number, out: number, G: number, os: number, mx: number, f16: number, tmp: number): void;
+  /** acc[g · D + i] = Σ_j p[g · ps + j] · V_j[i] over the same keys (acc overwritten). */
+  att_wsum(p: number, v: number, stride: number, cap: number, first: number, n: number, D: number, acc: number, G: number, ps: number, f16: number, tmp: number): void;
 }
 
 /** Which gemv a threaded job runs. */
