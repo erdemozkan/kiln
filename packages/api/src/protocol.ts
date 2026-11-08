@@ -70,6 +70,25 @@ export interface WireEncoderOptions {
 }
 
 export type EncoderTask = "feature-extraction" | "text-classification" | "token-classification" | "question-answering" | "fill-mask" | "zero-shot-classification";
+export type Seq2SeqTask = "summarization" | "translation" | "text2text-generation";
+
+/** Load options of an encoder-decoder model (summarization, translation, text2text). */
+export interface WireSeq2SeqOptions extends WireEncoderOptions {
+  /** Longest output in tokens (default the model's position limit). */
+  maxTarget?: number;
+}
+
+export interface Seq2SeqInfo {
+  model: string;
+  /** "bart", "marian" or "m2m100". */
+  family: string;
+  encoderLayers: number;
+  decoderLayers: number;
+  dModel: number;
+  vocabSize: number;
+  backend: string;
+  cpuThreads?: number;
+}
 
 export interface EncoderInfo {
   model: string;
@@ -89,7 +108,8 @@ export interface EncoderInfo {
 export type Request =
   | { id: number; type: "load"; model: string; opts: WireLoadOptions }
   | { id: number; type: "loadEncoder"; model: string; opts: WireEncoderOptions }
-  | { id: number; type: "task"; task: EncoderTask; args: unknown[] }
+  | { id: number; type: "loadSeq2Seq"; model: string; opts: WireSeq2SeqOptions }
+  | { id: number; type: "task"; task: EncoderTask | Seq2SeqTask; args: unknown[] }
   | { id: number; type: "chat"; messages: ChatMessage[]; opts: WireGenerateOptions }
   | { id: number; type: "complete"; prompt: string; opts: WireGenerateOptions }
   | { id: number; type: "abort"; target: number }
@@ -100,6 +120,7 @@ export type Response =
   | { id: number; type: "progress"; progress: LoadProgress }
   | { id: number; type: "loaded"; info: ModelInfo }
   | { id: number; type: "encoderLoaded"; info: EncoderInfo }
+  | { id: number; type: "seq2seqLoaded"; info: Seq2SeqInfo }
   | { id: number; type: "result"; result: unknown }
   | { id: number; type: "delta"; text: string }
   | { id: number; type: "done"; stats: GenerateStats | undefined }

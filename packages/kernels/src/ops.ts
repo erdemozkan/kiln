@@ -18,7 +18,8 @@ import {
   copyRowSpec,
   avgPoolSpec,
   embedSpec,
-  geluSpec,
+  actSpec,
+  type Activation,
   layernormSpec,
   gatedActSpec,
   gemmSpec,
@@ -264,6 +265,11 @@ export interface AttentionShape {
    * f32 and not a ring.
    */
   span?: boolean;
+  /**
+   * Step block to read positions and the span from instead of the context's (cross-attention: a step
+   * whose span covers every query, so each decoder row sees all encoder keys whatever its position).
+   */
+  step?: Buf;
 }
 
 let spanOverride: SpanTile | undefined;
@@ -288,35 +294,36 @@ export function attention(ctx: Ctx, q: Tensor, kc: Buf, vc: Buf, s: AttentionSha
   if (slots < s.maxSeq && (!s.window || slots < s.window + s.T - 1 || slots < ATTN_WG)) {
     throw new Error(`attention: a ${slots}-slot ring cannot hold a ${s.window ?? 0}-key window for ${s.T} rows`);
   }
+  const step = s.step ?? ctx.step;
   const params = ctx.uniform([
     u32(s.T), u32(s.H), u32(s.Hkv), u32(s.D), u32(s.maxSeq), f32(s.scale ?? 1 / Math.sqrt(s.D)), u32(splits), u32(s.window ?? 0),
     u32(slots), u32(0), u32(0), u32(0),
   ]);
   if (ctx.backend.name === "cpu") {
     // One CPU implementation serves every attention shape; the split-K pair is a GPU occupancy trick.
-    ctx.run(attentionSpec(s.kv), [params, ctx.step, q.buf, kc, vc, out.buf], [s.H, s.T, 1]);
+    ctx.run(attentionSpec(s.kv), [params, step, q.buf, kc, vc, out.buf], [s.H, s.T, 1]);
     return out;
   }
   if (s.T === 1) {
     const ml = ctx.alloc([s.H, splits, 2]);
     const po = ctx.alloc([s.H, splits, s.D]);
-    ctx.run(attentionSplitSpec(s.kv), [params, ctx.step, q.buf, kc, vc, ml.buf, po.buf], [s.H, 1, splits]);
-    ctx.run(attentionCombineSpec(), [params, ctx.step, ml.buf, po.buf, out.buf], [s.H, 1, 1]);
+    ctx.run(attentionSplitSpec(s.kv), [params, step, q.buf, kc, vc, ml.buf, po.buf], [s.H, 1, splits]);
+    ctx.run(attentionCombineSpec(), [params, step, ml.buf, po.buf, out.buf], [s.H, 1, 1]);
     return out;
   }
   if (s.span && (s.kv ?? "f32") === "f32" && slots === s.maxSeq && !s.window) {
     const t = spanOverride ?? spanTile(s.D, ctx.backend.limits.maxWorkgroupStorage);
     if (t) {
-      ctx.run(attentionSpanSpec(s.D, t), [params, ctx.step, q.buf, kc, vc, out.buf], [Math.ceil(s.T / (8 * t.RT)), s.H, 1]);
+      ctx.run(attentionSpanSpec(s.D, t), [params, step, q.buf, kc, vc, out.buf], [Math.ceil(s.T / (8 * t.RT)), s.H, 1]);
       return out;
     }
   }
   if (prefillAttention === "tiled") {
     const tile = attentionTile(s.D, ctx.backend.limits.maxWorkgroupStorage);
-    ctx.run(attentionTiledSpec(s.kv ?? "f32", s.D, tile), [params, ctx.step, q.buf, kc, vc, out.buf], [s.Hkv, Math.ceil((s.T * (s.H / s.Hkv)) / tile.R), 1]);
+    ctx.run(attentionTiledSpec(s.kv ?? "f32", s.D, tile), [params, step, q.buf, kc, vc, out.buf], [s.Hkv, Math.ceil((s.T * (s.H / s.Hkv)) / tile.R), 1]);
     return out;
   }
-  ctx.run(attentionSpec(s.kv), [params, ctx.step, q.buf, kc, vc, out.buf], [s.H, s.T, 1]);
+  ctx.run(attentionSpec(s.kv), [params, step, q.buf, kc, vc, out.buf], [s.H, s.T, 1]);
   return out;
 }
 
@@ -359,8 +366,13 @@ export function layernorm(ctx: Ctx, x: Tensor, w: Tensor, b: Tensor, eps: number
 
 /** GELU in place: the tanh approximation, or the exact erf form (BERT's) with `exact`. */
 export function gelu(ctx: Ctx, x: Tensor, exact = false): void {
+  act(ctx, x, exact ? "gelu" : "gelu_tanh");
+}
+
+/** An activation in place: GELU (erf or tanh), SiLU or ReLU. */
+export function act(ctx: Ctx, x: Tensor, kind: Activation): void {
   const n = numel(x.shape);
-  ctx.run(geluSpec(exact), [ctx.uniform([u32(n), u32(0), u32(0), u32(0)]), x.buf], grid1d(n));
+  ctx.run(actSpec(kind), [ctx.uniform([u32(n), u32(0), u32(0), u32(0)]), x.buf], grid1d(n));
 }
 
 /** k × k average pooling of a side × side token grid [side², C] → [(side / k)², C]. */

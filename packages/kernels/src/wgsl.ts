@@ -1541,16 +1541,27 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
 }
 
 /** x = gelu_tanh(x) in place. */
+/** Elementwise activations: GELU exact (erf) or tanh-approximated, SiLU, ReLU. */
+export type Activation = "gelu" | "gelu_tanh" | "silu" | "relu";
+
 /**
- * GELU in place: the tanh approximation, or with `exact` the erf form (BERT's "gelu"), erf from
- * Abramowitz & Stegun 7.1.26 (absolute error under 1.5e-7), the same formula as the CPU kernel.
+ * An activation in place. Exact GELU takes erf from Abramowitz & Stegun 7.1.26 (absolute error under
+ * 1.5e-7), the same formula as the CPU kernel.
  */
-export function geluSpec(exact = false): KernelSpec {
-  return spec(exact ? "gelu/erf" : "gelu", ["uniform", "rw"], exact ? cpu.cpuGeluErf : cpu.cpuGelu, () => /* wgsl */ `
+export function actSpec(kind: Activation): KernelSpec {
+  const expr =
+    kind === "gelu"
+      ? "0.5 * a * (1.0 + erf_as(a * 0.70710678118654752))"
+      : kind === "gelu_tanh"
+        ? GELU_WGSL("a")
+        : kind === "silu"
+          ? "a / (1.0 + exp(-a))"
+          : "max(a, 0.0)";
+  return spec(kind === "gelu_tanh" ? "gelu" : `act/${kind}`, ["uniform", "rw"], cpu.cpuAct(kind), () => /* wgsl */ `
 struct P { n: u32, _a: u32, _b: u32, _c: u32 }
 @group(0) @binding(0) var<uniform> p: P;
 @group(0) @binding(1) var<storage, read_write> x: array<f32>;
-${exact ? `
+${kind === "gelu" ? `
 fn erf_as(v: f32) -> f32 {
   let z = abs(v);
   let t = 1.0 / (1.0 + 0.3275911 * z);
@@ -1563,9 +1574,12 @@ fn main(${EW_ARGS}) {
   ${FLAT}
   if (idx >= p.n) { return; }
   let a = x[idx];
-  x[idx] = ${exact ? "0.5 * a * (1.0 + erf_as(a * 0.70710678118654752))" : GELU_WGSL("a")};
+  x[idx] = ${expr};
 }`);
 }
+
+/** GELU in place (tanh approximation, or exact with `exact`); see `actSpec`. */
+export const geluSpec = (exact = false): KernelSpec => actSpec(exact ? "gelu" : "gelu_tanh");
 
 /**
  * Average pooling of a square grid of tokens: x [side·side, C] in raster order → y [(side/k)², C],

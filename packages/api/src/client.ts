@@ -2,7 +2,7 @@ import type { Profile } from "@kiln/core";
 import type { GenerateStats, LoadProgress } from "@kiln/runtime";
 import type { ChatMessage } from "@kiln/tokenizers";
 import { createWorker } from "./default-worker";
-import type { EncoderInfo, EncoderTask, ModelInfo, Request, Response, WireEncoderOptions, WireGenerateOptions, WireLoadOptions } from "./protocol";
+import type { EncoderInfo, EncoderTask, ModelInfo, Request, Response, Seq2SeqInfo, Seq2SeqTask, WireEncoderOptions, WireGenerateOptions, WireLoadOptions, WireSeq2SeqOptions } from "./protocol";
 
 type Listener = (msg: Response) => void;
 type RequestBody = Request extends infer R ? (R extends Request ? Omit<R, "id"> : never) : never;
@@ -224,3 +224,52 @@ export class KilnEncoder extends WorkerChannel {
 }
 
 export const loadEncoder = KilnEncoder.load;
+
+export interface Seq2SeqLoadOptions extends WireSeq2SeqOptions {
+  onProgress?: (p: LoadProgress) => void;
+  /** Supply your own worker. Defaults to Kiln's module worker. */
+  worker?: Worker;
+}
+
+/** Main-thread handle to an encoder-decoder model (BART, Marian, M2M100 / NLLB) running in a worker. */
+export class KilnSeq2Seq extends WorkerChannel {
+  private constructor(
+    worker: Worker,
+    public info: Seq2SeqInfo,
+  ) {
+    super(worker);
+  }
+
+  static async load(model: string, opts: Seq2SeqLoadOptions = {}): Promise<KilnSeq2Seq> {
+    const worker = opts.worker ?? createWorker();
+    const m = new KilnSeq2Seq(worker, undefined as unknown as Seq2SeqInfo);
+    const { onProgress, worker: _w, ...wire } = opts;
+    try {
+      m.info = await new Promise<Seq2SeqInfo>((resolve, reject) => {
+        m.send({ type: "loadSeq2Seq", model, opts: wire }, (msg) => {
+          if (msg.type === "progress") onProgress?.(msg.progress);
+          else if (msg.type === "seq2seqLoaded") resolve(msg.info);
+          else if (msg.type === "error") reject(new Error(msg.message));
+          return msg.type === "seq2seqLoaded" || msg.type === "error";
+        });
+      });
+    } catch (err) {
+      if (!opts.worker) worker.terminate();
+      throw err;
+    }
+    return m;
+  }
+
+  /** Runs summarization, translation or text2text-generation on one text or several. */
+  run(task: Seq2SeqTask, texts: string | string[], options: Record<string, unknown> = {}): Promise<Record<string, string>[]> {
+    return new Promise((resolve, reject) =>
+      this.send({ type: "task", task, args: [texts, options] }, (msg) => {
+        if (msg.type === "result") resolve(msg.result as Record<string, string>[]);
+        else if (msg.type === "error") reject(new Error(msg.message));
+        return msg.type === "result" || msg.type === "error";
+      }),
+    );
+  }
+}
+
+export const loadSeq2Seq = KilnSeq2Seq.load;

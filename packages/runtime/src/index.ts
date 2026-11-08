@@ -5,3 +5,4 @@ export * from "./tune";
 export * from "./prompt-cache";
 export * from "./prefix-store";
 export * from "./encoder";
+export * from "./seq2seq";

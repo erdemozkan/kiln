@@ -4,7 +4,7 @@
 // the backend (GPU or CPU); the small task heads run here in TypeScript on the final hidden states.
 import type { Backend } from "@kiln/core";
 import { ref as kref } from "@kiln/kernels";
-import { fetchJSON, fetchText, fileUrl, listRepoFiles, parseModelId, readSafetensorsHeader, safetensorsFiles, toF32, type ByteSource, type TensorEntry } from "@kiln/loader";
+import { fetchJSON, fetchText, fileUrl, listRepoFiles, parseModelId, readPytorchHeader, readSafetensorsHeader, toF32, weightFiles, type ByteSource, type TensorEntry } from "@kiln/loader";
 import { EncoderModel, encoderConfigFromHF, encoderName, type EncoderConfig } from "@kiln/models";
 import { encoderTokenizerFromJSON, wordPieceFromVocab, type EncoderTokenizer, type EncoderTokenizerJSON, type Encoding } from "@kiln/tokenizers";
 import { openBackend, openParsed } from "./load";
@@ -408,7 +408,7 @@ export async function createEncoder(modelId: string, opts: EncoderLoadOptions = 
     has("tokenizer.json").then((y) => (y ? fetchJSON<EncoderTokenizerJSON>(fileUrl(ref, "tokenizer.json", ep), true) : undefined)),
     has("tokenizer_config.json").then((y) => (y ? fetchJSON<Record<string, unknown>>(fileUrl(ref, "tokenizer_config.json", ep), true) : undefined)),
     has("vocab.txt").then((y) => (y ? fetchText(fileUrl(ref, "vocab.txt", ep), true) : undefined)),
-    listing.then((files) => safetensorsFiles(ref, ep, files)),
+    listing.then((files) => weightFiles(ref, ep, files)),
   ]);
   const cfg = encoderConfigFromHF(config!);
   let tokenizer: EncoderTokenizer;
@@ -423,8 +423,8 @@ export async function createEncoder(modelId: string, opts: EncoderLoadOptions = 
   const tensors = new Map<string, Located>();
   try {
     const files: WeightFile[] = [];
-    for (const name of names) {
-      const { source, header } = await openParsed(ref, name, ep, readSafetensorsHeader);
+    for (const name of names.names) {
+      const { source, header } = await openParsed(ref, name, ep, names.format === "safetensors" ? readSafetensorsHeader : readPytorchHeader);
       sources.push(source);
       for (const t of header.tensors) tensors.set(t.name, { source, entry: t });
       files.push({ name, source, tensors: header.tensors.filter((t) => encoderName(t.name) !== undefined), rename: encoderName });

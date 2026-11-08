@@ -613,6 +613,18 @@ export const cpuGeluErf: CpuKernel = (b) => {
   for (let i = 0; i < n; i++) x[i] = 0.5 * x[i]! * (1 + erfAS(x[i]! * Math.SQRT1_2));
 };
 
+/** An activation in place (see actSpec). */
+export function cpuAct(kind: "gelu" | "gelu_tanh" | "silu" | "relu"): CpuKernel {
+  if (kind === "gelu") return cpuGeluErf;
+  if (kind === "gelu_tanh") return cpuGelu;
+  return (b) => {
+    const n = b[0]!.u32[0]!;
+    const x = b[1]!.f32;
+    if (kind === "silu") for (let i = 0; i < n; i++) x[i] = x[i]! / (1 + Math.exp(-x[i]!));
+    else for (let i = 0; i < n; i++) x[i] = Math.max(0, x[i]!);
+  };
+}
+
 export const cpuAvgPool: CpuKernel = (b) => {
   const [side, k, C] = [b[0]!.u32[0]!, b[0]!.u32[1]!, b[0]!.u32[2]!];
   const x = b[1]!.f32;

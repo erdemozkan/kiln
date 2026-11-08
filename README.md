@@ -476,6 +476,18 @@ run in TypeScript on the final hidden states. Tokenizers: WordPiece from tokeniz
 and RoBERTa's byte-level BPE, both matching Python tokenizers on 56 test encodings. Not yet: Unigram
 tokenizers (XLM-R), ModernBERT, MPNet, DeBERTa, and batching several inputs into one forward pass.
 
+Encoder-decoder models (BART and DistilBART so far; Marian, M2M100 / NLLB layouts are in the model
+code but not yet loadable) run `summarization`, `translation` and `text2text-generation` with
+transformers.js's settings: greedy search (transformers.js ignores `num_beams` too), the model's
+`min_length`, `no_repeat_ngram_size`, forced first and last tokens, its config prefix, and 256 new
+tokens unless told otherwise. The encoder runs once and writes every decoder layer's cross-attention
+K/V; each decoder step reads them through a step block whose span covers every position. BART-base
+matches Python transformers' logits within 3.2e-5 over 12 decoding steps and its greedy output token
+for token; DistilBART-CNN (loaded from its 2020 pickle checkpoint) gives the same summary on the CPU
+and on WebGPU (64 tokens in 3.4 s on the Intel GPU). Repos without safetensors load from
+`pytorch_model.bin`: zip and legacy checkpoints are read as byte ranges from their pickle (a small
+pickle reader for state dicts; nothing is executed), and match the repos' safetensors copies exactly.
+
 Gemma 3 was checked token by token against an independent NumPy forward pass written from
 transformers' `modeling_gemma3`: greedy output matched on every prompt tried, for 1B in q4 and q8 and 270M
 in q8 and f32. On a 1,138-token prompt, where the fact asked about lies outside the sliding layers' 512-token

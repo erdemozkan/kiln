@@ -602,6 +602,11 @@ async function main() {
     const te = upload(x, [1000]);
     await run(S0, (ctx) => ops.gelu(ctx, te, true));
     check("gelu", "erf n1000", await download(te.buf, 1000), x.map(ref.geluErf), 1e-5);
+    for (const [kind, f] of [["silu", (v: number) => v / (1 + Math.exp(-v))], ["relu", (v: number) => Math.max(0, v)]] as const) {
+      const ta = upload(x, [1000]);
+      await run(S0, (ctx) => ops.act(ctx, ta, kind));
+      check("act", `${kind} n1000`, await download(ta.buf, 1000), x.map(f), 1e-5);
+    }
     for (const [side, k, C] of [[64, 4, 24], [8, 2, 1152]] as const) {
       const g = randn(side * side * C);
       const out = side / k;

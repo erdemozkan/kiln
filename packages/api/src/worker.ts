@@ -1,5 +1,5 @@
-import { createEncoder, createEngine, loadPromptCache, promptCacheName, savePromptCache, type EncoderEngine, type Engine, type TextDelta } from "@kiln/runtime";
-import type { EncoderTask, Request, Response } from "./protocol";
+import { createEncoder, createEngine, createSeq2Seq, loadPromptCache, promptCacheName, savePromptCache, type EncoderEngine, type Engine, type Seq2SeqEngine, type Seq2SeqGenerateOptions, type TextDelta } from "@kiln/runtime";
+import type { EncoderTask, Request, Response, Seq2SeqTask } from "./protocol";
 
 /** The slice of DedicatedWorkerGlobalScope we use (lib.webworker conflicts with lib.dom in one program). */
 const scope = self as unknown as {
@@ -8,6 +8,25 @@ const scope = self as unknown as {
 };
 let engine: Engine | undefined;
 let encoder: EncoderEngine | undefined;
+let seq2seq: Seq2SeqEngine | undefined;
+
+const OUTPUT_KEY: Record<Seq2SeqTask, string> = { summarization: "summary_text", translation: "translation_text", "text2text-generation": "generated_text" };
+
+/**
+ * A text2text call as transformers.js makes it: config.prefix and the task's prefix from
+ * task_specific_params before each text, 256 new tokens unless told otherwise, one result object
+ * per text.
+ */
+async function runSeq2Seq(e: Seq2SeqEngine, task: Seq2SeqTask, texts: string | string[], options: Seq2SeqGenerateOptions = {}): Promise<Record<string, string>[]> {
+  const raw = e.cfg.raw;
+  const tsp = (raw.task_specific_params as Record<string, { prefix?: string }> | undefined)?.[task];
+  const prefix = String(raw.prefix ?? "") + (tsp?.prefix ?? "");
+  const out: Record<string, string>[] = [];
+  for (const t of Array.isArray(texts) ? texts : [texts]) {
+    out.push({ [OUTPUT_KEY[task]]: await e.run(t, { max_new_tokens: 256, ...options }, prefix) });
+  }
+  return out;
+}
 
 /** Runs an encoder task with transformers.js's arguments. */
 function runTask(e: EncoderEngine, task: EncoderTask, args: unknown[]): Promise<unknown> {
@@ -158,13 +177,39 @@ scope.onmessage = async (e: MessageEvent<Request>) => {
         });
         break;
       }
+      case "loadSeq2Seq": {
+        await queue;
+        seq2seq?.destroy();
+        seq2seq = undefined;
+        const m = await createSeq2Seq(msg.model, { ...msg.opts, onProgress: (progress) => post({ id: msg.id, type: "progress", progress }) });
+        seq2seq = m;
+        post({
+          id: msg.id,
+          type: "seq2seqLoaded",
+          info: {
+            model: msg.model,
+            family: m.cfg.family,
+            encoderLayers: m.cfg.encLayers,
+            decoderLayers: m.cfg.decLayers,
+            dModel: m.cfg.dModel,
+            vocabSize: m.cfg.vocab,
+            backend: m.backend.name,
+            cpuThreads: m.backend.name === "cpu" ? (m.backend as { threads?: number }).threads : undefined,
+          },
+        });
+        break;
+      }
       case "task": {
+        const isS2S = msg.task in OUTPUT_KEY;
         const enc = encoder;
-        if (!enc) throw new Error("no encoder model loaded");
+        const s2s = seq2seq;
+        if (isS2S ? !s2s : !enc) throw new Error(`no ${isS2S ? "encoder-decoder" : "encoder"} model loaded`);
         // One call at a time, like generation.
         queue = queue.then(async () => {
           try {
-            post({ id: msg.id, type: "result", result: await runTask(enc, msg.task, msg.args) });
+            const a = msg.args as never[];
+            const result = isS2S ? await runSeq2Seq(s2s!, msg.task as Seq2SeqTask, a[0], a[1]) : await runTask(enc!, msg.task as EncoderTask, msg.args);
+            post({ id: msg.id, type: "result", result });
           } catch (err) {
             post({ id: msg.id, type: "error", message: err instanceof Error ? err.message : String(err) });
           }
@@ -202,6 +247,8 @@ scope.onmessage = async (e: MessageEvent<Request>) => {
         engine = undefined;
         encoder?.destroy();
         encoder = undefined;
+        seq2seq?.destroy();
+        seq2seq = undefined;
         post({ id: msg.id, type: "done", stats: undefined });
         break;
     }

@@ -339,3 +339,20 @@ export function wordPieceFromVocab(vocabTxt: string, opts: { lowercase?: boolean
     added_tokens: specials.map((t) => ({ id: vocab[t]!, content: t, special: true })),
   });
 }
+
+/**
+ * RoBERTa / BART's byte-level BPE from vocab.json and merges.txt (repos without a tokenizer.json),
+ * with `<s> A </s>` and `<s> A </s></s> B </s>` as transformers' RobertaTokenizer builds them.
+ */
+export function byteLevelFromVocabMerges(vocab: Record<string, number>, mergesTxt: string): EncoderTokenizer {
+  const merges = mergesTxt.split(/\r?\n/).filter((l) => l && !l.startsWith("#version"));
+  const specials = ["<s>", "<pad>", "</s>", "<unk>", "<mask>"].filter((t) => vocab[t] !== undefined);
+  const added = specials.map((t) => ({ id: vocab[t]!, content: t, special: true, lstrip: t === "<mask>" }));
+  const json: EncoderTokenizerJSON = {
+    model: { type: "BPE", vocab, merges },
+    pre_tokenizer: { type: "ByteLevel", add_prefix_space: false, trim_offsets: true } as never,
+    post_processor: { type: "RobertaProcessing", cls: ["<s>", vocab["<s>"]!], sep: ["</s>", vocab["</s>"]!] },
+    added_tokens: added,
+  };
+  return encoderTokenizerFromJSON(json);
+}

@@ -2,8 +2,8 @@
 // transformers.js's text-generation pipeline runs on Kiln with little more than a new import.
 import type { LoadProgress } from "@kiln/runtime";
 import type { ChatMessage } from "@kiln/tokenizers";
-import { KilnEncoder, KilnModel, type GenerateOptions, type LoadOptions, type TextStream } from "./client";
-import type { EncoderInfo, EncoderTask, ModelInfo } from "./protocol";
+import { KilnEncoder, KilnModel, KilnSeq2Seq, type GenerateOptions, type LoadOptions, type TextStream } from "./client";
+import type { EncoderInfo, EncoderTask, ModelInfo, Seq2SeqInfo, Seq2SeqTask } from "./protocol";
 
 /** Task names, with transformers.js's aliases. */
 export type PipelineTask =
@@ -16,7 +16,12 @@ export type PipelineTask =
   | "ner"
   | "question-answering"
   | "fill-mask"
-  | "zero-shot-classification";
+  | "zero-shot-classification"
+  | "summarization"
+  | "translation"
+  | "text2text-generation";
+
+const SEQ2SEQ = new Set<string>(["summarization", "translation", "text2text-generation"]);
 
 const ALIASES: Partial<Record<PipelineTask, PipelineTask>> = { embeddings: "feature-extraction", "sentiment-analysis": "text-classification", ner: "token-classification" };
 
@@ -29,6 +34,7 @@ export const DEFAULT_MODELS: Record<string, string> = {
   "question-answering": "distilbert/distilbert-base-cased-distilled-squad",
   "fill-mask": "google-bert/bert-base-uncased",
   "zero-shot-classification": "typeform/distilbert-base-uncased-mnli",
+  summarization: "sshleifer/distilbart-cnn-6-6",
 };
 
 /** transformers.js's names, plus any of Kiln's own load options. */
@@ -305,6 +311,37 @@ export interface ZeroShotClassificationPipeline extends EncoderPipelineBase {
   (texts: string | string[], candidate_labels: string | string[], options?: { hypothesis_template?: string; multi_label?: boolean }): Promise<ZeroShotResult | ZeroShotResult[]>;
 }
 
+/** transformers' generation settings for summarization, translation and text2text (greedy; `num_beams` is ignored, as in transformers.js). */
+export interface Text2TextOptions {
+  /** Tokens to generate at most (default 256). */
+  max_new_tokens?: number;
+  min_length?: number;
+  no_repeat_ngram_size?: number;
+  repetition_penalty?: number;
+  forced_bos_token_id?: number;
+  forced_eos_token_id?: number;
+  /** Multilingual translation models (NLLB): source and target language codes, e.g. "eng_Latn", "fra_Latn". */
+  src_lang?: string;
+  tgt_lang?: string;
+}
+
+interface Seq2SeqPipelineBase {
+  readonly task: PipelineTask;
+  readonly model: KilnSeq2Seq;
+  readonly info: Seq2SeqInfo;
+  readonly tokenizer: object;
+  dispose(): Promise<void>;
+}
+export interface SummarizationPipeline extends Seq2SeqPipelineBase {
+  (texts: string | string[], options?: Text2TextOptions): Promise<{ summary_text: string }[]>;
+}
+export interface TranslationPipeline extends Seq2SeqPipelineBase {
+  (texts: string | string[], options?: Text2TextOptions): Promise<{ translation_text: string }[]>;
+}
+export interface Text2TextGenerationPipeline extends Seq2SeqPipelineBase {
+  (texts: string | string[], options?: Text2TextOptions): Promise<{ generated_text: string }[]>;
+}
+
 /** Encoder dtypes: 8-bit names load as q8, 4-bit as q4, float and "auto" as f32 (encoders are small). */
 function encoderQuant(dtype: string | undefined): "f32" | "q8" | "q4" {
   if (dtype === undefined || dtype === "auto" || dtype === "fp32" || dtype === "fp16" || dtype === "f32") return "f32";
@@ -331,6 +368,9 @@ export async function pipeline(task: "token-classification" | "ner", model?: str
 export async function pipeline(task: "question-answering", model?: string, options?: PipelineOptions): Promise<QuestionAnsweringPipeline>;
 export async function pipeline(task: "fill-mask", model?: string, options?: PipelineOptions): Promise<FillMaskPipeline>;
 export async function pipeline(task: "zero-shot-classification", model?: string, options?: PipelineOptions): Promise<ZeroShotClassificationPipeline>;
+export async function pipeline(task: "summarization", model?: string, options?: PipelineOptions): Promise<SummarizationPipeline>;
+export async function pipeline(task: "translation", model?: string, options?: PipelineOptions): Promise<TranslationPipeline>;
+export async function pipeline(task: "text2text-generation", model?: string, options?: PipelineOptions): Promise<Text2TextGenerationPipeline>;
 export async function pipeline(task: PipelineTask, model?: string, options: PipelineOptions = {}): Promise<unknown> {
   const t = ALIASES[task] ?? task;
   const id = model ?? DEFAULT_MODELS[t];
@@ -347,6 +387,12 @@ export async function pipeline(task: PipelineTask, model?: string, options: Pipe
   const progress = progress_callback ? toLoadOptions(id, { progress_callback }).onProgress : undefined;
   const dev = device === "webgpu" || device === "gpu" ? "gpu" : device === "wasm" || device === "cpu" ? "cpu" : "auto";
   const q = quant === "q4" || quant === "q8" || quant === "f32" ? quant : encoderQuant(dtype);
+  if (SEQ2SEQ.has(t)) {
+    const m = await KilnSeq2Seq.load(id, { quant: q, device: dev, cpuThreads, revision, endpoint, worker, onProgress: progress });
+    progress_callback?.({ status: "ready", task, model: id });
+    const call = (texts: string | string[], opts?: Text2TextOptions) => m.run(t as Seq2SeqTask, texts, { ...opts });
+    return Object.assign(call, { task, model: m, info: m.info, tokenizer: {}, dispose: () => m.unload() });
+  }
   const m = await KilnEncoder.load(id, { quant: q, device: dev, cpuThreads, revision, endpoint, worker, onProgress: progress });
   progress_callback?.({ status: "ready", task, model: id });
   const run = (...args: unknown[]) => m.run(t as EncoderTask, ...args);

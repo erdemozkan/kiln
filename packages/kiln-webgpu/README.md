@@ -73,6 +73,18 @@ in f32 by default (`dtype: "q8"` or `"q4"` to quantize their matrices). Inputs l
 takes are truncated. Each input runs on its own (no padding), so feature extraction without pooling
 returns zeros past a shorter input's last token.
 
+## Summarization, translation, text2text
+
+```js
+const summarizer = await pipeline("summarization"); // sshleifer/distilbart-cnn-6-6
+const [{ summary_text }] = await summarizer(article, { max_new_tokens: 100 });
+```
+
+BART and DistilBART models run today (`summarization`, `translation`, `text2text-generation`, with
+transformers.js's output keys). Generation is greedy, as in transformers.js, with the model's
+`min_length`, `no_repeat_ngram_size` and forced tokens; options override them. Repos that only ship
+`pytorch_model.bin` load too (the checkpoint's pickle is parsed for tensor offsets, never executed).
+
 ## Kiln's own API
 
 ```ts

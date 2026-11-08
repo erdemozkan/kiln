@@ -68,3 +68,18 @@ export async function safetensorsFiles(ref: ModelRef, endpoint?: string, files?:
   const index = files && !files.has(name) ? undefined : await fetchJSON<{ weight_map: Record<string, string> }>(fileUrl(ref, name, endpoint), true);
   return index ? [...new Set(Object.values(index.weight_map))].sort() : ["model.safetensors"];
 }
+
+/**
+ * The weight files of a transformers repo: safetensors when it has them (sharded or not), otherwise
+ * PyTorch's pytorch_model.bin (sharded or not). Without a file listing, safetensors is assumed.
+ */
+export async function weightFiles(ref: ModelRef, endpoint?: string, files?: Set<string>): Promise<{ format: "safetensors" | "pytorch"; names: string[] }> {
+  const hasSt = !files || files.has("model.safetensors") || files.has("model.safetensors.index.json");
+  if (hasSt) return { format: "safetensors", names: await safetensorsFiles(ref, endpoint, files) };
+  if (files.has("pytorch_model.bin.index.json")) {
+    const index = await fetchJSON<{ weight_map: Record<string, string> }>(fileUrl(ref, "pytorch_model.bin.index.json", endpoint));
+    return { format: "pytorch", names: [...new Set(Object.values(index!.weight_map))].sort() };
+  }
+  if (files.has("pytorch_model.bin")) return { format: "pytorch", names: ["pytorch_model.bin"] };
+  throw new Error(`${ref.repo} has no safetensors or pytorch_model.bin weights`);
+}
