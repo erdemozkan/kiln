@@ -26,6 +26,8 @@ export {
   type TranslationPipeline,
   type Text2TextGenerationPipeline,
   type Text2TextOptions,
+  type SpeechRecognitionPipeline,
+  type SpeechRecognitionOptions,
   type PipelineOptions,
   type PipelineTask,
   type ProgressInfo,
@@ -36,3 +38,4 @@ export {
   type TextGenerationSingle,
   type TextStreamerOptions,
 } from "./pipeline";
+export { readAudio, type AudioInput } from "@kiln/loader";

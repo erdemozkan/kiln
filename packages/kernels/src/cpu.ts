@@ -648,6 +648,21 @@ export function cpuAct(kind: "gelu" | "gelu_tanh" | "silu" | "relu"): CpuKernel 
   };
 }
 
+export const cpuIm2col1d: CpuKernel = (b) => {
+  const [tin, tout, C, k, stride, pad, row] = Array.from(b[0]!.u32.subarray(0, 7));
+  const x = b[1]!.f32;
+  const y = b[2]!.f32;
+  for (let t = 0; t < tout!; t++) {
+    const o = t * row!;
+    y.fill(0, o, o + row!);
+    for (let j = 0; j < k!; j++) {
+      const src = t * stride! + j - pad!;
+      if (src < 0 || src >= tin!) continue;
+      y.set(x.subarray(src * C!, (src + 1) * C!), o + j * C!);
+    }
+  }
+};
+
 export const cpuAvgPool: CpuKernel = (b) => {
   const [side, k, C] = [b[0]!.u32[0]!, b[0]!.u32[1]!, b[0]!.u32[2]!];
   const x = b[1]!.f32;

@@ -623,6 +623,30 @@ async function main() {
       await run(S0, (ctx) => ops.act(ctx, ta, kind));
       check("act", `${kind} n1000`, await download(ta.buf, 1000), x.map(f), 1e-5);
     }
+    // im2col for 1-D convolutions (Whisper's conv1: 80 channels, k 3, pad 1; conv2: stride 2), checked
+    // as a convolution against a direct one.
+    for (const [Tin, C, k, stride, pad, O] of [[300, 80, 3, 1, 1, 64], [300, 64, 3, 2, 1, 32], [37, 5, 4, 3, 2, 7]] as const) {
+      const xin = randn(Tin * C);
+      const w = randn(O * k * C); // [O, k, C], tap-major like the rows
+      const Tout = Math.floor((Tin + 2 * pad - k) / stride) + 1;
+      const row = Math.ceil((k * C) / 32) * 32;
+      const wp = new Float32Array(O * row);
+      for (let o = 0; o < O; o++) wp.set(w.subarray(o * k * C, (o + 1) * k * C), o * row);
+      const want = new Float32Array(Tout * O);
+      for (let t = 0; t < Tout; t++)
+        for (let o = 0; o < O; o++) {
+          let s = 0;
+          for (let j = 0; j < k; j++) {
+            const src = t * stride + j - pad;
+            if (src < 0 || src >= Tin) continue;
+            for (let c = 0; c < C; c++) s += xin[src * C + c]! * w[(o * k + j) * C + c]!;
+          }
+          want[t * O + o] = s;
+        }
+      let y!: Tensor;
+      await run(S0, (ctx) => (y = ops.linear(ctx, ops.im2col1d(ctx, upload(xin, [Tin, C]), k, stride, pad), upload(wp, [O, row]))));
+      check("im2col1d", `Tin${Tin} C${C} k${k} s${stride} p${pad}`, await download(y.buf, Tout * O), want, 1e-3);
+    }
     for (const [side, k, C] of [[64, 4, 24], [8, 2, 1152]] as const) {
       const g = randn(side * side * C);
       const out = side / k;

@@ -10,7 +10,7 @@ let engine: Engine | undefined;
 let encoder: EncoderEngine | undefined;
 let seq2seq: Seq2SeqEngine | undefined;
 
-const OUTPUT_KEY: Record<Seq2SeqTask, string> = { summarization: "summary_text", translation: "translation_text", "text2text-generation": "generated_text" };
+const OUTPUT_KEY: Record<Seq2SeqTask, string> = { summarization: "summary_text", translation: "translation_text", "text2text-generation": "generated_text", "automatic-speech-recognition": "text" };
 
 /**
  * A text2text call as transformers.js makes it: config.prefix and the task's prefix from
@@ -208,7 +208,12 @@ scope.onmessage = async (e: MessageEvent<Request>) => {
         queue = queue.then(async () => {
           try {
             const a = msg.args as never[];
-            const result = isS2S ? await runSeq2Seq(s2s!, msg.task as Seq2SeqTask, a[0], a[1]) : await runTask(enc!, msg.task as EncoderTask, msg.args);
+            const result =
+              msg.task === "automatic-speech-recognition"
+                ? await s2s!.transcribe(a[0] as unknown as Float32Array, a[1])
+                : isS2S
+                  ? await runSeq2Seq(s2s!, msg.task as Seq2SeqTask, a[0], a[1])
+                  : await runTask(enc!, msg.task as EncoderTask, msg.args);
             post({ id: msg.id, type: "result", result });
           } catch (err) {
             post({ id: msg.id, type: "error", message: err instanceof Error ? err.message : String(err) });

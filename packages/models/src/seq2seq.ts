@@ -3,7 +3,7 @@ import { ops, type Activation } from "@kiln/kernels";
 import { UnsupportedModelError } from "./config";
 
 /** BART-style encoder-decoder models: BART / DistilBART, Marian (OPUS-MT), M2M100 / NLLB. */
-export type Seq2SeqFamily = "bart" | "marian" | "m2m100" | "t5";
+export type Seq2SeqFamily = "bart" | "marian" | "m2m100" | "t5" | "whisper";
 
 export interface Seq2SeqConfig {
   family: Seq2SeqFamily;
@@ -34,6 +34,8 @@ export interface Seq2SeqConfig {
   decoderStart: number;
   /** Raw config.json, for generation settings, prefixes and task parameters. */
   raw: Record<string, unknown>;
+  /** Whisper: log-mel input of `frames` × `mels` through two convolutions to `frames / 2` positions. */
+  audio?: { mels: number; frames: number };
 }
 
 const num = (c: Record<string, unknown>, k: string): number => {
@@ -60,6 +62,33 @@ function activation(name: unknown): Activation {
 /** The config of a BART, Marian or M2M100 (NLLB) checkpoint. */
 export function seq2seqConfigFromHF(c: Record<string, unknown>): Seq2SeqConfig {
   const type = String(c.model_type);
+  if (type === "whisper") {
+    const src = num(c, "max_source_positions");
+    return {
+      family: "whisper",
+      modelType: type,
+      dModel: num(c, "d_model"),
+      encLayers: num(c, "encoder_layers"),
+      decLayers: num(c, "decoder_layers"),
+      encHeads: num(c, "encoder_attention_heads"),
+      decHeads: num(c, "decoder_attention_heads"),
+      encFfn: num(c, "encoder_ffn_dim"),
+      decFfn: num(c, "decoder_ffn_dim"),
+      vocab: num(c, "vocab_size"),
+      maxPositions: num(c, "max_target_positions"),
+      preNorm: true,
+      layernormEmbedding: false,
+      positions: "learned",
+      posOffset: 0,
+      embedScale: c.scale_embedding ? Math.sqrt(num(c, "d_model")) : 1,
+      act: activation(c.activation_function),
+      pad: Number(c.pad_token_id ?? 50257),
+      eos: Number(c.eos_token_id ?? 50257),
+      decoderStart: Number(c.decoder_start_token_id ?? 50258),
+      raw: c,
+      audio: { mels: num(c, "num_mel_bins"), frames: 2 * src },
+    };
+  }
   const family: Seq2SeqFamily | undefined = type === "bart" ? "bart" : type === "marian" ? "marian" : type === "m2m_100" || type === "m2m100" || type === "nllb-moe" ? "m2m100" : undefined;
   if (!family || type === "nllb-moe") throw new UnsupportedModelError(`encoder-decoder model_type "${type}" is not supported (bart, marian and m2m100 / NLLB are)`);
   const d = num(c, "d_model");
@@ -115,6 +144,9 @@ export function seq2seqName(name: string): string | undefined {
   if (n === "shared.weight" || n === "decoder.embed_tokens.weight" || n === "encoder.embed_tokens.weight") return "shared.weight";
   if (name === "final_logits_bias") return "flb";
   if (name === "lm_head.weight") return "lm_head.weight";
+  // Whisper: conv biases load as they are (the weights are rearranged by the loader); proj_out is tied.
+  const conv = /^model\.encoder\.(conv[12])\.bias$/.exec(name);
+  if (conv) return `enc.${conv[1]}.bias`;
   let m = /^(encoder|decoder)\.(embed_positions\.weight|layernorm_embedding\.(weight|bias)|layer_norm\.(weight|bias))$/.exec(n);
   if (m) {
     const side = m[1] === "encoder" ? "enc" : "dec";
@@ -146,6 +178,8 @@ interface Pair {
   /** Source length these plans are recorded for. */
   S: number;
   enc: { ctx: Ctx; dispatches: readonly Dispatch[]; step: Buf; ids: Buf; pos: Buf; kc: Buf; vc: Buf };
+  /** Whisper: the log-mel input [frames, mels]. */
+  feats?: Buf;
   dec: { ctx: Ctx; dispatches: readonly Dispatch[]; logits: Tensor };
   /** Cross-attention K/V per decoder layer, written by the encoder plan. */
   crossK: Buf[];
@@ -246,7 +280,20 @@ export class Seq2SeqModel {
     const pos = ectx.buffer(S * 4, "seq2seq/src-pos");
     const kc = be.alloc(S * d * 4, "storage", "seq2seq/enc-k");
     const vc = be.alloc(S * d * 4, "storage", "seq2seq/enc-v");
-    let x = this.embed(ectx, "enc", ids, pos, S);
+    let feats: Buf | undefined;
+    let x: Tensor;
+    if (c.audio) {
+      // Whisper: log-mel frames → conv1 (k 3) → GELU → conv2 (k 3, stride 2) → GELU → + positions.
+      const { mels, frames } = c.audio;
+      feats = ectx.buffer(frames * mels * 4, "seq2seq/mel");
+      const conv = (inp: Tensor, n: string, stride: number) => {
+        const y = ops.linear(ectx, ops.im2col1d(ectx, inp, 3, stride, 1), this.w(`enc.${n}.weight`), { bias: this.w(`enc.${n}.bias`) });
+        ops.gelu(ectx, y, true);
+        return y;
+      };
+      x = conv(conv({ shape: [frames, mels], dtype: "f32", buf: feats }, "conv1", 1), "conv2", 2);
+      ops.addInPlace(ectx, x, this.w("enc.pos"));
+    } else x = this.embed(ectx, "enc", ids, pos, S);
     const De = d / c.encHeads;
     const eshape = { T: S, H: c.encHeads, Hkv: c.encHeads, D: De, maxSeq: S, kv: "f32" as const, scale: De ** -0.5, span: true };
     for (let l = 0; l < c.encLayers; l++) {
@@ -290,6 +337,7 @@ export class Seq2SeqModel {
     const logits = ops.linear(dctx, y, head, { bias: this.weights.get("flb") });
     return {
       S,
+      feats,
       enc: { ctx: ectx, dispatches: ectx.dispatches, step, ids, pos, kc, vc },
       dec: { ctx: dctx, dispatches: dctx.dispatches, logits },
       crossK,
@@ -318,6 +366,22 @@ export class Seq2SeqModel {
     be.write(pair.enc.ids, 0, Uint32Array.from(ids));
     be.write(pair.enc.pos, 0, Uint32Array.from({ length: S }, (_, i) => i + this.cfg.posOffset));
     be.submit(pair.enc.dispatches);
+    this.current = pair;
+  }
+
+  /** Whisper: runs the encoder on log-mel features [frames, mels] and readies the decoder. */
+  async encodeAudio(features: Float32Array): Promise<void> {
+    const a = this.cfg.audio;
+    if (!a) throw new Error("seq2seq: this model takes text, not audio");
+    if (features.length !== a.frames * a.mels) throw new Error(`seq2seq: expected ${a.frames} × ${a.mels} features, got ${features.length}`);
+    const S = a.frames / 2;
+    let pair = this.pairs.get(S);
+    if (!pair) {
+      pair = this.build(S);
+      this.pairs.set(S, pair);
+    }
+    this.backend.write(pair.feats!, 0, features);
+    this.backend.submit(pair.enc.dispatches);
     this.current = pair;
   }
 

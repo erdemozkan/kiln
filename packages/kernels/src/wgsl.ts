@@ -1628,6 +1628,33 @@ fn main(${EW_ARGS}) {
 }`);
 }
 
+/**
+ * 1-D convolution inputs as matmul rows (im2col): x [Tin, C] → y [Tout, row], where row t holds the
+ * k kernel taps' C channels, tap-major (y[t, j·C + c] = x[t·stride + j − pad, c], zero outside the
+ * input), and zeros up to `row` (a multiple of 32 for the matmul kernels).
+ */
+export function im2col1dSpec(): KernelSpec {
+  return spec("im2col1d", ["uniform", "read", "rw"], cpu.cpuIm2col1d, () => /* wgsl */ `
+struct P { tin: u32, tout: u32, C: u32, k: u32, stride: u32, pad: u32, row: u32, _p: u32 }
+@group(0) @binding(0) var<uniform> p: P;
+@group(0) @binding(1) var<storage, read> x: array<f32>;
+@group(0) @binding(2) var<storage, read_write> y: array<f32>;
+
+@compute @workgroup_size(${EW})
+fn main(${EW_ARGS}) {
+  ${FLAT}
+  if (idx >= p.tout * p.row) { return; }
+  let t = idx / p.row;
+  let r = idx % p.row;
+  var v = 0.0;
+  if (r < p.k * p.C) {
+    let src = i32(t * p.stride + r / p.C) - i32(p.pad);
+    if (src >= 0 && u32(src) < p.tin) { v = x[u32(src) * p.C + r % p.C]; }
+  }
+  y[idx] = v;
+}`);
+}
+
 /** Copies row `st.lastRow` of x [T, D] into out [1, D]. */
 export function copyRowSpec(): KernelSpec {
   return spec("copy_row", ["uniform", "read", "read", "rw"], cpu.cpuCopyRow, () => /* wgsl */ `

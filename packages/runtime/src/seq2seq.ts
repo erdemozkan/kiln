@@ -1,7 +1,7 @@
 // Encoder-decoder models (BART, Marian, M2M100 / NLLB) and the text2text tasks transformers.js runs
 // on them: summarization, translation and text2text-generation, with its generation settings.
 import type { Backend, Tensor } from "@kiln/core";
-import { fetchJSON, fetchText, fileUrl, listRepoFiles, parseModelId, readPytorchHeader, readSafetensorsHeader, weightFiles, type ByteSource } from "@kiln/loader";
+import { fetchJSON, fetchText, fileUrl, listRepoFiles, parseModelId, readPytorchHeader, readSafetensorsHeader, toF32, weightFiles, whisperFeatures, type ByteSource, type TensorEntry } from "@kiln/loader";
 import { Seq2SeqModel, T5Model, seq2seqConfigFromHF, seq2seqName, sinusoidalTable, t5ConfigFromHF, t5Name, t5Transform, type Seq2SeqConfig, type T5Config } from "@kiln/models";
 import { byteLevelFromVocabMerges, encoderTokenizerFromJSON, marianTokenizer, type EncoderTokenizer, type EncoderTokenizerJSON } from "@kiln/tokenizers";
 import { openBackend, openParsed } from "./load";
@@ -130,9 +130,89 @@ export class Seq2SeqEngine {
     return this.tokenizer.decode(ids, true);
   }
 
+  /**
+   * Whisper: text of 16 kHz mono audio. The decoder starts from transformers.js's prompt (start,
+   * language and task for multilingual models, no-timestamps), with the model's suppressed tokens
+   * and its begin-suppressed ones at the first step. Audio longer than a window (30 s) is split
+   * into consecutive windows whose texts are joined (transformers.js keeps only the first window
+   * unless asked to chunk).
+   */
+  async transcribe(samples: Float32Array, options: WhisperOptions = {}): Promise<{ text: string }> {
+    const a = this.cfg.audio;
+    if (!a || !(this.model instanceof Seq2SeqModel)) throw new Error("this model does not take audio");
+    const g = this.generation;
+    const window = 16000 * (options.chunk_length_s ?? 30);
+    const texts: string[] = [];
+    for (let off = 0; off < Math.max(samples.length, 1); off += window) {
+      const feats = whisperFeatures(samples.subarray(off, off + window), { mels: a.mels });
+      await this.model.encodeAudio(feats);
+      const init = this.whisperPrompt(options);
+      const suppress = new Set<number>((g.suppress_tokens as number[] | undefined) ?? []);
+      const begin = new Set<number>((g.begin_suppress_tokens as number[] | undefined) ?? []);
+      const eos = Number(g.eos_token_id ?? this.cfg.eos);
+      const maxLen = Math.min(this.model.maxTarget, options.max_new_tokens !== undefined ? init.length + options.max_new_tokens : Number(g.max_length ?? this.model.maxTarget));
+      const ids = [...init];
+      let logits = new Float32Array(0);
+      for (let t = 0; t < init.length; t++) logits = await this.model.step(init[t]!, t);
+      while (ids.length < maxLen) {
+        for (const s of suppress) logits[s] = -Infinity;
+        if (ids.length === init.length) for (const s of begin) logits[s] = -Infinity;
+        let next = 0;
+        for (let i = 1; i < logits.length; i++) if (logits[i]! > logits[next]!) next = i;
+        ids.push(next);
+        if (next === eos) break;
+        logits = await this.model.step(next, ids.length - 1);
+      }
+      texts.push(this.tokenizer.decode(ids.slice(init.length), true));
+    }
+    return { text: texts.join("") };
+  }
+
+  /** transformers.js's Whisper prompt: [start, language, task, no-timestamps] (English-only models: [start, no-timestamps]). */
+  whisperPrompt(options: WhisperOptions = {}): number[] {
+    const g = this.generation;
+    const out = [Number(g.decoder_start_token_id ?? this.cfg.decoderStart)];
+    if (g.is_multilingual) {
+      const lang = whisperLanguage(options.language ?? "en");
+      const langId = (g.lang_to_id as Record<string, number> | undefined)?.[`<|${lang}|>`];
+      if (langId === undefined) throw new Error(`Whisper: unknown language "${options.language}"`);
+      const taskId = (g.task_to_id as Record<string, number> | undefined)?.[options.task ?? "transcribe"];
+      if (taskId === undefined) throw new Error(`Whisper: unknown task "${options.task}"`);
+      out.push(langId, taskId);
+    } else if (options.language || options.task) {
+      throw new Error("Whisper: language and task cannot be set for an English-only model");
+    }
+    if (g.no_timestamps_token_id !== undefined) out.push(Number(g.no_timestamps_token_id));
+    return out;
+  }
+
   destroy(): void {
     this.model.destroy();
   }
+}
+
+/** Options of automatic-speech-recognition with Whisper (transformers.js's names). */
+export interface WhisperOptions {
+  /** Spoken language: a code ("fr") or English name ("french"); multilingual models only (default English). */
+  language?: string;
+  /** "transcribe" (default) or "translate" (to English); multilingual models only. */
+  task?: "transcribe" | "translate";
+  max_new_tokens?: number;
+  /** Window length in seconds (default 30, Whisper's). */
+  chunk_length_s?: number;
+}
+
+const LANGUAGE_NAMES: Record<string, string> = {
+  english: "en", french: "fr", german: "de", spanish: "es", italian: "it", portuguese: "pt", dutch: "nl", russian: "ru",
+  chinese: "zh", japanese: "ja", korean: "ko", arabic: "ar", turkish: "tr", hindi: "hi", polish: "pl", ukrainian: "uk",
+  swedish: "sv", greek: "el", czech: "cs", romanian: "ro", hungarian: "hu", danish: "da", finnish: "fi", norwegian: "no",
+  hebrew: "he", indonesian: "id", vietnamese: "vi", thai: "th", persian: "fa", catalan: "ca",
+};
+
+/** A Whisper language code from a code, an English name or a <|code|> token. */
+export function whisperLanguage(l: string): string {
+  const s = l.toLowerCase().replace(/^<\|/, "").replace(/\|>$/, "");
+  return LANGUAGE_NAMES[s] ?? s;
 }
 
 /** Loads an encoder-decoder repo ("org/repo", safetensors) for summarization, translation and text2text. */
@@ -173,10 +253,12 @@ export async function createSeq2Seq(modelId: string, opts: Seq2SeqLoadOptions = 
   const sources: ByteSource[] = [];
   try {
     const files: WeightFile[] = [];
+    const tensorsByName = new Map<string, { source: ByteSource; entry: TensorEntry }>();
     let shared = false;
     for (const name of names.names) {
       const { source, header } = await openParsed(ref, name, ep, names.format === "safetensors" ? readSafetensorsHeader : readPytorchHeader);
       sources.push(source);
+      for (const t of header.tensors) tensorsByName.set(t.name, { source, entry: t });
       // The shared embedding is often stored three times (shared, encoder and decoder embed_tokens): load one.
       const tensors = header.tensors.filter((t) => {
         const n = rename(t.name);
@@ -190,6 +272,21 @@ export async function createSeq2Seq(modelId: string, opts: Seq2SeqLoadOptions = 
       files.push({ name, source, tensors, rename, transform: t5 ? t5Transform(cfg as T5Config) : undefined });
     }
     const weights = await loadWeights(backend, files, opts.quant ?? "f32", opts.onProgress);
+    if (cfg.audio) {
+      // Conv weights [out, in, k] → rows [out, k·in] tap-major, padded to a multiple of 32 (im2col1d's rows).
+      for (const n of ["conv1", "conv2"]) {
+        const t = tensorsByName.get(`model.encoder.${n}.weight`);
+        if (!t) throw new Error(`Whisper: model.encoder.${n}.weight is missing`);
+        const [O, C, k] = t.entry.shape as [number, number, number];
+        const raw = toF32(t.entry.type as Parameters<typeof toF32>[0], await t.source.read(t.entry.offset, t.entry.byteLength), O * C * k);
+        const row = Math.ceil((k * C) / 32) * 32;
+        const w = new Float32Array(O * row);
+        for (let o = 0; o < O; o++) for (let c = 0; c < C; c++) for (let j = 0; j < k; j++) w[o * row + j * C + c] = raw[(o * C + c) * k + j]!;
+        const buf = backend.alloc(w.byteLength, "storage", `whisper/${n}`);
+        backend.write(buf, 0, w);
+        weights.set(`enc.${n}.weight`, { shape: [O, row], dtype: "f32", buf } as Tensor);
+      }
+    }
     if (!t5 && cfg.positions !== "learned") {
       const rows = cfg.maxPositions + cfg.posOffset;
       const table = sinusoidalTable(cfg.positions, rows, cfg.dModel, cfg.positions === "sinusoidal-m2m100" ? cfg.pad : undefined);

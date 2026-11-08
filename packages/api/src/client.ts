@@ -260,8 +260,8 @@ export class KilnSeq2Seq extends WorkerChannel {
     return m;
   }
 
-  /** Runs summarization, translation or text2text-generation on one text or several. */
-  run(task: Seq2SeqTask, texts: string | string[], options: Record<string, unknown> = {}): Promise<Record<string, string>[]> {
+  /** Runs summarization, translation or text2text-generation on one text or several, or speech recognition on samples. */
+  run(task: Seq2SeqTask, texts: string | string[] | Float32Array, options: Record<string, unknown> = {}): Promise<Record<string, string>[]> {
     return new Promise((resolve, reject) =>
       this.send({ type: "task", task, args: [texts, options] }, (msg) => {
         if (msg.type === "result") resolve(msg.result as Record<string, string>[]);

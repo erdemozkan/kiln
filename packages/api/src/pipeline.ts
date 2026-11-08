@@ -3,6 +3,7 @@
 import type { LoadProgress } from "@kiln/runtime";
 import type { ChatMessage } from "@kiln/tokenizers";
 import { KilnEncoder, KilnModel, KilnSeq2Seq, type GenerateOptions, type LoadOptions, type TextStream } from "./client";
+import { readAudio, type AudioInput } from "@kiln/loader";
 import type { EncoderInfo, EncoderTask, ModelInfo, Seq2SeqInfo, Seq2SeqTask } from "./protocol";
 
 /** Task names, with transformers.js's aliases. */
@@ -19,9 +20,10 @@ export type PipelineTask =
   | "zero-shot-classification"
   | "summarization"
   | "translation"
-  | "text2text-generation";
+  | "text2text-generation"
+  | "automatic-speech-recognition";
 
-const SEQ2SEQ = new Set<string>(["summarization", "translation", "text2text-generation"]);
+const SEQ2SEQ = new Set<string>(["summarization", "translation", "text2text-generation", "automatic-speech-recognition"]);
 
 const ALIASES: Partial<Record<PipelineTask, PipelineTask>> = { embeddings: "feature-extraction", "sentiment-analysis": "text-classification", ner: "token-classification" };
 
@@ -37,6 +39,7 @@ export const DEFAULT_MODELS: Record<string, string> = {
   summarization: "sshleifer/distilbart-cnn-6-6",
   translation: "Helsinki-NLP/opus-mt-en-de",
   "text2text-generation": "google/flan-t5-small",
+  "automatic-speech-recognition": "openai/whisper-tiny.en",
 };
 
 /** transformers.js's names, plus any of Kiln's own load options. */
@@ -340,6 +343,21 @@ export interface SummarizationPipeline extends Seq2SeqPipelineBase {
 export interface TranslationPipeline extends Seq2SeqPipelineBase {
   (texts: string | string[], options?: Text2TextOptions): Promise<{ translation_text: string }[]>;
 }
+/** Speech recognition options (Whisper; transformers.js's names). */
+export interface SpeechRecognitionOptions {
+  /** Spoken language for multilingual models: a code ("fr") or English name ("french"); default English. */
+  language?: string;
+  /** "transcribe" (default) or "translate" (into English). */
+  task?: "transcribe" | "translate";
+  max_new_tokens?: number;
+  /** Window length in seconds (default 30). Longer audio is transcribed window by window. */
+  chunk_length_s?: number;
+}
+export interface SpeechRecognitionPipeline extends Seq2SeqPipelineBase {
+  /** 16 kHz samples, a URL, a Blob / File, or encoded audio bytes (WAV anywhere; other formats on a page's main thread). */
+  (audio: AudioInput, options?: SpeechRecognitionOptions): Promise<{ text: string }>;
+  (audio: AudioInput[], options?: SpeechRecognitionOptions): Promise<{ text: string }[]>;
+}
 export interface Text2TextGenerationPipeline extends Seq2SeqPipelineBase {
   (texts: string | string[], options?: Text2TextOptions): Promise<{ generated_text: string }[]>;
 }
@@ -373,6 +391,7 @@ export async function pipeline(task: "zero-shot-classification", model?: string,
 export async function pipeline(task: "summarization", model?: string, options?: PipelineOptions): Promise<SummarizationPipeline>;
 export async function pipeline(task: "translation", model?: string, options?: PipelineOptions): Promise<TranslationPipeline>;
 export async function pipeline(task: "text2text-generation", model?: string, options?: PipelineOptions): Promise<Text2TextGenerationPipeline>;
+export async function pipeline(task: "automatic-speech-recognition", model?: string, options?: PipelineOptions): Promise<SpeechRecognitionPipeline>;
 export async function pipeline(task: PipelineTask, model?: string, options: PipelineOptions = {}): Promise<unknown> {
   const t = ALIASES[task] ?? task;
   const id = model ?? DEFAULT_MODELS[t];
@@ -392,7 +411,19 @@ export async function pipeline(task: PipelineTask, model?: string, options: Pipe
   if (SEQ2SEQ.has(t)) {
     const m = await KilnSeq2Seq.load(id, { quant: q, device: dev, cpuThreads, revision, endpoint, worker, onProgress: progress });
     progress_callback?.({ status: "ready", task, model: id });
-    const call = (texts: string | string[], opts?: Text2TextOptions) => m.run(t as Seq2SeqTask, texts, { ...opts });
+    const call =
+      t === "automatic-speech-recognition"
+        ? async (audio: AudioInput | AudioInput[], opts?: SpeechRecognitionOptions) => {
+            // Decoded here: the Web Audio API is on the main thread, not in the worker.
+            const one = async (x: AudioInput) => (await m.run("automatic-speech-recognition", await readAudio(x, 16000), { ...opts })) as unknown as { text: string };
+            if (Array.isArray(audio)) {
+              const out: { text: string }[] = [];
+              for (const x of audio) out.push(await one(x));
+              return out;
+            }
+            return one(audio);
+          }
+        : (texts: string | string[], opts?: Text2TextOptions) => m.run(t as Seq2SeqTask, texts, { ...opts });
     return Object.assign(call, { task, model: m, info: m.info, tokenizer: {}, dispose: () => m.unload() });
   }
   const m = await KilnEncoder.load(id, { quant: q, device: dev, cpuThreads, revision, endpoint, worker, onProgress: progress });

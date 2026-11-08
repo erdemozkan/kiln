@@ -70,7 +70,7 @@ export interface WireEncoderOptions {
 }
 
 export type EncoderTask = "feature-extraction" | "text-classification" | "token-classification" | "question-answering" | "fill-mask" | "zero-shot-classification";
-export type Seq2SeqTask = "summarization" | "translation" | "text2text-generation";
+export type Seq2SeqTask = "summarization" | "translation" | "text2text-generation" | "automatic-speech-recognition";
 
 /** Load options of an encoder-decoder model (summarization, translation, text2text). */
 export interface WireSeq2SeqOptions extends WireEncoderOptions {
@@ -80,7 +80,7 @@ export interface WireSeq2SeqOptions extends WireEncoderOptions {
 
 export interface Seq2SeqInfo {
   model: string;
-  /** "bart", "marian" or "m2m100". */
+  /** "bart", "marian", "m2m100", "t5" or "whisper". */
   family: string;
   encoderLayers: number;
   decoderLayers: number;

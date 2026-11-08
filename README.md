@@ -463,7 +463,7 @@ cost.
 
 ## Status
 
-Verified on this GPU: all kernel checks pass (814 now that Chrome exposes shader-f16 on it, including q4 and q8 weights, symmetric and affine, in every matmul variant, bidirectional-span attention, LayerNorm and pooling, the decode GEMV and the prefill GEMM, both prefill attention kernels, fused variants, f16 cache paths,
+Verified on this GPU: all kernel checks pass (817 now that Chrome exposes shader-f16 on it, including q4 and q8 weights, symmetric and affine, in every matmul variant, bidirectional-span attention, LayerNorm and pooling, the decode GEMV and the prefill GEMM, both prefill attention kernels, fused variants, f16 cache paths,
 sliding-window attention, GELU gating, grammar masks and sampling distributions). SmolLM2-135M-Instruct chats from Hub safetensors (q4, f32) and from a GGUF
 Q4_K_M file.
 
@@ -519,6 +519,17 @@ K/V; each decoder step reads them through a step block whose span covers every p
 | Marian (`Helsinki-NLP/opus-mt-en-de`, source.spm + vocab.json) | transformers.js (`Xenova/opus-mt-en-de`) | the same German; 1.1 s against 4.2 s |
 | T5 (`google/flan-t5-small`) | an independent NumPy forward pass over the safetensors; transformers.js | logits within 7.8e-6 over 9 steps, outputs identical to both |
 | NLLB (`facebook/nllb-200-distilled-600M`, q8) | by hand | "La maison est merveilleuse. J'aimerais l'acheter, mais elle est trop chère." |
+| Whisper (`openai/whisper-tiny.en`, `whisper-tiny`, `whisper-base`) | transformers.js (`Xenova/whisper-*`, fp32) | the JFK clip transcribed to the same text by all three; log-mel features within 1.2e-7 of transformers.js's |
+
+Whisper (`automatic-speech-recognition`) takes 16 kHz samples, a URL, a Blob or encoded bytes (WAV
+parsed directly; other formats decoded and resampled by the page's Web Audio API). Its log-mel
+features follow transformers' WhisperFeatureExtractor (a mixed-radix FFT for the 400-point frames,
+slaney mel filters); the two convolutions run as matmuls over im2col rows; decoding starts from
+transformers.js's prompt (start, language and task for multilingual models, no-timestamps) with the
+model's suppressed tokens. Audio past 30 s is transcribed window by window (transformers.js keeps
+only the first window unless `chunk_length_s` is set). Not yet: timestamps, overlapping chunk
+merging, and a stable speed measurement (runs in a backgrounded browser pane varied 5× between
+calls; Kiln took 6.6–7.3 s for the 11 s clip against 10.5–18 s for transformers.js there).
 
 T5's learned relative position bias is added to each score by the per-row attention kernels (GPU
 and CPU, buckets computed in the kernel; bucket function equal to transformers' over ±300

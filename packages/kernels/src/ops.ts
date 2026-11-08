@@ -19,6 +19,7 @@ import {
   avgPoolSpec,
   embedSpec,
   actSpec,
+  im2col1dSpec,
   type Activation,
   layernormSpec,
   gatedActSpec,
@@ -382,6 +383,20 @@ export function gelu(ctx: Ctx, x: Tensor, exact = false): void {
 export function act(ctx: Ctx, x: Tensor, kind: Activation): void {
   const n = numel(x.shape);
   ctx.run(actSpec(kind), [ctx.uniform([u32(n), u32(0), u32(0), u32(0)]), x.buf], grid1d(n));
+}
+
+/**
+ * Rows for a 1-D convolution as a matmul (see im2col1dSpec): x [Tin, C] → [Tout, row] with
+ * Tout = floor((Tin + 2·pad − k) / stride) + 1 and row = k·C rounded up to a multiple of 32.
+ */
+export function im2col1d(ctx: Ctx, x: Tensor, k: number, stride: number, pad: number): Tensor {
+  const C = lastDim(x);
+  const tin = numel(x.shape) / C;
+  const tout = Math.floor((tin + 2 * pad - k) / stride) + 1;
+  const row = Math.ceil((k * C) / 32) * 32;
+  const y = ctx.alloc([tout, row]);
+  ctx.run(im2col1dSpec(), [ctx.uniform([u32(tin), u32(tout), u32(C), u32(k), u32(stride), u32(pad), u32(row), u32(0)]), x.buf, y.buf], grid1d(tout * row));
+  return y;
 }
 
 /** k × k average pooling of a side × side token grid [side², C] → [(side / k)², C]. */

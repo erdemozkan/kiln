@@ -94,6 +94,21 @@ model's `min_length`, `no_repeat_ngram_size` and forced tokens; options override
 only ship `pytorch_model.bin` load too (the checkpoint's pickle is parsed for tensor offsets, never
 executed).
 
+## Speech recognition
+
+```js
+const transcriber = await pipeline("automatic-speech-recognition"); // openai/whisper-tiny.en
+const { text } = await transcriber("https://example.com/speech.wav");
+
+const multilingual = await pipeline("automatic-speech-recognition", "openai/whisper-base");
+await multilingual(blob, { language: "french", task: "translate" }); // French speech → English text
+```
+
+Whisper models load from their original repos. Audio can be 16 kHz `Float32Array` samples, a URL, a
+Blob / File, or encoded bytes: WAV is parsed directly, other formats are decoded by the browser's
+Web Audio API on the page's main thread (`readAudio` is exported for doing it yourself). Audio
+longer than 30 s is transcribed in consecutive 30 s windows. Timestamps are not supported yet.
+
 ## Kiln's own API
 
 ```ts
