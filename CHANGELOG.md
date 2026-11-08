@@ -35,7 +35,7 @@ tools and documents, parsed tool calls (`<tool_call>`, Mistral's `[TOOL_CALLS]`,
 enforced by a grammar mask at every token. Draft tokens (speculative decoding by
 prompt lookup) on by default, also under a grammar. `startProfile` / `stopProfile` report the time
 per kernel and shape (GPU timestamp queries on WebGPU, wall clock on the CPU). Without WebGPU the
-CPU fallback runs matmuls in WASM SIMD, split across helper threads on cross-origin isolated pages.
+CPU fallback runs matmuls in WASM SIMD, split across helper threads on cross-origin isolated pages where timing each matmul shape both ways shows the split is faster.
 
 **Loading.** Weights stream into GPU buffers without holding the model in CPU memory. The download is
 the cache: files land in OPFS as 1 GiB segments, interrupted downloads resume, dropped connections
@@ -64,5 +64,5 @@ load in 2.4 s. Decode uses a block-per-lane GEMV with several rows per thread on
 prefill a tiled GEMM and tiled attention, and GPU work is cut into short submits so the page stays
 responsive.
 
-**Checks.** 161 unit tests; a kernel check page (808 checks on the Intel GPU, 763 on the CPU backend) compares every kernel with a CPU reference; Gemma 3 1B matches a NumPy reference token for
+**Checks.** 165 unit tests; a kernel check page (808 checks on the Intel GPU, 763 on the CPU backend) compares every kernel with a CPU reference; Gemma 3 1B matches a NumPy reference token for
 token in q8 and q4.

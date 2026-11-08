@@ -93,6 +93,52 @@ function runRows(k: SimdKernels, fn: number, M: number, N: number, K: number, x:
 /** Multiply-adds below which a matmul stays on one thread (waking helpers costs tens of µs). */
 const THREAD_MIN_MACS = 1 << 20;
 
+/**
+ * Picks, per matmul shape, whether splitting across the helper threads pays, by timing both ways.
+ * Whether it does depends on things only a run shows: on a browser reporting 2 cores with the page
+ * in the background, waking a helper took long enough that SmolLM2-135M decoded at 8.6 tok/s on two
+ * threads against 55 on one, while elsewhere the same split is a gain. Each shape is first timed
+ * twice each way; after that the faster way runs, and the slower one is timed again every `every`
+ * calls (16, doubling up to 1024 while it stays slower), so a change of conditions is picked up.
+ */
+export class ThreadTuner {
+  private readonly shapes = new Map<string, { one: number; many: number; nOne: number; nMany: number; best: boolean; calls: number; every: number }>();
+
+  /** True to split this call across the helpers. */
+  choose(key: string): boolean {
+    const t = this.shapes.get(key);
+    if (!t) return false;
+    if (t.nOne < 2 || t.nMany < 2) return t.nMany < t.nOne;
+    if (++t.calls >= t.every) {
+      t.calls = 0;
+      return !t.best;
+    }
+    return t.best;
+  }
+
+  /** Records how long a call took (ms) the way it ran. */
+  record(key: string, threaded: boolean, ms: number): void {
+    let t = this.shapes.get(key);
+    if (!t) this.shapes.set(key, (t = { one: 0, many: 0, nOne: 0, nMany: 0, best: false, calls: 0, every: 16 }));
+    const probe = t.nOne >= 2 && t.nMany >= 2 && threaded !== t.best;
+    if (threaded) t.many = t.nMany++ ? 0.7 * t.many + 0.3 * ms : ms;
+    else t.one = t.nOne++ ? 0.7 * t.one + 0.3 * ms : ms;
+    if (t.nOne < 2 || t.nMany < 2) return;
+    const best = t.many < t.one;
+    if (best !== t.best) {
+      t.best = best;
+      t.every = 16;
+    } else if (probe) t.every = Math.min(t.every * 2, 1024);
+  }
+
+  /** The way each shape currently runs (for profiling and tests). */
+  get choices(): Record<string, "one" | "threads"> {
+    const out: Record<string, "one" | "threads"> = {};
+    for (const [k, t] of this.shapes) if (t.nOne >= 2 && t.nMany >= 2) out[k] = t.best ? "threads" : "one";
+    return out;
+  }
+}
+
 const PAGE = 65536;
 const ALIGN = 16;
 const up = (n: number) => Math.ceil(n / ALIGN) * ALIGN;
@@ -109,6 +155,8 @@ export class WasmHeap {
   private scratchAt = 0;
   private scratchSize = 0;
 
+  /** Whether each matmul shape runs split across the helpers (see ThreadTuner). */
+  readonly tuner = new ThreadTuner();
   /** Helper threads and the control block they wait on (threaded heaps only). */
   private helpers: Worker[] = [];
   private ctrl: Int32Array | undefined;
@@ -171,6 +219,15 @@ export class WasmHeap {
       runRows(this.kernels, fn, M, N, K, x, xs, w, s, mn, xsum, y, 0, N);
       return;
     }
+    const key = `${fn}:${M}:${N}:${K}`;
+    const threaded = this.tuner.choose(key);
+    const t0 = performance.now();
+    if (threaded) this.gemmThreaded(c, parts, fn, M, N, K, x, xs, w, s, mn, xsum, y);
+    else runRows(this.kernels, fn, M, N, K, x, xs, w, s, mn, xsum, y, 0, N);
+    this.tuner.record(key, threaded, performance.now() - t0);
+  }
+
+  private gemmThreaded(c: Int32Array, parts: number, fn: number, M: number, N: number, K: number, x: number, xs: number, w: number, s: number, mn: number, xsum: number, y: number): void {
     c[C_FN] = fn; c[C_M] = M; c[C_N] = N; c[C_K] = K; c[C_X] = x; c[C_XS] = xs; c[C_W] = w; c[C_S] = s; c[C_MN] = mn; c[C_XSUM] = xsum; c[C_Y] = y; c[C_PARTS] = parts;
     Atomics.store(c, C_DONE, 0);
     Atomics.add(c, C_GEN, 1);

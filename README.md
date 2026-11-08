@@ -169,7 +169,12 @@ Key ideas:
   27 → 12 ms in f32 and 27 → 16 ms in q4; SmolLM2-135M's first token 1.77 → 1.36 s and decode 16.7 →
   17.7 tok/s (same tokens; decode's small matmuls stay on one thread, where waking helpers would
   cost more than they save). Without isolation, or with the engine on a page's main thread, it
-  stays on one thread. Prefill matmuls take four x rows per pass over a q4 or q8 weight block
+  stays on one thread. Whether a split pays is measured, not assumed: per matmul shape the CPU backend
+  times both ways twice, then runs the faster and times the slower again now and then (every 16
+  calls, doubling to 1024 while it stays slower; `ThreadTuner`). In a browser reporting 2 cores with
+  the page in the background, waking the helper had made SmolLM2-135M decode at 8.6 tok/s on two
+  threads against 55 on one; tuned, two threads give 57 tok/s with a 0.33 s first token (prompt
+  matmuls keep the split, decode's drop it). Prefill matmuls take four x rows per pass over a q4 or q8 weight block
   (`gemm4_q4i`, `gemm4_q8i`: each block's codes widened once for the four, the same operations per
   row as one at a time): the 64 × 3072 × 576 matmul takes 11.6 ms in q4 and 13.0 ms in q8 on one
   thread, against 25 and 24 ms with one row at a time in f32x4. Attention runs in WASM too (`att_scores`, `att_wsum` for f32 and f16 caches: queries
