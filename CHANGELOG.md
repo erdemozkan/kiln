@@ -38,7 +38,7 @@ calls queue.
 
 **CPU fallback.** Without WebGPU (or with `device: "cpu"`), the same engine runs on CPU versions of
 every kernel: matmuls and attention in WASM SIMD (TypeScript where SIMD is missing), the rest in
-TypeScript; q4/q8 matmuls are integer dot products with x as int16 per block, and large ones use
+TypeScript; q4/q8 matmuls are integer dot products with x as int16 per block (normalised and quantized in WASM), and large ones use
 several threads on cross-origin isolated pages. About 37 tok/s for SmolLM2-135M on an Intel Mac
 (32 with top-k / top-p sampling),
 with the GPU's greedy tokens; meant for small models. `info.backend` reports which

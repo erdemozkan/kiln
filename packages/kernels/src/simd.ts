@@ -10,6 +10,11 @@ export interface SimdKernels {
   /** The same for four x rows at once (xq rows K apart, xs/xsum rows K/32 apart, outputs ys floats apart), identical per row. */
   gemm4_q8i(xq: number, xs: number, q: number, s: number, mn: number, xsum: number, K: number, N: number, y: number, ys: number): void;
   gemm4_q4i(xq: number, xs: number, q: number, s: number, mn: number, xsum: number, K: number, N: number, y: number, ys: number): void;
+  /**
+   * rows × K floats at x as int16 per 32-value block (xq; q4's lane order when q4 is 1), block scales xs
+   * and float sums xsum; RMS-normalised first with weights nw and eps when nw is not 0.
+   */
+  quant_x(x: number, K: number, rows: number, nw: number, eps: number, xq: number, xs: number, xsum: number, q4: number): void;
   /** out[j] = q · K_j for keys j in [first, n), key j at k + (j mod cap) · stride bytes; returns the largest. */
   att_scores_f32(q: number, k: number, stride: number, cap: number, first: number, n: number, D: number, out: number): number;
   att_scores_f16(q: number, k: number, stride: number, cap: number, first: number, n: number, D: number, out: number): number;

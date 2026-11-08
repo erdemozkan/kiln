@@ -423,4 +423,104 @@
             (br $r)))
         (local.set $j (i32.add (local.get $j) (i32.const 1)))
         (br $keys))))
+
+  ;; ---- x rows for the integer dot products ----
+  ;; rows × K floats at x → int16 per 32-value block (xq; q4's lane order when q4 is set), the
+  ;; block's scale amax / 32767 (xs) and its float sum (xsum). With nw set, each row is first
+  ;; RMS-normalised, x · 1/√(mean(x²) + eps) · nw[k] (the mean in f64, as the TypeScript does).
+  (func (export "quant_x") (param $x i32) (param $K i32) (param $rows i32) (param $nw i32) (param $eps f32)
+    (param $xq i32) (param $xs i32) (param $xsum i32) (param $q4 i32)
+    (local $r i32) (local $k i32) (local $np i32) (local $ss f64) (local $t f64) (local $inv v128)
+    (local $v0 v128) (local $v1 v128) (local $v2 v128) (local $v3 v128)
+    (local $v4 v128) (local $v5 v128) (local $v6 v128) (local $v7 v128)
+    (local $m v128) (local $a f32) (local $sc f32) (local $is v128)
+    (local $n0 v128) (local $n1 v128) (local $n2 v128) (local $n3 v128)
+    (block $done
+      (loop $rows
+        (br_if $done (i32.ge_u (local.get $r) (local.get $rows)))
+        (if (local.get $nw)
+          (then
+            (local.set $ss (f64.const 0))
+            (local.set $k (i32.const 0))
+            (block $ds
+              (loop $ls
+                (br_if $ds (i32.ge_u (local.get $k) (local.get $K)))
+                (local.set $t (f64.promote_f32 (f32.load (i32.add (local.get $x) (i32.shl (local.get $k) (i32.const 2))))))
+                (local.set $ss (f64.add (local.get $ss) (f64.mul (local.get $t) (local.get $t))))
+                (local.set $k (i32.add (local.get $k) (i32.const 1)))
+                (br $ls)))
+            (local.set $inv (f32x4.splat (f32.demote_f64 (f64.div (f64.const 1)
+              (f64.sqrt (f64.add
+                (f64.promote_f32 (f32.demote_f64 (f64.div (local.get $ss) (f64.convert_i32_u (local.get $K)))))
+                (f64.promote_f32 (local.get $eps))))))))))
+        (local.set $np (local.get $nw))
+        (local.set $k (i32.const 0))
+        (block $db
+          (loop $lb
+            (br_if $db (i32.ge_u (local.get $k) (local.get $K)))
+            (local.set $v0 (v128.load (local.get $x)))
+            (local.set $v1 (v128.load offset=16 (local.get $x)))
+            (local.set $v2 (v128.load offset=32 (local.get $x)))
+            (local.set $v3 (v128.load offset=48 (local.get $x)))
+            (local.set $v4 (v128.load offset=64 (local.get $x)))
+            (local.set $v5 (v128.load offset=80 (local.get $x)))
+            (local.set $v6 (v128.load offset=96 (local.get $x)))
+            (local.set $v7 (v128.load offset=112 (local.get $x)))
+            (if (local.get $nw)
+              (then
+                (local.set $v0 (f32x4.mul (f32x4.mul (local.get $v0) (local.get $inv)) (v128.load (local.get $np))))
+                (local.set $v1 (f32x4.mul (f32x4.mul (local.get $v1) (local.get $inv)) (v128.load offset=16 (local.get $np))))
+                (local.set $v2 (f32x4.mul (f32x4.mul (local.get $v2) (local.get $inv)) (v128.load offset=32 (local.get $np))))
+                (local.set $v3 (f32x4.mul (f32x4.mul (local.get $v3) (local.get $inv)) (v128.load offset=48 (local.get $np))))
+                (local.set $v4 (f32x4.mul (f32x4.mul (local.get $v4) (local.get $inv)) (v128.load offset=64 (local.get $np))))
+                (local.set $v5 (f32x4.mul (f32x4.mul (local.get $v5) (local.get $inv)) (v128.load offset=80 (local.get $np))))
+                (local.set $v6 (f32x4.mul (f32x4.mul (local.get $v6) (local.get $inv)) (v128.load offset=96 (local.get $np))))
+                (local.set $v7 (f32x4.mul (f32x4.mul (local.get $v7) (local.get $inv)) (v128.load offset=112 (local.get $np))))
+                (local.set $np (i32.add (local.get $np) (i32.const 128)))))
+            ;; Largest magnitude and sum of the block.
+            (local.set $m (f32x4.max
+              (f32x4.max (f32x4.max (f32x4.abs (local.get $v0)) (f32x4.abs (local.get $v1))) (f32x4.max (f32x4.abs (local.get $v2)) (f32x4.abs (local.get $v3))))
+              (f32x4.max (f32x4.max (f32x4.abs (local.get $v4)) (f32x4.abs (local.get $v5))) (f32x4.max (f32x4.abs (local.get $v6)) (f32x4.abs (local.get $v7))))))
+            (local.set $a (f32.max
+              (f32.max (f32x4.extract_lane 0 (local.get $m)) (f32x4.extract_lane 1 (local.get $m)))
+              (f32.max (f32x4.extract_lane 2 (local.get $m)) (f32x4.extract_lane 3 (local.get $m)))))
+            (f32.store (local.get $xsum) (call $hsum (f32x4.add
+              (f32x4.add (f32x4.add (local.get $v0) (local.get $v1)) (f32x4.add (local.get $v2) (local.get $v3)))
+              (f32x4.add (f32x4.add (local.get $v4) (local.get $v5)) (f32x4.add (local.get $v6) (local.get $v7))))))
+            (local.set $sc (select (f32.div (local.get $a) (f32.const 32767)) (f32.const 1) (f32.gt (local.get $a) (f32.const 0))))
+            (f32.store (local.get $xs) (local.get $sc))
+            (local.set $is (f32x4.splat (f32.div (f32.const 1) (local.get $sc))))
+            ;; Rounded to the nearest integer, narrowed to int16 (saturating), kept within ±32767.
+            (local.set $n0 (i16x8.max_s (v128.const i16x8 -32767 -32767 -32767 -32767 -32767 -32767 -32767 -32767) (i16x8.narrow_i32x4_s
+              (i32x4.trunc_sat_f32x4_s (f32x4.nearest (f32x4.mul (local.get $v0) (local.get $is))))
+              (i32x4.trunc_sat_f32x4_s (f32x4.nearest (f32x4.mul (local.get $v1) (local.get $is)))))))
+            (local.set $n1 (i16x8.max_s (v128.const i16x8 -32767 -32767 -32767 -32767 -32767 -32767 -32767 -32767) (i16x8.narrow_i32x4_s
+              (i32x4.trunc_sat_f32x4_s (f32x4.nearest (f32x4.mul (local.get $v2) (local.get $is))))
+              (i32x4.trunc_sat_f32x4_s (f32x4.nearest (f32x4.mul (local.get $v3) (local.get $is)))))))
+            (local.set $n2 (i16x8.max_s (v128.const i16x8 -32767 -32767 -32767 -32767 -32767 -32767 -32767 -32767) (i16x8.narrow_i32x4_s
+              (i32x4.trunc_sat_f32x4_s (f32x4.nearest (f32x4.mul (local.get $v4) (local.get $is))))
+              (i32x4.trunc_sat_f32x4_s (f32x4.nearest (f32x4.mul (local.get $v5) (local.get $is)))))))
+            (local.set $n3 (i16x8.max_s (v128.const i16x8 -32767 -32767 -32767 -32767 -32767 -32767 -32767 -32767) (i16x8.narrow_i32x4_s
+              (i32x4.trunc_sat_f32x4_s (f32x4.nearest (f32x4.mul (local.get $v6) (local.get $is))))
+              (i32x4.trunc_sat_f32x4_s (f32x4.nearest (f32x4.mul (local.get $v7) (local.get $is)))))))
+            (if (local.get $q4)
+              (then
+                ;; Even elements to lanes 0–15, odd ones to 16–31.
+                (v128.store (local.get $xq) (i8x16.shuffle 0 1 4 5 8 9 12 13 16 17 20 21 24 25 28 29 (local.get $n0) (local.get $n1)))
+                (v128.store offset=16 (local.get $xq) (i8x16.shuffle 0 1 4 5 8 9 12 13 16 17 20 21 24 25 28 29 (local.get $n2) (local.get $n3)))
+                (v128.store offset=32 (local.get $xq) (i8x16.shuffle 2 3 6 7 10 11 14 15 18 19 22 23 26 27 30 31 (local.get $n0) (local.get $n1)))
+                (v128.store offset=48 (local.get $xq) (i8x16.shuffle 2 3 6 7 10 11 14 15 18 19 22 23 26 27 30 31 (local.get $n2) (local.get $n3))))
+              (else
+                (v128.store (local.get $xq) (local.get $n0))
+                (v128.store offset=16 (local.get $xq) (local.get $n1))
+                (v128.store offset=32 (local.get $xq) (local.get $n2))
+                (v128.store offset=48 (local.get $xq) (local.get $n3))))
+            (local.set $x (i32.add (local.get $x) (i32.const 128)))
+            (local.set $xq (i32.add (local.get $xq) (i32.const 64)))
+            (local.set $xs (i32.add (local.get $xs) (i32.const 4)))
+            (local.set $xsum (i32.add (local.get $xsum) (i32.const 4)))
+            (local.set $k (i32.add (local.get $k) (i32.const 32)))
+            (br $lb)))
+        (local.set $r (i32.add (local.get $r) (i32.const 1)))
+        (br $rows))))
 )

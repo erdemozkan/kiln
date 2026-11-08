@@ -172,6 +172,10 @@ Key ideas:
   bisection over only the ids still between its bounds: per token on SmolLM2-135M's 49,152 logits,
   greedy 1.6 → 0.6 ms and top-k 40 with top-p 0.9 28 → 4.4 ms (decode 19.5 → 32 tok/s, same
   tokens). Splitting decode's small matmuls across threads was measured too and made them slower.
+  The RMS norm in front of a q4/q8 matmul and the int16 quantization of its x rows run in WASM
+  (`quant_x`), and a matmul with no epilogue writes y in place: that TypeScript was 5 ms of every
+  25 ms forward pass, and decode over 96 tokens went from 32–35 to 35–38.5 tok/s (first token
+  0.76–0.89 → 0.67–0.75 s, same 64 greedy tokens as the GPU).
 - **GGUF weights held exactly.** Q4_1 and Q4_K blocks are code·scale + min per 32 values with 4-bit
   codes, and Q5_x with 5-bit codes, so Kiln's q4 and q8 planes plus one f32 min per block hold them
   as llama.cpp dequantizes them, where they used to be dequantized and rounded a second time. The GPU

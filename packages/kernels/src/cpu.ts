@@ -162,50 +162,30 @@ interface HeapView extends CpuView {
 }
 
 /**
- * acc[m, n] = Σ_k xs[m, k] · W[n, k] in WASM SIMD: x rows go to heap scratch (as floats for f32
- * weights; as int16 per block with scales and exact block sums for q4/q8, see simd.wat), then the
- * kernels run over them, four rows per pass where they can. Returns a copy of the result.
+ * acc[m, n] = Σ_k x[m, k] · W[n, k] in WASM SIMD, written to heap scratch, or to `out` (a heap
+ * pointer) when given; returns a view of it, valid until the heap is next used. For f32 weights the x
+ * rows (`xs`, already normalised) are copied to scratch; for q4 / q8, `quant_x` reads them from the
+ * heap at `xp` and writes them as int16 per block with scales and exact block sums, RMS-normalising
+ * them first when `nw` (the norm weights' pointer) is set. Then the kernels run over them, four rows
+ * per pass where they can.
  */
 const simdScratch = (M: number, N: number, K: number) => M * K * 4 + 2 * Math.ceil((M * (K >>> 5) * 4) / 16) * 16 + M * N * 4;
 
-/** Where element e of a 32-value block sits in q4's int16 x layout (low nibbles' lanes, then high ones'; see simd.wat). */
-const Q4_LANE = Int32Array.from({ length: 32 }, (_, e) => (e & 1) * 16 + 4 * (e >>> 3) + ((e & 7) >>> 1));
-
-function simdMatmul(heap: WasmHeap, wdtype: WeightDType, xs: Float32Array, w: HeapView[], M: number, N: number, K: number): Float32Array {
+function simdMatmul(heap: WasmHeap, wdtype: WeightDType, x: { xs?: Float32Array; xp: number; nw: number; eps: number }, w: HeapView[], M: number, N: number, K: number, out = 0): Float32Array {
   const KB = K >>> 5;
   const xBytes = M * K * 4;
   const sumBytes = Math.ceil((M * KB * 4) / 16) * 16;
   const at = heap.scratch(simdScratch(M, N, K)); // reserved by the caller: no growth here
-  const mem = new Float32Array(heap.buffer);
-  const xp = at, sp = at + xBytes, scp = sp + sumBytes, yp = scp + sumBytes;
+  const xp = at, sp = at + xBytes, scp = sp + sumBytes, yp = out || scp + sumBytes;
   if (wdtype === "f32") {
-    mem.set(xs.subarray(0, M * K), xp / 4);
+    new Float32Array(heap.buffer).set(x.xs!.subarray(0, M * K), xp / 4);
     heap.gemm(GEMV_F32, M, N, K, xp, 0, w[0]!.ptr, 0, 0, 0, yp);
   } else {
-    // x as int16 per 32-value block, scaled to the block's largest magnitude (error ≤ amax / 65534),
-    // plus each block's exact float sum for the min term.
-    const xq = new Int16Array(heap.buffer, xp, M * K);
-    const sc = mem.subarray(scp / 4, scp / 4 + M * KB);
-    const sum = mem.subarray(sp / 4, sp / 4 + M * KB);
     const q4 = wdtype === "q4";
-    for (let r = 0; r < M * KB; r++) {
-      const o = r * 32;
-      let amax = 0, t = 0;
-      for (let e = 0; e < 32; e++) {
-        const v = xs[o + e]!;
-        t += v;
-        if (v > amax) amax = v;
-        else if (-v > amax) amax = -v;
-      }
-      sum[r] = t;
-      const scale = amax > 0 ? amax / 32767 : 1;
-      sc[r] = scale;
-      const inv = 1 / scale;
-      for (let e = 0; e < 32; e++) xq[o + (q4 ? Q4_LANE[e]! : e)] = Math.max(-32767, Math.min(32767, Math.round(xs[o + e]! * inv)));
-    }
+    heap.kernels.quant_x(x.xp, K, M, x.nw, x.eps, xp, scp, sp, q4 ? 1 : 0);
     heap.gemm(q4 ? GEMV_Q4 : GEMV_Q8, M, N, K, xp, scp, w[0]!.ptr, w[1]!.ptr, w[2]?.ptr ?? 0, sp, yp);
   }
-  return new Float32Array(heap.buffer, yp, M * N).slice();
+  return new Float32Array(heap.buffer, yp, M * N);
 }
 
 export function cpuMatmul(v: CpuMatmulVariant): CpuKernel {
@@ -225,9 +205,13 @@ export function cpuMatmul(v: CpuMatmulVariant): CpuKernel {
     const norm = v.norm ? b[at++]!.f32 : undefined;
     const bias = v.bias ? b[at++]!.f32 : undefined;
     const y = b[at]!.f32;
+    const gated = v.epi === "silu" || v.epi === "gelu";
+    // Quantized matmuls on the heap normalise in WASM, and write y directly when nothing follows.
+    const wasmX = !!heap && quant;
+    const direct = !!heap && !bias && !gated && v.epi !== "add";
     // x rows, normalised on the fly as the GPU kernels do.
     let xs = x.subarray(0, M * K);
-    if (norm) {
+    if (norm && !wasmX) {
       xs = new Float32Array(M * K);
       for (let m = 0; m < M; m++) {
         let ss = 0;
@@ -236,10 +220,13 @@ export function cpuMatmul(v: CpuMatmulVariant): CpuKernel {
         for (let k = 0; k < K; k++) xs[m * K + k] = x[m * K + k]! * inv * norm[k]!;
       }
     }
-    const gated = v.epi === "silu" || v.epi === "gelu";
     const KB = K >>> 5;
     let acc: Float32Array;
-    if (heap) acc = simdMatmul(heap, v.wdtype, xs, w as HeapView[], M, N, K);
+    if (heap) {
+      const xv = { xs, xp: (b[1] as HeapView).ptr, nw: norm ? (b[nw] as HeapView).ptr : 0, eps };
+      acc = simdMatmul(heap, v.wdtype, xv, w as HeapView[], M, N, K, direct ? (b[at] as HeapView).ptr : 0);
+      if (direct) return;
+    }
     else if (v.wdtype === "f32") {
       acc = new Float32Array(M * N);
       const wf = w[0]!.f32;
