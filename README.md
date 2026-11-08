@@ -178,7 +178,9 @@ Key ideas:
   0.76–0.89 → 0.67–0.75 s, same 64 greedy tokens as the GPU). Attention takes all the query heads of a KV head per call
   (`att_scores`, `att_wsum`), so each cache row is read and widened from f16 once per group instead
   of once per head: for SmolLM2-135M's 9 heads over 3 KV heads, 196 → 91 µs per layer at 100
-  positions and 1078 → 468 µs at 500.
+  positions and 1078 → 468 µs at 500. Other architectures give the GPU's 48 greedy tokens on the CPU
+  too, on one thread of the Intel Mac (GPU in brackets): Gemma 3 270M-it q8 21 tok/s (30), Qwen2.5-0.5B-Instruct
+  q4 16.5 tok/s (30, its biased q/k/v included), Qwen3-0.6B q4 13.5 tok/s (28, per-head q/k norms).
 - **GGUF weights held exactly.** Q4_1 and Q4_K blocks are code·scale + min per 32 values with 4-bit
   codes, and Q5_x with 5-bit codes, so Kiln's q4 and q8 planes plus one f32 min per block hold them
   as llama.cpp dequantizes them, where they used to be dequantized and rounded a second time. The GPU
