@@ -37,9 +37,7 @@ for (const file of walk(root)) {
     } else return m;
     return `${lead}${q}${target}${q}`;
   });
-  const entry = file === join(root, "kiln-webgpu", "src", "index.d.ts");
-  const final = entry ? `/// <reference types="@webgpu/types" />\n${out}` : out;
-  if (final !== src) writeFileSync(file, final);
+  if (out !== src) writeFileSync(file, out);
   files++;
 }
 console.log(`fix-dts: ${files} declaration files`);

@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.1.0 (unreleased)
+## 0.1.0 (2026-11-08)
 
 First release of `kiln-webgpu`: LLM inference in the browser on WebGPU, loading Hugging Face
 safetensors and GGUF files directly.

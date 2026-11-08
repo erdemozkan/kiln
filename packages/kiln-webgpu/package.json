@@ -22,9 +22,6 @@
     "build": "vite build && tsc -p tsconfig.build.json && node scripts/fix-dts.mjs && cp ../../LICENSE LICENSE",
     "prepack": "npm run build"
   },
-  "dependencies": {
-    "@webgpu/types": "^0.1.40"
-  },
   "devDependencies": {
     "@kiln/api": "*",
     "@kiln/loader": "*",

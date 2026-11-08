@@ -52,7 +52,11 @@ export class KilnModel {
     // A worker that fails to start or crashes would otherwise leave every pending call hanging.
     worker.onerror = (e: ErrorEvent) => {
       e.preventDefault();
-      const message = `Kiln worker failed: ${e.message || "it could not start (see the browser console)"}`;
+      let message = `Kiln worker failed: ${e.message || "it could not start (see the browser console)"}`;
+      // Vite's dev server pre-bundles dependencies into .vite/deps, where the worker file is not.
+      if (import.meta.url.includes("/.vite/deps/")) {
+        message += '. Vite pre-bundled kiln-webgpu, so its worker file cannot be found: add optimizeDeps: { exclude: ["kiln-webgpu"] } to vite.config';
+      }
       for (const [id, listener] of [...this.listeners]) listener({ id, type: "error", message });
     };
   }

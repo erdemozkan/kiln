@@ -14,6 +14,14 @@ const llm = await load("HuggingFaceTB/SmolLM2-135M-Instruct", { quant: "q4", onP
 for await (const text of llm.chat([{ role: "user", content: "Hi!" }], { temperature: 0.7 })) render(text);
 ```
 
+With Vite, exclude the package from dependency pre-bundling, which would move it away from its
+worker file (production builds are unaffected):
+
+```ts
+// vite.config.ts
+export default defineConfig({ optimizeDeps: { exclude: ["kiln-webgpu"] } });
+```
+
 The model runs in a module worker; the main thread only sees an async iterator. The context defaults
 to the model's own, up to 8192 tokens and 512 MiB of KV cache; `load(id, { maxSeq })` sets it, and
 `llm.info.contextLength` says how long the model was trained for. A model id is
