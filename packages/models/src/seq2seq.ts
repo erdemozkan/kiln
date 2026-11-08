@@ -3,7 +3,7 @@ import { ops, type Activation } from "@kiln/kernels";
 import { UnsupportedModelError } from "./config";
 
 /** BART-style encoder-decoder models: BART / DistilBART, Marian (OPUS-MT), M2M100 / NLLB. */
-export type Seq2SeqFamily = "bart" | "marian" | "m2m100";
+export type Seq2SeqFamily = "bart" | "marian" | "m2m100" | "t5";
 
 export interface Seq2SeqConfig {
   family: Seq2SeqFamily;
@@ -60,7 +60,7 @@ function activation(name: unknown): Activation {
 /** The config of a BART, Marian or M2M100 (NLLB) checkpoint. */
 export function seq2seqConfigFromHF(c: Record<string, unknown>): Seq2SeqConfig {
   const type = String(c.model_type);
-  const family: Seq2SeqFamily | undefined = type === "bart" ? "bart" : type === "marian" ? "marian" : type === "m2m100" || type === "nllb-moe" ? "m2m100" : undefined;
+  const family: Seq2SeqFamily | undefined = type === "bart" ? "bart" : type === "marian" ? "marian" : type === "m2m_100" || type === "m2m100" || type === "nllb-moe" ? "m2m100" : undefined;
   if (!family || type === "nllb-moe") throw new UnsupportedModelError(`encoder-decoder model_type "${type}" is not supported (bart, marian and m2m100 / NLLB are)`);
   const d = num(c, "d_model");
   const pad = Number(c.pad_token_id ?? 1);

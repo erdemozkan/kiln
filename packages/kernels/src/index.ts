@@ -4,3 +4,4 @@ export * from "./wgsl";
 export { grid1d } from "./ops";
 export * from "./convert";
 export { CpuBackend } from "./cpu-backend";
+export { t5Bucket } from "./cpu";

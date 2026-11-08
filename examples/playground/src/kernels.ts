@@ -1,6 +1,6 @@
 import { createWebGPUBackend } from "@kiln/backend-webgpu";
 import { Ctx, STEP_BYTES, packStep, type Backend, type Buf, type StepParams, type Tensor } from "@kiln/core";
-import { CpuBackend, gpuConverts, ops, ref } from "@kiln/kernels";
+import { CpuBackend, gpuConverts, ops, ref, t5Bucket as cpuT5Bucket } from "@kiln/kernels";
 import { dequantQ4, dequantQ8, f16ToF32, MemorySource, quantizeQ4, quantizeQ8, rowBytes, type SrcType } from "@kiln/loader";
 import { loadWeights, setGpuConvert } from "@kiln/runtime";
 
@@ -430,6 +430,22 @@ async function main() {
       check("attention/span", `T${T} H${H}/${Hkv} D${D} pos${pos0} span ${lo}-${hi}${window ? ` win${window}` : ""} ${kind}`, await download(o.buf, q.length), want, 1e-4);
     }
     ops.setPrefillAttention("tiled");
+  }
+
+  // T5's relative position bias (per-row kernel): bidirectional over an encoder span, and causal
+  // decode steps far enough along for the logarithmic buckets past max distance.
+  for (const [T, H, D, pos0, lo, hi, bidirectional] of [[40, 4, 64, 0, 0, 40, true], [1, 8, 64, 300, 0, 0, false], [12, 6, 64, 150, 0, 0, false]] as const) {
+    const maxSeq = 512;
+    const buckets = 32;
+    const maxDistance = 128;
+    const q = randn(T * H * D);
+    const kc = randn(maxSeq * H * D);
+    const vc = randn(maxSeq * H * D);
+    const table = randn(buckets * H);
+    const want = ref.attentionRef(q, kc, vc, { T, H, Hkv: H, D, pos0, scale: 1, window: 0, span: hi ? [lo, hi] : undefined, bias: (h, qp, kp) => table[cpuT5Bucket(kp - qp, bidirectional, buckets, maxDistance) * H + h]! });
+    let o!: Tensor;
+    await run({ ...S0, pos0, spanLo: lo, spanHi: hi }, (ctx) => (o = ops.attention(ctx, upload(q, [T, H * D]), upload(kc, [0]).buf, upload(vc, [0]).buf, { T, H, Hkv: H, D, maxSeq, scale: 1, relBias: { table: upload(table, [buckets, H]), buckets, maxDistance, bidirectional } })));
+    check("attention/t5bias", `T${T} H${H} D${D} pos${pos0} ${bidirectional ? "bidirectional" : "causal"}`, await download(o.buf, q.length), want, 1e-4);
   }
 
   // Span attention (`span: true`, every row sees the same keys): the register-tiled kernel on the

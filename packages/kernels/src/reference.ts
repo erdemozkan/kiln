@@ -47,7 +47,7 @@ export function attentionRef(
   q: Float32Array,
   kc: Float32Array,
   vc: Float32Array,
-  s: { T: number; H: number; Hkv: number; D: number; pos0: number; scale?: number; window?: number; span?: [number, number] },
+  s: { T: number; H: number; Hkv: number; D: number; pos0: number; scale?: number; window?: number; span?: [number, number]; bias?: (h: number, qpos: number, kpos: number) => number },
 ): Float32Array {
   const { T, H, Hkv, D, pos0 } = s;
   const scale = s.scale ?? 1 / Math.sqrt(D);
@@ -65,7 +65,7 @@ export function attentionRef(
       for (let j = lo; j < n; j++) {
         let d = 0;
         for (let i = 0; i < D; i++) d += q[(t * H + h) * D + i]! * kc[(j * Hkv + kvh) * D + i]!;
-        scores[j] = d * scale;
+        scores[j] = d * scale + (s.bias ? s.bias(h, pos, j) : 0);
       }
       const mx = Math.max(...scores.subarray(lo));
       let sum = 0;

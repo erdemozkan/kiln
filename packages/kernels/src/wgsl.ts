@@ -730,9 +730,10 @@ const ATTN_P = (third: string) => `struct P { T: u32, H: u32, Hkv: u32, D: u32, 
  * reach global memory. The weighted sum splits each block's keys across ATTN_WG / D thread groups and
  * reduces their partial outputs at the end, so every thread works even when D is small.
  */
-export function attentionSpec(kv: KvDtype = "f32"): KernelSpec {
+export function attentionSpec(kv: KvDtype = "f32", rel = false): KernelSpec {
   const r = kvRead(kv);
-  return spec(`attention/online/${kv}`, ["uniform", "read", "read", "read", "read", "rw"], cpu.cpuAttention(kv === "f16"), () => /* wgsl */ `
+  const bindings: BindingKind[] = rel ? ["uniform", "read", "read", "read", "read", "read", "rw"] : ["uniform", "read", "read", "read", "read", "rw"];
+  return spec(`attention/online/${kv}${rel ? "/t5bias" : ""}`, bindings, cpu.cpuAttention(kv === "f16", rel), () => /* wgsl */ `
 ${STEP_WGSL}
 ${kv === "f16" ? KV4_FN : ""}
 ${ATTN_P("_a")}
@@ -742,7 +743,25 @@ ${FIRST_KEY_WGSL}
 @group(0) @binding(2) var<storage, read> q: array<f32>;
 @group(0) @binding(3) var<storage, read> kc: ${r.kDecl};
 @group(0) @binding(4) var<storage, read> vc: ${r.vDecl};
-@group(0) @binding(5) var<storage, read_write> o: array<f32>;
+${rel ? `@group(0) @binding(5) var<storage, read> rel: array<f32>;
+@group(0) @binding(6) var<storage, read_write> o: array<f32>;
+// T5's relative position bucket (see cpu.t5Bucket): _x buckets, _y max distance, _z bidirectional.
+fn bucket(r: i32) -> u32 {
+  var nb = p._x;
+  var ret = 0u;
+  var n: i32;
+  if (p._z != 0u) {
+    nb = nb / 2u;
+    ret = select(0u, nb, r > 0);
+    n = abs(r);
+  } else {
+    n = max(-r, 0);
+  }
+  let exact = nb / 2u;
+  if (u32(n) < exact) { return ret + u32(n); }
+  let large = exact + u32(log(f32(n) / f32(exact)) / log(f32(p._y) / f32(exact)) * f32(nb - exact));
+  return ret + min(large, nb - 1u);
+}` : `@group(0) @binding(5) var<storage, read_write> o: array<f32>;`}
 const WG = ${ATTN_WG}u;
 var<workgroup> red: array<f32, ${ATTN_WG}>;
 var<workgroup> ss: array<f32, ${ATTN_WG}>;
@@ -793,7 +812,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
       workgroupBarrier();
     }
 
-    let sc = select(-3.0e38, ss[li], li < bn);
+    let sc = select(-3.0e38, ss[li]${rel ? " + rel[bucket(i32(b0 + li) - i32(st.pos0 + t)) * p.H + h]" : ""}, li < bn);
     red[li] = sc;
     workgroupBarrier();
     for (var s = WG / 2u; s > 0u; s >>= 1u) {

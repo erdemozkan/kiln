@@ -433,7 +433,7 @@ cost.
 
 ## Status
 
-Verified on this GPU: all kernel checks pass (809 now that Chrome exposes shader-f16 on it, including q4 and q8 weights, symmetric and affine, in every matmul variant, bidirectional-span attention, LayerNorm and pooling, the decode GEMV and the prefill GEMM, both prefill attention kernels, fused variants, f16 cache paths,
+Verified on this GPU: all kernel checks pass (814 now that Chrome exposes shader-f16 on it, including q4 and q8 weights, symmetric and affine, in every matmul variant, bidirectional-span attention, LayerNorm and pooling, the decode GEMV and the prefill GEMM, both prefill attention kernels, fused variants, f16 cache paths,
 sliding-window attention, GELU gating, grammar masks and sampling distributions). SmolLM2-135M-Instruct chats from Hub safetensors (q4, f32) and from a GGUF
 Q4_K_M file.
 
@@ -476,17 +476,31 @@ run in TypeScript on the final hidden states. Tokenizers: WordPiece from tokeniz
 and RoBERTa's byte-level BPE, both matching Python tokenizers on 56 test encodings. Not yet: Unigram
 tokenizers (XLM-R), ModernBERT, MPNet, DeBERTa, and batching several inputs into one forward pass.
 
-Encoder-decoder models (BART and DistilBART so far; Marian, M2M100 / NLLB layouts are in the model
-code but not yet loadable) run `summarization`, `translation` and `text2text-generation` with
+Encoder-decoder models run `summarization`, `translation` and `text2text-generation` with
 transformers.js's settings: greedy search (transformers.js ignores `num_beams` too), the model's
 `min_length`, `no_repeat_ngram_size`, forced first and last tokens, its config prefix, and 256 new
 tokens unless told otherwise. The encoder runs once and writes every decoder layer's cross-attention
-K/V; each decoder step reads them through a step block whose span covers every position. BART-base
-matches Python transformers' logits within 3.2e-5 over 12 decoding steps and its greedy output token
-for token; DistilBART-CNN (loaded from its 2020 pickle checkpoint) gives the same summary on the CPU
-and on WebGPU (64 tokens in 3.4 s on the Intel GPU). Repos without safetensors load from
-`pytorch_model.bin`: zip and legacy checkpoints are read as byte ranges from their pickle (a small
-pickle reader for state dicts; nothing is executed), and match the repos' safetensors copies exactly.
+K/V; each decoder step reads them through a step block whose span covers every position.
+
+| Family | Checked with | Result |
+|---|---|---|
+| BART (`facebook/bart-base`) | Python transformers | logits within 3.2e-5 over 12 steps, greedy output identical |
+| DistilBART (`sshleifer/distilbart-cnn-6-6`, 2020 pickle checkpoint) | transformers.js (`Xenova/distilbart-cnn-6-6`, fp32) | the same summary; 3.2 s on WebGPU against 22 s for transformers.js on WASM |
+| Marian (`Helsinki-NLP/opus-mt-en-de`, source.spm + vocab.json) | transformers.js (`Xenova/opus-mt-en-de`) | the same German; 1.1 s against 4.2 s |
+| T5 (`google/flan-t5-small`) | an independent NumPy forward pass over the safetensors; transformers.js | logits within 7.8e-6 over 9 steps, outputs identical to both |
+| NLLB (`facebook/nllb-200-distilled-600M`, q8) | by hand | "La maison est merveilleuse. J'aimerais l'acheter, mais elle est trop chère." |
+
+T5's learned relative position bias is added to each score by the per-row attention kernels (GPU
+and CPU, buckets computed in the kernel; bucket function equal to transformers' over ±300
+positions, kernel checks within 6.1e-7). SentencePiece tokenizers: Unigram (Viterbi) and character
+BPE behind the Precompiled normalizer (its double-array trie read as SentencePiece does), from
+tokenizer.json or a .model / .spm file (protobuf). Against Python `sentencepiece` on 11 strings
+(accents, CJK, emoji, fullwidth and ligature characters, odd spacing): T5 and Marian ids identical;
+NLLB's text ids identical, its language-code template built by Kiln. Repos without safetensors load
+from `pytorch_model.bin`: zip and legacy checkpoints are read as byte ranges from their pickle (a
+small pickle reader for state dicts; nothing is executed), and match the repos' safetensors copies
+exactly. Range reads without the OPFS cache (Node, or a full browser store) retry network and
+server errors with backoff, which a 2.4 GB NLLB download in Node needed twice.
 
 Gemma 3 was checked token by token against an independent NumPy forward pass written from
 transformers' `modeling_gemma3`: greedy output matched on every prompt tried, for 1B in q4 and q8 and 270M

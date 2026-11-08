@@ -270,6 +270,11 @@ export interface AttentionShape {
    * whose span covers every query, so each decoder row sees all encoder keys whatever its position).
    */
   step?: Buf;
+  /**
+   * T5's learned relative position bias, a table [buckets, H] added to every score by bucket of key
+   * minus query position. Runs the per-row kernel.
+   */
+  relBias?: { table: Tensor; buckets: number; maxDistance: number; bidirectional: boolean };
 }
 
 let spanOverride: SpanTile | undefined;
@@ -297,8 +302,12 @@ export function attention(ctx: Ctx, q: Tensor, kc: Buf, vc: Buf, s: AttentionSha
   const step = s.step ?? ctx.step;
   const params = ctx.uniform([
     u32(s.T), u32(s.H), u32(s.Hkv), u32(s.D), u32(s.maxSeq), f32(s.scale ?? 1 / Math.sqrt(s.D)), u32(splits), u32(s.window ?? 0),
-    u32(slots), u32(0), u32(0), u32(0),
+    u32(slots), u32(s.relBias?.buckets ?? 0), u32(s.relBias?.maxDistance ?? 0), u32(s.relBias?.bidirectional ? 1 : 0),
   ]);
+  if (s.relBias) {
+    ctx.run(attentionSpec(s.kv, true), [params, step, q.buf, kc, vc, s.relBias.table.buf, out.buf], [s.H, s.T, 1]);
+    return out;
+  }
   if (ctx.backend.name === "cpu") {
     // One CPU implementation serves every attention shape; the split-K pair is a GPU occupancy trick.
     ctx.run(attentionSpec(s.kv), [params, step, q.buf, kc, vc, out.buf], [s.H, s.T, 1]);

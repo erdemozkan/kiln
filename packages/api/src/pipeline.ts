@@ -35,6 +35,8 @@ export const DEFAULT_MODELS: Record<string, string> = {
   "fill-mask": "google-bert/bert-base-uncased",
   "zero-shot-classification": "typeform/distilbert-base-uncased-mnli",
   summarization: "sshleifer/distilbart-cnn-6-6",
+  translation: "Helsinki-NLP/opus-mt-en-de",
+  "text2text-generation": "google/flan-t5-small",
 };
 
 /** transformers.js's names, plus any of Kiln's own load options. */

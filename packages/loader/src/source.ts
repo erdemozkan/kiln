@@ -39,24 +39,55 @@ export class HttpSource implements ByteSource {
   constructor(
     readonly url: string,
     readonly name = url,
+    /** First retry delay; later ones double (see `withRetries`). */
+    private readonly retryMs = 1000,
   ) {}
 
   async size(): Promise<number> {
     if (this.total === undefined) {
-      const res = await fetch(this.url, { headers: { Range: "bytes=0-0" } });
-      if (!res.ok) throw new Error(`${this.url}: HTTP ${res.status}`);
-      this.total = parseContentRangeTotal(res.headers.get("Content-Range")) ?? Number(res.headers.get("Content-Length"));
-      await res.body?.cancel();
+      this.total = await withRetries(this.name, this.retryMs, async () => {
+        const res = await fetch(this.url, { headers: { Range: "bytes=0-0" } });
+        check(this.url, res);
+        const total = parseContentRangeTotal(res.headers.get("Content-Range")) ?? Number(res.headers.get("Content-Length"));
+        await res.body?.cancel();
+        return total;
+      });
     }
     return this.total;
   }
 
   async read(offset: number, length: number): Promise<Uint8Array> {
-    const res = await fetch(this.url, { headers: { Range: `bytes=${offset}-${offset + length - 1}` } });
-    if (res.status !== 206 && res.status !== 200) throw new Error(`${this.url}: HTTP ${res.status}`);
-    const buf = new Uint8Array(await res.arrayBuffer());
-    // A server that ignores Range sends the whole file.
-    return res.status === 200 ? buf.subarray(offset, offset + length) : buf;
+    return withRetries(this.name, this.retryMs, async () => {
+      const res = await fetch(this.url, { headers: { Range: `bytes=${offset}-${offset + length - 1}` } });
+      check(this.url, res);
+      const buf = new Uint8Array(await res.arrayBuffer());
+      // A server that ignores Range sends the whole file.
+      const out = res.status === 200 ? buf.subarray(offset, offset + length) : buf;
+      if (out.length !== length) throw new TransientError(`${this.url}: got ${out.length} of ${length} bytes`);
+      return out;
+    });
+  }
+}
+
+/** A failure worth retrying: the network (fetch's TypeError), a server error, or a short body. */
+class TransientError extends Error {}
+
+function check(url: string, res: Response): void {
+  if (res.status >= 500 || res.status === 429) throw new TransientError(`${url}: HTTP ${res.status}`);
+  if (res.status !== 206 && res.status !== 200) throw new Error(`${url}: HTTP ${res.status}`);
+}
+
+/** Runs `f`, retrying transient failures up to 4 times after 1, 2, 4 and 8 × `retryMs`. */
+export async function withRetries<T>(name: string, retryMs: number, f: () => Promise<T>): Promise<T> {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await f();
+    } catch (err) {
+      const transient = err instanceof TransientError || (err instanceof Error && err.name === "TypeError");
+      if (!transient || attempt >= 4) throw err;
+      console.warn(`[kiln] ${name}: ${(err as Error).message}; retrying`);
+      await new Promise((r) => setTimeout(r, retryMs * 2 ** attempt));
+    }
   }
 }
 

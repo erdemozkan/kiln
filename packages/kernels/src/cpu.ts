@@ -436,16 +436,38 @@ function kvRow(u: Uint32Array, f: Float32Array, e: number, D: number, f16: boole
   }
 }
 
-export function cpuAttention(f16: boolean): CpuKernel {
+/**
+ * T5's relative position bucket of key position minus query position: exact for small distances,
+ * logarithmic up to `maxDistance`; both directions get half the buckets when `bidirectional`.
+ */
+export function t5Bucket(rel: number, bidirectional: boolean, buckets: number, maxDistance: number): number {
+  let nb = buckets;
+  let ret = 0;
+  let n: number;
+  if (bidirectional) {
+    nb = Math.floor(nb / 2);
+    if (rel > 0) ret = nb;
+    n = Math.abs(rel);
+  } else n = Math.max(-rel, 0);
+  const exact = Math.floor(nb / 2);
+  if (n < exact) return ret + n;
+  const large = exact + Math.trunc(Math.fround(Math.fround(Math.log(Math.fround(n / exact))) / Math.fround(Math.log(Math.fround(maxDistance / exact)))) * (nb - exact));
+  return ret + Math.min(large, nb - 1);
+}
+
+export function cpuAttention(f16: boolean, rel = false): CpuKernel {
   let scores = new Float32Array(0);
   return (b) => {
     const u = b[0]!.u32;
     const [T, H, Hkv, D, maxSeq] = [u[0]!, u[1]!, u[2]!, u[3]!, u[4]!];
     const scale = b[0]!.f32[5]!;
     const [win, cap] = [u[7]!, u[8]!];
+    const [buckets, maxDist, bidir] = [u[9]!, u[10]!, u[11]! !== 0];
     const { pos0, spanLo, spanHi } = step(b[1]!);
     const heap = (b[2] as HeapView).heap;
-    if (heap && D % (f16 ? 8 : 4) === 0) {
+    // T5's position bias is added to each score in TypeScript below (the WASM path takes the max first).
+    const table = rel ? b[5]!.f32 : undefined;
+    if (heap && !rel && D % (f16 ? 8 : 4) === 0) {
       // The per-key work in WASM SIMD, on the caches in place, for all the query heads of a KV head at
       // once (each cache row read and widened once); masking and the softmax stay here.
       const G = H / Hkv;
@@ -483,7 +505,7 @@ export function cpuAttention(f16: boolean): CpuKernel {
     const q = b[2]!.f32;
     // Views taken once: a heap buffer's view getter is too slow for the inner loops.
     const [ku, kf, vu, vf] = [b[3]!.u32, b[3]!.f32, b[4]!.u32, b[4]!.f32];
-    const o = b[5]!.f32;
+    const o = (rel ? b[6]! : b[5]!).f32;
     const stride = Hkv * D;
     if (scores.length < maxSeq) scores = new Float32Array(maxSeq);
     const qs = new Float32Array(D);
@@ -503,6 +525,7 @@ export function cpuAttention(f16: boolean): CpuKernel {
           kvRow(ku, kf, (j % cap) * stride + kvh * D, D, f16, row);
           let d = 0;
           for (let i = 0; i < D; i++) d += qs[i]! * row[i]!;
+          if (table) d += table[t5Bucket(j - pos, bidir, buckets, maxDist) * H + h]!;
           scores[j] = d;
           if (d > mx) mx = d;
         }

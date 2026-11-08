@@ -21,9 +21,12 @@ tokenizer.json or vocab.txt, RoBERTa's byte-level BPE) for `feature-extraction`,
 `zero-shot-classification`, with transformers.js's output shapes, `Tensor` and `cos_sim`; scores
 equal to Python transformers' to six decimals.
 
-**Summarization and text2text.** BART / DistilBART encoder-decoders for `summarization`,
-`translation` and `text2text-generation` (greedy, with the model's generation settings), and
-`pytorch_model.bin` checkpoints (zip and legacy) wherever a repo has no safetensors.
+**Summarization, translation and text2text.** BART / DistilBART, Marian (OPUS-MT), M2M100 /
+NLLB and T5 / Flan-T5 encoder-decoders for `summarization`, `translation` and
+`text2text-generation` (greedy, with the model's generation settings and language codes), with
+SentencePiece tokenizers (Unigram and BPE, the Precompiled normalizer, .spm files), T5's relative
+position bias in attention, and `pytorch_model.bin` checkpoints (zip and legacy) wherever a repo has
+no safetensors. Uncached range reads retry network and server errors.
 
 **Models.** Llama (including Llama 3 rope scaling), Mistral, Qwen2, Qwen3, SmolLM, Granite 3 and 4
 (350M to 2B; for Granite 4, the attention-only models) and Gemma 3 (270M to 4B and larger; images
@@ -74,5 +77,5 @@ load in 2.4 s. Decode uses a block-per-lane GEMV with several rows per thread on
 prefill a tiled GEMM and tiled attention, and GPU work is cut into short submits so the page stays
 responsive.
 
-**Checks.** 177 unit tests; a kernel check page (811 checks on the Intel GPU, 763 on the CPU backend) compares every kernel with a CPU reference; Gemma 3 1B matches a NumPy reference token for
+**Checks.** 185 unit tests; a kernel check page (814 checks on the Intel GPU, 763 on the CPU backend) compares every kernel with a CPU reference; Gemma 3 1B matches a NumPy reference token for
 token in q8 and q4.

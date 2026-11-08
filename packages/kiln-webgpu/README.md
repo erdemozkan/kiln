@@ -78,12 +78,21 @@ returns zeros past a shorter input's last token.
 ```js
 const summarizer = await pipeline("summarization"); // sshleifer/distilbart-cnn-6-6
 const [{ summary_text }] = await summarizer(article, { max_new_tokens: 100 });
+
+const translator = await pipeline("translation", "Helsinki-NLP/opus-mt-en-de");
+await translator("The house is wonderful."); // [{ translation_text: "Das Haus ist wunderbar." }]
+
+const nllb = await pipeline("translation", "facebook/nllb-200-distilled-600M", { dtype: "q8" });
+await nllb("The house is wonderful.", { src_lang: "eng_Latn", tgt_lang: "fra_Latn" });
+
+const t2t = await pipeline("text2text-generation", "google/flan-t5-small");
 ```
 
-BART and DistilBART models run today (`summarization`, `translation`, `text2text-generation`, with
-transformers.js's output keys). Generation is greedy, as in transformers.js, with the model's
-`min_length`, `no_repeat_ngram_size` and forced tokens; options override them. Repos that only ship
-`pytorch_model.bin` load too (the checkpoint's pickle is parsed for tensor offsets, never executed).
+BART / DistilBART, Marian (OPUS-MT), M2M100 / NLLB and T5 / Flan-T5 / mT5 load from their original
+repos, with transformers.js's output keys. Generation is greedy, as in transformers.js, with the
+model's `min_length`, `no_repeat_ngram_size` and forced tokens; options override them. Repos that
+only ship `pytorch_model.bin` load too (the checkpoint's pickle is parsed for tensor offsets, never
+executed).
 
 ## Kiln's own API
 
