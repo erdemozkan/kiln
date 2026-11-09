@@ -163,6 +163,10 @@ const { predicted_depth, depth: grey } = await depth("cats.jpg"); // Tensor [480
 // DETR panoptic: one mask per segment, 255 inside.
 const segmenter = await pipeline("image-segmentation"); // facebook/detr-resnet-50-panoptic
 await segmenter("cats.jpg"); // [{ score: 0.994, label: "cat", mask: { width: 640, height: 480, channels: 1, data } }, ...]
+
+// RMBG-1.4 (non-commercial license): the image as RGBA, the background transparent.
+const remover = await pipeline("background-removal"); // briaai/RMBG-1.4
+const cutout = await remover("portrait.jpg"); // { width, height, channels: 4, data }
 ```
 
 With a CLIP model, `image-feature-extraction` returns the image embedding (the visual projection's

@@ -368,4 +368,43 @@ describe("image convolution kernels (CPU)", () => {
       s.forEach((v, j) => expect(y[i * S * Hh + j]).toBeCloseTo(Math.exp(v - m) / z, 6));
     });
   });
+
+  it("conv2d with dilation spaces its taps (padding = dilation keeps the size)", async () => {
+    const [H, W, C, O, dil] = [9, 7, 4, 5, 2];
+    const x = randn(H * W * C);
+    const K = 64;
+    const wt = randn(O * C * 9); // [O, C, 3, 3]
+    const w = new Float32Array(O * K);
+    for (let o = 0; o < O; o++) for (let c = 0; c < C; c++) for (let t = 0; t < 9; t++) w[o * K + t * C + c] = wt[(o * C + c) * 9 + t]!;
+    const bias = randn(O);
+    const r = await run((ctx) => ops.conv2d(ctx, upload(x, [H * W, C]), upload(w, [O, K]), upload(bias, [O]), { H, W, k: 3, stride: 1, pad: dil, dilation: dil }).y, H * W * O);
+    for (let oy = 0; oy < H; oy++)
+      for (let ox = 0; ox < W; ox++)
+        for (let o = 0; o < O; o++) {
+          let s = bias[o]!;
+          for (let ky = 0; ky < 3; ky++)
+            for (let kx = 0; kx < 3; kx++) {
+              const iy = oy - dil + ky * dil;
+              const ix = ox - dil + kx * dil;
+              if (iy >= 0 && iy < H && ix >= 0 && ix < W) for (let c = 0; c < C; c++) s += x[(iy * W + ix) * C + c]! * wt[(o * C + c) * 9 + ky * 3 + kx]!;
+            }
+          expect(r[(oy * W + ox) * O + o]).toBeCloseTo(s, 5);
+        }
+  });
+
+  it("maxPool2d with ceil_mode keeps the partial window at an odd edge, as torch does", async () => {
+    expect(ops.convOut(7, 2, 2, 0, 1, true)).toBe(4);
+    expect(ops.convOut(8, 2, 2, 0, 1, true)).toBe(4);
+    expect(ops.convOut(7, 2, 2, 0)).toBe(3);
+    const [H, W, C] = [3, 5, 4];
+    const x = randn(H * W * C);
+    const y = await run((ctx) => ops.maxPool2d(ctx, upload(x, [H * W, C]), { H, W, k: 2, stride: 2, pad: 0, ceil: true }).y, 2 * 3 * C);
+    for (let oy = 0; oy < 2; oy++)
+      for (let ox = 0; ox < 3; ox++)
+        for (let c = 0; c < C; c++) {
+          let m = -Infinity;
+          for (let dy = 0; dy < 2; dy++) for (let dx = 0; dx < 2; dx++) if (oy * 2 + dy < H && ox * 2 + dx < W) m = Math.max(m, x[((oy * 2 + dy) * W + ox * 2 + dx) * C + c]!);
+          expect(y[(oy * 3 + ox) * C + c]).toBe(m);
+        }
+  });
 });

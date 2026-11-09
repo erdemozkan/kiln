@@ -10,3 +10,4 @@ export * from "./vit";
 export * from "./clip";
 export * from "./detr";
 export * from "./depth";
+export * from "./isnet";

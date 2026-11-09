@@ -45,6 +45,8 @@ export {
   type ImageSegmentationPipeline,
   type ImageSegmentationOptions,
   type ImageSegmentationResult,
+  type BackgroundRemovalPipeline,
+  type BackgroundRemovalResult,
   type ZeroShotImageClassificationOptions,
   type PipelineOptions,
   type PipelineTask,

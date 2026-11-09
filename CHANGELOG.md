@@ -66,7 +66,11 @@ DINOv2 encoder with position embeddings fitted to each grid, DPT neck and head o
 convolution and bilinear resize kernels; DPT's aspect-keeping resize to multiples of 14. DETR
 panoptic (`facebook/detr-resnet-50-panoptic`): `image-segmentation` with transformers.js's panoptic
 post-processing, the mask head run only for the queries kept (GroupNorm, nearest-upsample-and-add
-and box attention kernels; the conv kernel takes a batch of images).
+and box attention kernels; the conv kernel takes a batch of images). RMBG-1.4 (`briaai/RMBG-1.4`):
+`background-removal` (RGBA with the matte as alpha) and `image-segmentation` (the matte), IS-Net
+from one architecture description, concatenations as split convolutions; dilated convolutions,
+ceil-mode pooling, a direct kernel for convolutions with at most four outputs; `resizeImage` takes
+one-channel images.
 
 **Loading.** Reads ahead of a download in progress are fetched on their own instead of waiting
 (a `pytorch_model.bin` keeps its zip directory at the end, so large checkpoints showed no progress

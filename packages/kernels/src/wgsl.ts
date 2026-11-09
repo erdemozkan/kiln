@@ -1871,7 +1871,8 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid:
  * 32-element block at a time); only the x tile's loads differ, gathering each pixel's patch from the
  * image instead of reading a stored im2col row. Batch-norm is folded into w and bias at load time.
  * With `reluIn` the input goes through ReLU as it is read (pre-activation residual blocks). A batch of
- * N images ([N·H·W, C] → [N·Ho·Wo, O]) runs as one GEMM of N·Ho·Wo rows.
+ * N images ([N·H·W, C] → [N·Ho·Wo, O]) runs as one GEMM of N·Ho·Wo rows. Taps are `dil` pixels apart
+ * (dilated convolution).
  */
 export function conv2dSpec(v: { relu: boolean; residual: boolean; reluIn?: boolean }): KernelSpec {
   const R8 = [0, 1, 2, 3, 4, 5, 6, 7];
@@ -1886,7 +1887,7 @@ ${[0, 1, 2, 3].map((j) => `    if (n0 + tn * 4u + ${j}u < p.O) { let n = n0 + tn
   }`,
   ).join("\n");
   return spec(`conv2d${v.reluIn ? "/relu-in" : ""}${v.relu ? "/relu" : ""}${v.residual ? "/res" : ""}`, bindings, cpu.cpuConv2d(v), () => /* wgsl */ `
-struct P { H: u32, W: u32, C: u32, O: u32, Ho: u32, Wo: u32, kh: u32, kw: u32, stride: u32, pad: u32, K: u32, M: u32, N: u32, _b: u32, _c: u32, _d: u32 }
+struct P { H: u32, W: u32, C: u32, O: u32, Ho: u32, Wo: u32, kh: u32, kw: u32, stride: u32, pad: u32, K: u32, M: u32, N: u32, dil: u32, _c: u32, _d: u32 }
 @group(0) @binding(0) var<uniform> p: P;
 @group(0) @binding(1) var<storage, read> x: array<vec4<f32>>;
 @group(0) @binding(2) var<storage, read> w: array<vec4<f32>>;
@@ -1926,8 +1927,8 @@ ${R8.map((i) => `  var acc${i} = vec4<f32>();`).join("\n")}
     let k = kb * 32u + (li % 8u) * 4u;
     let tap = k / p.C;
     let c4 = (k % p.C) / 4u;
-    let ky = i32(tap / p.kw);
-    let kx = i32(tap % p.kw);
+    let ky = i32((tap / p.kw) * p.dil);
+    let kx = i32((tap % p.kw) * p.dil);
     for (var c = 0u; c < 4u; c++) {
       let iy = oy[c] + ky;
       let ix = ox[c] + kx;
@@ -2148,6 +2149,56 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
   }
   let inv = 1.0 / red[0];
   for (var j = li; j < n; j += 256u) { o[base + j] *= inv; }
+}`);
+}
+
+/**
+ * The same convolution as conv2dSpec for at most 4 output channels (a mask or matte head), where a
+ * 64-channel GEMM tile would waste nearly all its work: one thread per output pixel walks the taps
+ * and channels as vec4s, with up to 4 accumulators.
+ */
+export function conv2dNarrowSpec(v: { relu: boolean; residual: boolean }): KernelSpec {
+  const bindings: BindingKind[] = ["uniform", "read", "read", "read"];
+  if (v.residual) bindings.push("read");
+  bindings.push("rw");
+  return spec(`conv2d_narrow${v.relu ? "/relu" : ""}${v.residual ? "/res" : ""}`, bindings, cpu.cpuConv2d(v), () => /* wgsl */ `
+struct P { H: u32, W: u32, C: u32, O: u32, Ho: u32, Wo: u32, kh: u32, kw: u32, stride: u32, pad: u32, K: u32, M: u32, N: u32, dil: u32, _c: u32, _d: u32 }
+@group(0) @binding(0) var<uniform> p: P;
+@group(0) @binding(1) var<storage, read> x: array<vec4<f32>>;
+@group(0) @binding(2) var<storage, read> w: array<vec4<f32>>;
+@group(0) @binding(3) var<storage, read> bias: array<f32>;
+${v.residual ? "@group(0) @binding(4) var<storage, read> res: array<f32>;\n@group(0) @binding(5)" : "@group(0) @binding(4)"} var<storage, read_write> y: array<f32>;
+
+@compute @workgroup_size(${EW})
+fn main(${EW_ARGS}) {
+  ${FLAT}
+  if (idx >= p.M) { return; }
+  let plane = p.Ho * p.Wo;
+  let r = idx % plane;
+  let base = (idx / plane) * p.H * p.W;
+  let oy = i32((r / p.Wo) * p.stride) - i32(p.pad);
+  let ox = i32((r % p.Wo) * p.stride) - i32(p.pad);
+  let C4 = p.C / 4u;
+  let K4 = p.K / 4u;
+  var acc = vec4<f32>();
+  for (var ky = 0u; ky < p.kh; ky++) {
+    let iy = oy + i32(ky * p.dil);
+    if (iy < 0 || iy >= i32(p.H)) { continue; }
+    for (var kx = 0u; kx < p.kw; kx++) {
+      let ix = ox + i32(kx * p.dil);
+      if (ix < 0 || ix >= i32(p.W)) { continue; }
+      let xo = (base + u32(iy) * p.W + u32(ix)) * C4;
+      let wo = (ky * p.kw + kx) * C4;
+      for (var c = 0u; c < C4; c++) {
+        let xv = x[xo + c];
+        for (var o = 0u; o < p.O; o++) { acc[o] += dot(xv, w[o * K4 + wo + c]); }
+      }
+    }
+  }
+  for (var o = 0u; o < p.O; o++) {
+    let val = acc[o] + bias[o]${v.residual ? " + res[idx * p.O + o]" : ""};
+    y[idx * p.O + o] = ${v.relu ? "max(val, 0.0)" : "val"};
+  }
 }`);
 }
 

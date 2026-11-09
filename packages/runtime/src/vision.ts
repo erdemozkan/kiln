@@ -1,9 +1,10 @@
-// Image models from transformers checkpoints (ViT, DeiT, CLIP, YOLOS, DETR, Depth Anything): image
-// classification, image features, zero-shot classification, object detection, panoptic segmentation
-// and depth estimation, with transformers' image preprocessing (PIL-exact resizing).
+// Image models from transformers checkpoints (ViT, DeiT, CLIP, YOLOS, DETR, Depth Anything, RMBG):
+// image classification, image features, zero-shot classification, object detection, panoptic
+// segmentation, depth estimation and background removal, with transformers' image preprocessing
+// (PIL-exact resizing).
 import type { Backend, Tensor } from "@kiln/core";
-import { fetchJSON, fileUrl, listRepoFiles, parseModelId, preprocessImage, readPytorchHeader, readSafetensorsHeader, toF32, weightFiles, type ByteSource, type ImageProcessorConfig, type RgbImage, type TensorEntry } from "@kiln/loader";
-import { ClipTextModel, DETR_IN_CHANNELS, DepthAnythingModel, DetrModel, VitModel, bicubicResize, convMatrix, convTransposeMatrix, depthConfigFromHF, depthName, detrConfigFromHF, detrName, dinov2Positions, foldConvBn, clipPoolIndex, clipTextConfigFromHF, clipTextName, vitConfigFromHF, vitGrid, vitName, vitPatchK, type DepthAnythingConfig, type DetrConfig, type VitConfig, type VitEmbeddings } from "@kiln/models";
+import { fetchJSON, fileUrl, listRepoFiles, parseModelId, preprocessImage, resizeImage, readPytorchHeader, readSafetensorsHeader, toF32, weightFiles, type ByteSource, type ImageProcessorConfig, type RgbImage, type TensorEntry } from "@kiln/loader";
+import { ClipTextModel, DETR_IN_CHANNELS, DepthAnythingModel, ISNET_IN_CHANNELS, IsNetModel, isnetConvs, DetrModel, VitModel, bicubicResize, convMatrix, convTransposeMatrix, depthConfigFromHF, depthName, detrConfigFromHF, detrName, dinov2Positions, foldConvBn, clipPoolIndex, clipTextConfigFromHF, clipTextName, vitConfigFromHF, vitGrid, vitName, vitPatchK, type DepthAnythingConfig, type DetrConfig, type VitConfig, type VitEmbeddings } from "@kiln/models";
 import { ClipTokenizer, type ClipTokenizerJSON } from "@kiln/tokenizers";
 import { openBackend, openParsed } from "./load";
 import { loadWeights, type LoadProgress, type WeightFile } from "./weights";
@@ -54,10 +55,10 @@ export interface ImageSegmentationOptions {
   overlap_mask_area_threshold?: number;
 }
 
-/** A segment: its class, score, and mask (255 inside, 0 outside) at the image's size. */
+/** A segment: its class, score, and mask (255 inside, 0 outside) at the image's size. A matting model's one segment has neither class nor score (null), as in transformers.js. */
 export interface ImageSegment {
-  score: number;
-  label: string;
+  score: number | null;
+  label: string | null;
   mask: { width: number; height: number; channels: 1; data: Uint8Array };
 }
 
@@ -140,6 +141,7 @@ export class VisionEngine {
     private readonly clip?: ClipParts,
     private readonly detr?: { cfg: DetrConfig; model: DetrModel },
     private readonly depthModel?: { cfg: DepthAnythingConfig; model: DepthAnythingModel },
+    private readonly matte?: IsNetModel,
   ) {}
 
   get cfg(): VitConfig {
@@ -155,6 +157,7 @@ export class VisionEngine {
   /** Family, depth, width, input size and labels, for the model info. */
   summary(): { family: string; layers: number; hiddenSize: number; imageSize: number; labels: Record<number, string> } {
     const labels = (l: string[]) => Object.fromEntries(l.map((v, i) => [i, v]));
+    if (this.matte) return { family: "rmbg", layers: 0, hiddenSize: 0, imageSize: 1024, labels: {} };
     if (this.depthModel) {
       const c = this.depthModel.cfg;
       return { family: "depth_anything", layers: c.layers, hiddenSize: c.hidden, imageSize: c.imageSize, labels: {} };
@@ -300,6 +303,7 @@ export class VisionEngine {
    * `mask_threshold` on. Masks run only for the kept queries.
    */
   async segment(img: RgbImage, options: ImageSegmentationOptions = {}): Promise<ImageSegment[]> {
+    if (this.matte) return [{ score: null, label: null, mask: await this.matteMask(img) }];
     if (!this.detr) throw new Error("this model does not segment images");
     const threshold = options.threshold ?? 0.5;
     const maskThreshold = options.mask_threshold ?? 0.5;
@@ -375,6 +379,37 @@ export class VisionEngine {
     return out;
   }
 
+  /**
+   * The foreground matte (RMBG) as transformers.js makes it: sigmoid of the model's output at its input
+   * size, times 255 truncated to bytes, then resized to the image (bilinear, PIL's filter; transformers.js
+   * resizes on a canvas).
+   */
+  private async matteMask(img: RgbImage): Promise<{ width: number; height: number; channels: 1; data: Uint8Array }> {
+    const p = preprocessImage(img, this.processor);
+    const logits = await this.matte!.predict(p.data, p.width, p.height);
+    const f = Math.fround;
+    const grey = new Uint8Array(logits.length);
+    for (let i = 0; i < logits.length; i++) grey[i] = Math.trunc(f(f(1 / (1 + Math.exp(-logits[i]!))) * 255));
+    const data = p.width === img.width && p.height === img.height ? grey : Uint8Array.from(resizeImage({ width: p.width, height: p.height, data: grey }, img.width, img.height, 2).data);
+    return { width: img.width, height: img.height, channels: 1, data };
+  }
+
+  /** Background removal (RMBG): the image as RGBA with the matte as its alpha, as transformers.js returns it. */
+  async removeBackground(img: RgbImage): Promise<{ width: number; height: number; channels: 4; data: Uint8Array }> {
+    if (!this.matte) throw new Error("this model does not remove backgrounds (use a matting model such as briaai/RMBG-1.4)");
+    const mask = await this.matteMask(img);
+    const n = img.width * img.height;
+    const C = img.data.length / n;
+    const data = new Uint8Array(n * 4);
+    for (let i = 0; i < n; i++) {
+      data[i * 4] = img.data[i * C]!;
+      data[i * 4 + 1] = img.data[i * C + 1]!;
+      data[i * 4 + 2] = img.data[i * C + 2]!;
+      data[i * 4 + 3] = mask.data[i]!;
+    }
+    return { width: img.width, height: img.height, channels: 4, data };
+  }
+
   /** Class logits of an image (DeiT with a teacher: the mean of the CLS and distillation heads). */
   async logits(img: RgbImage): Promise<Float32Array> {
     if (!this.heads.cls) throw new Error("this model has no classification head");
@@ -409,6 +444,7 @@ export class VisionEngine {
     this.vit?.model.destroy();
     this.detr?.model.destroy();
     this.depthModel?.model.destroy();
+    this.matte?.destroy();
     this.clip?.text.destroy();
   }
 }
@@ -431,6 +467,7 @@ export async function createVision(modelId: string, opts: VisionLoadOptions = {}
   ]);
   if (config!.model_type === "detr") return createDetr(modelId, ref, config!, prep, names, opts);
   if (config!.model_type === "depth_anything") return createDepth(modelId, ref, config!, prep, names, opts);
+  if (((config!.architectures as string[] | undefined) ?? []).includes("BriaRMBG")) return createRmbg(modelId, ref, prep, names, opts);
   const cfg = vitConfigFromHF(config!);
   const clip = cfg.modelType === "clip";
   if (clip && config!.model_type !== "clip") throw new Error(`${modelId}: a CLIP vision tower alone; zero-shot classification needs the full CLIP model`);
@@ -779,6 +816,73 @@ async function createDepth(
     };
     const model = new DepthAnythingModel(backend, cfg, weights, addend);
     return new VisionEngine(backend, undefined, prep, {}, undefined, undefined, { cfg, model });
+  } finally {
+    for (const s of sources) s.close?.();
+  }
+}
+
+/**
+ * BRIA RMBG-1.4: every convolution read, its batch norm folded in (eps 1e-5) and its weight split
+ * along the input channels where briarmbg.py concatenates (isnetConvs lists the splits).
+ */
+async function createRmbg(
+  modelId: string,
+  ref: ReturnType<typeof parseModelId>,
+  prep: ImageProcessorConfig | undefined,
+  names: Awaited<ReturnType<typeof weightFiles>>,
+  opts: VisionLoadOptions,
+): Promise<VisionEngine> {
+  if (!prep) throw new Error(`${modelId}: no preprocessor_config.json`);
+  const ep = opts.endpoint;
+  const backend = opts.backend ?? (await openBackend(opts.device ?? "auto", opts.cpuThreads));
+  const sources: ByteSource[] = [];
+  const located = new Map<string, { source: ByteSource; entry: TensorEntry }>();
+  try {
+    for (const name of names.names) {
+      const { source, header } = await openParsed(ref, name, ep, names.format === "safetensors" ? readSafetensorsHeader : readPytorchHeader);
+      sources.push(source);
+      for (const t of header.tensors) located.set(t.name, { source, entry: t });
+    }
+    const need = async (name: string) => {
+      const t = located.get(name);
+      if (!t) throw new Error(`${modelId}: "${name}" is missing`);
+      const count = t.entry.shape.reduce((a, b) => a * b, 1);
+      return { shape: t.entry.shape, data: toF32(t.entry.type as Parameters<typeof toF32>[0], await t.source.read(t.entry.offset, t.entry.byteLength), count) };
+    };
+    const weights = new Map<string, Tensor>();
+    const upload = (name: string, shape: number[], data: Float32Array) => {
+      const buf = backend.alloc(data.byteLength, "storage", `rmbg/${name}`);
+      backend.write(buf, 0, data);
+      weights.set(name, { shape, dtype: "f32", buf } as Tensor);
+    };
+    const convs = [...isnetConvs()];
+    let done = 0;
+    for (const [path, { splits, bn }] of convs) {
+      const base = bn ? `${path}.conv_s1` : path;
+      const [w, b] = await Promise.all([need(`${base}.weight`), need(`${base}.bias`)]);
+      const [O, Cin, k] = w.shape as [number, number, number];
+      if (Cin !== splits.reduce((a, c) => a + c, 0)) throw new Error(`${modelId}: ${base}.weight has ${Cin} input channels, expected ${splits.join(" + ")}`);
+      const bias = Float32Array.from(b.data);
+      if (bn) {
+        const [g, beta, mean, variance] = await Promise.all(["weight", "bias", "running_mean", "running_var"].map((f) => need(`${path}.bn_s1.${f}`)));
+        for (let o = 0; o < O; o++) {
+          const s = Math.fround(g.data[o]! / Math.sqrt(variance.data[o]! + 1e-5));
+          bias[o] = (b.data[o]! - mean.data[o]!) * s + beta.data[o]!;
+          for (let i = o * Cin * k * k; i < (o + 1) * Cin * k * k; i++) w.data[i] = w.data[i]! * s;
+        }
+      }
+      let c0 = 0;
+      splits.forEach((ci, i) => {
+        const part = new Float32Array(O * ci * k * k);
+        for (let o = 0; o < O; o++) part.set(w.data.subarray((o * Cin + c0) * k * k, (o * Cin + c0 + ci) * k * k), o * ci * k * k);
+        const m = convMatrix(part, [O, ci, k, k], path === "conv_in" ? ISNET_IN_CHANNELS : ci);
+        upload(`${path}.p${i}.weight`, [O, m.K], m.w);
+        upload(`${path}.p${i}.bias`, [O], i === 0 ? bias : new Float32Array(O));
+        c0 += ci;
+      });
+      opts.onProgress?.({ file: names.names[0]!, loaded: ++done, total: convs.length });
+    }
+    return new VisionEngine(backend, undefined, prep, {}, undefined, undefined, undefined, new IsNetModel(backend, weights));
   } finally {
     for (const s of sources) s.close?.();
   }

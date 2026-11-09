@@ -526,6 +526,7 @@ K/V; each decoder step reads them through a step block whose span covers every p
 | wav2vec2 classifier (`superb/wav2vec2-base-superb-ks`, weighted layer sum) | transformers.js (`Xenova/wav2vec2-base-superb-ks`, fp32) | the same five labels, scores within 2e-7 |
 | Image preprocessing (all six PIL filters; DeiT and CLIP pipelines) | PIL 8 + numpy | resized bytes identical; pixel values identical (float32) |
 | CLIP tokenizer (`openai/clip-vit-base-patch32`) | transformers.js | the same ids for 8 texts (punctuation, accents, CJK, emoji, long words) |
+| RMBG-1.4 (`briaai/RMBG-1.4`) | transformers.js (the repo's ONNX export, fp32) on the same pixel values | 3 of 1,048,576 matte bytes one level apart; 2.9 s end to end against 4.0 s |
 | DETR panoptic (`facebook/detr-resnet-50-panoptic`) | transformers.js (`Xenova/detr-resnet-50-panoptic`, fp32) on the same pixel values | the same five segments on the cats photo, scores within 1.4e-6, one pixel of 307,200 assigned differently; 2.4 s end to end against 28.2 s |
 | Depth Anything V2 (`depth-anything/Depth-Anything-V2-Small-hf`) | transformers.js (`onnx-community/depth-anything-v2-small`, fp32) on the same pixel values | depth within 1.7e-5 relative on the cats photo; 20 of 307,200 grey bytes one level apart; 3.1 s end to end against 7.4 s |
 | DETR (`facebook/detr-resnet-50`) | transformers.js (`Xenova/detr-resnet-50`, fp32) on the same pixel values | the same five detections and labels on the cats photo; scores within 2.8e-7, boxes within 2.3e-6; 1.57 s end to end against 4.02 s |
@@ -674,6 +675,23 @@ the mask 255 inside, 0 outside. On the cats photo, fed the same pixel values as 
 in the same order, scores within 1.4e-6, and one pixel of the 307,200 assigned differently. Both
 pipelines end to end (median of five warm calls, WebGPU, backgrounded pane): 2.4 s in Kiln against
 28.2 s for transformers.js, which runs the mask head for every query.
+
+Background removal (`background-removal`) runs BRIA's RMBG-1.4 (`briaai/RMBG-1.4`, IS-Net; its
+license allows non-commercial use only). transformers.js's default, MODNet (`Xenova/modnet`), is
+published only as ONNX with folded, renamed weights, which Kiln does not load. The network is
+written once as a description (briarmbg.py's nested U-blocks) that both lists the convolutions for
+loading and builds the plan. Every convolution runs on the conv kernel, now with dilation, its
+batch norm folded in. A channel concatenation becomes one convolution per input, summed in the
+epilogue, so nothing is copied. Max pooling rounds up as ceil_mode does, and convolutions with at
+most four output channels use a direct kernel instead of a mostly idle 64-channel tile. Output is
+transformers.js's: the image as RGBA with the matte (sigmoid × 255, truncated) as its alpha, the
+matte resized to the image with PIL's bilinear filter; `image-segmentation` on the same model
+returns the matte as a mask with null label and score. On a 1024 × 1024 copy of the cats photo
+(no resize on either side), fed the same pixel values as transformers.js's ONNX export of the
+same model (fp32): 3 of the 1,048,576 matte bytes one level apart. transformers.js's own
+background-removal pipeline rejects RMBG-1.4's config; run as its model card shows (AutoModel,
+processor, RawImage), it took 4.0 s end to end against 2.9 s in Kiln (median of five warm
+calls, WebGPU, backgrounded pane). Kiln's GPU time is the 3×3 convolutions at the GEMM's rate.
 
 T5's learned relative position bias is added to each score by the per-row attention kernels (GPU
 and CPU, buckets computed in the kernel; bucket function equal to transformers' over ±300

@@ -771,6 +771,7 @@ export function cpuConv2d(v: { relu: boolean; residual: boolean; reluIn?: boolea
   return (b) => {
     const [H, W, C, O, Ho, Wo, kh, kw, stride, pad, K, M] = Array.from(b[0]!.u32.subarray(0, 12)) as number[];
     const plane = Ho! * Wo!;
+    const dil = b[0]!.u32[13]! || 1;
     const x = b[1]!.f32;
     const w = b[2]!.f32;
     const bias = b[3]!.f32;
@@ -784,10 +785,10 @@ export function cpuConv2d(v: { relu: boolean; residual: boolean; reluIn?: boolea
       const oy = Math.floor(r / Wo!) * stride! - pad!;
       const ox = (r % Wo!) * stride! - pad!;
       for (let ky = 0; ky < kh!; ky++) {
-        const iy = oy + ky;
+        const iy = oy + ky * dil;
         if (iy < 0 || iy >= H!) continue;
         for (let kx = 0; kx < kw!; kx++) {
-          const ix = ox + kx;
+          const ix = ox + kx * dil;
           if (ix < 0 || ix >= W!) continue;
           const xo = (img + iy * W! + ix) * C!;
           const ko = (ky * kw! + kx) * C!;

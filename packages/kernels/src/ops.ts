@@ -27,6 +27,7 @@ import {
   attnProbsSpec,
   blockAttentionSpec,
   conv2dSpec,
+  conv2dNarrowSpec,
   groupNormSpec,
   nearestAddSpec,
   bboxAttentionSpec,
@@ -466,8 +467,13 @@ export function blockAttention(ctx: Ctx, q: Tensor, k: Tensor, v: Tensor, s: { T
   return out;
 }
 
-/** Output side of a convolution or pooling window. */
-export const convOut = (n: number, k: number, stride: number, pad: number): number => Math.floor((n + 2 * pad - k) / stride) + 1;
+/** Output side of a convolution or pooling window (torch's rule; `ceil` as MaxPool2d's ceil_mode, the last window starting inside the input or its left padding). */
+export const convOut = (n: number, k: number, stride: number, pad: number, dil = 1, ceil = false): number => {
+  const span = n + 2 * pad - dil * (k - 1) - 1;
+  if (!ceil) return Math.floor(span / stride) + 1;
+  const out = Math.ceil(span / stride) + 1;
+  return (out - 1) * stride >= n + pad ? out - 1 : out;
+};
 
 /**
  * 2-D convolution of an image x [H·W, C] (raster order, channels last, C a multiple of 4) with
@@ -475,21 +481,26 @@ export const convOut = (n: number, k: number, stride: number, pad: number): numb
  * [Ho·Wo, O] = bias + conv (+ residual), then ReLU with `relu`; `reluIn` applies ReLU to the input
  * as it is read; `n` images stacked in x convolve as one batch (see conv2dSpec).
  */
-export function conv2d(ctx: Ctx, x: Tensor, w: Tensor, bias: Tensor, o: { H: number; W: number; k: number; stride: number; pad: number; relu?: boolean; reluIn?: boolean; residual?: Tensor; n?: number }): { y: Tensor; H: number; W: number } {
+export function conv2d(ctx: Ctx, x: Tensor, w: Tensor, bias: Tensor, o: { H: number; W: number; k: number; stride: number; pad: number; relu?: boolean; reluIn?: boolean; residual?: Tensor; n?: number; dilation?: number }): { y: Tensor; H: number; W: number } {
   const C = lastDim(x);
   const [O, K] = w.shape as [number, number];
   const n = o.n ?? 1;
   if (C % 4 !== 0 || numel(x.shape) !== n * o.H * o.W * C) throw new Error(`conv2d: [${x.shape}] is not ${n} ${o.H}×${o.W} image(s) with a multiple of 4 channels`);
   if (K !== Math.ceil((o.k * o.k * C) / 32) * 32) throw new Error(`conv2d: weight [${w.shape}] does not fit ${o.k}×${o.k} taps of ${C} channels`);
-  const Ho = convOut(o.H, o.k, o.stride, o.pad);
-  const Wo = convOut(o.W, o.k, o.stride, o.pad);
+  const dil = o.dilation ?? 1;
+  const Ho = convOut(o.H, o.k, o.stride, o.pad, dil);
+  const Wo = convOut(o.W, o.k, o.stride, o.pad, dil);
   const M = n * Ho * Wo;
   const y = ctx.alloc([M, O]);
   const groups = Math.ceil(O / 64);
-  const params = ctx.uniform([o.H, o.W, C, O, Ho, Wo, o.k, o.k, o.stride, o.pad, K, M, n, 0, 0, 0].map(u32));
+  const params = ctx.uniform([o.H, o.W, C, O, Ho, Wo, o.k, o.k, o.stride, o.pad, K, M, n, dil, 0, 0].map(u32));
   const bufs = [params, x.buf, w.buf, bias.buf];
   if (o.residual) bufs.push(o.residual.buf);
   bufs.push(y.buf);
+  if (O <= 4 && !o.reluIn) {
+    ctx.run(conv2dNarrowSpec({ relu: !!o.relu, residual: !!o.residual }), bufs, grid1d(M), `conv2d narrow ${o.k}x${o.k}/${o.stride} ${C}→${O}`);
+    return { y, H: Ho, W: Wo };
+  }
   ctx.run(conv2dSpec({ relu: !!o.relu, residual: !!o.residual, reluIn: !!o.reluIn }), bufs, [Math.min(groups, MM_SLICE), Math.ceil(M / 64), Math.ceil(groups / MM_SLICE)], `conv2d ${o.k}x${o.k}/${o.stride} ${C}→${O}`);
   return { y, H: Ho, W: Wo };
 }
@@ -540,11 +551,11 @@ export function convTranspose(ctx: Ctx, x: Tensor, w: Tensor, bias: Tensor, o: {
   return { y, H: o.H * o.f, W: o.W * o.f };
 }
 
-/** k × k max pooling of an image x [H·W, C] → [Ho·Wo, C]. */
-export function maxPool2d(ctx: Ctx, x: Tensor, o: { H: number; W: number; k: number; stride: number; pad: number }): { y: Tensor; H: number; W: number } {
+/** k × k max pooling of an image x [H·W, C] → [Ho·Wo, C] (`ceil`: MaxPool2d's ceil_mode, partial windows at the edge kept). */
+export function maxPool2d(ctx: Ctx, x: Tensor, o: { H: number; W: number; k: number; stride: number; pad: number; ceil?: boolean }): { y: Tensor; H: number; W: number } {
   const C = lastDim(x);
-  const Ho = convOut(o.H, o.k, o.stride, o.pad);
-  const Wo = convOut(o.W, o.k, o.stride, o.pad);
+  const Ho = convOut(o.H, o.k, o.stride, o.pad, 1, o.ceil);
+  const Wo = convOut(o.W, o.k, o.stride, o.pad, 1, o.ceil);
   const y = ctx.alloc([Ho * Wo, C]);
   ctx.run(maxPool2dSpec(), [ctx.uniform([o.H, o.W, C, Ho, Wo, o.k, o.stride, o.pad].map(u32)), x.buf, y.buf], grid1d(Ho * Wo * C));
   return { y, H: Ho, W: Wo };

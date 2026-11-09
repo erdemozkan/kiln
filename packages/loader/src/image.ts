@@ -94,7 +94,8 @@ const clip8 = (v: number) => {
  */
 export function resizeImage(img: RgbImage, width: number, height: number, resample = 2): RgbImage {
   const C = img.data.length / (img.width * img.height);
-  if (C !== 3 && C !== 4) throw new Error("image data must be RGB or RGBA bytes");
+  // One channel too: greyscale (PIL's "L") resamples the same way, e.g. a mask.
+  if (C !== 1 && C !== 3 && C !== 4) throw new Error("image data must be grey, RGB or RGBA bytes");
   if (width === img.width && height === img.height) return { width, height, data: Uint8Array.from(img.data) };
   if (resample === 0) {
     // PIL's nearest: source pixel floor((x + 0.5) · scale).
