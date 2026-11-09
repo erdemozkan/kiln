@@ -115,7 +115,13 @@ const out = await transcriber(audio, { return_timestamps: true, chunk_length_s: 
 ```
 
 Audio longer than 30 s is chunked in 30 s windows (5 s overlap each side) even without
-`chunk_length_s`. Word-level timestamps (`return_timestamps: "word"`) are not supported yet.
+`chunk_length_s`. Word-level timestamps work too, computed as transformers.js computes them (from
+the cross-attention of the model's alignment heads), with no special export needed:
+
+```js
+const out = await transcriber(audio, { return_timestamps: "word" });
+// { text, chunks: [{ text: " And", timestamp: [0.76, 1.06] }, { text: " so", timestamp: [1.06, 1.44] }, ...] }
+```
 
 wav2vec2 and HuBERT CTC models work in the same pipeline (Kiln reads the model's config to tell them
 from Whisper), and their sequence classifiers run `audio-classification`:

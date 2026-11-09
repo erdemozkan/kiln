@@ -362,10 +362,13 @@ export interface SpeechRecognitionOptions {
   chunk_length_s?: number;
   /** Overlap on each side of a window in seconds (default chunk_length_s / 6). */
   stride_length_s?: number;
-  /** true: also return `chunks`, segments with [start, end] times in seconds. */
-  return_timestamps?: boolean;
+  /**
+   * true: also return `chunks`, segments with [start, end] times in seconds. "word": `chunks` are words
+   * with [start, end] times, aligned through the model's cross-attention (Whisper only).
+   */
+  return_timestamps?: boolean | "word";
 }
-/** A transcribed segment (with `return_timestamps: true`). */
+/** A transcribed segment (with `return_timestamps: true`), or a word (with `return_timestamps: "word"`). */
 export interface SpeechChunk {
   timestamp: [number | null, number | null];
   text: string;

@@ -76,3 +76,34 @@ describe("speech front-end kernels (CPU)", () => {
     for (let i = 0; i < 10; i++) expect(y[i]).toBeCloseTo(0.25 * a[i]! + 0.75 * b[i]!, 6);
   });
 });
+
+describe("attention probabilities (CPU)", () => {
+  it("attnProbs writes softmax(q·K) of the selected heads at the step's row", async () => {
+    const be = new CpuBackend({ simd: false });
+    const step = be.alloc(STEP_BYTES);
+    be.write(step, 0, packStep({ pos0: 2, lastRow: 0, seed: 1, temperature: 0 }));
+    const [S, H, D] = [9, 3, 4];
+    const q = Float32Array.from({ length: H * D }, (_, i) => Math.sin(i));
+    const k = Float32Array.from({ length: S * H * D }, (_, i) => Math.cos(i * 0.7));
+    const qb = be.alloc(q.byteLength);
+    be.write(qb, 0, q);
+    const kb = be.alloc(k.byteLength);
+    be.write(kb, 0, k);
+    const nSlots = 3;
+    const out = be.alloc(4 * nSlots * S * 4);
+    const ctx = new Ctx(be, step, "t");
+    ops.attnProbs(ctx, { shape: [1, H * D], dtype: "f32", buf: qb }, kb, out, { S, H, D, mask: 0b101, scale: 0.5, slotBase: 1, nSlots });
+    be.submit(ctx.dispatches);
+    const y = new Float32Array(await be.readback(out, 0, 4 * nSlots * S * 4));
+    [0, 2].forEach((h, i) => {
+      const s = Array.from({ length: S }, (_, j) => {
+        let d = 0;
+        for (let e = 0; e < D; e++) d += q[h * D + e]! * k[j * H * D + h * D + e]!;
+        return d * 0.5;
+      });
+      const m = Math.max(...s);
+      const z = s.reduce((a, v) => a + Math.exp(v - m), 0);
+      for (let j = 0; j < S; j++) expect(y[(2 * nSlots + 1 + i) * S + j]).toBeCloseTo(Math.exp(s[j]! - m) / z, 6);
+    });
+  });
+});

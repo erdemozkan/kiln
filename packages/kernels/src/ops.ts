@@ -24,6 +24,7 @@ import {
   groupConv1dSpec,
   scaleAddSpec,
   pickLogitSpec,
+  attnProbsSpec,
   type Activation,
   layernormSpec,
   gatedActSpec,
@@ -428,6 +429,25 @@ export function groupConv1d(ctx: Ctx, x: Tensor, w: Tensor, bias: Tensor, o: { k
 /** out[1] = logits[out[0]] (as f32 bits): the chosen token's logit, after sample(). */
 export function pickLogit(ctx: Ctx, logits: Tensor, out: Buf): void {
   ctx.run(pickLogitSpec(), [logits.buf, out], [1, 1, 1]);
+}
+
+/**
+ * Attention probabilities of the heads set in `mask` for the query row q [1, H·D] against keys
+ * kc [S, H·D], into out rows (step.pos0 · nSlots + slotBase + i) of S floats. Dispatches labelled
+ * "attn_probs" so a plan can be replayed with or without them.
+ */
+export function attnProbs(ctx: Ctx, q: Tensor, kc: Buf, out: Buf, s: { S: number; H: number; D: number; mask: number; scale: number; slotBase: number; nSlots: number }): void {
+  const n = popcount(s.mask);
+  if (!n) return;
+  if (s.H > 32) throw new Error(`attnProbs: at most 32 heads, got ${s.H}`);
+  const params = ctx.uniform([u32(s.S), u32(s.D), u32(s.H * s.D), u32(s.mask), f32(s.scale), u32(s.slotBase), u32(s.nSlots), u32(0)]);
+  ctx.run(attnProbsSpec(), [params, ctx.step, q.buf, kc, out], [1, n, 1]);
+}
+
+function popcount(m: number): number {
+  let n = 0;
+  for (let v = m >>> 0; v; v &= v - 1) n++;
+  return n;
 }
 
 /** y = a·x, or y += a·x when accumulating (same element count). */

@@ -250,6 +250,8 @@ interface Pair {
   /** Whisper: the log-mel input [frames, mels]. */
   feats?: Buf;
   dec: { ctx: Ctx; dispatches: readonly Dispatch[]; logits: Tensor };
+  /** The decoder plan with the alignment heads' cross-attention recorded (see enableAlignment). */
+  decAlign?: readonly Dispatch[];
   /** Cross-attention K/V per decoder layer, written by the encoder plan. */
   crossK: Buf[];
   crossV: Buf[];
@@ -273,6 +275,12 @@ export class Seq2SeqModel {
   private readonly sampler: DecoderSampler;
   /** Longest target, in tokens. */
   readonly maxTarget: number;
+  /** Cross-attention heads [layer, head] whose weights the decoder records, and where. */
+  private alignHeads: [number, number][] = [];
+  private align: Buf | undefined;
+  private alignS = 0;
+  /** Whether next/nextDetail/step record the alignment heads (enableAlignment first). */
+  recordAlignment = false;
 
   constructor(
     readonly backend: Backend,
@@ -400,7 +408,19 @@ export class Seq2SeqModel {
         ops.kvWrite(dctx, this.lin(dctx, h, `${p}.k`), this.lin(dctx, h, `${p}.v`), this.selfK[l]!, this.selfV[l]!, 1, this.maxTarget, "f32");
         return ops.attention(dctx, q, this.selfK[l]!, this.selfV[l]!, self);
       }, `${p}.o`);
-      y = this.block(dctx, y, `${p}.lnc`, (h) => ops.attention(dctx, this.lin(dctx, h, `${p}.cq`), crossK[l]!, crossV[l]!, cross), `${p}.co`);
+      y = this.block(dctx, y, `${p}.lnc`, (h) => {
+        const q = this.lin(dctx, h, `${p}.cq`);
+        const out = ops.attention(dctx, q, crossK[l]!, crossV[l]!, cross);
+        let mask = 0;
+        let slotBase = -1;
+        this.alignHeads.forEach(([al, ah], i) => {
+          if (al !== l) return;
+          mask |= 1 << ah;
+          if (slotBase < 0) slotBase = i;
+        });
+        if (mask && this.align && S === this.alignS) ops.attnProbs(dctx, q, crossK[l]!, this.align, { S, H: c.decHeads, D: Dd, mask, scale: Dd ** -0.5, slotBase, nSlots: this.alignHeads.length });
+        return out;
+      }, `${p}.co`);
       y = this.ffn(dctx, y, p);
     }
     if (c.preNorm) y = this.ln(dctx, y, "dec.lnF");
@@ -408,11 +428,14 @@ export class Seq2SeqModel {
     const logits = ops.linear(dctx, y, head, { bias: this.weights.get("flb") });
     ops.sample(dctx, logits, this.sampler.out, this.sampler.seen, this.sampler.allowed);
     ops.pickLogit(dctx, logits, this.sampler.out);
+    const all = dctx.dispatches;
+    const plain = all.filter((x) => x.label !== "attn_probs");
     return {
       S,
       feats,
       enc: { ctx: ectx, dispatches: ectx.dispatches, step, ids, pos, kc, vc },
-      dec: { ctx: dctx, dispatches: dctx.dispatches, logits },
+      dec: { ctx: dctx, dispatches: plain, logits },
+      decAlign: plain.length < all.length ? all : undefined,
       crossK,
       crossV,
     };
@@ -467,7 +490,7 @@ export class Seq2SeqModel {
     be.write(this.tok, 0, Uint32Array.of(token));
     be.write(this.posBuf, 0, Uint32Array.of(t + this.cfg.posOffset));
     be.write(this.decStep, 0, packStep({ pos0: t, lastRow: 0, seed: 0, temperature: 0 }));
-    be.submit(pair.dec.dispatches);
+    be.submit(this.decPlan(pair));
     return new Float32Array(await be.readback(physical(pair.dec.logits.buf), 0, this.cfg.vocab * 4));
   }
 
@@ -482,7 +505,7 @@ export class Seq2SeqModel {
     be.write(this.tok, 0, Uint32Array.of(token));
     be.write(this.posBuf, 0, Uint32Array.of(t + this.cfg.posOffset));
     be.write(this.decStep, 0, packStep({ pos0: t, lastRow: 0, seed: 0, temperature: 0, repetitionPenalty: rep }));
-    be.submit(pair.dec.dispatches);
+    be.submit(this.decPlan(pair));
     return this.sampler.read();
   }
 
@@ -500,7 +523,7 @@ export class Seq2SeqModel {
     be.write(this.tok, 0, Uint32Array.of(token));
     be.write(this.posBuf, 0, Uint32Array.of(t + this.cfg.posOffset));
     be.write(this.decStep, 0, packStep({ pos0: t, lastRow: 0, seed: 0, temperature: 0 }));
-    be.submit(pair.dec.dispatches);
+    be.submit(this.decPlan(pair));
     const V = this.cfg.vocab;
     const [out, tail] = await Promise.all([
       be.readback(this.sampler.out, 0, 8),
@@ -508,6 +531,36 @@ export class Seq2SeqModel {
     ]);
     const u = new Uint32Array(out);
     return { id: u[0]!, logit: new Float32Array(out)[1]!, tail: tail ? new Float32Array(tail) : undefined };
+  }
+
+  private decPlan(pair: Pair): readonly Dispatch[] {
+    return this.recordAlignment && pair.decAlign ? pair.decAlign : pair.dec.dispatches;
+  }
+
+  /**
+   * Makes the decoder able to record the cross-attention weights of `heads` ([layer, head], in the order
+   * alignment() returns them) for source length S. Plans built before are rebuilt.
+   */
+  enableAlignment(heads: readonly (readonly [number, number])[], S: number): void {
+    const c = this.cfg;
+    for (const [l, h] of heads) {
+      if (l < 0 || l >= c.decLayers || h < 0 || h >= c.decHeads || h >= 32) throw new Error(`seq2seq: alignment head [${l}, ${h}] is out of range`);
+    }
+    const same = this.align && this.alignS === S && heads.length === this.alignHeads.length && heads.every(([l, h], i) => this.alignHeads[i]![0] === l && this.alignHeads[i]![1] === h);
+    if (same) return;
+    if (this.align) this.backend.free(this.align);
+    this.alignHeads = heads.map(([l, h]) => [l, h]);
+    this.alignS = S;
+    this.align = heads.length ? this.backend.alloc(this.maxTarget * heads.length * S * 4, "storage", "seq2seq/align") : undefined;
+    for (const p of this.pairs.values()) this.dropPair(p);
+    this.pairs.clear();
+  }
+
+  /** Recorded alignment weights of decoder positions 0..rows-1: [rows, heads, S]. */
+  async alignment(rows: number): Promise<Float32Array> {
+    if (!this.align) throw new Error("seq2seq: enableAlignment first");
+    const n = this.alignHeads.length * this.alignS;
+    return new Float32Array(await this.backend.readback(this.align, 0, rows * n * 4));
   }
 
   private dropPair(p: Pair): void {
@@ -528,5 +581,6 @@ export class Seq2SeqModel {
     this.pool.destroy();
     this.sampler.destroy();
     for (const b of [this.decStep, this.crossStep, this.tok, this.posBuf, ...this.selfK, ...this.selfV]) this.backend.free(b);
+    if (this.align) this.backend.free(this.align);
   }
 }

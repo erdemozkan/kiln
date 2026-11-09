@@ -1740,6 +1740,66 @@ fn main() {
 }`);
 }
 
+/**
+ * Attention probabilities of selected heads for one query row: softmax(q_h · K_h^T · scale) over S keys,
+ * written to out[(st.pos0 · nSlots + slotBase + i) · S + j] for the i-th head set in `mask`. Whisper's
+ * word timestamps align tokens to audio through these cross-attention weights.
+ */
+export function attnProbsSpec(): KernelSpec {
+  return spec("attn_probs", ["uniform", "read", "read", "read", "rw"], cpu.cpuAttnProbs, () => /* wgsl */ `
+${STEP_WGSL}
+struct P { S: u32, D: u32, row: u32, mask: u32, scale: f32, slotBase: u32, nSlots: u32, _a: u32 }
+@group(0) @binding(0) var<uniform> p: P;
+@group(0) @binding(1) var<storage, read> st: Step;
+@group(0) @binding(2) var<storage, read> q: array<f32>;
+@group(0) @binding(3) var<storage, read> k: array<f32>;
+@group(0) @binding(4) var<storage, read_write> out: array<f32>;
+var<workgroup> red: array<f32, 256>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+  var h = 0u;
+  var seen = 0u;
+  for (var b = 0u; b < 32u; b++) {
+    if (((p.mask >> b) & 1u) == 1u) {
+      if (seen == wg.y) { h = b; }
+      seen++;
+    }
+  }
+  let base = (st.pos0 * p.nSlots + p.slotBase + wg.y) * p.S;
+  var m = -3.4e38;
+  for (var j = lid.x; j < p.S; j += 256u) {
+    var s = 0.0;
+    for (var d = 0u; d < p.D; d++) { s += q[h * p.D + d] * k[j * p.row + h * p.D + d]; }
+    s *= p.scale;
+    out[base + j] = s;
+    m = max(m, s);
+  }
+  red[lid.x] = m;
+  workgroupBarrier();
+  for (var w = 128u; w > 0u; w >>= 1u) {
+    if (lid.x < w) { red[lid.x] = max(red[lid.x], red[lid.x + w]); }
+    workgroupBarrier();
+  }
+  let mx = red[0];
+  workgroupBarrier();
+  var sum = 0.0;
+  for (var j = lid.x; j < p.S; j += 256u) {
+    let e = exp(out[base + j] - mx);
+    out[base + j] = e;
+    sum += e;
+  }
+  red[lid.x] = sum;
+  workgroupBarrier();
+  for (var w = 128u; w > 0u; w >>= 1u) {
+    if (lid.x < w) { red[lid.x] += red[lid.x + w]; }
+    workgroupBarrier();
+  }
+  let inv = 1.0 / red[0];
+  for (var j = lid.x; j < p.S; j += 256u) { out[base + j] *= inv; }
+}`);
+}
+
 /** y = a·x (accumulate 0) or y += a·x (accumulate 1), elementwise. */
 export function scaleAddSpec(): KernelSpec {
   return spec("scale_add", ["uniform", "read", "rw"], cpu.cpuScaleAdd, () => /* wgsl */ `

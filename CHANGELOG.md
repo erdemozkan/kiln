@@ -34,7 +34,9 @@ features as transformers computes them, convolutions as matmuls, transformers.js
 and token suppression, `language` / `task` options, audio from samples, URLs, Blobs or bytes;
 segment timestamps (`return_timestamps: true`, with transformers' timestamp rule and seek loop) and
 overlapping `chunk_length_s` / `stride_length_s` windows merged as transformers.js merges them (by
-default for audio past 30 s).
+default for audio past 30 s); word timestamps (`return_timestamps: "word"`) from the alignment heads'
+cross-attention, recorded on the GPU during decoding, with transformers.js's dynamic time warping
+and word grouping.
 
 **Speech encoders.** wav2vec2 and HuBERT from safetensors or `pytorch_model.bin`: CTC
 `automatic-speech-recognition` (the pipeline picks Whisper or CTC from the config) and

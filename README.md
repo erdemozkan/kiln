@@ -520,6 +520,7 @@ K/V; each decoder step reads them through a step block whose span covers every p
 | T5 (`google/flan-t5-small`) | an independent NumPy forward pass over the safetensors; transformers.js | logits within 7.8e-6 over 9 steps, outputs identical to both |
 | NLLB (`facebook/nllb-200-distilled-600M`, q8) | by hand | "La maison est merveilleuse. J'aimerais l'acheter, mais elle est trop chère." |
 | Whisper (`openai/whisper-tiny.en`, `whisper-tiny`, `whisper-base`) | transformers.js (`Xenova/whisper-*`, fp32) | the JFK clip transcribed to the same text by all three; log-mel features within 1.2e-7 of transformers.js's |
+| Whisper word timestamps (`whisper-tiny.en`, `whisper-base`) | transformers.js (`onnx-community/whisper-*_timestamped`, fp32) | the same words and start / end times in all six runs (single window, 30 s chunks, 10 s chunks) |
 | wav2vec2 CTC (`facebook/wav2vec2-base-960h`) | an independent NumPy (float64) forward pass over the safetensors; transformers.js | logits within 6.3e-4 on all 549 frames of the JFK clip, the same token in every frame; transformers.js (fp32 WebGPU) printed "FELOW" for "FELLOW" (two L frames three blank frames apart) |
 | wav2vec2 large (`facebook/wav2vec2-large-robust-ft-libri-960h`: LayerNorm front end, pre-LayerNorm layers) | the NumPy forward pass | logits within 3.1e-4 over 149 frames, the same token in every frame |
 | wav2vec2 classifier (`superb/wav2vec2-base-superb-ks`, weighted layer sum) | transformers.js (`Xenova/wav2vec2-base-superb-ks`, fp32) | the same five labels, scores within 2e-7 |
@@ -540,8 +541,17 @@ the first 30 s unless `chunk_length_s` is set). Against transformers.js with whi
 whisper-base on the JFK clip, once alone and three times back to back (33 s): the same text,
 segments and timestamps in all eight runs (timestamps, 30 s chunks, both, 10 s chunks with
 timestamps); 1.6–4.6 s a case against 5.4–16.4 s for tiny.en, 2.4–7.4 s against 9.1–27.4 s for base
-(one warm call each, backgrounded pane). Not yet: word-level timestamps, and a stable
-speed measurement (runs in a backgrounded browser pane varied 5× between
+(one warm call each, backgrounded pane). `return_timestamps: "word"` returns words (`chunks: [{
+text, timestamp: [start, end] }]`) timed as transformers.js times them: the decoder records the
+cross-attention weights of the model's `alignment_heads` at each step (one small kernel per layer,
+left out of the plan when words are not asked for), and after the pass they are normalized over
+tokens, median-filtered over time, averaged over heads and aligned to the audio frames by dynamic
+time warping; tokens are grouped into words with punctuation attached (per character for Chinese,
+Japanese, Thai, Lao and Burmese when `language` names them, as transformers does; transformers.js's
+pipeline always splits on spaces). Against transformers.js's
+`_timestamped` exports of the same two models: the same words and times in all six runs (the 11 s
+clip, the 33 s clip in 30 s chunks, 10 s chunks); 1.4–4.6 s a case against 4.1–14.2 s for tiny.en,
+2.2–6.8 s against 6.4–21.2 s for base. Not yet: a stable speed measurement (runs in a backgrounded browser pane varied 5× between
 calls; Kiln took 6.6–7.3 s for the 11 s clip against 10.5–18 s for transformers.js there). Encoder-
 decoder decoding picks each token on the backend with the LLM engine's sampling kernel (greedy,
 under a banned-token mask built from the logits processors), so a step reads back 4 bytes instead

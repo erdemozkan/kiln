@@ -710,6 +710,32 @@ export const cpuPickLogit: CpuKernel = (b) => {
   b[1]!.f32[1] = b[0]!.f32[b[1]!.u32[0]!]!;
 };
 
+export const cpuAttnProbs: CpuKernel = (b) => {
+  const u = b[0]!.u32;
+  const [S, D, row, mask] = [u[0]!, u[1]!, u[2]!, u[3]!];
+  const scale = b[0]!.f32[4]!;
+  const [slotBase, nSlots] = [u[5]!, u[6]!];
+  const { pos0 } = step(b[1]!);
+  const q = b[2]!.f32;
+  const k = b[3]!.f32;
+  const out = b[4]!.f32;
+  let i = 0;
+  for (let h = 0; h < 32; h++) {
+    if (!((mask >>> h) & 1)) continue;
+    const base = (pos0 * nSlots + slotBase + i++) * S;
+    let m = -Infinity;
+    for (let j = 0; j < S; j++) {
+      let s = 0;
+      for (let d = 0; d < D; d++) s += q[h * D + d]! * k[j * row + h * D + d]!;
+      out[base + j] = s * scale;
+      m = Math.max(m, out[base + j]!);
+    }
+    let sum = 0;
+    for (let j = 0; j < S; j++) sum += out[base + j] = Math.exp(out[base + j]! - m);
+    for (let j = 0; j < S; j++) out[base + j] = out[base + j]! / sum;
+  }
+};
+
 export const cpuScaleAdd: CpuKernel = (b) => {
   const [n, accumulate] = [b[0]!.u32[0]!, b[0]!.u32[1]!];
   const a = b[0]!.f32[2]!;
