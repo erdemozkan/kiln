@@ -1,11 +1,11 @@
-// Image models from transformers checkpoints (ViT, DeiT, CLIP, YOLOS, DETR, Depth Anything, RMBG, SegFormer,
-// Swin2SR):
+// Image models from transformers checkpoints (ViT, DeiT, DINOv2, CLIP, ResNet, ConvNeXt, YOLOS, DETR, Depth
+// Anything, RMBG, SegFormer, Swin2SR):
 // image classification, image features, zero-shot classification, object detection, panoptic
 // segmentation, depth estimation, background removal and super-resolution, with transformers' image preprocessing
 // (PIL-exact resizing).
 import type { Backend, Tensor } from "@kiln/core";
 import { fetchJSON, fileUrl, listRepoFiles, parseModelId, preprocessImage, resizeImage, readPytorchHeader, readSafetensorsHeader, toF32, weightFiles, type ByteSource, type ImageProcessorConfig, type RgbImage, type TensorEntry } from "@kiln/loader";
-import { ClipTextModel, SWIN2SR_MEAN, Swin2srModel, swin2srBias, swin2srConfigFromHF, DETR_IN_CHANNELS, DepthAnythingModel, ISNET_IN_CHANNELS, IsNetModel, SEGFORMER_IN_CHANNELS, SegformerModel, isnetConvs, segformerConfigFromHF, segformerName, type SegformerConfig, DetrModel, VitModel, bicubicResize, convMatrix, convTransposeMatrix, depthConfigFromHF, depthName, detrConfigFromHF, detrName, dinov2Positions, foldConvBn, clipPoolIndex, clipTextConfigFromHF, clipTextName, vitConfigFromHF, vitGrid, vitName, vitPatchK, type DepthAnythingConfig, type DetrConfig, type VitConfig, type VitEmbeddings } from "@kiln/models";
+import { ClipTextModel, ConvNetModel, convNetConfigFromHF, convNetConvs, convNextName, type ConvNetConfig, SWIN2SR_MEAN, Swin2srModel, swin2srBias, swin2srConfigFromHF, DETR_IN_CHANNELS, DepthAnythingModel, ISNET_IN_CHANNELS, IsNetModel, SEGFORMER_IN_CHANNELS, SegformerModel, isnetConvs, segformerConfigFromHF, segformerName, type SegformerConfig, DetrModel, VitModel, bicubicResize, convMatrix, convTransposeMatrix, depthConfigFromHF, depthName, detrConfigFromHF, detrName, dinov2Positions, foldConvBn, clipPoolIndex, clipTextConfigFromHF, clipTextName, vitConfigFromHF, vitGrid, vitName, vitPatchK, type DepthAnythingConfig, type DetrConfig, type VitConfig, type VitEmbeddings } from "@kiln/models";
 import { ClipTokenizer, type ClipTokenizerJSON } from "@kiln/tokenizers";
 import { openBackend, openParsed } from "./load";
 import { loadWeights, type LoadProgress, type WeightFile } from "./weights";
@@ -145,6 +145,7 @@ export class VisionEngine {
     private readonly matte?: IsNetModel,
     private readonly semantic?: { cfg: SegformerConfig; model: SegformerModel },
     private readonly sr?: Swin2srModel,
+    private readonly convnet?: { cfg: ConvNetConfig; model: ConvNetModel; head: Head; norm?: { w: Float32Array; b: Float32Array; eps: number }; labels: string[] },
   ) {}
 
   get cfg(): VitConfig {
@@ -161,6 +162,10 @@ export class VisionEngine {
   summary(): { family: string; layers: number; hiddenSize: number; imageSize: number; labels: Record<number, string> } {
     const labels = (l: string[]) => Object.fromEntries(l.map((v, i) => [i, v]));
     if (this.matte) return { family: "rmbg", layers: 0, hiddenSize: 0, imageSize: 1024, labels: {} };
+    if (this.convnet) {
+      const c = this.convnet.cfg;
+      return { family: c.kind, layers: c.depths.reduce((a, b) => a + b, 0), hiddenSize: c.hidden[c.hidden.length - 1]!, imageSize: 224, labels: Object.fromEntries(this.convnet.labels.map((v, i) => [i, v])) };
+    }
     if (this.sr) return { family: "swin2sr", layers: this.sr.cfg.depths.reduce((a, b) => a + b, 0), hiddenSize: this.sr.cfg.dim, imageSize: this.sr.cfg.gridSize, labels: {} };
     if (this.semantic) {
       const c = this.semantic.cfg;
@@ -230,6 +235,13 @@ export class VisionEngine {
     const S = this.cfg.imageSize;
     if (p.width !== S || p.height !== S) throw new Error(`the image processor made a ${p.width}×${p.height} image; the model takes ${S}×${S}`);
     return p.data;
+  }
+
+  /** The vision transformer's last hidden state for an image; DINOv2 takes any size (its embeddings follow the patch grid). */
+  private async hidden(img: RgbImage): Promise<Float32Array> {
+    if (this.cfg.modelType !== "dinov2") return this.model.forward(this.pixels(img));
+    const p = preprocessImage(img, this.processor);
+    return this.model.forward(p.data, p.width, p.height);
   }
 
   /**
@@ -469,11 +481,38 @@ export class VisionEngine {
     return { width: ow, height: oh, channels: 3, data };
   }
 
-  /** Class logits of an image (DeiT with a teacher: the mean of the CLS and distillation heads). */
+  /**
+   * Class logits of an image (DeiT with a teacher: the mean of the CLS and distillation heads; DINOv2:
+   * the head over [CLS, mean of the patch tokens]; ResNet: over the mean of the last feature map;
+   * ConvNeXt: over its LayerNorm).
+   */
   async logits(img: RgbImage): Promise<Float32Array> {
+    if (this.convnet) {
+      const c = this.convnet;
+      const p = preprocessImage(img, this.processor);
+      const f = await c.model.features(p.data, p.width, p.height);
+      const mean = new Float32Array(f.channels);
+      for (let ch = 0; ch < f.channels; ch++) {
+        let s = 0;
+        for (let r = 0; r < f.rows; r++) s += f.data[r * f.channels + ch]!;
+        mean[ch] = s / f.rows;
+      }
+      return applyHead(c.head, c.norm ? layerNorm(mean, c.norm.w, c.norm.b, c.norm.eps) : mean);
+    }
     if (!this.heads.cls) throw new Error("this model has no classification head");
-    const h = await this.model.forward(this.pixels(img));
+    const h = await this.hidden(img);
     const H = this.cfg.hidden;
+    if (this.cfg.modelType === "dinov2") {
+      const x = new Float32Array(2 * H);
+      x.set(h.subarray(0, H));
+      const T = h.length / H - 1;
+      for (let i = 0; i < H; i++) {
+        let s = 0;
+        for (let t = 1; t <= T; t++) s += h[t * H + i]!;
+        x[H + i] = s / T;
+      }
+      return applyHead(this.heads.cls, x);
+    }
     const y = applyHead(this.heads.cls, h.subarray(0, H));
     if (this.heads.distill) {
       const d = applyHead(this.heads.distill, h.subarray(H, 2 * H));
@@ -483,8 +522,9 @@ export class VisionEngine {
   }
 
   async classify(img: RgbImage, options: ImageClassificationOptions = {}): Promise<{ label: string; score: number }[]> {
-    return topLabels(await this.logits(img), this.cfg.labels, options.top_k ?? 5);
+    return topLabels(await this.logits(img), this.convnet?.labels ?? this.cfg.labels, options.top_k ?? 5);
   }
+
 
   /** The last hidden state [tokens, hidden], or with `pool` the pooled output [1, hidden]. */
   async features(img: RgbImage, options: ImageFeatureOptions = {}): Promise<{ data: Float32Array; dims: number[] }> {
@@ -492,9 +532,9 @@ export class VisionEngine {
       const e = await this.imageEmbed(img);
       return { data: e, dims: [1, e.length] };
     }
-    const h = await this.model.forward(this.pixels(img));
+    const h = await this.hidden(img);
     const H = this.cfg.hidden;
-    if (!options.pool) return { data: h, dims: [1, this.model.tokens, H] };
+    if (!options.pool) return { data: h, dims: [1, h.length / H, H] };
     if (!this.heads.pooler) throw new Error("this model has no pooler; call without `pool`");
     return { data: applyHead(this.heads.pooler, h.subarray(0, H)).map(Math.tanh), dims: [1, H] };
   }
@@ -506,6 +546,7 @@ export class VisionEngine {
     this.matte?.destroy();
     this.semantic?.model.destroy();
     this.sr?.destroy();
+    this.convnet?.model.destroy();
     this.clip?.text.destroy();
   }
 }
@@ -531,6 +572,7 @@ export async function createVision(modelId: string, opts: VisionLoadOptions = {}
   if (((config!.architectures as string[] | undefined) ?? []).includes("BriaRMBG")) return createRmbg(modelId, ref, prep, names, opts);
   if (config!.model_type === "segformer") return createSegformer(modelId, ref, config!, prep, names, opts);
   if (config!.model_type === "swin2sr") return createSwin2sr(modelId, ref, config!, prep, names, opts);
+  if (config!.model_type === "resnet" || config!.model_type === "convnext") return createConvNet(modelId, ref, config!, prep, names, opts);
   const cfg = vitConfigFromHF(config!);
   const clip = cfg.modelType === "clip";
   if (clip && config!.model_type !== "clip") throw new Error(`${modelId}: a CLIP vision tower alone; zero-shot classification needs the full CLIP model`);
@@ -543,8 +585,10 @@ export async function createVision(modelId: string, opts: VisionLoadOptions = {}
     for (const name of names.names) {
       const { source, header } = await openParsed(ref, name, ep, names.format === "safetensors" ? readSafetensorsHeader : readPytorchHeader);
       sources.push(source);
-      for (const t of header.tensors) located.set(t.name.replace(/^(vit|deit)\./, ""), { source, entry: t });
-      files.push({ name, source, tensors: header.tensors.filter((t) => vitName(t.name) !== undefined), rename: vitName });
+      for (const t of header.tensors) located.set(t.name.replace(/^(vit|deit|dinov2)\./, ""), { source, entry: t });
+      // DINOv2's output projections are loaded below, scaled by the layer scales.
+      const rename = cfg.modelType === "dinov2" ? (n: string) => (/attention\.output\.dense|mlp\.fc2/.test(n) ? undefined : vitName(n)) : vitName;
+      files.push({ name, source, tensors: header.tensors.filter((t) => vitName(t.name) !== undefined), rename });
     }
     const read = async (name: string) => {
       const t = located.get(name);
@@ -581,6 +625,33 @@ export async function createVision(modelId: string, opts: VisionLoadOptions = {}
     let embeddings: ((gh: number, gw: number) => VitEmbeddings) | undefined;
     if (cfg.detTokens) {
       embeddings = await yolosEmbeddings(cfg, need, read, v);
+    } else if (cfg.modelType === "dinov2") {
+      // Layer scale γ folded into the projection before it: γ ⊙ (W x + b).
+      for (let l = 0; l < cfg.layers; l++) {
+        for (const [from, gamma, to] of [["attention.output.dense", "layer_scale1.lambda1", "o"], ["mlp.fc2", "layer_scale2.lambda1", "down"]] as const) {
+          const [w, b, g] = await Promise.all([need(`encoder.layer.${l}.${from}.weight`), need(`encoder.layer.${l}.${from}.bias`), need(`encoder.layer.${l}.${gamma}`)]);
+          const [rows, cols] = w.shape as [number, number];
+          for (let r = 0; r < rows; r++) {
+            for (let c = 0; c < cols; c++) w.data[r * cols + c] = w.data[r * cols + c]! * g.data[r]!;
+            b.data[r] = b.data[r]! * g.data[r]!;
+          }
+          upload(`l${l}.${to}.weight`, [rows, cols], w.data);
+          upload(`l${l}.${to}.bias`, [rows], b.data);
+        }
+      }
+      // CLS first, then the patch grid's position embeddings fitted to the image (bicubic) plus the patch bias.
+      const pos = await need(v + "position_embeddings");
+      const cls = (await need(v + "cls_token")).data;
+      const pb = (await need(v + "patch_embeddings.projection.bias")).data;
+      const n0 = Math.round(Math.sqrt(pos.data.length / H - 1));
+      const grid = pos.data.subarray(H);
+      embeddings = (gh, gw) => {
+        const add = new Float32Array((1 + gh * gw) * H);
+        for (let i = 0; i < H; i++) add[i] = cls[i]! + pos.data[i]!;
+        add.set(gh === n0 && gw === n0 ? grid : dinov2Positions(grid, H, n0, gh, gw), H);
+        for (let t = 1; t <= gh * gw; t++) for (let i = 0; i < H; i++) add[t * H + i] += pb[i]!;
+        return { add };
+      };
     } else {
       // Constant addend: position embeddings, plus the CLS / distillation tokens on the prefix rows and
       // the patch bias on the rest.
@@ -1144,6 +1215,104 @@ async function createSwin2sr(
     await conv("upsample.final_convolution", "final");
     const processor: ImageProcessorConfig = prep ?? {};
     return new VisionEngine(backend, undefined, processor, {}, undefined, undefined, undefined, undefined, undefined, new Swin2srModel(backend, cfg, weights));
+  } finally {
+    for (const s of sources) s.close?.();
+  }
+}
+
+/**
+ * ResNet / ConvNeXt classifiers: ResNet's convolutions with their batch norms folded in (eps 1e-5),
+ * ConvNeXt's patchify, downsampling and depthwise convolutions reshaped for their kernels, its MLP
+ * matrices loaded as weights with the layer scale folded into the second; the classifier (and
+ * ConvNeXt's final LayerNorm) applied on the CPU to the pooled features.
+ */
+async function createConvNet(
+  modelId: string,
+  ref: ReturnType<typeof parseModelId>,
+  config: Record<string, unknown>,
+  prep: ImageProcessorConfig | undefined,
+  names: Awaited<ReturnType<typeof weightFiles>>,
+  opts: VisionLoadOptions,
+): Promise<VisionEngine> {
+  const cfg = convNetConfigFromHF(config);
+  if (!prep) throw new Error(`${modelId}: no preprocessor_config.json`);
+  const ep = opts.endpoint;
+  const backend = opts.backend ?? (await openBackend(opts.device ?? "auto", opts.cpuThreads));
+  const sources: ByteSource[] = [];
+  const located = new Map<string, { source: ByteSource; entry: TensorEntry }>();
+  try {
+    const files: WeightFile[] = [];
+    const rename = (n: string) => (cfg.kind === "convnext" && !/pwconv2/.test(n) ? convNextName(n) : undefined);
+    for (const name of names.names) {
+      const { source, header } = await openParsed(ref, name, ep, names.format === "safetensors" ? readSafetensorsHeader : readPytorchHeader);
+      sources.push(source);
+      for (const t of header.tensors) located.set(t.name, { source, entry: t });
+      files.push({ name, source, tensors: header.tensors.filter((t) => rename(t.name) !== undefined), rename });
+    }
+    const read = async (name: string) => {
+      const t = located.get(name);
+      if (!t) return undefined;
+      const count = t.entry.shape.reduce((a, b) => a * b, 1);
+      return { shape: t.entry.shape, data: toF32(t.entry.type as Parameters<typeof toF32>[0], await t.source.read(t.entry.offset, t.entry.byteLength), count) };
+    };
+    const need = async (name: string) => {
+      const t = await read(name);
+      if (!t) throw new Error(`${modelId}: "${name}" is missing`);
+      return t;
+    };
+    const weights = await loadWeights(backend, files, opts.quant ?? "f32", opts.onProgress);
+    const upload = (name: string, shape: number[], data: Float32Array) => {
+      const buf = backend.alloc(data.byteLength, "storage", `${cfg.kind}/${name}`);
+      backend.write(buf, 0, data);
+      weights.set(name, { shape, dtype: "f32", buf } as Tensor);
+    };
+    for (const c of convNetConvs(cfg)) {
+      if (c.kind === "dw") {
+        const w = await need(`${c.path}.weight`);
+        const [C, , k] = w.shape as [number, number, number];
+        const m = new Float32Array(k * k * C);
+        for (let ch = 0; ch < C; ch++) for (let t = 0; t < k * k; t++) m[t * C + ch] = w.data[ch * k * k + t]!;
+        upload(`${c.to}.weight`, [k * k, C], m);
+        upload(`${c.to}.bias`, [C], (await need(`${c.path}.bias`)).data);
+        continue;
+      }
+      if (c.kind === "conv") {
+        const w = await need(`${c.path}.weight`);
+        const m = convMatrix(w.data, w.shape, c.cp);
+        upload(`${c.to}.weight`, [w.shape[0]!, m.K], m.w);
+        upload(`${c.to}.bias`, [w.shape[0]!], (await need(`${c.path}.bias`)).data);
+        continue;
+      }
+      const w = await need(`${c.path}.convolution.weight`);
+      const [weight, bias, mean, variance] = await Promise.all(["weight", "bias", "running_mean", "running_var"].map((f) => need(`${c.path}.normalization.${f}`)));
+      const f = foldConvBn(w.data, w.shape, { weight: weight.data, bias: bias.data, mean: mean.data, var: variance.data }, c.cp);
+      upload(`${c.to}.weight`, [w.shape[0]!, f.K], f.w);
+      upload(`${c.to}.bias`, [w.shape[0]!], f.b);
+    }
+    let norm: { w: Float32Array; b: Float32Array; eps: number } | undefined;
+    if (cfg.kind === "convnext") {
+      for (let s = 0; s < cfg.hidden.length; s++)
+        for (let l = 0; l < cfg.depths[s]!; l++) {
+          const p = `convnext.encoder.stages.${s}.layers.${l}.`;
+          const [w, b] = await Promise.all([need(p + "pwconv2.weight"), need(p + "pwconv2.bias")]);
+          const g = await read(p + "layer_scale_parameter");
+          const [rows, cols] = w.shape as [number, number];
+          if (g)
+            for (let r = 0; r < rows; r++) {
+              for (let c = 0; c < cols; c++) w.data[r * cols + c] = w.data[r * cols + c]! * g.data[r]!;
+              b.data[r] = b.data[r]! * g.data[r]!;
+            }
+          upload(`s${s}.${l}.down.weight`, [rows, cols], w.data);
+          upload(`s${s}.${l}.down.bias`, [rows], b.data);
+        }
+      norm = { w: (await need("convnext.layernorm.weight")).data, b: (await need("convnext.layernorm.bias")).data, eps: cfg.eps };
+    }
+    const hw = (await read("classifier.1.weight")) ?? (await need("classifier.weight"));
+    const hb = (await read("classifier.1.bias")) ?? (await need("classifier.bias"));
+    const labels: string[] = [];
+    for (const [k, v] of Object.entries((config.id2label as Record<string, string> | undefined) ?? {})) labels[Number(k)] = v;
+    const model = new ConvNetModel(backend, cfg, weights);
+    return new VisionEngine(backend, undefined, prep, {}, undefined, undefined, undefined, undefined, undefined, undefined, { cfg, model, head: { w: hw.data, b: hb.data, out: hw.shape[0]! }, norm, labels });
   } finally {
     for (const s of sources) s.close?.();
   }

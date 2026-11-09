@@ -2255,12 +2255,12 @@ fn main(${EW_ARGS}) {
 }
 
 /**
- * Depthwise 3 × 3 convolution (groups = channels, stride 1, padding 1) of an image x [H·W, C]:
- * y[p, c] = bias[c] + Σ_taps x[p + tap, c] · w[tap, c], weight stored [9, C].
+ * Depthwise k × k convolution (groups = channels, stride 1, padding k / 2, k odd) of an image x [H·W, C]:
+ * y[p, c] = bias[c] + Σ_taps x[p + tap, c] · w[tap, c], weight stored [k·k, C].
  */
-export function dwConv3Spec(): KernelSpec {
-  return spec("dwconv3", ["uniform", "read", "read", "read", "rw"], cpu.cpuDwConv3, () => /* wgsl */ `
-struct P { H: u32, W: u32, C: u32, _a: u32 }
+export function dwConvSpec(): KernelSpec {
+  return spec("dwconv", ["uniform", "read", "read", "read", "rw"], cpu.cpuDwConv, () => /* wgsl */ `
+struct P { H: u32, W: u32, C: u32, k: u32 }
 @group(0) @binding(0) var<uniform> p: P;
 @group(0) @binding(1) var<storage, read> x: array<f32>;
 @group(0) @binding(2) var<storage, read> w: array<f32>;
@@ -2275,14 +2275,16 @@ fn main(${EW_ARGS}) {
   let t = idx / p.C;
   let py = i32(t / p.W);
   let px = i32(t % p.W);
+  let k = i32(p.k);
+  let half = k / 2;
   var s = bias[c];
-  for (var ky = 0; ky < 3; ky++) {
-    let iy = py + ky - 1;
+  for (var ky = 0; ky < k; ky++) {
+    let iy = py + ky - half;
     if (iy < 0 || iy >= i32(p.H)) { continue; }
-    for (var kx = 0; kx < 3; kx++) {
-      let ix = px + kx - 1;
+    for (var kx = 0; kx < k; kx++) {
+      let ix = px + kx - half;
       if (ix < 0 || ix >= i32(p.W)) { continue; }
-      s += x[(u32(iy) * p.W + u32(ix)) * p.C + c] * w[u32(ky * 3 + kx) * p.C + c];
+      s += x[(u32(iy) * p.W + u32(ix)) * p.C + c] * w[u32(ky * k + kx) * p.C + c];
     }
   }
   y[idx] = s;

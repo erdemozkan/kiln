@@ -908,19 +908,20 @@ export const cpuConvTranspose: CpuKernel = (b) => {
       }
 };
 
-export const cpuDwConv3: CpuKernel = (b) => {
-  const [H, W, C] = [b[0]!.u32[0]!, b[0]!.u32[1]!, b[0]!.u32[2]!];
+export const cpuDwConv: CpuKernel = (b) => {
+  const [H, W, C, k] = [b[0]!.u32[0]!, b[0]!.u32[1]!, b[0]!.u32[2]!, b[0]!.u32[3]!];
+  const half = Math.floor(k / 2);
   const [x, w, bias, y] = [b[1]!.f32, b[2]!.f32, b[3]!.f32, b[4]!.f32];
   for (let py = 0; py < H; py++)
     for (let px = 0; px < W; px++)
       for (let c = 0; c < C; c++) {
         let s = bias[c]!;
-        for (let ky = 0; ky < 3; ky++) {
-          const iy = py + ky - 1;
+        for (let ky = 0; ky < k; ky++) {
+          const iy = py + ky - half;
           if (iy < 0 || iy >= H) continue;
-          for (let kx = 0; kx < 3; kx++) {
-            const ix = px + kx - 1;
-            if (ix >= 0 && ix < W) s += x[(iy * W + ix) * C + c]! * w[(ky * 3 + kx) * C + c]!;
+          for (let kx = 0; kx < k; kx++) {
+            const ix = px + kx - half;
+            if (ix >= 0 && ix < W) s += x[(iy * W + ix) * C + c]! * w[(ky * k + kx) * C + c]!;
           }
         }
         y[(py * W + px) * C + c] = s;

@@ -276,7 +276,9 @@ export function preprocessImage(img: RgbImage, cfg: ImageProcessorConfig): { dat
   // Images go in as RGB (PIL's convert("RGB") drops alpha).
   let im = toRgb(img);
   if (cfg.do_resize !== false && cfg.size !== undefined) {
-    const s = cfg.size;
+    // An integer size on a shortest-edge processor is its shortest edge (get_size_dict with
+    // default_to_square=False), so ConvNeXt's crop_pct applies to it too.
+    const s = typeof cfg.size === "number" && SHORTEST_EDGE.test(kind) ? { shortest_edge: cfg.size } : cfg.size;
     let w: number;
     let h: number;
     if (typeof s === "number") {
@@ -287,6 +289,8 @@ export function preprocessImage(img: RgbImage, cfg: ImageProcessorConfig): { dat
       // ConvNeXt: below 384, resize to shortest_edge / crop_pct, then crop shortest_edge.
       if (cfg.crop_pct !== undefined && /ConvNext/.test(kind) && edge < 384) edge = Math.trunc(edge / cfg.crop_pct);
       if (/Yolos|Detr/.test(kind)) [w, h] = detrResizeSize(im.width, im.height, edge, s.longest_edge, /Yolos/.test(kind));
+      // ConvNeXt at 384 and above: straight to a square, no crop.
+      else if (/ConvNext/.test(kind) && edge >= 384) [w, h] = [edge, edge];
       else [w, h] = shortestEdge(im.width, im.height, edge, s.longest_edge);
     } else if (/DPT/.test(kind)) {
       [w, h] = dptResizeSize(im.width, im.height, s.width ?? s.height!, s.height ?? s.width!, cfg.keep_aspect_ratio === true, cfg.ensure_multiple_of ?? 1);

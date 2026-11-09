@@ -58,3 +58,15 @@ describe("DPT resize (keep_aspect_ratio, ensure_multiple_of)", () => {
     expect(dptResizeSize(640, 480, 384, 384, false, 1)).toEqual([384, 384]);
   });
 });
+
+describe("ConvNeXt-style preprocessing (crop_pct)", () => {
+  const img = { width: 300, height: 200, data: new Uint8Array(300 * 200 * 3).map((_, i) => i % 251) };
+  it("takes an integer size as the shortest edge: resize to size / crop_pct, then crop size × size", () => {
+    const p = preprocessImage(img, { feature_extractor_type: "ConvNextFeatureExtractor", size: 224, crop_pct: 0.875, resample: 3 });
+    expect([p.width, p.height]).toEqual([224, 224]);
+  });
+  it("goes straight to a square at 384 and above, with no crop", () => {
+    const p = preprocessImage(img, { image_processor_type: "ConvNextImageProcessor", size: { shortest_edge: 384 }, crop_pct: 0.875 });
+    expect([p.width, p.height]).toEqual([384, 384]);
+  });
+});

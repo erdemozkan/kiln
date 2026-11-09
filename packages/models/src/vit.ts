@@ -29,14 +29,15 @@ export interface VitConfig {
   labels: string[];
 }
 
-export const VIT_TYPES = new Set(["vit", "deit", "clip", "clip_vision_model", "yolos"]);
+export const VIT_TYPES = new Set(["vit", "deit", "clip", "clip_vision_model", "yolos", "dinov2"]);
 
 /** CLIPVisionConfig's defaults, for configs that leave fields out. */
 const CLIP_VISION_DEFAULTS = { hidden_size: 768, intermediate_size: 3072, num_hidden_layers: 12, num_attention_heads: 12, image_size: 224, patch_size: 32, hidden_act: "quick_gelu", layer_norm_eps: 1e-5 };
 
 export function vitConfigFromHF(config: Record<string, unknown>): VitConfig {
   const outer = String(config.model_type ?? "");
-  if (!VIT_TYPES.has(outer)) throw new UnsupportedModelError(`vision model type "${outer}" is not supported (ViT, DeiT, CLIP, YOLOS)`);
+  if (!VIT_TYPES.has(outer)) throw new UnsupportedModelError(`vision model type "${outer}" is not supported (ViT, DeiT, CLIP, YOLOS, DINOv2)`);
+  if (outer === "dinov2" && config.use_swiglu_ffn === true) throw new UnsupportedModelError("DINOv2 with a SwiGLU MLP is not supported");
   const clip = outer.startsWith("clip");
   const c: Record<string, unknown> = clip ? { ...CLIP_VISION_DEFAULTS, ...((outer === "clip" ? config.vision_config : config) as Record<string, unknown>) } : config;
   const type = clip ? "clip" : outer;
@@ -63,7 +64,8 @@ export function vitConfigFromHF(config: Record<string, unknown>): VitConfig {
     hidden: num("hidden_size"),
     layers: num("num_hidden_layers"),
     heads: num("num_attention_heads"),
-    intermediate: num("intermediate_size"),
+    // DINOv2 gives an MLP ratio instead.
+    intermediate: type === "dinov2" ? num("hidden_size") * num("mlp_ratio", 4) : num("intermediate_size"),
     imageSize: imageHW[0],
     imageHW,
     patchSize: num("patch_size", 16),
@@ -101,7 +103,7 @@ export function vitName(name: string): string | undefined {
     return m ? `lnPre.${m[1]}` : undefined;
   }
   if (/^(text_model|text_projection|visual_projection|logit_scale)/.test(name)) return undefined;
-  const n = name.replace(/^(vit|deit)\./, "");
+  const n = name.replace(/^(vit|deit|dinov2)\./, "");
   m = /^encoder\.layer\.(\d+)\.(.+)\.(weight|bias)$/.exec(n);
   if (m) {
     const part: Record<string, string> = {
@@ -113,6 +115,10 @@ export function vitName(name: string): string | undefined {
       "output.dense": "down",
       layernorm_before: "ln1",
       layernorm_after: "ln2",
+      // DINOv2 (its output projections are scaled by the layer scales when loaded, not here).
+      norm1: "ln1",
+      norm2: "ln2",
+      "mlp.fc1": "up",
     };
     const p = part[m[2]!];
     return p ? `l${m[1]}.${p}.${m[3]}` : undefined;

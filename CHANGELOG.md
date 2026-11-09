@@ -75,7 +75,10 @@ transformers.js's output (a mask per class present), a depthwise convolution ker
 resize and per-pixel best class fused into one kernel. Swin2SR (`caidas/swin2SR-classical-sr-x*`):
 `image-to-image` super-resolution with the width padded to a multiple of 32, a Swin V2
 shifted-window cosine attention kernel, pixel shuffle and a leaky-ReLU conv epilogue; LayerNorm
-takes many short rows 8 per workgroup.
+takes many short rows 8 per workgroup. Classifiers: ResNet (`microsoft/resnet-*`), ConvNeXt
+(`facebook/convnext-*`, 7×7 depthwise convolution) and DINOv2 (`facebook/dinov2-*-imagenet1k-*`,
+on the ViT code). Fixed: an integer `size` with `crop_pct` (ConvNeXt-style processors) now resizes
+and crops as transformers does; ConvNeXt at 384 and above resizes to a square.
 
 **Loading.** Reads ahead of a download in progress are fetched on their own instead of waiting
 (a `pytorch_model.bin` keeps its zip directory at the end, so large checkpoints showed no progress

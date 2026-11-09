@@ -408,26 +408,30 @@ describe("image convolution kernels (CPU)", () => {
         }
   });
 
-  it("dwConv3 is PyTorch's depthwise 3×3 convolution (groups = channels, padding 1)", async () => {
-    const [H, W, C] = [5, 4, 6];
-    const x = randn(H * W * C);
-    const wt = randn(C * 9); // [C, 1, 3, 3]
-    const w = new Float32Array(9 * C);
-    for (let c = 0; c < C; c++) for (let t = 0; t < 9; t++) w[t * C + c] = wt[c * 9 + t]!;
-    const bias = randn(C);
-    const y = await run((ctx) => ops.dwConv3(ctx, upload(x, [H * W, C]), upload(w, [9, C]), upload(bias, [C]), { H, W }), H * W * C);
-    for (let py = 0; py < H; py++)
-      for (let px = 0; px < W; px++)
-        for (let c = 0; c < C; c++) {
-          let s = bias[c]!;
-          for (let ky = 0; ky < 3; ky++)
-            for (let kx = 0; kx < 3; kx++) {
-              const iy = py + ky - 1;
-              const ix = px + kx - 1;
-              if (iy >= 0 && iy < H && ix >= 0 && ix < W) s += x[(iy * W + ix) * C + c]! * wt[c * 9 + ky * 3 + kx]!;
-            }
-          expect(y[(py * W + px) * C + c]).toBeCloseTo(s, 5);
-        }
+  it("dwConv is PyTorch's depthwise convolution (groups = channels, padding k / 2), 3×3 and 7×7", async () => {
+    for (const k of [3, 7]) {
+      const [H, W, C] = [9, 8, 6];
+      const kk = k * k;
+      const half = (k - 1) / 2;
+      const x = randn(H * W * C);
+      const wt = randn(C * kk); // [C, 1, k, k]
+      const w = new Float32Array(kk * C);
+      for (let c = 0; c < C; c++) for (let t = 0; t < kk; t++) w[t * C + c] = wt[c * kk + t]!;
+      const bias = randn(C);
+      const y = await run((ctx) => ops.dwConv(ctx, upload(x, [H * W, C]), upload(w, [kk, C]), upload(bias, [C]), { H, W, k }), H * W * C);
+      for (let py = 0; py < H; py++)
+        for (let px = 0; px < W; px++)
+          for (let c = 0; c < C; c++) {
+            let s = bias[c]!;
+            for (let ky = 0; ky < k; ky++)
+              for (let kx = 0; kx < k; kx++) {
+                const iy = py + ky - half;
+                const ix = px + kx - half;
+                if (iy >= 0 && iy < H && ix >= 0 && ix < W) s += x[(iy * W + ix) * C + c]! * wt[c * kk + ky * k + kx]!;
+              }
+            expect(y[(py * W + px) * C + c]).toBeCloseTo(s, 5);
+          }
+    }
   });
 
   it("resizeArgmax picks the class transformers.js's interpolate + argmax picks", async () => {

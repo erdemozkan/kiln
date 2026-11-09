@@ -168,6 +168,10 @@ await segmenter("cats.jpg"); // [{ score: 0.994, label: "cat", mask: { width: 64
 const semantic = await pipeline("image-segmentation", "nvidia/segformer-b0-finetuned-ade-512-512");
 await semantic("cats.jpg"); // [{ score: null, label: "wall", mask }, { score: null, label: "floor", mask }, ...]
 
+// ResNet, ConvNeXt and DINOv2 classifiers as well as ViT / DeiT.
+const resnet = await pipeline("image-classification", "microsoft/resnet-50");
+await resnet("tiger.jpg"); // [{ label: "tiger, Panthera tigris", score: 0.940 }, ...]
+
 // Swin2SR: 2× super-resolution.
 const upscaler = await pipeline("image-to-image"); // caidas/swin2SR-classical-sr-x2-64
 const big = await upscaler("small.png"); // { width: 2 × w, height: 2 × h, channels: 3, data }

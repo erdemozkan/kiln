@@ -29,7 +29,7 @@ import {
   conv2dSpec,
   pixelShuffleSpec,
   swinAttentionSpec,
-  dwConv3Spec,
+  dwConvSpec,
   resizeArgmaxSpec,
   conv2dNarrowSpec,
   groupNormSpec,
@@ -518,11 +518,13 @@ export function conv2d(ctx: Ctx, x: Tensor, w: Tensor, bias: Tensor, o: { H: num
   return { y, H: Ho, W: Wo };
 }
 
-/** Depthwise 3 × 3 convolution (padding 1) of an image x [H·W, C] with w [9, C] (see dwConv3Spec). */
-export function dwConv3(ctx: Ctx, x: Tensor, w: Tensor, bias: Tensor, o: { H: number; W: number }): Tensor {
+/** Depthwise k × k convolution (padding k / 2, default k 3) of an image x [H·W, C] with w [k·k, C] (see dwConvSpec). */
+export function dwConv(ctx: Ctx, x: Tensor, w: Tensor, bias: Tensor, o: { H: number; W: number; k?: number }): Tensor {
   const C = lastDim(x);
+  const k = o.k ?? 3;
+  if (k % 2 !== 1 || w.shape[0] !== k * k) throw new Error(`dwConv: weight [${w.shape}] is not [${k * k}, C] for an odd k`);
   const y = ctx.alloc([o.H * o.W, C]);
-  ctx.run(dwConv3Spec(), [ctx.uniform([u32(o.H), u32(o.W), u32(C), u32(0)]), x.buf, w.buf, bias.buf, y.buf], grid1d(o.H * o.W * C));
+  ctx.run(dwConvSpec(), [ctx.uniform([u32(o.H), u32(o.W), u32(C), u32(k)]), x.buf, w.buf, bias.buf, y.buf], grid1d(o.H * o.W * C));
   return y;
 }
 

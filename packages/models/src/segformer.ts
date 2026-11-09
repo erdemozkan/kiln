@@ -160,7 +160,7 @@ export class SegformerModel {
         const a = ops.attention(ctx, q, kc, vc, { T: N, H: heads, Hkv: heads, D, maxSeq: S, kv: "f32", scale: D ** -0.5, span: true });
         this.lin(ctx, a, `${p}.o`, h);
         const up = this.lin(ctx, this.ln(ctx, h, `${p}.ln2`), `${p}.up`);
-        const mixed = ops.dwConv3(ctx, up, this.w(`${p}.dw.weight`), this.w(`${p}.dw.bias`), { H: e.H, W: e.W });
+        const mixed = ops.dwConv(ctx, up, this.w(`${p}.dw.weight`), this.w(`${p}.dw.bias`), { H: e.H, W: e.W });
         ops.act(ctx, mixed, "gelu");
         this.lin(ctx, mixed, `${p}.down`, h);
       }

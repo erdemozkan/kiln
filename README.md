@@ -526,6 +526,8 @@ K/V; each decoder step reads them through a step block whose span covers every p
 | wav2vec2 classifier (`superb/wav2vec2-base-superb-ks`, weighted layer sum) | transformers.js (`Xenova/wav2vec2-base-superb-ks`, fp32) | the same five labels, scores within 2e-7 |
 | Image preprocessing (all six PIL filters; DeiT and CLIP pipelines) | PIL 8 + numpy | resized bytes identical; pixel values identical (float32) |
 | CLIP tokenizer (`openai/clip-vit-base-patch32`) | transformers.js | the same ids for 8 texts (punctuation, accents, CJK, emoji, long words) |
+| ResNet-50 (`microsoft/resnet-50`), ConvNeXt (`facebook/convnext-tiny-224`) | transformers.js (`Xenova/*`, fp32) on the same pixel values | every uniquely labelled class within 1.7e-8 (ResNet) and 4.7e-7 (ConvNeXt); 337 / 374 ms end to end against 370 / 434 ms |
+| DINOv2 (`facebook/dinov2-small-imagenet1k-1-layer`) | transformers.js (`Xenova/dinov2-small-imagenet1k-1-layer`, fp32) on the same pixel values | within 6e-3: its export resizes position embeddings bilinearly, Python bicubically (Kiln); with its resize, within 3.2e-7. 383 ms end to end against 683 ms |
 | Swin2SR (`caidas/swin2SR-classical-sr-x2-64`) | transformers.js (`Xenova/swin2SR-classical-sr-x2-64`, fp32) on the same pixel values | 4 of 147,456 output bytes one level apart (128 × 96 → 256 × 192); 3.4 s end to end against 10.4 s |
 | SegFormer (`nvidia/segformer-b0-finetuned-ade-512-512`) | transformers.js (`Xenova/segformer-b0-finetuned-ade-512-512`, fp32) on the same pixel values | the same 14 classes on the cats photo, all 307,200 pixels the same class; 0.75 s end to end against 3.9 s |
 | RMBG-1.4 (`briaai/RMBG-1.4`) | transformers.js (the repo's ONNX export, fp32) on the same pixel values | 3 of 1,048,576 matte bytes one level apart; 2.9 s end to end against 4.0 s |
@@ -723,6 +725,24 @@ copy of the cats photo, fed the same pixel values as transformers.js
 pipelines end to end (median of five warm calls, WebGPU, backgrounded pane): 3.4 s in Kiln against
 10.4 s for transformers.js. Profiling this model also led to a LayerNorm kernel for many short rows,
 8 rows per workgroup, which every vision model now uses.
+
+`image-classification` also runs ResNet (`microsoft/resnet-*`, bottleneck and basic blocks),
+ConvNeXt (`facebook/convnext-*`) and DINOv2 (`facebook/dinov2-*-imagenet1k-1-layer`). ResNet's
+convolutions run on the conv kernel with batch norms folded in, and the residual and ReLU in the
+epilogue. ConvNeXt adds a 7 × 7 depthwise convolution (the depthwise kernel now takes any odd size)
+and folds its layer scale into the second MLP matrix. DINOv2 runs on the ViT code: layer scales
+folded, position embeddings fitted to the 224 crop by bicubic interpolation as Python transformers
+does it, and the head over [CLS, mean of the patches]. Pooling and the heads run on the CPU. On
+the tiger photo, fed the same pixel values as transformers.js (`Xenova/*`, fp32), probabilities of
+every uniquely labelled class: ResNet-50 within 1.7e-8, ConvNeXt-tiny within 4.7e-7. DINOv2
+differs by up to 6e-3 (tiger 0.7865 against 0.7805) because transformers.js's export resizes the
+position embeddings bilinearly at a fixed scale, which Python transformers does not. With that
+resize copied for the check, Kiln matches it within 3.2e-7, so the difference is in the resize
+alone. Both pipelines end to end (median of five warm calls, WebGPU, backgrounded pane): ResNet-50
+337 against 370 ms, ConvNeXt-tiny 374 against 434 ms, DINOv2-small 383 against 683 ms. Checking
+them found a preprocessing bug, now fixed: an integer `size` on a ConvNeXt-style processor
+(`microsoft/resnet-50`'s config) skipped the `crop_pct` resize and crop, and at 384 and above
+ConvNeXt now resizes straight to a square as Python does.
 
 T5's learned relative position bias is added to each score by the per-row attention kernels (GPU
 and CPU, buckets computed in the kernel; bucket function equal to transformers' over ±300
