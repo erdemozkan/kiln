@@ -22,6 +22,8 @@ export interface TensorEntry {
   /** Absolute byte offset inside the file. */
   offset: number;
   byteLength: number;
+  /** A 2-D tensor stored column-major (a transposed view saved as is): the bytes hold [cols, rows]. */
+  transposed?: boolean;
 }
 
 export function rowBytes(type: SrcType, cols: number): number {

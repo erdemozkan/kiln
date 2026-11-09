@@ -106,12 +106,12 @@ export interface AudioInfo {
   labels?: Record<number, string>;
 }
 
-/** Tasks of image models (ViT, DeiT). */
-export type VisionTask = "image-classification" | "image-feature-extraction";
+/** Tasks of image models (ViT, DeiT, CLIP). */
+export type VisionTask = "image-classification" | "image-feature-extraction" | "zero-shot-image-classification";
 
 export interface VisionInfo {
   model: string;
-  /** "vit" or "deit". */
+  /** "vit", "deit" or "clip". */
   family: string;
   layers: number;
   hiddenSize: number;

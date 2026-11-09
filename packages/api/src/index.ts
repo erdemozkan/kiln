@@ -36,6 +36,8 @@ export {
   type ImageClassificationOptions,
   type ImageFeatureExtractionPipeline,
   type ImageFeatureExtractionOptions,
+  type ZeroShotImageClassificationPipeline,
+  type ZeroShotImageClassificationOptions,
   type PipelineOptions,
   type PipelineTask,
   type ProgressInfo,

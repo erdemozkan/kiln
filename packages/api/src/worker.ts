@@ -251,9 +251,14 @@ scope.onmessage = async (e: MessageEvent<Request>) => {
         if (!v) throw new Error("no image model loaded");
         queue = queue.then(async () => {
           try {
-            const [input, opts] = msg.args as [ImageInput, Record<string, unknown> | undefined];
-            const img = await readImage(input);
-            const result = (msg.task as VisionTask) === "image-classification" ? await v.classify(img, opts) : await v.features(img, opts);
+            const task = msg.task as VisionTask;
+            const img = await readImage(msg.args[0] as ImageInput);
+            const result =
+              task === "zero-shot-image-classification"
+                ? await v.zeroShot(img, msg.args[1] as string[], msg.args[2] as { hypothesis_template?: string } | undefined)
+                : task === "image-classification"
+                  ? await v.classify(img, msg.args[1] as Record<string, unknown> | undefined)
+                  : await v.features(img, msg.args[1] as Record<string, unknown> | undefined);
             post({ id: msg.id, type: "result", result });
           } catch (err) {
             post({ id: msg.id, type: "error", message: err instanceof Error ? err.message : String(err) });

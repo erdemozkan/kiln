@@ -2,7 +2,8 @@
 // with transformers' image preprocessing (PIL-exact resizing).
 import type { Backend, Tensor } from "@kiln/core";
 import { fetchJSON, fileUrl, listRepoFiles, parseModelId, preprocessImage, readPytorchHeader, readSafetensorsHeader, toF32, weightFiles, type ByteSource, type ImageProcessorConfig, type RgbImage, type TensorEntry } from "@kiln/loader";
-import { VitModel, vitConfigFromHF, vitName, vitPatchK, type VitConfig } from "@kiln/models";
+import { ClipTextModel, VitModel, clipPoolIndex, clipTextConfigFromHF, clipTextName, vitConfigFromHF, vitName, vitPatchK, type VitConfig } from "@kiln/models";
+import { ClipTokenizer, type ClipTokenizerJSON } from "@kiln/tokenizers";
 import { openBackend, openParsed } from "./load";
 import { loadWeights, type LoadProgress, type WeightFile } from "./weights";
 
@@ -20,6 +21,43 @@ export interface VisionLoadOptions {
 export interface ImageClassificationOptions {
   /** Labels returned, best first (default 5; 0 or negative: all). */
   top_k?: number;
+}
+
+export interface ZeroShotImageOptions {
+  /** Turns a label into the text the model reads (default "This is a photo of {}"). */
+  hypothesis_template?: string;
+}
+
+/** CLIP's text side and the pieces that join the two towers. */
+interface ClipParts {
+  text: ClipTextModel;
+  tokenizer: ClipTokenizer;
+  eosId: number;
+  /** post_layernorm of the pooled image token. */
+  post: { w: Float32Array; b: Float32Array; eps: number };
+  visual: Head;
+  textProj: Head;
+  /** exp(logit_scale). */
+  scale: number;
+  /** Text embeddings by text, already normalized. */
+  cache: Map<string, Float32Array>;
+}
+
+function layerNorm(x: Float32Array, w: Float32Array, b: Float32Array, eps: number): Float32Array {
+  let m = 0;
+  for (const v of x) m += v;
+  m /= x.length;
+  let v2 = 0;
+  for (const v of x) v2 += (v - m) ** 2;
+  const inv = 1 / Math.sqrt(v2 / x.length + eps);
+  return x.map((v, i) => (v - m) * inv * w[i]! + b[i]!);
+}
+
+function normalize(x: Float32Array): Float32Array {
+  let n = 0;
+  for (const v of x) n += v * v;
+  n = Math.sqrt(n);
+  return x.map((v) => v / n);
 }
 
 export interface ImageFeatureOptions {
@@ -61,7 +99,48 @@ export class VisionEngine {
     readonly model: VitModel,
     readonly processor: ImageProcessorConfig,
     private readonly heads: { cls?: Head; distill?: Head; pooler?: Head },
+    private readonly clip?: ClipParts,
   ) {}
+
+  /** CLIP's image embedding (post-LayerNorm of the CLS token, visual projection), unnormalized. */
+  private async imageEmbed(img: RgbImage): Promise<Float32Array> {
+    const c = this.clip!;
+    const h = await this.model.forward(this.pixels(img));
+    return applyHead(c.visual, layerNorm(h.subarray(0, this.cfg.hidden), c.post.w, c.post.b, c.post.eps));
+  }
+
+  /** CLIP's normalized text embedding of a text. */
+  async textEmbed(text: string): Promise<Float32Array> {
+    const c = this.clip;
+    if (!c) throw new Error("this model has no text tower");
+    let e = c.cache.get(text);
+    if (!e) {
+      const ids = c.tokenizer.encode(text);
+      e = normalize(applyHead(c.textProj, await c.text.forward(ids, clipPoolIndex(ids, c.eosId))));
+      if (c.cache.size > 256) c.cache.clear();
+      c.cache.set(text, e);
+    }
+    return e;
+  }
+
+  /**
+   * Zero-shot classification (CLIP): every label put into the template, scored by the scaled cosine
+   * similarity of its text embedding with the image's, softmaxed over the labels; best first.
+   */
+  async zeroShot(img: RgbImage, labels: readonly string[], options: ZeroShotImageOptions = {}): Promise<{ score: number; label: string }[]> {
+    if (!this.clip) throw new Error("zero-shot image classification needs a CLIP model");
+    if (!labels.length) throw new Error("zero-shot image classification needs candidate labels");
+    const template = options.hypothesis_template ?? "This is a photo of {}";
+    const image = normalize(await this.imageEmbed(img));
+    const logits = new Float32Array(labels.length);
+    for (let i = 0; i < labels.length; i++) {
+      const t = await this.textEmbed(template.replace("{}", labels[i]!));
+      let d = 0;
+      for (let j = 0; j < t.length; j++) d += t[j]! * image[j]!;
+      logits[i] = this.clip.scale * d;
+    }
+    return topLabels(logits, labels, 0).map(({ label, score }) => ({ score, label }));
+  }
 
   /** Pixel values [3, size, size] of an image, as the model's image processor makes them. */
   pixels(img: RgbImage): Float32Array {
@@ -90,6 +169,10 @@ export class VisionEngine {
 
   /** The last hidden state [tokens, hidden], or with `pool` the pooled output [1, hidden]. */
   async features(img: RgbImage, options: ImageFeatureOptions = {}): Promise<{ data: Float32Array; dims: number[] }> {
+    if (this.clip) {
+      const e = await this.imageEmbed(img);
+      return { data: e, dims: [1, e.length] };
+    }
     const h = await this.model.forward(this.pixels(img));
     const H = this.cfg.hidden;
     if (!options.pool) return { data: h, dims: [1, this.model.tokens, H] };
@@ -99,10 +182,11 @@ export class VisionEngine {
 
   destroy(): void {
     this.model.destroy();
+    this.clip?.text.destroy();
   }
 }
 
-/** Loads a ViT or DeiT checkpoint (safetensors or pytorch_model.bin) from the Hugging Face Hub. */
+/** Loads a ViT, DeiT or CLIP checkpoint (safetensors or pytorch_model.bin) from the Hugging Face Hub. */
 export async function createVision(modelId: string, opts: VisionLoadOptions = {}): Promise<VisionEngine> {
   const ref = parseModelId(modelId, opts.revision);
   if (ref.gguf) throw new Error("vision models load from safetensors or PyTorch repos, not GGUF files");
@@ -112,12 +196,16 @@ export async function createVision(modelId: string, opts: VisionLoadOptions = {}
     const files = await listing;
     return !files || files.has(f);
   };
-  const [config, prep, names] = await Promise.all([
+  const [config, prep, names, tokJson] = await Promise.all([
     fetchJSON<Record<string, unknown>>(fileUrl(ref, "config.json", ep)),
     has("preprocessor_config.json").then((y) => (y ? fetchJSON<ImageProcessorConfig>(fileUrl(ref, "preprocessor_config.json", ep), true) : undefined)),
     listing.then((files) => weightFiles(ref, ep, files)),
+    has("tokenizer.json").then((y) => (y ? fetchJSON<ClipTokenizerJSON>(fileUrl(ref, "tokenizer.json", ep), true) : undefined)),
   ]);
   const cfg = vitConfigFromHF(config!);
+  const clip = cfg.modelType === "clip";
+  if (clip && config!.model_type !== "clip") throw new Error(`${modelId}: a CLIP vision tower alone; zero-shot classification needs the full CLIP model`);
+  if (clip && !tokJson) throw new Error(`${modelId}: no tokenizer.json`);
   const backend = opts.backend ?? (await openBackend(opts.device ?? "auto", opts.cpuThreads));
   const sources: ByteSource[] = [];
   const located = new Map<string, { source: ByteSource; entry: TensorEntry }>();
@@ -133,7 +221,13 @@ export async function createVision(modelId: string, opts: VisionLoadOptions = {}
       const t = located.get(name);
       if (!t) return undefined;
       const count = t.entry.shape.reduce((a, b) => a * b, 1);
-      return { shape: t.entry.shape, data: toF32(t.entry.type as Parameters<typeof toF32>[0], await t.source.read(t.entry.offset, t.entry.byteLength), count) };
+      const data = toF32(t.entry.type as Parameters<typeof toF32>[0], await t.source.read(t.entry.offset, t.entry.byteLength), count);
+      if (!t.entry.transposed) return { shape: t.entry.shape, data };
+      // Stored [cols, rows]: transpose into the logical [rows, cols].
+      const [rows, cols] = t.entry.shape as [number, number];
+      const out = new Float32Array(count);
+      for (let r = 0; r < rows; r++) for (let c = 0; c < cols; c++) out[r * cols + c] = data[c * rows + r]!;
+      return { shape: t.entry.shape, data: out };
     };
     const need = async (name: string) => {
       const t = await read(name);
@@ -148,7 +242,8 @@ export async function createVision(modelId: string, opts: VisionLoadOptions = {}
     };
     const H = cfg.hidden;
     // Patch convolution [hidden, 3, p, p] as a matrix [hidden, patchK], zero-padded.
-    const pw = await need("embeddings.patch_embeddings.projection.weight");
+    const v = clip ? "vision_model.embeddings." : "embeddings.";
+    const pw = await need(clip ? v + "patch_embedding.weight" : v + "patch_embeddings.projection.weight");
     const K = vitPatchK(cfg);
     const row = 3 * cfg.patchSize * cfg.patchSize;
     const patch = new Float32Array(H * K);
@@ -156,16 +251,16 @@ export async function createVision(modelId: string, opts: VisionLoadOptions = {}
     upload("patch.weight", [H, K], patch);
     // Constant addend: position embeddings, plus the CLS / distillation tokens on the prefix rows and
     // the patch bias on the rest.
-    const pos = await need("embeddings.position_embeddings");
+    const pos = await need(clip ? v + "position_embedding.weight" : v + "position_embeddings");
     const T = cfg.prefix + (cfg.imageSize / cfg.patchSize) ** 2;
     if (pos.data.length !== T * H) throw new Error(`${modelId}: position embeddings hold ${pos.data.length / H} tokens, the model has ${T}`);
     const add = Float32Array.from(pos.data);
-    const prefixTokens = [await need("embeddings.cls_token")];
-    if (cfg.prefix === 2) prefixTokens.push(await need("embeddings.distillation_token"));
+    const prefixTokens = [await need(clip ? v + "class_embedding" : v + "cls_token")];
+    if (cfg.prefix === 2) prefixTokens.push(await need(v + "distillation_token"));
     prefixTokens.forEach((t, r) => {
       for (let i = 0; i < H; i++) add[r * H + i] += t.data[i]!;
     });
-    const pb = (await read("embeddings.patch_embeddings.projection.bias"))?.data;
+    const pb = clip ? undefined : (await read(v + "patch_embeddings.projection.bias"))?.data;
     if (pb) for (let r = cfg.prefix; r < T; r++) for (let i = 0; i < H; i++) add[r * H + i] += pb[i]!;
     upload("embed.add", [T, H], add);
 
@@ -180,9 +275,31 @@ export async function createVision(modelId: string, opts: VisionLoadOptions = {}
       distill: await head("distillation_classifier"),
       pooler: (await read("pooler.dense.weight")) ? await head("pooler.dense") : undefined,
     };
+    let parts: ClipParts | undefined;
+    if (clip) {
+      const tcfg = clipTextConfigFromHF(config!);
+      const textWeights = await loadWeights(
+        backend,
+        files.map((f) => ({ ...f, tensors: located.size ? [...located.values()].filter((t) => t.source === f.source && clipTextName(t.entry.name) !== undefined).map((t) => t.entry) : [], rename: clipTextName })),
+        opts.quant ?? "f32",
+        opts.onProgress,
+      );
+      const [pw2, pb2, vp, tp, ls] = await Promise.all(["vision_model.post_layernorm.weight", "vision_model.post_layernorm.bias", "visual_projection.weight", "text_projection.weight", "logit_scale"].map(need));
+      const proj = (t: { shape: number[]; data: Float32Array }): Head => ({ w: t.data, b: new Float32Array(t.shape[0]!), out: t.shape[0]! });
+      parts = {
+        text: new ClipTextModel(backend, tcfg, textWeights),
+        tokenizer: new ClipTokenizer(tokJson!, tcfg.maxPositions),
+        eosId: tcfg.eosId,
+        post: { w: pw2!.data, b: pb2!.data, eps: cfg.eps },
+        visual: proj(vp!),
+        textProj: proj(tp!),
+        scale: Math.exp(ls!.data[0]!),
+        cache: new Map(),
+      };
+    }
     const model = new VitModel(backend, cfg, weights);
     const processor: ImageProcessorConfig = prep ?? { size: { height: cfg.imageSize, width: cfg.imageSize } };
-    return new VisionEngine(backend, cfg, model, processor, heads);
+    return new VisionEngine(backend, cfg, model, processor, heads, parts);
   } finally {
     for (const s of sources) s.close?.();
   }

@@ -91,6 +91,11 @@ export function opfsAvailable(): boolean {
  * the file longer than the bytes that actually reached disk, so that tail is cut off before resuming.
  * Peak memory is one network chunk.
  */
+/** How far past the downloaded bytes a read must start to be fetched on its own instead of awaited. */
+const READ_AHEAD = 64 * 2 ** 20;
+/** Reads up to this size are fetched on their own once they start this far past the download. */
+const SMALL_READ = 2 ** 20;
+
 export class CachedHttpSource implements ByteSource {
   private have = 0;
   private complete = false;
@@ -99,6 +104,10 @@ export class CachedHttpSource implements ByteSource {
   private closed = false;
   /** Set once the cache stopped taking bytes: reads past `have` then go straight to the network. */
   private spill: HttpSource | undefined;
+  /** Range reads of bytes far past the download (a zip's directory at the end of pytorch_model.bin). */
+  private ahead: HttpSource | undefined;
+  private url = "";
+  private readAhead = READ_AHEAD;
 
   private constructor(
     readonly name: string,
@@ -115,7 +124,7 @@ export class CachedHttpSource implements ByteSource {
   static async open(
     url: string,
     key: string,
-    { fresh = false, segment = SEGMENT, retryMs = 1000 }: { fresh?: boolean; segment?: number; retryMs?: number } = {},
+    { fresh = false, segment = SEGMENT, retryMs = 1000, readAhead = READ_AHEAD }: { fresh?: boolean; segment?: number; retryMs?: number; readAhead?: number } = {},
   ): Promise<ByteSource> {
     if (!opfsAvailable()) return new HttpSource(url);
     const root = await navigator.storage.getDirectory();
@@ -151,6 +160,8 @@ export class CachedHttpSource implements ByteSource {
       handle.truncate(src.have);
       handle.flush();
       await writeMeta(dir, fileName, { size: total, complete: false, flushed: src.have });
+      src.url = url;
+      src.readAhead = readAhead;
       void src.download(url);
     }
     return src;
@@ -162,6 +173,13 @@ export class CachedHttpSource implements ByteSource {
 
   async read(offset: number, length: number): Promise<Uint8Array> {
     if (offset + length > this.total) throw new RangeError(`${this.name}: read past end`);
+    // Ahead of the download: fetch just those bytes rather than wait for everything before them, for
+    // small reads anywhere past it and large ones far past it (a pytorch_model.bin is a zip whose
+    // directory sits at the end and whose every entry has a small header to read first).
+    const gap = length <= SMALL_READ ? Math.min(SMALL_READ, this.readAhead) : this.readAhead;
+    if (!this.complete && !this.spill && this.url && offset >= this.have + gap) {
+      return (this.ahead ??= new HttpSource(this.url, this.name, this.retryMs)).read(offset, length);
+    }
     while (!this.complete && !this.spill && this.have < offset + length) {
       if (this.failure) throw this.failure;
       await new Promise<void>((r) => this.waiters.push(r));

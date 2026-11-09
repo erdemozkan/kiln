@@ -48,7 +48,16 @@ the grouped positional convolution as one kernel.
 `pytorch_model.bin`: `image-classification` and `image-feature-extraction`, with transformers' image
 preprocessing: PIL's resampling filters reimplemented with its fixed-point arithmetic, so resized
 pixels equal PIL's byte for byte, plus shortest-edge and ConvNeXt resizing, center crop, and float32
-rescale and normalize as numpy does them. `quick_gelu` activation.
+rescale and normalize as numpy does them. `quick_gelu` activation. CLIP (`openai/clip-*`):
+`zero-shot-image-classification` with transformers.js's hypothesis template and softmax over labels,
+the vision tower on the ViT code (pre-LayerNorm, post-LayerNorm of the pooled token), a causal text
+tower, CLIP's tokenizer (lowercasing, whitespace-dropping split, `</w>` word ends), text embeddings
+cached per text; `image-feature-extraction` on CLIP returns the image embedding.
+
+**Loading.** Reads ahead of a download in progress are fetched on their own instead of waiting
+(a `pytorch_model.bin` keeps its zip directory at the end, so large checkpoints showed no progress
+until fully downloaded). 2-D tensors saved as transposed views load where the weights are read on
+the CPU. An unsupported tensor no longer makes the cache re-download the file.
 
 **Models.** Llama (including Llama 3 rope scaling), Mistral, Qwen2, Qwen3, SmolLM, Granite 3 and 4
 (350M to 2B; for Granite 4, the attention-only models) and Gemma 3 (270M to 4B and larger; images

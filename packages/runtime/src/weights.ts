@@ -157,6 +157,7 @@ async function loadTensor(
     const f = Math.fround(factor ?? 1);
     if (f !== 1) for (let i = 0; i < v.length; i++) v[i] = v[i]! * f;
   };
+  if (e.transposed) throw new Error(`${name}: stored transposed (non-contiguous); only tensors read on the CPU can be`);
   const shape = e.shape.length === 1 ? e.shape : [e.shape.slice(0, -1).reduce((a, b) => a * b, 1), e.shape[e.shape.length - 1]!];
   const cols = shape[shape.length - 1]!;
   const rows = shape.length === 2 ? shape[0]! : 1;

@@ -525,6 +525,8 @@ K/V; each decoder step reads them through a step block whose span covers every p
 | wav2vec2 large (`facebook/wav2vec2-large-robust-ft-libri-960h`: LayerNorm front end, pre-LayerNorm layers) | the NumPy forward pass | logits within 3.1e-4 over 149 frames, the same token in every frame |
 | wav2vec2 classifier (`superb/wav2vec2-base-superb-ks`, weighted layer sum) | transformers.js (`Xenova/wav2vec2-base-superb-ks`, fp32) | the same five labels, scores within 2e-7 |
 | Image preprocessing (all six PIL filters; DeiT and CLIP pipelines) | PIL 8 + numpy | resized bytes identical; pixel values identical (float32) |
+| CLIP tokenizer (`openai/clip-vit-base-patch32`) | transformers.js | the same ids for 8 texts (punctuation, accents, CJK, emoji, long words) |
+| CLIP zero-shot (`openai/clip-vit-base-patch32`) | transformers.js (`Xenova/clip-vit-base-patch32`, fp32) on the same pixel values | six labels' probabilities within 2.2e-7 |
 | ViT (`google/vit-base-patch16-224`), DeiT (`facebook/deit-base-distilled-patch16-224`) | transformers.js (`Xenova/*`, fp32) on the same pixel values | all 1,000 class probabilities within 2.2e-6 (ViT) and 7.8e-7 (DeiT) |
 
 Whisper (`automatic-speech-recognition`) takes 16 kHz samples, a URL, a Blob or encoded bytes (WAV
@@ -586,6 +588,27 @@ tiger photo, fed the same pixel values: every class probability within 2.2e-6 of
 ViT and 7.8e-7 for DeiT. One warm call took 364 ms (ViT) and 474 ms (DeiT) in Kiln, decoding and
 preprocessing included, against 1.5 s and 0.8 s for transformers.js's model call alone (rough,
 backgrounded pane). The pooled output (`pool: true`) has not been checked against a reference.
+
+CLIP (`zero-shot-image-classification`) runs its vision tower on the same code (LayerNorm after the
+embeddings, and post-LayerNorm plus the visual projection on the pooled token, on the CPU) and its
+text tower as a causal transformer, one plan per token count; the text embedding is pooled at the end
+token (or, for legacy configs, the highest id, as transformers does), projected, normalized and
+cached per text, so asking about the same labels again only runs the image tower. Scores are
+exp(logit_scale) times the cosine similarity, softmaxed over the labels, with transformers.js's
+default template "This is a photo of {}". CLIP's tokenizer is its own small class: NFC, whitespace
+runs to one space, lowercase, CLIP's split (whitespace dropped), byte-level mapping, BPE with `</w>`
+word ends. On the tiger photo with six labels, fed the same pixel values: every probability within
+2.2e-7 of transformers.js. Speed is not a win yet: a warm call took 0.4–1.2 s in Kiln (decoding and
+resizing a 612 × 408 JPEG included, labels run one at a time) against 0.44 s for transformers.js's
+model call alone.
+
+Loading CLIP's `pytorch_model.bin` showed three loader problems, now fixed. The cache downloads a
+file front to back, but a zip keeps its directory at the end and a small header before every entry,
+so the header parse waited for nearly the whole file with no progress shown; reads ahead of the
+download now go to the network on their own (small ones anywhere past it, large ones 64 MiB past
+it). A tensor saved as a transposed view (CLIP's projections) was refused; it is now read and
+transposed when loaded on the CPU (GPU-loaded weights still must be contiguous). And an unsupported
+tensor made the loader take the cached file for corrupt and download it again; it now fails at once.
 
 T5's learned relative position bias is added to each score by the per-row attention kernels (GPU
 and CPU, buckets computed in the kernel; bucket function equal to transformers' over ±300

@@ -2,6 +2,7 @@ import type { Backend } from "@kiln/core";
 import { createWebGPUBackend } from "@kiln/backend-webgpu";
 import {
   CachedHttpSource,
+  UnsupportedTensorError,
   MemorySource,
   cacheKey,
   fetchJSON,
@@ -220,7 +221,8 @@ export async function openParsed<H>(ref: ModelRef, file: string, endpoint: strin
   try {
     return { source, header: await parse(source) };
   } catch (err) {
-    if (!(source instanceof CachedHttpSource) || source.failed) throw err;
+    // A format Kiln does not support is not damage: downloading it again would only fail the same way.
+    if (!(source instanceof CachedHttpSource) || source.failed || err instanceof UnsupportedTensorError) throw err;
     console.warn(`[kiln] cached ${file} looks corrupt (${String(err)}); downloading it again`);
     source.close();
     // Overwritten in place rather than evicted: removing the file fails quietly while anything still

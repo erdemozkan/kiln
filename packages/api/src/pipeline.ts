@@ -24,7 +24,8 @@ export type PipelineTask =
   | "automatic-speech-recognition"
   | "audio-classification"
   | "image-classification"
-  | "image-feature-extraction";
+  | "image-feature-extraction"
+  | "zero-shot-image-classification";
 
 const SEQ2SEQ = new Set<string>(["summarization", "translation", "text2text-generation", "automatic-speech-recognition"]);
 
@@ -46,9 +47,10 @@ export const DEFAULT_MODELS: Record<string, string> = {
   "audio-classification": "superb/wav2vec2-base-superb-ks",
   "image-classification": "google/vit-base-patch16-224",
   "image-feature-extraction": "google/vit-base-patch16-224-in21k",
+  "zero-shot-image-classification": "openai/clip-vit-base-patch32",
 };
 
-const VISION = new Set<string>(["image-classification", "image-feature-extraction"]);
+const VISION = new Set<string>(["image-classification", "image-feature-extraction", "zero-shot-image-classification"]);
 
 /** Speech encoders run on raw samples (CTC or a classifier) rather than as encoder-decoders. */
 const AUDIO_ENCODERS = new Set(["wav2vec2", "hubert"]);
@@ -433,6 +435,19 @@ export interface ImageFeatureExtractionPipeline {
   (images: ImageInput[], options?: ImageFeatureExtractionOptions): Promise<Tensor[]>;
 }
 
+export interface ZeroShotImageClassificationOptions {
+  /** Turns each label into the text the model reads (default "This is a photo of {}"). */
+  hypothesis_template?: string;
+}
+export interface ZeroShotImageClassificationPipeline {
+  readonly task: PipelineTask;
+  readonly model: KilnVision;
+  readonly info: VisionInfo;
+  dispose(): Promise<void>;
+  (image: ImageInput, candidate_labels: string[], options?: ZeroShotImageClassificationOptions): Promise<{ score: number; label: string }[]>;
+  (images: ImageInput[], candidate_labels: string[], options?: ZeroShotImageClassificationOptions): Promise<{ score: number; label: string }[][]>;
+}
+
 /** An image in a form the worker can receive and decode: relative URLs resolved, DOM images drawn to bitmaps. */
 async function toWorkerImage(x: ImageInput): Promise<unknown> {
   if (typeof x === "string") return typeof location !== "undefined" ? new URL(x, location.href).href : x;
@@ -486,6 +501,7 @@ export async function pipeline(task: "automatic-speech-recognition", model?: str
 export async function pipeline(task: "audio-classification", model?: string, options?: PipelineOptions): Promise<AudioClassificationPipeline>;
 export async function pipeline(task: "image-classification", model?: string, options?: PipelineOptions): Promise<ImageClassificationPipeline>;
 export async function pipeline(task: "image-feature-extraction", model?: string, options?: PipelineOptions): Promise<ImageFeatureExtractionPipeline>;
+export async function pipeline(task: "zero-shot-image-classification", model?: string, options?: PipelineOptions): Promise<ZeroShotImageClassificationPipeline>;
 export async function pipeline(task: PipelineTask, model?: string, options: PipelineOptions = {}): Promise<unknown> {
   const t = ALIASES[task] ?? task;
   const id = model ?? DEFAULT_MODELS[t];
@@ -505,18 +521,21 @@ export async function pipeline(task: PipelineTask, model?: string, options: Pipe
   if (VISION.has(t)) {
     const m = await KilnVision.load(id, { quant: q, device: dev, cpuThreads, revision, endpoint, worker, onProgress: progress });
     progress_callback?.({ status: "ready", task, model: id });
-    const one = async (x: ImageInput, opts?: object) => {
-      const r = await m.run<unknown>(t as "image-classification" | "image-feature-extraction", await toWorkerImage(x), { ...opts });
+    const zeroShot = t === "zero-shot-image-classification";
+    const one = async (x: ImageInput, a?: unknown, b?: object) => {
+      const img = await toWorkerImage(x);
+      if (zeroShot) return m.run<unknown>("zero-shot-image-classification", img, a, { ...b });
+      const r = await m.run<unknown>(t as "image-classification" | "image-feature-extraction", img, { ...(a as object) });
       if (t === "image-feature-extraction") {
         const f = r as { data: Float32Array; dims: number[] };
         return new Tensor("float32", f.data, f.dims);
       }
       return r;
     };
-    const call = async (images: ImageInput | ImageInput[], opts?: object) => {
-      if (!Array.isArray(images)) return one(images, opts);
+    const call = async (images: ImageInput | ImageInput[], a?: unknown, b?: object) => {
+      if (!Array.isArray(images)) return one(images, a, b);
       const out: unknown[] = [];
-      for (const x of images) out.push(await one(x, opts));
+      for (const x of images) out.push(await one(x, a, b));
       return out;
     };
     return Object.assign(call, { task, model: m, info: m.info, tokenizer: {}, dispose: () => m.unload() });

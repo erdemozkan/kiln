@@ -147,7 +147,15 @@ await classifier("tiger.jpg"); // [{ label: "tiger, Panthera tigris", score: 0.8
 
 const extractor = await pipeline("image-feature-extraction", "google/vit-base-patch16-224-in21k");
 const features = await extractor(image); // Tensor [1, 197, 768]
+
+// CLIP: any labels, no training.
+const zeroShot = await pipeline("zero-shot-image-classification"); // openai/clip-vit-base-patch32
+await zeroShot(image, ["tiger", "cat", "dog"]); // [{ score: 0.996, label: "tiger" }, ...]
 ```
+
+With a CLIP model, `image-feature-extraction` returns the image embedding (the visual projection's
+output). Text embeddings are cached per text, so asking about the same labels again only runs the
+image tower.
 
 ## Kiln's own API
 

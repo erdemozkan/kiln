@@ -161,6 +161,14 @@ describe("CachedHttpSource", () => {
     },
   );
 
+  it("fetches a read far past the download on its own instead of waiting for it", async () => {
+    const src = await CachedHttpSource.open("u", KEY, { readAhead: 100 });
+    expect(await src.read(250, 50)).toEqual(BODY.subarray(250, 300));
+    expect(requests).toContain("bytes=250-299");
+    expect(await readAll(src)).toEqual(BODY);
+    expect(getMeta()).toMatchObject({ complete: true });
+  });
+
   it("a write that does not land switches the rest of the file to the network instead of caching a hole", async () => {
     FakeHandle.writeFailsAt = 128;
     const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);

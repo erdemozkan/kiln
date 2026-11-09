@@ -352,10 +352,13 @@ export class KilnVision extends WorkerChannel {
     return m;
   }
 
-  /** Image classification ([{ label, score }]) or image features ({ data, dims }) of an image the worker can decode. */
-  run<T>(task: VisionTask, image: unknown, options: Record<string, unknown> = {}): Promise<T> {
+  /**
+   * Image classification ([{ label, score }]), image features ({ data, dims }) or, with labels first,
+   * zero-shot classification ([{ score, label }]) of an image the worker can decode.
+   */
+  run<T>(task: VisionTask, image: unknown, ...args: unknown[]): Promise<T> {
     return new Promise((resolve, reject) =>
-      this.send({ type: "visionTask", task, args: [image, options] }, (msg) => {
+      this.send({ type: "visionTask", task, args: [image, ...args] }, (msg) => {
         if (msg.type === "result") resolve(msg.result as T);
         else if (msg.type === "error") reject(new Error(msg.message));
         return msg.type === "result" || msg.type === "error";

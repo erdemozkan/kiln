@@ -311,12 +311,14 @@ function entries(tensors: Map<string, TensorRef>, storageOffset: (s: StorageRef)
     if (!info) throw new UnsupportedTensorError(`${name}: storage ${t.storage.cls} is not supported`);
     if (!info.type) continue;
     const numel = t.shape.reduce((a, b) => a * b, 1);
+    // A transposed 2-D view saved as is (CLIP's projections): strides [1, rows].
+    const transposed = t.shape.length === 2 && t.shape[0]! > 1 && t.shape[1]! > 1 && t.stride[0] === 1 && t.stride[1] === t.shape[0];
     let expect = 1;
-    for (let d = t.shape.length - 1; d >= 0; d--) {
+    for (let d = t.shape.length - 1; d >= 0 && !transposed; d--) {
       if (t.shape[d]! > 1 && t.stride[d] !== expect) throw new UnsupportedTensorError(`${name}: non-contiguous tensors are not supported`);
       expect *= t.shape[d]!;
     }
-    out.push({ name, shape: t.shape, type: info.type, offset: storageOffset(t.storage) + t.offset * info.size, byteLength: numel * info.size });
+    out.push({ name, shape: t.shape, type: info.type, offset: storageOffset(t.storage) + t.offset * info.size, byteLength: numel * info.size, ...(transposed ? { transposed } : {}) });
   }
   return out.sort((a, b) => a.offset - b.offset);
 }
