@@ -1525,7 +1525,7 @@ ${wdtype === "q4"
 /** y = (x - mean) / sqrt(var + eps) * w + b over rows of D (LayerNorm, the vision encoder's norm). */
 export function layernormSpec(): KernelSpec {
   return spec("layernorm", ["uniform", "read", "read", "read", "rw"], cpu.cpuLayernorm, () => /* wgsl */ `
-struct P { R: u32, D: u32, eps: f32, _p: u32 }
+struct P { R: u32, D: u32, eps: f32, n: u32 }
 @group(0) @binding(0) var<uniform> p: P;
 @group(0) @binding(1) var<storage, read> x: array<f32>;
 @group(0) @binding(2) var<storage, read> w: array<f32>;
@@ -1549,13 +1549,62 @@ fn total(li: u32, v: f32) -> f32 {
 fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) li: u32) {
   let o = (wid.x + wid.y * ${MAX_X}u) * p.D;
   if (wid.x + wid.y * ${MAX_X}u >= p.R) { return; }
+  // Statistics over the first n columns (rows padded past the model's width), all D written.
+  let n = select(p.D, p.n, p.n > 0u);
   var s = 0.0;
-  for (var i = li; i < p.D; i += 256u) { s += x[o + i]; }
-  let mean = total(li, s) / f32(p.D);
+  for (var i = li; i < n; i += 256u) { s += x[o + i]; }
+  let mean = total(li, s) / f32(n);
   var v = 0.0;
-  for (var i = li; i < p.D; i += 256u) { let d = x[o + i] - mean; v += d * d; }
-  let inv = inverseSqrt(total(li, v) / f32(p.D) + p.eps);
+  for (var i = li; i < n; i += 256u) { let d = x[o + i] - mean; v += d * d; }
+  let inv = inverseSqrt(total(li, v) / f32(n) + p.eps);
   for (var i = li; i < p.D; i += 256u) { y[o + i] = (x[o + i] - mean) * inv * w[i] + b[i]; }
+}`);
+}
+
+/**
+ * LayerNorm for many short rows (D ≤ 1024): 8 rows per 256-thread workgroup, 32 threads per row, so
+ * a row's reductions take 5 steps and the workgroup is not mostly idle (the per-row kernel spends
+ * 256 threads and 8-step reductions on each row). Same uniform layout and result as layernormSpec.
+ */
+export function layernormRowsSpec(): KernelSpec {
+  return spec("layernorm_rows", ["uniform", "read", "read", "read", "rw"], cpu.cpuLayernorm, () => /* wgsl */ `
+struct P { R: u32, D: u32, eps: f32, n: u32 }
+@group(0) @binding(0) var<uniform> p: P;
+@group(0) @binding(1) var<storage, read> x: array<f32>;
+@group(0) @binding(2) var<storage, read> w: array<f32>;
+@group(0) @binding(3) var<storage, read> b: array<f32>;
+@group(0) @binding(4) var<storage, read_write> y: array<f32>;
+var<workgroup> red: array<f32, 256>;
+
+fn total(li: u32, v: f32) -> f32 {
+  red[li] = v;
+  workgroupBarrier();
+  let lane = li % 32u;
+  for (var s = 16u; s > 0u; s >>= 1u) {
+    if (lane < s) { red[li] += red[li + s]; }
+    workgroupBarrier();
+  }
+  let t = red[li - lane];
+  workgroupBarrier();
+  return t;
+}
+
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) li: u32) {
+  let r = (wid.x + wid.y * ${MAX_X}u) * 8u + li / 32u;
+  let lane = li % 32u;
+  let live = r < p.R;
+  let o = min(r, p.R - 1u) * p.D;
+  let n = select(p.D, p.n, p.n > 0u);
+  var s = 0.0;
+  for (var i = lane; i < n; i += 32u) { s += x[o + i]; }
+  let mean = total(li, s) / f32(n);
+  var v = 0.0;
+  for (var i = lane; i < n; i += 32u) { let d = x[o + i] - mean; v += d * d; }
+  let inv = inverseSqrt(total(li, v) / f32(n) + p.eps);
+  if (live) {
+    for (var i = lane; i < p.D; i += 32u) { y[o + i] = (x[o + i] - mean) * inv * w[i] + b[i]; }
+  }
 }`);
 }
 
@@ -1874,19 +1923,19 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid:
  * N images ([N·H·W, C] → [N·Ho·Wo, O]) runs as one GEMM of N·Ho·Wo rows. Taps are `dil` pixels apart
  * (dilated convolution).
  */
-export function conv2dSpec(v: { relu: boolean; residual: boolean; reluIn?: boolean }): KernelSpec {
+export function conv2dSpec(v: { relu: boolean; residual: boolean; reluIn?: boolean; leaky?: boolean }): KernelSpec {
   const R8 = [0, 1, 2, 3, 4, 5, 6, 7];
   const bindings: BindingKind[] = ["uniform", "read", "read", "read"];
   if (v.residual) bindings.push("read");
   bindings.push("rw");
-  const out = (val: string) => (v.relu ? `max(${val}, 0.0)` : val);
+  const out = (val: string) => (v.leaky ? `leaky(${val})` : v.relu ? `max(${val}, 0.0)` : val);
   const store = R8.map(
     (i) => `  if (m0 + tm * 8u + ${i}u < p.M) {
     let m = m0 + tm * 8u + ${i}u;
 ${[0, 1, 2, 3].map((j) => `    if (n0 + tn * 4u + ${j}u < p.O) { let n = n0 + tn * 4u + ${j}u; y[m * p.O + n] = ${out(`acc${i}[${j}] + bias[n]${v.residual ? " + res[m * p.O + n]" : ""}`)}; }`).join("\n")}
   }`,
   ).join("\n");
-  return spec(`conv2d${v.reluIn ? "/relu-in" : ""}${v.relu ? "/relu" : ""}${v.residual ? "/res" : ""}`, bindings, cpu.cpuConv2d(v), () => /* wgsl */ `
+  return spec(`conv2d${v.reluIn ? "/relu-in" : ""}${v.relu ? "/relu" : ""}${v.leaky ? "/leaky" : ""}${v.residual ? "/res" : ""}`, bindings, cpu.cpuConv2d(v), () => /* wgsl */ `
 struct P { H: u32, W: u32, C: u32, O: u32, Ho: u32, Wo: u32, kh: u32, kw: u32, stride: u32, pad: u32, K: u32, M: u32, N: u32, dil: u32, _c: u32, _d: u32 }
 @group(0) @binding(0) var<uniform> p: P;
 @group(0) @binding(1) var<storage, read> x: array<vec4<f32>>;
@@ -1895,6 +1944,9 @@ struct P { H: u32, W: u32, C: u32, O: u32, Ho: u32, Wo: u32, kh: u32, kw: u32, s
 ${v.residual ? "@group(0) @binding(4) var<storage, read> res: array<f32>;\n@group(0) @binding(5)" : "@group(0) @binding(4)"} var<storage, read_write> y: array<f32>;
 var<workgroup> xt: array<vec4<f32>, 512>;
 var<workgroup> wt: array<vec4<f32>, 512>;
+
+/** LeakyReLU, torch's default slope 0.01. */
+fn leaky(a: f32) -> f32 { return select(a * 0.01, a, a > 0.0); }
 
 @compute @workgroup_size(128)
 fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) li: u32) {
@@ -2276,6 +2328,109 @@ fn main(${EW_ARGS}) {
     if (v > top) { top = v; best = l; }
   }
   y[idx] = best;
+}`);
+}
+
+/**
+ * PixelShuffle(r) on channels-last images: x [H·W, C·r²] → y [(H·r)·(W·r), C], output pixel
+ * (oy, ox) channel c taking input channel c·r² + (oy % r)·r + ox % r of pixel (oy / r, ox / r).
+ */
+export function pixelShuffleSpec(): KernelSpec {
+  return spec("pixel_shuffle", ["uniform", "read", "rw"], cpu.cpuPixelShuffle, () => /* wgsl */ `
+struct P { H: u32, W: u32, C: u32, r: u32 }
+@group(0) @binding(0) var<uniform> p: P;
+@group(0) @binding(1) var<storage, read> x: array<f32>;
+@group(0) @binding(2) var<storage, read_write> y: array<f32>;
+
+@compute @workgroup_size(${EW})
+fn main(${EW_ARGS}) {
+  ${FLAT}
+  let Wo = p.W * p.r;
+  if (idx >= p.H * p.r * Wo * p.C) { return; }
+  let c = idx % p.C;
+  let t = idx / p.C;
+  let oy = t / Wo;
+  let ox = t % Wo;
+  y[idx] = x[((oy / p.r) * p.W + ox / p.r) * p.C * p.r * p.r + c * p.r * p.r + (oy % p.r) * p.r + ox % p.r];
+}`);
+}
+
+/**
+ * Swin V2 window attention (Swin2SR) over an H × W image of tokens, q, k, v [H·W, row] with heads of
+ * D columns: the image cyclically shifted by -shift, cut into win × win windows, and in each window
+ * cosine attention (q and k L2-normalized, times the head's logit scale) plus the head's position
+ * bias (bias [heads, win², win²], already 16·sigmoid of the continuous-position MLP) and, when
+ * shifted, -200 between tokens from different regions of the wrap-around (transformers adds its
+ * -100 mask twice); the output written back at each token's unshifted position. One workgroup of
+ * win² threads per (window, head), keys and values staged in workgroup memory.
+ */
+export function swinAttentionSpec(D: number, win: number): KernelSpec {
+  const N = win * win;
+  if (N > 256 || (2 * N * D + N) * 4 > 16384) throw new Error(`swin attention: a ${win} × ${win} window with ${D}-wide heads does not fit workgroup memory`);
+  return spec(`swin_attention/D${D}/w${win}`, ["uniform", "read", "read", "read", "read", "read", "rw"], cpu.cpuSwinAttention, () => /* wgsl */ `
+struct P { H: u32, W: u32, row: u32, D: u32, heads: u32, shift: u32, win: u32, _a: u32 }
+@group(0) @binding(0) var<uniform> p: P;
+@group(0) @binding(1) var<storage, read> q: array<f32>;
+@group(0) @binding(2) var<storage, read> k: array<f32>;
+@group(0) @binding(3) var<storage, read> v: array<f32>;
+@group(0) @binding(4) var<storage, read> bias: array<f32>;
+@group(0) @binding(5) var<storage, read> scale: array<f32>;
+@group(0) @binding(6) var<storage, read_write> o: array<f32>;
+const D = ${D}u;
+const N = ${N}u;
+const WIN = ${win}u;
+var<workgroup> ks: array<f32, ${N * D}>;
+var<workgroup> vs: array<f32, ${N * D}>;
+var<workgroup> region: array<u32, ${N}>;
+
+fn band(s: u32, n: u32) -> u32 {
+  if (p.shift == 0u) { return 0u; }
+  return select(0u, 1u, s >= n - WIN) + select(0u, 1u, s >= n - p.shift);
+}
+
+@compute @workgroup_size(${N})
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) li: u32) {
+  let h = wid.y;
+  let wpr = p.W / WIN;
+  let sy = (wid.x / wpr) * WIN + li / WIN;
+  let sx = (wid.x % wpr) * WIN + li % WIN;
+  let tok = ((sy + p.shift) % p.H) * p.W + (sx + p.shift) % p.W;
+  let at = tok * p.row + h * D;
+  var kn = 0.0;
+  for (var d = 0u; d < D; d++) { let a = k[at + d]; kn += a * a; }
+  let kinv = 1.0 / max(sqrt(kn), 1e-12);
+  for (var d = 0u; d < D; d++) { ks[li * D + d] = k[at + d] * kinv; vs[li * D + d] = v[at + d]; }
+  region[li] = band(sy, p.H) * 3u + band(sx, p.W);
+  var qv: array<f32, ${D}>;
+  var qn = 0.0;
+  for (var d = 0u; d < D; d++) { qv[d] = q[at + d]; qn += qv[d] * qv[d]; }
+  let qinv = 1.0 / max(sqrt(qn), 1e-12);
+  for (var d = 0u; d < D; d++) { qv[d] *= qinv; }
+  workgroupBarrier();
+  var s: array<f32, ${N}>;
+  var m = -3.4e38;
+  let bo = (h * N + li) * N;
+  let mine = region[li];
+  for (var j = 0u; j < N; j++) {
+    var dot = 0.0;
+    for (var d = 0u; d < D; d++) { dot += qv[d] * ks[j * D + d]; }
+    var sc = dot * scale[h] + bias[bo + j];
+    if (region[j] != mine) { sc -= 200.0; }
+    s[j] = sc;
+    m = max(m, sc);
+  }
+  var z = 0.0;
+  for (var j = 0u; j < N; j++) { s[j] = exp(s[j] - m); z += s[j]; }
+  let inv = 1.0 / z;
+  for (var d = 0u; d < D; d++) {
+    var acc = 0.0;
+    for (var j = 0u; j < N; j++) { acc += s[j] * vs[j * D + d]; }
+    o[at + d] = acc * inv;
+  }
+  // Columns past the last head (rows padded past the model's width) are zeroed, never left stale.
+  if (h == p.heads - 1u) {
+    for (var c = p.heads * D; c < p.row; c++) { o[tok * p.row + c] = 0.0; }
+  }
 }`);
 }
 

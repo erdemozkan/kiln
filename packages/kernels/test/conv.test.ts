@@ -461,4 +461,71 @@ describe("image convolution kernels (CPU)", () => {
       expect(got[k]).toBe(best);
     }
   });
+
+  it("swinAttention equals roll → window partition → cosine attention with bias and mask → window reverse → roll back", async () => {
+    const [H, W, heads, D, win, row] = [8, 12, 2, 3, 4, 8];
+    const q = randn(H * W * row);
+    const k = randn(H * W * row);
+    const v = randn(H * W * row);
+    const N = win * win;
+    const bias = randn(heads * N * N);
+    const scale = Float32Array.from([3.5, 7]);
+    for (const shift of [0, 2]) {
+      const y = await run((ctx) => ops.swinAttention(ctx, upload(q, [H * W, row]), upload(k, [H * W, row]), upload(v, [H * W, row]), upload(bias, [heads * N * N]), upload(scale, [heads]), { H, W, heads, D, win, shift }), H * W * row);
+      // Reference: explicit torch.roll(-shift), windows, transformers' region mask (-100, added twice).
+      const src = (sy: number, sx: number) => ((sy + shift) % H) * W + ((sx + shift) % W);
+      const region = (s: number, n: number) => (shift ? (s >= n - win ? 1 : 0) + (s >= n - shift ? 1 : 0) : 0);
+      for (let wy = 0; wy < H / win; wy++)
+        for (let wx = 0; wx < W / win; wx++)
+          for (let h = 0; h < heads; h++) {
+            const toks = Array.from({ length: N }, (_, i) => ({ sy: wy * win + Math.floor(i / win), sx: wx * win + (i % win) }));
+            const norm = (t: Float32Array, r: number) => {
+              const a = Array.from({ length: D }, (_, d) => t[r * row + h * D + d]!);
+              const n = Math.sqrt(a.reduce((x, e) => x + e * e, 0));
+              return a.map((e) => e / n);
+            };
+            toks.forEach((ti, i) => {
+              const qi = norm(q, src(ti.sy, ti.sx));
+              const sc = toks.map((tj, j) => {
+                const kj = norm(k, src(tj.sy, tj.sx));
+                const mask = region(ti.sy, H) * 3 + region(ti.sx, W) !== region(tj.sy, H) * 3 + region(tj.sx, W) ? -200 : 0;
+                return qi.reduce((a, e, d) => a + e * kj[d]!, 0) * scale[h]! + bias[(h * N + i) * N + j]! + mask;
+              });
+              const m = Math.max(...sc);
+              const e = sc.map((x) => Math.exp(x - m));
+              const z = e.reduce((a, x) => a + x, 0);
+              for (let d = 0; d < D; d++) {
+                const want = toks.reduce((a, tj, j) => a + e[j]! * v[src(tj.sy, tj.sx) * row + h * D + d]!, 0) / z;
+                expect(y[src(ti.sy, ti.sx) * row + h * D + d]).toBeCloseTo(want, 5);
+              }
+              for (let c = heads * D; c < row; c++) expect(y[src(ti.sy, ti.sx) * row + c]).toBe(0);
+            });
+          }
+    }
+  });
+
+  it("pixelShuffle rearranges channels into r × r blocks as torch's PixelShuffle", async () => {
+    const [H, W, C, r] = [2, 3, 2, 2];
+    const x = randn(H * W * C * r * r);
+    const y = await run((ctx) => ops.pixelShuffle(ctx, upload(x, [H * W, C * r * r]), { H, W, r }), H * r * W * r * C);
+    for (let c = 0; c < C; c++)
+      for (let i = 0; i < r; i++)
+        for (let j = 0; j < r; j++)
+          for (let h = 0; h < H; h++)
+            for (let w = 0; w < W; w++) expect(y[((h * r + i) * W * r + w * r + j) * C + c]).toBe(x[(h * W + w) * C * r * r + c * r * r + i * r + j]);
+  });
+
+  it("layernorm with cols takes its statistics from the first cols only", async () => {
+    const [R, D, n] = [3, 8, 5];
+    const x = randn(R * D);
+    const w = randn(D).map((v, i) => (i < n ? v : 0));
+    const b = randn(D).map((v, i) => (i < n ? v : 0));
+    const y = await run((ctx) => ops.layernorm(ctx, upload(x, [R, D]), upload(w, [D]), upload(b, [D]), 1e-5, n), R * D);
+    for (let r = 0; r < R; r++) {
+      const a = Array.from(x.subarray(r * D, r * D + n));
+      const m = a.reduce((s, e) => s + e, 0) / n;
+      const inv = 1 / Math.sqrt(a.reduce((s, e) => s + (e - m) ** 2, 0) / n + 1e-5);
+      for (let i = 0; i < D; i++) expect(y[r * D + i]).toBeCloseTo(i < n ? (x[r * D + i]! - m) * inv * w[i]! + b[i]! : 0, 5);
+    }
+  });
 });

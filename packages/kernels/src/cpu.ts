@@ -601,17 +601,18 @@ export function cpuEmbed(wdtype: WeightDType, affine: boolean, features = false)
 export const cpuLayernorm: CpuKernel = (b) => {
   const [R, D] = [b[0]!.u32[0]!, b[0]!.u32[1]!];
   const eps = b[0]!.f32[2]!;
+  const n = b[0]!.u32[3]! || D;
   const x = b[1]!.f32;
   const w = b[2]!.f32;
   const bias = b[3]!.f32;
   const y = b[4]!.f32;
   for (let r = 0; r < R; r++) {
     let s = 0;
-    for (let i = 0; i < D; i++) s += x[r * D + i]!;
-    const mean = s / D;
+    for (let i = 0; i < n; i++) s += x[r * D + i]!;
+    const mean = s / n;
     let v = 0;
-    for (let i = 0; i < D; i++) v += (x[r * D + i]! - mean) ** 2;
-    const inv = 1 / Math.sqrt(v / D + eps);
+    for (let i = 0; i < n; i++) v += (x[r * D + i]! - mean) ** 2;
+    const inv = 1 / Math.sqrt(v / n + eps);
     for (let i = 0; i < D; i++) y[r * D + i] = (x[r * D + i]! - mean) * inv * w[i]! + bias[i]!;
   }
 };
@@ -767,7 +768,7 @@ export const cpuBlockAttention: CpuKernel = (b) => {
   }
 };
 
-export function cpuConv2d(v: { relu: boolean; residual: boolean; reluIn?: boolean }): CpuKernel {
+export function cpuConv2d(v: { relu: boolean; residual: boolean; reluIn?: boolean; leaky?: boolean }): CpuKernel {
   return (b) => {
     const [H, W, C, O, Ho, Wo, kh, kw, stride, pad, K, M] = Array.from(b[0]!.u32.subarray(0, 12)) as number[];
     const plane = Ho! * Wo!;
@@ -802,7 +803,7 @@ export function cpuConv2d(v: { relu: boolean; residual: boolean; reluIn?: boolea
       }
       for (let o = 0; o < O!; o++) {
         const val = acc[o]! + (res ? res[m * O! + o]! : 0);
-        y[m * O! + o] = v.relu ? Math.max(val, 0) : val;
+        y[m * O! + o] = v.leaky ? (val > 0 ? val : val * Math.fround(0.01)) : v.relu ? Math.max(val, 0) : val;
       }
     }
   };
@@ -950,6 +951,58 @@ export const cpuResizeArgmax: CpuKernel = (b) => {
     }
     y[i] = best;
   }
+};
+
+export const cpuPixelShuffle: CpuKernel = (b) => {
+  const [H, W, C, r] = [b[0]!.u32[0]!, b[0]!.u32[1]!, b[0]!.u32[2]!, b[0]!.u32[3]!];
+  const [x, y] = [b[1]!.f32, b[2]!.f32];
+  const Wo = W * r;
+  for (let oy = 0; oy < H * r; oy++)
+    for (let ox = 0; ox < Wo; ox++)
+      for (let c = 0; c < C; c++) y[(oy * Wo + ox) * C + c] = x[(Math.floor(oy / r) * W + Math.floor(ox / r)) * C * r * r + c * r * r + (oy % r) * r + (ox % r)]!;
+};
+
+export const cpuSwinAttention: CpuKernel = (b) => {
+  const [H, W, row, D, heads, shift, win] = Array.from(b[0]!.u32.subarray(0, 7)) as number[];
+  const [q, k, v, bias, scale, o] = [b[1]!.f32, b[2]!.f32, b[3]!.f32, b[4]!.f32, b[5]!.f32, b[6]!.f32];
+  const N = win! * win!;
+  const band = (s: number, n: number) => (shift ? (s >= n - win! ? 1 : 0) + (s >= n - shift! ? 1 : 0) : 0);
+  for (let wy = 0; wy < H! / win!; wy++)
+    for (let wx = 0; wx < W! / win!; wx++)
+      for (let h = 0; h < heads!; h++) {
+        const at: number[] = [];
+        const reg: number[] = [];
+        for (let i = 0; i < N; i++) {
+          const sy = wy * win! + Math.floor(i / win!);
+          const sx = wx * win! + (i % win!);
+          at.push((((sy + shift!) % H!) * W! + ((sx + shift!) % W!)) * row! + h * D!);
+          reg.push(band(sy, H!) * 3 + band(sx, W!));
+        }
+        const unit = (t: Float32Array, a: number) => {
+          let n = 0;
+          for (let d = 0; d < D!; d++) n += t[a + d]! ** 2;
+          const inv = 1 / Math.max(Math.sqrt(n), 1e-12);
+          return Array.from({ length: D! }, (_, d) => t[a + d]! * inv);
+        };
+        const kn = at.map((a) => unit(k, a));
+        for (let i = 0; i < N; i++) {
+          const qn = unit(q, at[i]!);
+          const s = kn.map((kj, j) => {
+            let dot = 0;
+            for (let d = 0; d < D!; d++) dot += qn[d]! * kj[d]!;
+            return dot * scale[h]! + bias[(h * N + i) * N + j]! - (reg[j] !== reg[i] ? 200 : 0);
+          });
+          const m = Math.max(...s);
+          const e = s.map((x) => Math.exp(x - m));
+          const z = e.reduce((a, x) => a + x, 0);
+          for (let d = 0; d < D!; d++) {
+            let acc = 0;
+            for (let j = 0; j < N; j++) acc += e[j]! * v[at[j]! + d]!;
+            o[at[i]! + d] = acc / z;
+          }
+          if (h === heads! - 1) o.fill(0, at[i]! - h * D! + heads! * D!, at[i]! - h * D! + row!);
+        }
+      }
 };
 
 export const cpuMaxPool2d: CpuKernel = (b) => {

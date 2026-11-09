@@ -27,6 +27,8 @@ import {
   attnProbsSpec,
   blockAttentionSpec,
   conv2dSpec,
+  pixelShuffleSpec,
+  swinAttentionSpec,
   dwConv3Spec,
   resizeArgmaxSpec,
   conv2dNarrowSpec,
@@ -38,6 +40,7 @@ import {
   resizeBilinearSpec,
   type Activation,
   layernormSpec,
+  layernormRowsSpec,
   gatedActSpec,
   gemmSpec,
   GEMM_TILE,
@@ -382,11 +385,19 @@ export function embed(ctx: Ctx, table: Tensor, tokens: Buf, T: number, scale = 1
 }
 
 /** LayerNorm over the last axis, with weight and bias. */
-export function layernorm(ctx: Ctx, x: Tensor, w: Tensor, b: Tensor, eps: number): Tensor {
+export function layernorm(ctx: Ctx, x: Tensor, w: Tensor, b: Tensor, eps: number, cols = 0): Tensor {
   const D = lastDim(x);
   const rows = numel(x.shape) / D;
   const y = ctx.alloc(x.shape);
-  ctx.run(layernormSpec(), [ctx.uniform([u32(rows), u32(D), f32(eps), u32(0)]), x.buf, w.buf, b.buf, y.buf], [Math.min(rows, MAX_X), Math.ceil(rows / MAX_X), 1]);
+  // `cols`: statistics over the first cols of each row (rows zero-padded past the model's width).
+  const params = ctx.uniform([u32(rows), u32(D), f32(eps), u32(cols)]);
+  if (D <= 1024 && rows >= 64) {
+    // Many short rows (image tokens): 8 rows per workgroup.
+    const groups = Math.ceil(rows / 8);
+    ctx.run(layernormRowsSpec(), [params, x.buf, w.buf, b.buf, y.buf], [Math.min(groups, MAX_X), Math.ceil(groups / MAX_X), 1], "layernorm_rows");
+    return y;
+  }
+  ctx.run(layernormSpec(), [params, x.buf, w.buf, b.buf, y.buf], [Math.min(rows, MAX_X), Math.ceil(rows / MAX_X), 1]);
   return y;
 }
 
@@ -483,7 +494,7 @@ export const convOut = (n: number, k: number, stride: number, pad: number, dil =
  * [Ho·Wo, O] = bias + conv (+ residual), then ReLU with `relu`; `reluIn` applies ReLU to the input
  * as it is read; `n` images stacked in x convolve as one batch (see conv2dSpec).
  */
-export function conv2d(ctx: Ctx, x: Tensor, w: Tensor, bias: Tensor, o: { H: number; W: number; k: number; stride: number; pad: number; relu?: boolean; reluIn?: boolean; residual?: Tensor; n?: number; dilation?: number }): { y: Tensor; H: number; W: number } {
+export function conv2d(ctx: Ctx, x: Tensor, w: Tensor, bias: Tensor, o: { H: number; W: number; k: number; stride: number; pad: number; relu?: boolean; reluIn?: boolean; leaky?: boolean; residual?: Tensor; n?: number; dilation?: number }): { y: Tensor; H: number; W: number } {
   const C = lastDim(x);
   const [O, K] = w.shape as [number, number];
   const n = o.n ?? 1;
@@ -499,11 +510,11 @@ export function conv2d(ctx: Ctx, x: Tensor, w: Tensor, bias: Tensor, o: { H: num
   const bufs = [params, x.buf, w.buf, bias.buf];
   if (o.residual) bufs.push(o.residual.buf);
   bufs.push(y.buf);
-  if (O <= 4 && !o.reluIn) {
+  if (O <= 4 && !o.reluIn && !o.leaky) {
     ctx.run(conv2dNarrowSpec({ relu: !!o.relu, residual: !!o.residual }), bufs, grid1d(M), `conv2d narrow ${o.k}x${o.k}/${o.stride} ${C}→${O}`);
     return { y, H: Ho, W: Wo };
   }
-  ctx.run(conv2dSpec({ relu: !!o.relu, residual: !!o.residual, reluIn: !!o.reluIn }), bufs, [Math.min(groups, MM_SLICE), Math.ceil(M / 64), Math.ceil(groups / MM_SLICE)], `conv2d ${o.k}x${o.k}/${o.stride} ${C}→${O}`);
+  ctx.run(conv2dSpec({ relu: !!o.relu, residual: !!o.residual, reluIn: !!o.reluIn, leaky: !!o.leaky }), bufs, [Math.min(groups, MM_SLICE), Math.ceil(M / 64), Math.ceil(groups / MM_SLICE)], `conv2d ${o.k}x${o.k}/${o.stride} ${C}→${O}`);
   return { y, H: Ho, W: Wo };
 }
 
@@ -520,6 +531,24 @@ export function resizeArgmax(ctx: Ctx, x: Tensor, o: { H: number; W: number; Ho:
   const y = ctx.alloc([o.Ho * o.Wo], "u32");
   ctx.run(resizeArgmaxSpec(), [ctx.uniform([o.H, o.W, lastDim(x), o.Ho, o.Wo, 0, 0, 0].map(u32)), x.buf, y.buf], grid1d(o.Ho * o.Wo));
   return y;
+}
+
+/** PixelShuffle(r) of an image x [H·W, C·r²] → [(H·r)·(W·r), C] (see pixelShuffleSpec). */
+export function pixelShuffle(ctx: Ctx, x: Tensor, o: { H: number; W: number; r: number }): Tensor {
+  const C = lastDim(x) / (o.r * o.r);
+  const y = ctx.alloc([o.H * o.r * o.W * o.r, C]);
+  ctx.run(pixelShuffleSpec(), [ctx.uniform([u32(o.H), u32(o.W), u32(C), u32(o.r)]), x.buf, y.buf], grid1d(o.H * o.r * o.W * o.r * C));
+  return y;
+}
+
+/** Swin V2 shifted-window cosine attention over an H × W token image (see swinAttentionSpec): q, k, v [H·W, row] → [H·W, row]. */
+export function swinAttention(ctx: Ctx, q: Tensor, k: Tensor, v: Tensor, bias: Tensor, scale: Tensor, o: { H: number; W: number; heads: number; D: number; win: number; shift: number }): Tensor {
+  if (o.H % o.win || o.W % o.win) throw new Error(`swinAttention: ${o.H} × ${o.W} is not a whole number of ${o.win}-pixel windows`);
+  const row = lastDim(q);
+  const out = ctx.alloc(q.shape);
+  const params = ctx.uniform([o.H, o.W, row, o.D, o.heads, o.shift, o.win, 0].map(u32));
+  ctx.run(swinAttentionSpec(o.D, o.win), [params, q.buf, k.buf, v.buf, bias.buf, scale.buf, out.buf], [(o.H / o.win) * (o.W / o.win), o.heads, 1]);
+  return out;
 }
 
 /** GroupNorm of n images x [n·T, C] in G groups, ReLU after with `relu` (see groupNormSpec). */

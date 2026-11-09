@@ -72,7 +72,10 @@ from one architecture description, concatenations as split convolutions; dilated
 ceil-mode pooling, a direct kernel for convolutions with at most four outputs; `resizeImage` takes
 one-channel images. SegFormer (`nvidia/segformer-*`): semantic `image-segmentation` with
 transformers.js's output (a mask per class present), a depthwise convolution kernel, and the score
-resize and per-pixel best class fused into one kernel.
+resize and per-pixel best class fused into one kernel. Swin2SR (`caidas/swin2SR-classical-sr-x*`):
+`image-to-image` super-resolution with the width padded to a multiple of 32, a Swin V2
+shifted-window cosine attention kernel, pixel shuffle and a leaky-ReLU conv epilogue; LayerNorm
+takes many short rows 8 per workgroup.
 
 **Loading.** Reads ahead of a download in progress are fetched on their own instead of waiting
 (a `pytorch_model.bin` keeps its zip directory at the end, so large checkpoints showed no progress

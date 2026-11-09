@@ -1,10 +1,11 @@
-// Image models from transformers checkpoints (ViT, DeiT, CLIP, YOLOS, DETR, Depth Anything, RMBG, SegFormer):
+// Image models from transformers checkpoints (ViT, DeiT, CLIP, YOLOS, DETR, Depth Anything, RMBG, SegFormer,
+// Swin2SR):
 // image classification, image features, zero-shot classification, object detection, panoptic
-// segmentation, depth estimation and background removal, with transformers' image preprocessing
+// segmentation, depth estimation, background removal and super-resolution, with transformers' image preprocessing
 // (PIL-exact resizing).
 import type { Backend, Tensor } from "@kiln/core";
 import { fetchJSON, fileUrl, listRepoFiles, parseModelId, preprocessImage, resizeImage, readPytorchHeader, readSafetensorsHeader, toF32, weightFiles, type ByteSource, type ImageProcessorConfig, type RgbImage, type TensorEntry } from "@kiln/loader";
-import { ClipTextModel, DETR_IN_CHANNELS, DepthAnythingModel, ISNET_IN_CHANNELS, IsNetModel, SEGFORMER_IN_CHANNELS, SegformerModel, isnetConvs, segformerConfigFromHF, segformerName, type SegformerConfig, DetrModel, VitModel, bicubicResize, convMatrix, convTransposeMatrix, depthConfigFromHF, depthName, detrConfigFromHF, detrName, dinov2Positions, foldConvBn, clipPoolIndex, clipTextConfigFromHF, clipTextName, vitConfigFromHF, vitGrid, vitName, vitPatchK, type DepthAnythingConfig, type DetrConfig, type VitConfig, type VitEmbeddings } from "@kiln/models";
+import { ClipTextModel, SWIN2SR_MEAN, Swin2srModel, swin2srBias, swin2srConfigFromHF, DETR_IN_CHANNELS, DepthAnythingModel, ISNET_IN_CHANNELS, IsNetModel, SEGFORMER_IN_CHANNELS, SegformerModel, isnetConvs, segformerConfigFromHF, segformerName, type SegformerConfig, DetrModel, VitModel, bicubicResize, convMatrix, convTransposeMatrix, depthConfigFromHF, depthName, detrConfigFromHF, detrName, dinov2Positions, foldConvBn, clipPoolIndex, clipTextConfigFromHF, clipTextName, vitConfigFromHF, vitGrid, vitName, vitPatchK, type DepthAnythingConfig, type DetrConfig, type VitConfig, type VitEmbeddings } from "@kiln/models";
 import { ClipTokenizer, type ClipTokenizerJSON } from "@kiln/tokenizers";
 import { openBackend, openParsed } from "./load";
 import { loadWeights, type LoadProgress, type WeightFile } from "./weights";
@@ -143,6 +144,7 @@ export class VisionEngine {
     private readonly depthModel?: { cfg: DepthAnythingConfig; model: DepthAnythingModel },
     private readonly matte?: IsNetModel,
     private readonly semantic?: { cfg: SegformerConfig; model: SegformerModel },
+    private readonly sr?: Swin2srModel,
   ) {}
 
   get cfg(): VitConfig {
@@ -159,6 +161,7 @@ export class VisionEngine {
   summary(): { family: string; layers: number; hiddenSize: number; imageSize: number; labels: Record<number, string> } {
     const labels = (l: string[]) => Object.fromEntries(l.map((v, i) => [i, v]));
     if (this.matte) return { family: "rmbg", layers: 0, hiddenSize: 0, imageSize: 1024, labels: {} };
+    if (this.sr) return { family: "swin2sr", layers: this.sr.cfg.depths.reduce((a, b) => a + b, 0), hiddenSize: this.sr.cfg.dim, imageSize: this.sr.cfg.gridSize, labels: {} };
     if (this.semantic) {
       const c = this.semantic.cfg;
       return { family: "segformer", layers: c.depths.reduce((a, b) => a + b, 0), hiddenSize: c.hidden[c.hidden.length - 1]!, imageSize: 512, labels: Object.fromEntries(c.labels.map((v, i) => [i, v])) };
@@ -427,6 +430,45 @@ export class VisionEngine {
     return { width: img.width, height: img.height, channels: 4, data };
   }
 
+  /**
+   * Super-resolution (Swin2SR), as transformers.js's image-to-image pipeline does it: pixels rescaled
+   * to 0…1 and, only when a side is not a multiple of pad_size, padded at the bottom and right by
+   * reflection (transformers.js's "symmetric", which does not repeat the edge pixel; Python pads
+   * every image), then upscaled; the output (padding included) clamped to 0…1 and rounded to bytes.
+   */
+  async upscale(img: RgbImage): Promise<{ width: number; height: number; channels: 3; data: Uint8Array }> {
+    const sr = this.sr;
+    if (!sr) throw new Error("this model does not upscale images (use a Swin2SR model)");
+    const p = preprocessImage(img, { ...this.processor, do_resize: false, do_center_crop: false, do_normalize: false });
+    const size = (n: number, m: number) => n + ((m - (n % m)) % m);
+    const pad = (this.processor as { pad_size?: number }).pad_size ?? 8;
+    const [W, H] = [size(p.width, pad), size(p.height, pad)];
+    // The model reflect-pads further to whole windows, then crops its output back to W × H.
+    const [Wm, Hm] = [size(W, sr.cfg.window), size(H, sr.cfg.window)];
+    // Index i of a side of length n extended by reflection (the edge pixel not repeated).
+    const at = (i: number, n: number) => (i < n ? i : n === 1 ? 0 : Math.abs(((i + n - 1) % (2 * n - 2)) - (n - 1)));
+    const f = Math.fround;
+    const x = new Float32Array(3 * Hm * Wm);
+    for (let c = 0; c < 3; c++)
+      for (let y = 0; y < Hm; y++)
+        for (let xx = 0; xx < Wm; xx++) {
+          // Model padding over the processor's, which is over the image.
+          const v = p.data[(c * p.height + at(at(y, H), p.height)) * p.width + at(at(xx, W), p.width)]!;
+          x[(c * Hm + y) * Wm + xx] = f(f(v - f(SWIN2SR_MEAN[c]!)) * sr.cfg.imgRange);
+        }
+    const up = sr.cfg.upscale;
+    const out = await sr.upscale(x, Wm, Hm);
+    const [ow, oh] = [W * up, H * up];
+    const data = new Uint8Array(ow * oh * 3);
+    for (let c = 0; c < 3; c++)
+      for (let y = 0; y < oh; y++)
+        for (let xx = 0; xx < ow; xx++) {
+          const v = f(f(out[(c * Hm * up + y) * Wm * up + xx]! / sr.cfg.imgRange) + f(SWIN2SR_MEAN[c]!));
+          data[(y * ow + xx) * 3 + c] = Math.round(f(Math.min(Math.max(v, 0), 1) * 255));
+        }
+    return { width: ow, height: oh, channels: 3, data };
+  }
+
   /** Class logits of an image (DeiT with a teacher: the mean of the CLS and distillation heads). */
   async logits(img: RgbImage): Promise<Float32Array> {
     if (!this.heads.cls) throw new Error("this model has no classification head");
@@ -463,6 +505,7 @@ export class VisionEngine {
     this.depthModel?.model.destroy();
     this.matte?.destroy();
     this.semantic?.model.destroy();
+    this.sr?.destroy();
     this.clip?.text.destroy();
   }
 }
@@ -487,6 +530,7 @@ export async function createVision(modelId: string, opts: VisionLoadOptions = {}
   if (config!.model_type === "depth_anything") return createDepth(modelId, ref, config!, prep, names, opts);
   if (((config!.architectures as string[] | undefined) ?? []).includes("BriaRMBG")) return createRmbg(modelId, ref, prep, names, opts);
   if (config!.model_type === "segformer") return createSegformer(modelId, ref, config!, prep, names, opts);
+  if (config!.model_type === "swin2sr") return createSwin2sr(modelId, ref, config!, prep, names, opts);
   const cfg = vitConfigFromHF(config!);
   const clip = cfg.modelType === "clip";
   if (clip && config!.model_type !== "clip") throw new Error(`${modelId}: a CLIP vision tower alone; zero-shot classification needs the full CLIP model`);
@@ -990,6 +1034,116 @@ async function createSegformer(
     upload("dec.cls.bias", [cls.shape[0]!], (await need(d + "classifier.bias")).data);
     const model = new SegformerModel(backend, cfg, weights);
     return new VisionEngine(backend, undefined, prep, {}, undefined, undefined, undefined, undefined, { cfg, model });
+  } finally {
+    for (const s of sources) s.close?.();
+  }
+}
+
+/**
+ * Swin2SR: every weight read and padded from the model's width to the next multiple of 32 (zero rows
+ * and columns, LayerNorm weights and biases zero past the width); each layer's attention bias table
+ * computed from its continuous-position MLP, and its logit scale clamped and exponentiated.
+ */
+async function createSwin2sr(
+  modelId: string,
+  ref: ReturnType<typeof parseModelId>,
+  config: Record<string, unknown>,
+  prep: ImageProcessorConfig | undefined,
+  names: Awaited<ReturnType<typeof weightFiles>>,
+  opts: VisionLoadOptions,
+): Promise<VisionEngine> {
+  const cfg = swin2srConfigFromHF(config);
+  const ep = opts.endpoint;
+  const backend = opts.backend ?? (await openBackend(opts.device ?? "auto", opts.cpuThreads));
+  const sources: ByteSource[] = [];
+  const located = new Map<string, { source: ByteSource; entry: TensorEntry }>();
+  try {
+    for (const name of names.names) {
+      const { source, header } = await openParsed(ref, name, ep, names.format === "safetensors" ? readSafetensorsHeader : readPytorchHeader);
+      sources.push(source);
+      for (const t of header.tensors) located.set(t.name, { source, entry: t });
+    }
+    const read = async (name: string) => {
+      const t = located.get(name);
+      if (!t) return undefined;
+      const count = t.entry.shape.reduce((a, b) => a * b, 1);
+      return { shape: t.entry.shape, data: toF32(t.entry.type as Parameters<typeof toF32>[0], await t.source.read(t.entry.offset, t.entry.byteLength), count) };
+    };
+    const need = async (name: string) => {
+      const t = await read(name);
+      if (!t) throw new Error(`${modelId}: "${name}" is missing`);
+      return t;
+    };
+    const weights = new Map<string, Tensor>();
+    const upload = (name: string, shape: number[], data: Float32Array) => {
+      const buf = backend.alloc(data.byteLength, "storage", `swin2sr/${name}`);
+      backend.write(buf, 0, data);
+      weights.set(name, { shape, dtype: "f32", buf } as Tensor);
+    };
+    const pad32 = (n: number) => Math.ceil(n / 32) * 32;
+    const vec = (v: Float32Array, n: number) => {
+      const out = new Float32Array(n);
+      out.set(v);
+      return out;
+    };
+    const linear = async (from: string, to: string) => {
+      const w = await need(`${from}.weight`);
+      const [N, K] = w.shape as [number, number];
+      const [Np, Kp] = [pad32(N), pad32(K)];
+      const m = new Float32Array(Np * Kp);
+      for (let r = 0; r < N; r++) m.set(w.data.subarray(r * K, (r + 1) * K), r * Kp);
+      upload(`${to}.weight`, [Np, Kp], m);
+      const b = await read(`${from}.bias`);
+      if (b) upload(`${to}.bias`, [Np], vec(b.data, Np));
+    };
+    const norm = async (from: string, to: string) => {
+      for (const f of ["weight", "bias"]) upload(`${to}.${f}`, [pad32(cfg.dim)], vec((await need(`${from}.${f}`)).data, pad32(cfg.dim)));
+    };
+    const conv = async (from: string, to: string, cin?: number) => {
+      const w = await need(`${from}.weight`);
+      const O = w.shape[0]!;
+      const Op = O > 4 ? pad32(O) : O;
+      const m = convMatrix(w.data, w.shape, cin ?? pad32(w.shape[1]!));
+      upload(`${to}.weight`, [Op, m.K], vec(m.w, Op * m.K));
+      upload(`${to}.bias`, [Op], vec((await need(`${from}.bias`)).data, Op));
+    };
+    const m = "swin2sr.";
+    await conv(m + "first_convolution", "first", 4);
+    await conv(m + "embeddings.patch_embeddings.projection", "patch");
+    await norm(m + "embeddings.patch_embeddings.layernorm", "patchLn");
+    let done = 0;
+    const total = cfg.depths.reduce((a, b) => a + b, 0);
+    for (let s = 0; s < cfg.depths.length; s++) {
+      const st = `${m}encoder.stages.${s}.`;
+      for (let l = 0; l < cfg.depths[s]!; l++) {
+        const L = `${st}layers.${l}.`;
+        const p = `s${s}.${l}`;
+        await linear(L + "attention.self.query", `${p}.q`);
+        await linear(L + "attention.self.key", `${p}.k`);
+        await linear(L + "attention.self.value", `${p}.v`);
+        await linear(L + "attention.output.dense", `${p}.o`);
+        await linear(L + "intermediate.dense", `${p}.up`);
+        await linear(L + "output.dense", `${p}.down`);
+        await norm(L + "layernorm_before", `${p}.ln1`);
+        await norm(L + "layernorm_after", `${p}.ln2`);
+        const heads = cfg.heads[s]!;
+        const ls = (await need(L + "attention.self.logit_scale")).data;
+        upload(`${p}.scale`, [heads], Float32Array.from(ls, (v) => Math.exp(Math.min(v, Math.log(100)))));
+        const [w1, b1, w2] = await Promise.all(["0.weight", "0.bias", "2.weight"].map((f) => need(`${L}attention.self.continuous_position_bias_mlp.${f}`)));
+        const N = cfg.window ** 2;
+        upload(`${p}.bias`, [heads * N * N], swin2srBias(w1.data, b1.data, w2.data, heads, cfg.window));
+        opts.onProgress?.({ file: names.names[0]!, loaded: ++done, total });
+      }
+      await conv(st + "conv", `s${s}.conv`);
+      await conv(st + "patch_embed.projection", `s${s}.proj`);
+    }
+    await norm(m + "layernorm", "lnF");
+    await conv(m + "conv_after_body", "afterBody");
+    await conv("upsample.conv_before_upsample", "beforeUp");
+    for (let i = 0; 2 ** i < cfg.upscale; i++) await conv(`upsample.upsample.convolution_${i}`, `up${i}`);
+    await conv("upsample.final_convolution", "final");
+    const processor: ImageProcessorConfig = prep ?? {};
+    return new VisionEngine(backend, undefined, processor, {}, undefined, undefined, undefined, undefined, undefined, new Swin2srModel(backend, cfg, weights));
   } finally {
     for (const s of sources) s.close?.();
   }

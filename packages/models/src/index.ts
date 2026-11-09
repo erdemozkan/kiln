@@ -12,3 +12,4 @@ export * from "./detr";
 export * from "./depth";
 export * from "./isnet";
 export * from "./segformer";
+export * from "./swin2sr";

@@ -262,6 +262,8 @@ scope.onmessage = async (e: MessageEvent<Request>) => {
                         ? await v.segment(img, msg.args[1] as Record<string, unknown> | undefined)
                         : task === "background-removal"
                           ? await v.removeBackground(img)
+                          : task === "image-to-image"
+                            ? await v.upscale(img)
                       : await v.features(img, msg.args[1] as Record<string, unknown> | undefined);
             post({ id: msg.id, type: "result", result });
           } catch (err) {

@@ -29,7 +29,8 @@ export type PipelineTask =
   | "object-detection"
   | "depth-estimation"
   | "image-segmentation"
-  | "background-removal";
+  | "background-removal"
+  | "image-to-image";
 
 const SEQ2SEQ = new Set<string>(["summarization", "translation", "text2text-generation", "automatic-speech-recognition"]);
 
@@ -57,9 +58,10 @@ export const DEFAULT_MODELS: Record<string, string> = {
   "image-segmentation": "facebook/detr-resnet-50-panoptic",
   // transformers.js's default (MODNet) exists only as ONNX. RMBG-1.4's license is non-commercial.
   "background-removal": "briaai/RMBG-1.4",
+  "image-to-image": "caidas/swin2SR-classical-sr-x2-64",
 };
 
-const VISION = new Set<string>(["image-classification", "image-feature-extraction", "zero-shot-image-classification", "object-detection", "depth-estimation", "image-segmentation", "background-removal"]);
+const VISION = new Set<string>(["image-classification", "image-feature-extraction", "zero-shot-image-classification", "object-detection", "depth-estimation", "image-segmentation", "background-removal", "image-to-image"]);
 
 /** Speech encoders run on raw samples (CTC or a classifier) rather than as encoder-decoders. */
 const AUDIO_ENCODERS = new Set(["wav2vec2", "hubert"]);
@@ -530,6 +532,22 @@ export interface BackgroundRemovalPipeline {
   (images: ImageInput[]): Promise<BackgroundRemovalResult[]>;
 }
 
+/** An upscaled image as RGB bytes. */
+export interface ImageToImageResult {
+  width: number;
+  height: number;
+  channels: 3;
+  data: Uint8Array;
+}
+export interface ImageToImagePipeline {
+  readonly task: PipelineTask;
+  readonly model: KilnVision;
+  readonly info: VisionInfo;
+  dispose(): Promise<void>;
+  (image: ImageInput): Promise<ImageToImageResult>;
+  (images: ImageInput[]): Promise<ImageToImageResult[]>;
+}
+
 /** An image in a form the worker can receive and decode: relative URLs resolved, DOM images drawn to bitmaps. */
 async function toWorkerImage(x: ImageInput): Promise<unknown> {
   if (typeof x === "string") return typeof location !== "undefined" ? new URL(x, location.href).href : x;
@@ -588,6 +606,7 @@ export async function pipeline(task: "object-detection", model?: string, options
 export async function pipeline(task: "depth-estimation", model?: string, options?: PipelineOptions): Promise<DepthEstimationPipeline>;
 export async function pipeline(task: "image-segmentation", model?: string, options?: PipelineOptions): Promise<ImageSegmentationPipeline>;
 export async function pipeline(task: "background-removal", model?: string, options?: PipelineOptions): Promise<BackgroundRemovalPipeline>;
+export async function pipeline(task: "image-to-image", model?: string, options?: PipelineOptions): Promise<ImageToImagePipeline>;
 export async function pipeline(task: PipelineTask, model?: string, options: PipelineOptions = {}): Promise<unknown> {
   const t = ALIASES[task] ?? task;
   const id = model ?? DEFAULT_MODELS[t];
@@ -611,7 +630,7 @@ export async function pipeline(task: PipelineTask, model?: string, options: Pipe
     const one = async (x: ImageInput, a?: unknown, b?: object) => {
       const img = await toWorkerImage(x);
       if (zeroShot) return m.run<unknown>("zero-shot-image-classification", img, a, { ...b });
-      const r = await m.run<unknown>(t as "image-classification" | "image-feature-extraction" | "object-detection" | "depth-estimation" | "image-segmentation" | "background-removal", img, { ...(a as object) });
+      const r = await m.run<unknown>(t as "image-classification" | "image-feature-extraction" | "object-detection" | "depth-estimation" | "image-segmentation" | "background-removal" | "image-to-image", img, { ...(a as object) });
       if (t === "image-feature-extraction") {
         const f = r as { data: Float32Array; dims: number[] };
         return new Tensor("float32", f.data, f.dims);

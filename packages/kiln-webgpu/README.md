@@ -168,6 +168,10 @@ await segmenter("cats.jpg"); // [{ score: 0.994, label: "cat", mask: { width: 64
 const semantic = await pipeline("image-segmentation", "nvidia/segformer-b0-finetuned-ade-512-512");
 await semantic("cats.jpg"); // [{ score: null, label: "wall", mask }, { score: null, label: "floor", mask }, ...]
 
+// Swin2SR: 2× super-resolution.
+const upscaler = await pipeline("image-to-image"); // caidas/swin2SR-classical-sr-x2-64
+const big = await upscaler("small.png"); // { width: 2 × w, height: 2 × h, channels: 3, data }
+
 // RMBG-1.4 (non-commercial license): the image as RGBA, the background transparent.
 const remover = await pipeline("background-removal"); // briaai/RMBG-1.4
 const cutout = await remover("portrait.jpg"); // { width, height, channels: 4, data }

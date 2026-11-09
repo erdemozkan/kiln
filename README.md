@@ -526,6 +526,7 @@ K/V; each decoder step reads them through a step block whose span covers every p
 | wav2vec2 classifier (`superb/wav2vec2-base-superb-ks`, weighted layer sum) | transformers.js (`Xenova/wav2vec2-base-superb-ks`, fp32) | the same five labels, scores within 2e-7 |
 | Image preprocessing (all six PIL filters; DeiT and CLIP pipelines) | PIL 8 + numpy | resized bytes identical; pixel values identical (float32) |
 | CLIP tokenizer (`openai/clip-vit-base-patch32`) | transformers.js | the same ids for 8 texts (punctuation, accents, CJK, emoji, long words) |
+| Swin2SR (`caidas/swin2SR-classical-sr-x2-64`) | transformers.js (`Xenova/swin2SR-classical-sr-x2-64`, fp32) on the same pixel values | 4 of 147,456 output bytes one level apart (128 × 96 → 256 × 192); 3.4 s end to end against 10.4 s |
 | SegFormer (`nvidia/segformer-b0-finetuned-ade-512-512`) | transformers.js (`Xenova/segformer-b0-finetuned-ade-512-512`, fp32) on the same pixel values | the same 14 classes on the cats photo, all 307,200 pixels the same class; 0.75 s end to end against 3.9 s |
 | RMBG-1.4 (`briaai/RMBG-1.4`) | transformers.js (the repo's ONNX export, fp32) on the same pixel values | 3 of 1,048,576 matte bytes one level apart; 2.9 s end to end against 4.0 s |
 | DETR panoptic (`facebook/detr-resnet-50-panoptic`) | transformers.js (`Xenova/detr-resnet-50-panoptic`, fp32) on the same pixel values | the same five segments on the cats photo, scores within 1.4e-6, one pixel of 307,200 assigned differently; 2.4 s end to end against 28.2 s |
@@ -706,6 +707,22 @@ fed the same pixel values as transformers.js (`Xenova/segformer-b0-finetuned-ade
 and post-processed by its own code: the same 14 classes, and every one of the 307,200 pixels given
 the same class. Both pipelines end to end with b0 (median of five warm calls, WebGPU, backgrounded
 pane): 0.75 s in Kiln against 3.9 s for transformers.js.
+
+Image-to-image (`image-to-image`) runs Swin2SR super-resolution (`caidas/swin2SR-classical-sr-x2-64`,
+the default, as in transformers.js). Its width of 180 is padded to 192 in every row (zero weight rows
+and columns), so the matmul and conv kernels take it unchanged and LayerNorm takes its statistics over
+the real width. A new kernel runs Swin V2's shifted-window attention for 30-wide heads. It does the
+cyclic shift, the window partition and the shifted-window mask as index arithmetic, so nothing is
+rolled or copied. Within each window it computes cosine scores with each head's logit scale and the
+position bias, which is precomputed at load from the continuous-position MLP (checked against torch).
+A pixel-shuffle kernel and a leaky-ReLU epilogue on the conv kernel handle the upsampler. Pre- and
+post-processing follow transformers.js: pixels rescaled to 0–1, padded by reflection only when a side
+is not a multiple of 8 (Python pads every image), output clamped and rounded to bytes. On a 128 × 96
+copy of the cats photo, fed the same pixel values as transformers.js
+(`Xenova/swin2SR-classical-sr-x2-64`, fp32): 4 of the 147,456 output bytes one level apart. Both
+pipelines end to end (median of five warm calls, WebGPU, backgrounded pane): 3.4 s in Kiln against
+10.4 s for transformers.js. Profiling this model also led to a LayerNorm kernel for many short rows,
+8 rows per workgroup, which every vision model now uses.
 
 T5's learned relative position bias is added to each score by the per-row attention kernels (GPU
 and CPU, buckets computed in the kernel; bucket function equal to transformers' over ±300
