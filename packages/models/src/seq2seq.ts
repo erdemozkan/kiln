@@ -407,6 +407,7 @@ export class Seq2SeqModel {
     const head = this.weights.get("lm_head.weight") ?? this.w("shared.weight");
     const logits = ops.linear(dctx, y, head, { bias: this.weights.get("flb") });
     ops.sample(dctx, logits, this.sampler.out, this.sampler.seen, this.sampler.allowed);
+    ops.pickLogit(dctx, logits, this.sampler.out);
     return {
       S,
       feats,
@@ -483,6 +484,30 @@ export class Seq2SeqModel {
     be.write(this.decStep, 0, packStep({ pos0: t, lastRow: 0, seed: 0, temperature: 0, repetitionPenalty: rep }));
     be.submit(pair.dec.dispatches);
     return this.sampler.read();
+  }
+
+  /**
+   * As next(), also returning the chosen token's logit and, with `tail`, the logits of every token
+   * from `tail` up (Whisper's timestamp rule compares the timestamp tokens' total probability with
+   * the best text token's). One wait for all of it.
+   */
+  async nextDetail(token: number, t: number, opts: StepOptions & { tail?: number } = {}): Promise<{ id: number; logit: number; tail?: Float32Array }> {
+    const pair = this.current;
+    if (!pair) throw new Error("seq2seq: encode a source first");
+    if (t >= this.maxTarget) throw new Error(`seq2seq: target longer than ${this.maxTarget} tokens`);
+    const be = this.backend;
+    this.sampler.prepare(opts.banned ?? []);
+    be.write(this.tok, 0, Uint32Array.of(token));
+    be.write(this.posBuf, 0, Uint32Array.of(t + this.cfg.posOffset));
+    be.write(this.decStep, 0, packStep({ pos0: t, lastRow: 0, seed: 0, temperature: 0 }));
+    be.submit(pair.dec.dispatches);
+    const V = this.cfg.vocab;
+    const [out, tail] = await Promise.all([
+      be.readback(this.sampler.out, 0, 8),
+      opts.tail !== undefined && opts.tail < V ? be.readback(physical(pair.dec.logits.buf), opts.tail * 4, (V - opts.tail) * 4) : undefined,
+    ]);
+    const u = new Uint32Array(out);
+    return { id: u[0]!, logit: new Float32Array(out)[1]!, tail: tail ? new Float32Array(tail) : undefined };
   }
 
   private dropPair(p: Pair): void {

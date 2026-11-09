@@ -706,6 +706,10 @@ export const cpuGroupConv1d: CpuKernel = (b) => {
   }
 };
 
+export const cpuPickLogit: CpuKernel = (b) => {
+  b[1]!.f32[1] = b[0]!.f32[b[1]!.u32[0]!]!;
+};
+
 export const cpuScaleAdd: CpuKernel = (b) => {
   const [n, accumulate] = [b[0]!.u32[0]!, b[0]!.u32[1]!];
   const a = b[0]!.f32[2]!;

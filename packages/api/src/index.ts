@@ -28,6 +28,7 @@ export {
   type Text2TextOptions,
   type SpeechRecognitionPipeline,
   type SpeechRecognitionOptions,
+  type SpeechChunk,
   type AudioClassificationPipeline,
   type AudioClassificationOptions,
   type PipelineOptions,

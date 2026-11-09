@@ -1728,6 +1728,18 @@ fn main(${EW_ARGS}) {
 }`);
 }
 
+/** out[1] = the bits of logits[out[0]]: the value of the token the sampler just chose. */
+export function pickLogitSpec(): KernelSpec {
+  return spec("pick_logit", ["read", "rw"], cpu.cpuPickLogit, () => /* wgsl */ `
+@group(0) @binding(0) var<storage, read> logits: array<f32>;
+@group(0) @binding(1) var<storage, read_write> out: array<u32>;
+
+@compute @workgroup_size(1)
+fn main() {
+  out[1] = bitcast<u32>(logits[out[0]]);
+}`);
+}
+
 /** y = a·x (accumulate 0) or y += a·x (accumulate 1), elementwise. */
 export function scaleAddSpec(): KernelSpec {
   return spec("scale_add", ["uniform", "read", "rw"], cpu.cpuScaleAdd, () => /* wgsl */ `

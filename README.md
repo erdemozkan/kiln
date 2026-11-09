@@ -529,9 +529,19 @@ parsed directly; other formats decoded and resampled by the page's Web Audio API
 features follow transformers' WhisperFeatureExtractor (a mixed-radix FFT for the 400-point frames,
 slaney mel filters); the two convolutions run as matmuls over im2col rows; decoding starts from
 transformers.js's prompt (start, language and task for multilingual models, no-timestamps) with the
-model's suppressed tokens. Audio past 30 s is transcribed window by window (transformers.js keeps
-only the first window unless `chunk_length_s` is set). Not yet: timestamps, overlapping chunk
-merging, and a stable speed measurement (runs in a backgrounded browser pane varied 5× between
+model's suppressed tokens. `return_timestamps: true` returns segments (`chunks: [{ timestamp:
+[start, end], text }]`) as transformers.js computes them: its timestamp rule (pairs, and a timestamp
+whenever the timestamp tokens' total probability beats the best text token, decided from 1,501
+timestamp logits and the chosen text token's logit read back with the step's token), its seek loop
+(a pass that stops on a segment boundary early is followed by another from there), and its segment
+decoding. `chunk_length_s` / `stride_length_s` cut long audio into overlapping windows merged where
+their tokens agree; audio past 30 s is chunked in 30 s windows by default (transformers.js keeps only
+the first 30 s unless `chunk_length_s` is set). Against transformers.js with whisper-tiny.en and
+whisper-base on the JFK clip, once alone and three times back to back (33 s): the same text,
+segments and timestamps in all eight runs (timestamps, 30 s chunks, both, 10 s chunks with
+timestamps); 1.6–4.6 s a case against 5.4–16.4 s for tiny.en, 2.4–7.4 s against 9.1–27.4 s for base
+(one warm call each, backgrounded pane). Not yet: word-level timestamps, and a stable
+speed measurement (runs in a backgrounded browser pane varied 5× between
 calls; Kiln took 6.6–7.3 s for the 11 s clip against 10.5–18 s for transformers.js there). Encoder-
 decoder decoding picks each token on the backend with the LLM engine's sampling kernel (greedy,
 under a banned-token mask built from the logits processors), so a step reads back 4 bytes instead

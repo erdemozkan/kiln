@@ -106,8 +106,16 @@ await multilingual(blob, { language: "french", task: "translate" }); // French s
 
 Whisper models load from their original repos. Audio can be 16 kHz `Float32Array` samples, a URL, a
 Blob / File, or encoded bytes: WAV is parsed directly, other formats are decoded by the browser's
-Web Audio API on the page's main thread (`readAudio` is exported for doing it yourself). Audio
-longer than 30 s is transcribed in consecutive 30 s windows. Timestamps are not supported yet.
+Web Audio API on the page's main thread (`readAudio` is exported for doing it yourself).
+Timestamps and long audio work as in transformers.js:
+
+```js
+const out = await transcriber(audio, { return_timestamps: true, chunk_length_s: 30 });
+// { text, chunks: [{ timestamp: [0, 8], text: " And so my fellow Americans ..." }, ...] }
+```
+
+Audio longer than 30 s is chunked in 30 s windows (5 s overlap each side) even without
+`chunk_length_s`. Word-level timestamps (`return_timestamps: "word"`) are not supported yet.
 
 wav2vec2 and HuBERT CTC models work in the same pipeline (Kiln reads the model's config to tell them
 from Whisper), and their sequence classifiers run `audio-classification`:

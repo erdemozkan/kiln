@@ -23,6 +23,7 @@ import {
   channelNormSpec,
   groupConv1dSpec,
   scaleAddSpec,
+  pickLogitSpec,
   type Activation,
   layernormSpec,
   gatedActSpec,
@@ -422,6 +423,11 @@ export function groupConv1d(ctx: Ctx, x: Tensor, w: Tensor, bias: Tensor, o: { k
   const y = ctx.alloc([tout, O]);
   ctx.run(groupConv1dSpec(), [ctx.uniform([u32(tin), u32(tout), u32(C), u32(O), u32(o.k), u32(o.pad), u32(o.groups), u32(0)]), x.buf, w.buf, bias.buf, y.buf], grid1d(tout * O));
   return y;
+}
+
+/** out[1] = logits[out[0]] (as f32 bits): the chosen token's logit, after sample(). */
+export function pickLogit(ctx: Ctx, logits: Tensor, out: Buf): void {
+  ctx.run(pickLogitSpec(), [logits.buf, out], [1, 1, 1]);
 }
 
 /** y = a·x, or y += a·x when accumulating (same element count). */

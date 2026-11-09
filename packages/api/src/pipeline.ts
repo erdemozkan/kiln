@@ -355,8 +355,20 @@ export interface SpeechRecognitionOptions {
   /** "transcribe" (default) or "translate" (into English). */
   task?: "transcribe" | "translate";
   max_new_tokens?: number;
-  /** Window length in seconds (default 30). Longer audio is transcribed window by window. */
+  /**
+   * Window length in seconds for chunked transcription: overlapping windows, their texts merged where
+   * they agree. Default none, except that audio past 30 s is chunked in 30 s windows.
+   */
   chunk_length_s?: number;
+  /** Overlap on each side of a window in seconds (default chunk_length_s / 6). */
+  stride_length_s?: number;
+  /** true: also return `chunks`, segments with [start, end] times in seconds. */
+  return_timestamps?: boolean;
+}
+/** A transcribed segment (with `return_timestamps: true`). */
+export interface SpeechChunk {
+  timestamp: [number | null, number | null];
+  text: string;
 }
 export interface SpeechRecognitionPipeline {
   readonly task: PipelineTask;
@@ -366,8 +378,8 @@ export interface SpeechRecognitionPipeline {
   readonly tokenizer: object;
   dispose(): Promise<void>;
   /** 16 kHz samples, a URL, a Blob / File, or encoded audio bytes (WAV anywhere; other formats on a page's main thread). */
-  (audio: AudioInput, options?: SpeechRecognitionOptions): Promise<{ text: string }>;
-  (audio: AudioInput[], options?: SpeechRecognitionOptions): Promise<{ text: string }[]>;
+  (audio: AudioInput, options?: SpeechRecognitionOptions): Promise<{ text: string; chunks?: SpeechChunk[] }>;
+  (audio: AudioInput[], options?: SpeechRecognitionOptions): Promise<{ text: string; chunks?: SpeechChunk[] }[]>;
 }
 export interface AudioClassificationOptions {
   /** Labels returned, best first (default 5). */

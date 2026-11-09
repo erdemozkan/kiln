@@ -126,42 +126,142 @@ export class Seq2SeqEngine {
   }
 
   /**
-   * Whisper: text of 16 kHz mono audio. The decoder starts from transformers.js's prompt (start,
-   * language and task for multilingual models, no-timestamps), with the model's suppressed tokens
-   * and its begin-suppressed ones at the first step. Audio longer than a window (30 s) is split
-   * into consecutive windows whose texts are joined (transformers.js keeps only the first window
-   * unless asked to chunk).
+   * Whisper: text of 16 kHz mono audio, as transformers.js's pipeline computes it. The decoder starts
+   * from its prompt (start, language and task for multilingual models, then no-timestamps unless
+   * timestamps are asked for), with the model's suppressed tokens and its begin-suppressed ones at
+   * the first step. With `chunk_length_s`, the audio is cut into overlapping windows (`stride_length_s`
+   * each side, default a sixth of the window) whose token sequences are merged where they agree;
+   * audio longer than 30 s is chunked that way by default (transformers.js keeps only the first 30 s).
+   * `return_timestamps: true` adds `chunks`: [{ timestamp: [start, end], text }].
    */
-  async transcribe(samples: Float32Array, options: WhisperOptions = {}): Promise<{ text: string }> {
-    const a = this.cfg.audio;
-    if (!a || !(this.model instanceof Seq2SeqModel)) throw new Error("this model does not take audio");
-    const g = this.generation;
-    const window = 16000 * (options.chunk_length_s ?? 30);
-    const texts: string[] = [];
-    for (let off = 0; off < Math.max(samples.length, 1); off += window) {
-      const feats = whisperFeatures(samples.subarray(off, off + window), { mels: a.mels });
-      await this.model.encodeAudio(feats);
-      const init = this.whisperPrompt(options);
-      const suppress = new Set<number>((g.suppress_tokens as number[] | undefined) ?? []);
-      const begin = new Set<number>((g.begin_suppress_tokens as number[] | undefined) ?? []);
-      const eos = Number(g.eos_token_id ?? this.cfg.eos);
-      const maxLen = Math.min(this.model.maxTarget, options.max_new_tokens !== undefined ? init.length + options.max_new_tokens : Number(g.max_length ?? this.model.maxTarget));
-      const ids = [...init];
-      // The prompt goes in a token at a time; only the last step's choice is kept.
-      for (let t = 0; t + 1 < init.length; t++) await this.model.next(init[t]!, t);
-      while (ids.length < maxLen) {
-        const banned = ids.length === init.length ? new Set([...suppress, ...begin]) : suppress;
-        const next = await this.model.next(ids.at(-1)!, ids.length - 1, { banned });
-        ids.push(next);
-        if (next === eos) break;
+  async transcribe(samples: Float32Array, options: WhisperOptions = {}): Promise<{ text: string; chunks?: WhisperChunk[] }> {
+    if (!this.cfg.audio || !(this.model instanceof Seq2SeqModel)) throw new Error("this model does not take audio");
+    if (options.return_timestamps === "word") throw new Error("Whisper: word-level timestamps are not supported yet (use return_timestamps: true)");
+    const timestamps = options.return_timestamps === true;
+    const rate = 16000;
+    let chunkLen = options.chunk_length_s ?? 0;
+    if (!chunkLen && samples.length > 30 * rate) chunkLen = 30;
+    const windows: { start: number; end: number; stride: [number, number, number] }[] = [];
+    if (chunkLen > 0) {
+      const strideS = options.stride_length_s ?? chunkLen / 6;
+      if (chunkLen <= strideS) throw new Error("chunk_length_s must be larger than stride_length_s");
+      const window = Math.round(rate * chunkLen);
+      const stride = Math.round(rate * strideS);
+      const jump = window - 2 * stride;
+      for (let off = 0; ; off += jump) {
+        const end = Math.min(off + window, samples.length);
+        const first = off === 0;
+        const last = off + window >= samples.length;
+        windows.push({ start: off, end, stride: [end - off, first ? 0 : stride, last ? 0 : stride] });
+        if (last) break;
       }
-      texts.push(this.tokenizer.decode(ids.slice(init.length), true));
+    } else windows.push({ start: 0, end: samples.length, stride: [samples.length, 0, 0] });
+    const seqs: AsrSequence[] = [];
+    for (const w of windows) {
+      const tokens = await this.whisperGenerate(samples.subarray(w.start, w.end), options, timestamps);
+      seqs.push({ tokens, stride: w.stride.map((x) => x / rate) as [number, number, number] });
     }
-    return { text: texts.join("") };
+    const g = this.generation;
+    const noTs = Number(g.no_timestamps_token_id);
+    const eos = Number(g.eos_token_id ?? this.cfg.eos);
+    return decodeAsr(seqs, {
+      timestampBegin: noTs + 1,
+      firstSpecial: Math.min(eos, Number(g.decoder_start_token_id ?? this.cfg.decoderStart)),
+      timePrecision: 30 / (this.cfg.audio.frames / 2),
+      timestamps,
+      decode: (ids) => this.tokenizer.decode(ids, true),
+    });
   }
 
-  /** transformers.js's Whisper prompt: [start, language, task, no-timestamps] (English-only models: [start, no-timestamps]). */
-  whisperPrompt(options: WhisperOptions = {}): number[] {
+  /**
+   * One window's generated ids, prompt included. With timestamps, transformers' timestamp rule
+   * applies: the first token is a timestamp, timestamps come in pairs, and a timestamp is chosen
+   * whenever the timestamp tokens' total probability beats the best text token's. Each step still
+   * picks on the backend; steps where both kinds are allowed also read back the 1,501 timestamp
+   * logits and the chosen text token's logit. Timestamp mode then seeks as transformers does: a
+   * pass that stops on a segment boundary before the window's end is followed by another from that
+   * boundary (the features shifted left and zero-padded), its timestamps offset to match.
+   */
+  private async whisperGenerate(samples: Float32Array, options: WhisperOptions, timestamps: boolean): Promise<number[]> {
+    const a = this.cfg.audio!;
+    const g = this.generation;
+    const feats = whisperFeatures(samples, { mels: a.mels });
+    const init = this.whisperPrompt(options, timestamps);
+    if (!timestamps || options.max_new_tokens !== undefined) return this.whisperPass(feats, init, options, timestamps);
+    const eos = Number(g.eos_token_id ?? this.cfg.eos);
+    const tsBegin = Number(g.no_timestamps_token_id) + 1;
+    const total = a.frames;
+    const all: number[] = [];
+    for (let seek = 0; seek < total; ) {
+      const shifted = new Float32Array(feats.length);
+      shifted.set(feats.subarray(seek * a.mels));
+      const gen = (await this.whisperPass(shifted, init, options, true)).slice(init.length);
+      if (gen.at(-1) === eos) gen.pop();
+      if (!gen.length) break;
+      const isTs = gen.map((t) => t >= tsBegin);
+      const single = gen.length >= 2 && isTs[gen.length - 1]! && !isTs[gen.length - 2]!;
+      const pairs: number[] = [];
+      for (let i = 0; i + 1 < gen.length; i++) if (isTs[i] && isTs[i + 1]) pairs.push(i + 1);
+      let advance = total - seek;
+      let keep = gen.length;
+      if (pairs.length && !single) {
+        const last = pairs.at(-1)!;
+        advance = (gen[last - 1]! - tsBegin) * 2;
+        keep = last;
+      }
+      const offset = Math.floor(seek / 2);
+      for (let i = 0; i < keep; i++) if (gen[i]! >= tsBegin) gen[i] = Math.min(gen[i]! + offset, tsBegin + 1500);
+      all.push(...gen.slice(0, keep));
+      seek += advance;
+    }
+    return [...init, ...all, eos];
+  }
+
+  /** One decoding pass over log-mel features [frames, mels] from a prompt. */
+  private async whisperPass(feats: Float32Array, init: number[], options: WhisperOptions, timestamps: boolean): Promise<number[]> {
+    const model = this.model as Seq2SeqModel;
+    const g = this.generation;
+    await model.encodeAudio(feats);
+    const suppress = (g.suppress_tokens as number[] | undefined) ?? [];
+    const begin = (g.begin_suppress_tokens as number[] | undefined) ?? [];
+    const eos = Number(g.eos_token_id ?? this.cfg.eos);
+    const noTs = Number(g.no_timestamps_token_id);
+    const tsBegin = noTs + 1;
+    const V = this.cfg.vocab;
+    const range = (lo: number, hi: number) => Array.from({ length: Math.max(0, hi - lo) }, (_, i) => lo + i);
+    const tsRange = timestamps ? range(tsBegin, V) : [];
+    const maxLen = Math.min(model.maxTarget, options.max_new_tokens !== undefined ? init.length + options.max_new_tokens : Number(g.max_length ?? model.maxTarget));
+    const ids = [...init];
+    // The prompt goes in a token at a time; only the last step's choice is kept.
+    for (let t = 0; t + 1 < init.length; t++) await model.next(init[t]!, t);
+    while (ids.length < maxLen) {
+      const first = ids.length === init.length;
+      const banned: number[] = first ? [...suppress, ...begin] : [...suppress];
+      const pos = ids.length - 1;
+      const prev = ids.at(-1)!;
+      let next: number;
+      if (!timestamps) next = await model.next(prev, pos, { banned });
+      else {
+        banned.push(noTs);
+        const seq = ids.slice(init.length);
+        const lastTs = seq.length >= 1 && seq.at(-1)! >= tsBegin;
+        const penultTs = seq.length < 2 || seq.at(-2)! >= tsBegin;
+        if (first) next = await model.next(prev, pos, { banned: [...banned, ...range(0, tsBegin)] });
+        else if (lastTs && penultTs) next = await model.next(prev, pos, { banned: [...banned, ...tsRange] });
+        else {
+          if (lastTs) banned.push(...range(0, eos));
+          const d = await model.nextDetail(prev, pos, { banned: [...banned, ...tsRange], tail: tsBegin });
+          next = whisperTimestampChoice(d.id, d.logit, d.tail!, tsBegin);
+        }
+      }
+      ids.push(next);
+      if (next === eos) break;
+    }
+    return ids;
+  }
+
+  /** transformers.js's Whisper prompt: [start, language, task, no-timestamps] (English-only models: [start, no-timestamps]); no-timestamps is left out when timestamps are wanted. */
+  whisperPrompt(options: WhisperOptions = {}, timestamps = false): number[] {
     const g = this.generation;
     const out = [Number(g.decoder_start_token_id ?? this.cfg.decoderStart)];
     if (g.is_multilingual) {
@@ -174,7 +274,7 @@ export class Seq2SeqEngine {
     } else if (options.language || options.task) {
       throw new Error("Whisper: language and task cannot be set for an English-only model");
     }
-    if (g.no_timestamps_token_id !== undefined) out.push(Number(g.no_timestamps_token_id));
+    if (!timestamps && g.no_timestamps_token_id !== undefined) out.push(Number(g.no_timestamps_token_id));
     return out;
   }
 
@@ -190,8 +290,141 @@ export interface WhisperOptions {
   /** "transcribe" (default) or "translate" (to English); multilingual models only. */
   task?: "transcribe" | "translate";
   max_new_tokens?: number;
-  /** Window length in seconds (default 30, Whisper's). */
+  /** Window length in seconds for chunked transcription (default: none, or 30 for audio past 30 s). */
   chunk_length_s?: number;
+  /** Overlap on each side of a window, in seconds (default chunk_length_s / 6). */
+  stride_length_s?: number;
+  /** true: segments with start and end times ("word" is not supported yet). */
+  return_timestamps?: boolean | "word";
+}
+
+export interface WhisperChunk {
+  timestamp: [number | null, number | null];
+  text: string;
+}
+
+/**
+ * Whisper's timestamp rule for one step: the best text token (`textId`, logit `textLogit`) unless the
+ * timestamp tokens' logits (`tail`, from `tsBegin` up) have a larger log-sum-exp, then the best timestamp.
+ */
+export function whisperTimestampChoice(textId: number, textLogit: number, tail: Float32Array, tsBegin: number): number {
+  let max = -Infinity;
+  let arg = 0;
+  for (let i = 0; i < tail.length; i++) if (tail[i]! > max) [max, arg] = [tail[i]!, i];
+  let sum = 0;
+  for (let i = 0; i < tail.length; i++) sum += Math.exp(tail[i]! - max);
+  const lse = max + Math.log(sum);
+  return lse > textLogit ? tsBegin + arg : textId;
+}
+
+/** One window's ids and its stride [length, left overlap, right overlap] in seconds. */
+export interface AsrSequence {
+  tokens: number[];
+  stride: [number, number, number];
+}
+
+const round2 = (x: number) => Math.round(x * 100) / 100;
+
+/**
+ * transformers' longest-common-sequence merge of overlapping windows' token lists: each neighbour
+ * pair is aligned where most tokens agree, and cut in the middle of the agreeing stretch.
+ */
+export function findLongestCommonSequence(sequences: number[][]): number[] {
+  let left = sequences[0] ?? [];
+  const total: number[] = [];
+  for (let i = 1; i < sequences.length; i++) {
+    const right = sequences[i]!;
+    const L = left.length;
+    const R = right.length;
+    let best = 0;
+    let idx = [L, L, 0, 0];
+    for (let j = 1; j < L + R; j++) {
+      const ls = Math.max(0, L - j);
+      const le = Math.min(L, L + R - j);
+      const rs = Math.max(0, j - L);
+      const re = Math.min(R, j);
+      let matches = 0;
+      for (let k = 0; k < le - ls; k++) if (left[ls + k] === right[rs + k]) matches++;
+      const score = matches / j + j / 10000;
+      if (matches > 1 && score > best) {
+        best = score;
+        idx = [ls, le, rs, re];
+      }
+    }
+    const [ls, le, rs, re] = idx as [number, number, number, number];
+    total.push(...left.slice(0, Math.floor((le + ls) / 2)));
+    left = right.slice(Math.floor((re + rs) / 2));
+  }
+  total.push(...left);
+  return total;
+}
+
+/**
+ * transformers.js's WhisperTokenizer._decode_asr (segment timestamps, no languages): walks every
+ * window's tokens, opens and closes segments on timestamp pairs (offset by the windows before,
+ * skipping timestamps inside the overlaps), and merges the text of overlapping windows.
+ */
+export function decodeAsr(
+  sequences: readonly AsrSequence[],
+  o: { timestampBegin: number; firstSpecial: number; timePrecision: number; timestamps: boolean; decode: (ids: number[]) => string },
+): { text: string; chunks?: WhisperChunk[] } {
+  const tsBegin = o.timestampBegin;
+  const tsEnd = tsBegin + 1500;
+  const chunks: WhisperChunk[] = [];
+  const newChunk = (): WhisperChunk => ({ timestamp: [null, null], text: "" });
+  let chunk = newChunk();
+  let timeOffset = 0;
+  let previous: number[][] = [];
+  let skip = false;
+  for (const out of sequences) {
+    const ids = out.tokens;
+    let lastTimestamp: number | null = null;
+    let firstTimestamp = tsBegin;
+    const [chunkLen, strideLeft, strideRight] = out.stride;
+    timeOffset -= strideLeft;
+    const rightStrideStart = chunkLen - strideRight;
+    if (strideLeft) firstTimestamp = strideLeft / o.timePrecision + tsBegin;
+    if (strideRight) {
+      for (let i = ids.length - 1; i >= 0; i--) {
+        const t = ids[i]!;
+        if (t >= tsBegin) {
+          if (lastTimestamp !== null && (t - tsBegin) * o.timePrecision < rightStrideStart) break;
+          lastTimestamp = t;
+        }
+      }
+    }
+    let current: number[] = [];
+    for (const t of ids) {
+      if (t >= o.firstSpecial && t < tsBegin) continue; // special tokens
+      if (t >= tsBegin && t <= tsEnd) {
+        const time = round2((t - tsBegin) * o.timePrecision + timeOffset);
+        if (lastTimestamp !== null && t >= lastTimestamp) skip = true;
+        else if (skip || (previous.length > 0 && t < firstTimestamp)) skip = false;
+        else if (chunk.timestamp[0] === null) chunk.timestamp[0] = time;
+        else if (time !== chunk.timestamp[0]) {
+          chunk.timestamp[1] = time;
+          previous.push(current);
+          chunk.text = o.decode(findLongestCommonSequence(previous));
+          chunks.push(chunk);
+          previous = [];
+          current = [];
+          chunk = newChunk();
+        }
+      } else current.push(t);
+    }
+    timeOffset += chunkLen - strideRight;
+    if (current.length) previous.push(current);
+    else if (previous.every((p) => p.length === 0)) {
+      chunk = newChunk();
+      previous = [];
+    }
+  }
+  if (previous.length) {
+    chunk.text = o.decode(findLongestCommonSequence(previous));
+    chunks.push(chunk);
+  }
+  const text = chunks.map((c) => c.text).join("");
+  return o.timestamps ? { text, chunks } : { text };
 }
 
 const LANGUAGE_NAMES: Record<string, string> = {
