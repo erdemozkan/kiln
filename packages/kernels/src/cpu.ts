@@ -737,6 +737,36 @@ export const cpuAttnProbs: CpuKernel = (b) => {
   }
 };
 
+export const cpuBlockAttention: CpuKernel = (b) => {
+  const [T, D, row] = [b[0]!.u32[0]!, b[0]!.u32[1]!, b[0]!.u32[2]!];
+  const scale = b[0]!.f32[3]!;
+  const [q, k, v, out] = [b[1]!.f32, b[2]!.f32, b[3]!.f32, b[4]!.f32];
+  const H = row / D;
+  const rows = b[0]!.u32[4]!;
+  const s = new Float32Array(T);
+  for (let r = 0; r < rows; r++) {
+    const k0 = r - (r % T);
+    const n = (r % T) + 1;
+    for (let h = 0; h < H; h++) {
+      const qo = r * row + h * D;
+      let m = -Infinity;
+      for (let j = 0; j < n; j++) {
+        let d = 0;
+        for (let e = 0; e < D; e++) d += q[qo + e]! * k[(k0 + j) * row + h * D + e]!;
+        s[j] = d * scale;
+        m = Math.max(m, s[j]!);
+      }
+      let z = 0;
+      for (let j = 0; j < n; j++) z += s[j] = Math.exp(s[j]! - m);
+      for (let e = 0; e < D; e++) {
+        let acc = 0;
+        for (let j = 0; j < n; j++) acc += s[j]! * v[(k0 + j) * row + h * D + e]!;
+        out[qo + e] = acc / z;
+      }
+    }
+  }
+};
+
 export const cpuScaleAdd: CpuKernel = (b) => {
   const [n, accumulate] = [b[0]!.u32[0]!, b[0]!.u32[1]!];
   const a = b[0]!.f32[2]!;

@@ -154,8 +154,8 @@ await zeroShot(image, ["tiger", "cat", "dog"]); // [{ score: 0.996, label: "tige
 ```
 
 With a CLIP model, `image-feature-extraction` returns the image embedding (the visual projection's
-output). Text embeddings are cached per text, so asking about the same labels again only runs the
-image tower.
+output). All labels go through the text tower in one batch, alongside the image, and their
+embeddings are cached, so asking about the same labels again only runs the image tower.
 
 ## Kiln's own API
 

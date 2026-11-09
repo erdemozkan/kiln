@@ -107,3 +107,46 @@ describe("attention probabilities (CPU)", () => {
     });
   });
 });
+
+describe("block attention (CPU)", () => {
+  it("each row attends causally within its own block", async () => {
+    const be = new CpuBackend({ simd: false });
+    const step = be.alloc(STEP_BYTES);
+    const [B, T, H, D] = [3, 5, 2, 4];
+    const N = B * T;
+    const C = H * D;
+    const mk = (f: (i: number) => number): Tensor => {
+      const data = Float32Array.from({ length: N * C }, (_, i) => f(i));
+      const buf = be.alloc(data.byteLength + 64);
+      be.write(buf, 0, data);
+      return { shape: [N, C], dtype: "f32", buf };
+    };
+    const q = mk((i) => Math.sin(i * 0.3));
+    const k = mk((i) => Math.cos(i * 0.7));
+    const v = mk((i) => Math.sin(i * 1.1 + 2));
+    const [qd, kd, vd] = await Promise.all([q, k, v].map(async (t) => new Float32Array(await be.readback(t.buf, 0, N * C * 4))));
+    const ctx = new Ctx(be, step, "t");
+    const out = ops.blockAttention(ctx, q, k, v, { T, H, D, scale: 0.5 });
+    be.submit(ctx.dispatches);
+    const y = new Float32Array(await be.readback(out.buf, 0, N * C * 4));
+    for (let r = 0; r < N; r++) {
+      const k0 = r - (r % T);
+      for (let h = 0; h < H; h++) {
+        const s: number[] = [];
+        for (let j = k0; j <= r; j++) {
+          let d = 0;
+          for (let e = 0; e < D; e++) d += qd[r * C + h * D + e]! * kd[j * C + h * D + e]!;
+          s.push(d * 0.5);
+        }
+        const m = Math.max(...s);
+        const p = s.map((x) => Math.exp(x - m));
+        const z = p.reduce((a, b) => a + b, 0);
+        for (let e = 0; e < D; e++) {
+          let acc = 0;
+          p.forEach((w, j) => (acc += w * vd[(k0 + j) * C + h * D + e]!));
+          expect(y[r * C + h * D + e]).toBeCloseTo(acc / z, 6);
+        }
+      }
+    }
+  });
+});

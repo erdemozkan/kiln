@@ -73,14 +73,15 @@ export function clipPoolIndex(ids: readonly number[], eosId: number): number {
 
 /**
  * CLIP's text transformer: token + position embeddings → pre-norm layers with causal attention →
- * final LayerNorm. forward() returns the normalized hidden state of one row (the pooled token).
- * One plan per sequence length (a few kept).
+ * final LayerNorm. A batch of sequences runs as one pass, each padded to the longest (padding comes
+ * after a sequence's pooled token, which causal attention keeps it from touching). One plan per
+ * batch shape (a few kept).
  */
 export class ClipTextModel {
-  private readonly plans = new Map<number, { dispatches: readonly Dispatch[]; ids: Buf; pos: Buf; out: Tensor; ctx: Ctx }>();
+  /** Sequences per pass; longer batches run in chunks. */
+  static readonly MAX_BATCH = 32;
+  private readonly plans = new Map<string, { dispatches: readonly Dispatch[]; ids: Buf; pos: Buf; out: Tensor; ctx: Ctx }>();
   private readonly step: Buf;
-  private readonly kc: Buf;
-  private readonly vc: Buf;
   private readonly pool: ActivationPool;
 
   constructor(
@@ -89,10 +90,7 @@ export class ClipTextModel {
     private readonly weights: Map<string, Tensor>,
   ) {
     this.step = backend.alloc(STEP_BYTES, "storage", "clip-text/step");
-    // No span: every row sees keys up to its own position (causal).
     backend.write(this.step, 0, packStep({ pos0: 0, lastRow: 0, seed: 0, temperature: 0 }));
-    this.kc = backend.alloc(cfg.maxPositions * cfg.hidden * 4, "storage", "clip-text/k");
-    this.vc = backend.alloc(cfg.maxPositions * cfg.hidden * 4, "storage", "clip-text/v");
     this.pool = new ActivationPool(backend, "clip-text");
   }
 
@@ -106,21 +104,21 @@ export class ClipTextModel {
     return ops.linear(ctx, x, this.w(`${p}.weight`), { bias: this.weights.get(`${p}.bias`), residual });
   }
 
-  private build(T: number) {
+  private build(B: number, T: number) {
     const c = this.cfg;
     const D = c.hidden / c.heads;
-    const ctx = new Ctx(this.backend, this.step, `clip-text/T${T}`, this.pool);
-    const ids = ctx.buffer(T * 4, "clip-text/ids");
-    const pos = ctx.buffer(T * 4, "clip-text/pos");
-    const x = ops.embed(ctx, this.w("tok.weight"), ids, T);
-    ops.addInPlace(ctx, x, ops.embed(ctx, this.w("tpos.weight"), pos, T));
-    const shape = { T, H: c.heads, Hkv: c.heads, D, maxSeq: c.maxPositions, kv: "f32" as const, scale: D ** -0.5 };
+    const N = B * T;
+    const ctx = new Ctx(this.backend, this.step, `clip-text/${B}x${T}`, this.pool);
+    const ids = ctx.buffer(N * 4, "clip-text/ids");
+    const pos = ctx.buffer(N * 4, "clip-text/pos");
+    const x = ops.embed(ctx, this.w("tok.weight"), ids, N);
+    ops.addInPlace(ctx, x, ops.embed(ctx, this.w("tpos.weight"), pos, N));
+    const shape = { T, H: c.heads, D, scale: D ** -0.5 };
     for (let l = 0; l < c.layers; l++) {
       const p = `t${l}`;
       const h = ops.layernorm(ctx, x, this.w(`${p}.ln1.weight`), this.w(`${p}.ln1.bias`), c.eps);
-      const q = this.lin(ctx, h, `${p}.q`);
-      ops.kvWrite(ctx, this.lin(ctx, h, `${p}.k`), this.lin(ctx, h, `${p}.v`), this.kc, this.vc, T, c.maxPositions, "f32");
-      this.lin(ctx, ops.attention(ctx, q, this.kc, this.vc, shape), `${p}.o`, x);
+      const a = ops.blockAttention(ctx, this.lin(ctx, h, `${p}.q`), this.lin(ctx, h, `${p}.k`), this.lin(ctx, h, `${p}.v`), shape);
+      this.lin(ctx, a, `${p}.o`, x);
       const h2 = ops.layernorm(ctx, x, this.w(`${p}.ln2.weight`), this.w(`${p}.ln2.bias`), c.eps);
       const up = this.lin(ctx, h2, `${p}.up`);
       ops.act(ctx, up, c.act);
@@ -130,26 +128,54 @@ export class ClipTextModel {
     return { dispatches: ctx.dispatches, ids, pos, out, ctx };
   }
 
-  /** The final-normed hidden state [hidden] at row `row` of the token sequence `ids`. */
-  async forward(ids: readonly number[], row: number): Promise<Float32Array> {
-    const T = ids.length;
-    if (!T || T > this.cfg.maxPositions) throw new Error(`CLIP text: ${T} tokens; the model takes 1 to ${this.cfg.maxPositions}`);
-    let plan = this.plans.get(T);
+  private plan(B: number, T: number) {
+    const key = `${B}x${T}`;
+    let plan = this.plans.get(key);
     if (!plan) {
       if (this.plans.size >= 6) {
         const [k, old] = this.plans.entries().next().value!;
         old.ctx.destroy();
         this.plans.delete(k);
       }
-      plan = this.build(T);
-      this.plans.set(T, plan);
+      plan = this.build(B, T);
+      this.plans.set(key, plan);
     }
-    const be = this.backend;
-    be.write(plan.ids, 0, Uint32Array.from(ids));
-    be.write(plan.pos, 0, Uint32Array.from({ length: T }, (_, i) => i));
-    be.submit(plan.dispatches);
+    return plan;
+  }
+
+  /** The final-normed hidden state [hidden] of each sequence at its row `rows[i]`, in one pass per chunk. */
+  async forwardBatch(seqs: readonly (readonly number[])[], rows: readonly number[]): Promise<Float32Array[]> {
     const H = this.cfg.hidden;
-    return new Float32Array(await be.readback(physical(plan.out.buf), row * H * 4, H * 4));
+    const res: Float32Array[] = [];
+    for (let at = 0; at < seqs.length; at += ClipTextModel.MAX_BATCH) {
+      const chunk = seqs.slice(at, at + ClipTextModel.MAX_BATCH);
+      const B = chunk.length;
+      const T = Math.max(...chunk.map((s) => s.length));
+      if (!chunk.every((s) => s.length) || T > this.cfg.maxPositions) throw new Error(`CLIP text: sequences take 1 to ${this.cfg.maxPositions} tokens`);
+      const plan = this.plan(B, T);
+      const ids = new Uint32Array(B * T);
+      const pos = new Uint32Array(B * T);
+      chunk.forEach((s, b) => {
+        ids.set(s, b * T);
+        ids.fill(s[s.length - 1]!, b * T + s.length, (b + 1) * T);
+        for (let t = 0; t < T; t++) pos[b * T + t] = t;
+      });
+      const be = this.backend;
+      be.write(plan.ids, 0, ids);
+      be.write(plan.pos, 0, pos);
+      be.submit(plan.dispatches);
+      const out = new Float32Array(await be.readback(physical(plan.out.buf), 0, B * T * H * 4));
+      chunk.forEach((_, b) => {
+        const r = (b * T + rows[at + b]!) * H;
+        res.push(out.slice(r, r + H));
+      });
+    }
+    return res;
+  }
+
+  /** The final-normed hidden state [hidden] at row `row` of the token sequence `ids`. */
+  async forward(ids: readonly number[], row: number): Promise<Float32Array> {
+    return (await this.forwardBatch([ids], [row]))[0]!;
   }
 
   destroy(): void {
@@ -160,6 +186,6 @@ export class ClipTextModel {
     }
     for (const p of this.plans.values()) p.ctx.destroy();
     this.pool.destroy();
-    for (const b of [this.step, this.kc, this.vc]) this.backend.free(b);
+    this.backend.free(this.step);
   }
 }

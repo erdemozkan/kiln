@@ -25,6 +25,7 @@ import {
   scaleAddSpec,
   pickLogitSpec,
   attnProbsSpec,
+  blockAttentionSpec,
   type Activation,
   layernormSpec,
   gatedActSpec,
@@ -442,6 +443,20 @@ export function attnProbs(ctx: Ctx, q: Tensor, kc: Buf, out: Buf, s: { S: number
   if (s.H > 32) throw new Error(`attnProbs: at most 32 heads, got ${s.H}`);
   const params = ctx.uniform([u32(s.S), u32(s.D), u32(s.H * s.D), u32(s.mask), f32(s.scale), u32(s.slotBase), u32(s.nSlots), u32(0)]);
   ctx.run(attnProbsSpec(), [params, ctx.step, q.buf, kc, out], [1, n, 1]);
+}
+
+/**
+ * Causal attention for a batch of sequences packed as blocks of T rows: q, k, v [B·T, H·D] →
+ * [B·T, H·D], each row seeing the keys of its own block up to itself (padding after a sequence's
+ * end leaves its earlier rows untouched).
+ */
+export function blockAttention(ctx: Ctx, q: Tensor, k: Tensor, v: Tensor, s: { T: number; H: number; D: number; scale: number }): Tensor {
+  const rows = q.shape[0]!;
+  if (s.T > 256 || rows % s.T !== 0) throw new Error(`blockAttention: ${rows} rows are not blocks of ${s.T} (at most 256)`);
+  const out = ctx.alloc([rows, s.H * s.D]);
+  const params = ctx.uniform([u32(s.T), u32(s.D), u32(s.H * s.D), f32(s.scale), u32(rows), u32(0), u32(0), u32(0)]);
+  ctx.run(blockAttentionSpec(), [params, q.buf, k.buf, v.buf, out.buf], [s.H, rows, 1]);
+  return out;
 }
 
 function popcount(m: number): number {

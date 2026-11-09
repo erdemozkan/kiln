@@ -1802,6 +1802,66 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid:
 }`);
 }
 
+/**
+ * Causal attention over a batch of sequences packed as blocks of T rows: q, k, v [B·T, H·D]; row
+ * b·T + t sees keys b·T … b·T + t of its own block. One workgroup per (head, row); T ≤ 256.
+ */
+export function blockAttentionSpec(): KernelSpec {
+  return spec("block_attention", ["uniform", "read", "read", "read", "rw"], cpu.cpuBlockAttention, () => /* wgsl */ `
+struct P { T: u32, D: u32, row: u32, scale: f32, rows: u32, _a: u32, _b: u32, _c: u32 }
+@group(0) @binding(0) var<uniform> p: P;
+@group(0) @binding(1) var<storage, read> q: array<f32>;
+@group(0) @binding(2) var<storage, read> k: array<f32>;
+@group(0) @binding(3) var<storage, read> v: array<f32>;
+@group(0) @binding(4) var<storage, read_write> out: array<f32>;
+var<workgroup> sc: array<f32, 256>;
+var<workgroup> red: array<f32, 64>;
+
+@compute @workgroup_size(64)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+  let h = wg.x;
+  let r = wg.y;
+  let k0 = r - r % p.T;
+  let n = r % p.T + 1u;
+  let qo = r * p.row + h * p.D;
+  var m = -3.4e38;
+  for (var j = lid.x; j < n; j += 64u) {
+    let ko = (k0 + j) * p.row + h * p.D;
+    var s = 0.0;
+    for (var d = 0u; d < p.D; d++) { s += q[qo + d] * k[ko + d]; }
+    s *= p.scale;
+    sc[j] = s;
+    m = max(m, s);
+  }
+  red[lid.x] = m;
+  workgroupBarrier();
+  for (var w = 32u; w > 0u; w >>= 1u) {
+    if (lid.x < w) { red[lid.x] = max(red[lid.x], red[lid.x + w]); }
+    workgroupBarrier();
+  }
+  let mx = red[0];
+  workgroupBarrier();
+  var sum = 0.0;
+  for (var j = lid.x; j < n; j += 64u) {
+    let e = exp(sc[j] - mx);
+    sc[j] = e;
+    sum += e;
+  }
+  red[lid.x] = sum;
+  workgroupBarrier();
+  for (var w = 32u; w > 0u; w >>= 1u) {
+    if (lid.x < w) { red[lid.x] += red[lid.x + w]; }
+    workgroupBarrier();
+  }
+  let inv = 1.0 / red[0];
+  for (var d = lid.x; d < p.D; d += 64u) {
+    var acc = 0.0;
+    for (var j = 0u; j < n; j++) { acc += sc[j] * v[(k0 + j) * p.row + h * p.D + d]; }
+    out[qo + d] = acc * inv;
+  }
+}`);
+}
+
 /** y = a·x (accumulate 0) or y += a·x (accumulate 1), elementwise. */
 export function scaleAddSpec(): KernelSpec {
   return spec("scale_add", ["uniform", "read", "rw"], cpu.cpuScaleAdd, () => /* wgsl */ `

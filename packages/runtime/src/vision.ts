@@ -111,34 +111,39 @@ export class VisionEngine {
 
   /** CLIP's normalized text embedding of a text. */
   async textEmbed(text: string): Promise<Float32Array> {
+    return (await this.textEmbeds([text]))[0]!;
+  }
+
+  /** CLIP's normalized text embeddings of several texts; the ones not cached run as one batch. */
+  async textEmbeds(texts: readonly string[]): Promise<Float32Array[]> {
     const c = this.clip;
     if (!c) throw new Error("this model has no text tower");
-    let e = c.cache.get(text);
-    if (!e) {
-      const ids = c.tokenizer.encode(text);
-      e = normalize(applyHead(c.textProj, await c.text.forward(ids, clipPoolIndex(ids, c.eosId))));
-      if (c.cache.size > 256) c.cache.clear();
-      c.cache.set(text, e);
+    const missing = [...new Set(texts.filter((t) => !c.cache.has(t)))];
+    if (missing.length) {
+      const ids = missing.map((t) => c.tokenizer.encode(t));
+      const hidden = await c.text.forwardBatch(ids, ids.map((s) => clipPoolIndex(s, c.eosId)));
+      if (c.cache.size + missing.length > 256) c.cache.clear();
+      missing.forEach((t, i) => c.cache.set(t, normalize(applyHead(c.textProj, hidden[i]!))));
     }
-    return e;
+    return texts.map((t) => c.cache.get(t)!);
   }
 
   /**
    * Zero-shot classification (CLIP): every label put into the template, scored by the scaled cosine
-   * similarity of its text embedding with the image's, softmaxed over the labels; best first.
+   * similarity of its text embedding with the image's, softmaxed over the labels; best first. The
+   * labels run as one batch, queued on the GPU alongside the image.
    */
   async zeroShot(img: RgbImage, labels: readonly string[], options: ZeroShotImageOptions = {}): Promise<{ score: number; label: string }[]> {
     if (!this.clip) throw new Error("zero-shot image classification needs a CLIP model");
     if (!labels.length) throw new Error("zero-shot image classification needs candidate labels");
     const template = options.hypothesis_template ?? "This is a photo of {}";
-    const image = normalize(await this.imageEmbed(img));
+    const [image, texts] = await Promise.all([this.imageEmbed(img).then(normalize), this.textEmbeds(labels.map((l) => template.replace("{}", l)))]);
     const logits = new Float32Array(labels.length);
-    for (let i = 0; i < labels.length; i++) {
-      const t = await this.textEmbed(template.replace("{}", labels[i]!));
+    texts.forEach((t, i) => {
       let d = 0;
       for (let j = 0; j < t.length; j++) d += t[j]! * image[j]!;
-      logits[i] = this.clip.scale * d;
-    }
+      logits[i] = this.clip!.scale * d;
+    });
     return topLabels(logits, labels, 0).map(({ label, score }) => ({ score, label }));
   }
 

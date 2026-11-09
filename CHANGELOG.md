@@ -51,7 +51,8 @@ pixels equal PIL's byte for byte, plus shortest-edge and ConvNeXt resizing, cent
 rescale and normalize as numpy does them. `quick_gelu` activation. CLIP (`openai/clip-*`):
 `zero-shot-image-classification` with transformers.js's hypothesis template and softmax over labels,
 the vision tower on the ViT code (pre-LayerNorm, post-LayerNorm of the pooled token), a causal text
-tower, CLIP's tokenizer (lowercasing, whitespace-dropping split, `</w>` word ends), text embeddings
+tower that encodes all labels in one batch (block-causal attention kernel) alongside the image,
+CLIP's tokenizer (lowercasing, whitespace-dropping split, `</w>` word ends), text embeddings
 cached per text; `image-feature-extraction` on CLIP returns the image embedding.
 
 **Loading.** Reads ahead of a download in progress are fetched on their own instead of waiting
