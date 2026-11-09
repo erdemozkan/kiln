@@ -1870,7 +1870,8 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid:
  * The tiling is gemm's (64 pixels × 64 channels per 128-thread workgroup, 8 × 4 per thread, K one
  * 32-element block at a time); only the x tile's loads differ, gathering each pixel's patch from the
  * image instead of reading a stored im2col row. Batch-norm is folded into w and bias at load time.
- * With `reluIn` the input goes through ReLU as it is read (pre-activation residual blocks).
+ * With `reluIn` the input goes through ReLU as it is read (pre-activation residual blocks). A batch of
+ * N images ([N·H·W, C] → [N·Ho·Wo, O]) runs as one GEMM of N·Ho·Wo rows.
  */
 export function conv2dSpec(v: { relu: boolean; residual: boolean; reluIn?: boolean }): KernelSpec {
   const R8 = [0, 1, 2, 3, 4, 5, 6, 7];
@@ -1885,7 +1886,7 @@ ${[0, 1, 2, 3].map((j) => `    if (n0 + tn * 4u + ${j}u < p.O) { let n = n0 + tn
   }`,
   ).join("\n");
   return spec(`conv2d${v.reluIn ? "/relu-in" : ""}${v.relu ? "/relu" : ""}${v.residual ? "/res" : ""}`, bindings, cpu.cpuConv2d(v), () => /* wgsl */ `
-struct P { H: u32, W: u32, C: u32, O: u32, Ho: u32, Wo: u32, kh: u32, kw: u32, stride: u32, pad: u32, K: u32, M: u32, _a: u32, _b: u32, _c: u32, _d: u32 }
+struct P { H: u32, W: u32, C: u32, O: u32, Ho: u32, Wo: u32, kh: u32, kw: u32, stride: u32, pad: u32, K: u32, M: u32, N: u32, _b: u32, _c: u32, _d: u32 }
 @group(0) @binding(0) var<uniform> p: P;
 @group(0) @binding(1) var<storage, read> x: array<vec4<f32>>;
 @group(0) @binding(2) var<storage, read> w: array<vec4<f32>>;
@@ -1907,12 +1908,16 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
   var oy: array<i32, 4>;
   var ox: array<i32, 4>;
   var live: array<bool, 4>;
+  var base: array<u32, 4>;
+  let plane = p.Ho * p.Wo;
   for (var c = 0u; c < 4u; c++) {
     let m = m0 + (li / 8u) * 4u + c;
     let mm = min(m, p.M - 1u);
+    let r = mm % plane;
     live[c] = m < p.M;
-    oy[c] = i32((mm / p.Wo) * p.stride) - i32(p.pad);
-    ox[c] = i32((mm % p.Wo) * p.stride) - i32(p.pad);
+    base[c] = (mm / plane) * p.H * p.W;
+    oy[c] = i32((r / p.Wo) * p.stride) - i32(p.pad);
+    ox[c] = i32((r % p.Wo) * p.stride) - i32(p.pad);
   }
 ${R8.map((i) => `  var acc${i} = vec4<f32>();`).join("\n")}
   var xr: array<vec4<f32>, 4>;
@@ -1927,7 +1932,7 @@ ${R8.map((i) => `  var acc${i} = vec4<f32>();`).join("\n")}
       let iy = oy[c] + ky;
       let ix = ox[c] + kx;
       let inside = live[c] && tap < taps && iy >= 0 && iy < i32(p.H) && ix >= 0 && ix < i32(p.W);
-      let at = (u32(clamp(iy, 0, i32(p.H) - 1)) * p.W + u32(clamp(ix, 0, i32(p.W) - 1))) * C4 + min(c4, C4 - 1u);
+      let at = (base[c] + u32(clamp(iy, 0, i32(p.H) - 1)) * p.W + u32(clamp(ix, 0, i32(p.W) - 1))) * C4 + min(c4, C4 - 1u);
       xr[c] = select(vec4<f32>(0.0), ${v.reluIn ? "max(x[at], vec4<f32>(0.0))" : "x[at]"}, inside);
     }
     for (var c = 0u; c < 4u; c++) {
@@ -2017,6 +2022,132 @@ fn main(${EW_ARGS}) {
   var s = bias[o];
   for (var c = 0u; c < p.C; c++) { s += x[xo + c] * w[wo + c]; }
   y[idx] = s;
+}`);
+}
+
+/**
+ * GroupNorm over a batch of images x [N, T, C] (T pixels, channels last): for each image and each of
+ * G groups of C / G channels, normalized over the group's T · C / G values (biased variance), then
+ * scaled by w[c] and shifted by b[c], ReLU after with `relu`. One workgroup per (group, image).
+ */
+export function groupNormSpec(relu: boolean): KernelSpec {
+  return spec(`group_norm${relu ? "/relu" : ""}`, ["uniform", "read", "read", "read", "rw"], cpu.cpuGroupNorm(relu), () => /* wgsl */ `
+struct P { T: u32, C: u32, G: u32, eps: f32, N: u32, _a: u32, _b: u32, _c: u32 }
+@group(0) @binding(0) var<uniform> p: P;
+@group(0) @binding(1) var<storage, read> x: array<f32>;
+@group(0) @binding(2) var<storage, read> w: array<f32>;
+@group(0) @binding(3) var<storage, read> b: array<f32>;
+@group(0) @binding(4) var<storage, read_write> y: array<f32>;
+var<workgroup> red: array<f32, 256>;
+
+fn total(li: u32, v: f32) -> f32 {
+  red[li] = v;
+  workgroupBarrier();
+  for (var s = 128u; s > 0u; s >>= 1u) {
+    if (li < s) { red[li] += red[li + s]; }
+    workgroupBarrier();
+  }
+  let t = red[0];
+  workgroupBarrier();
+  return t;
+}
+
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) li: u32) {
+  let cg = p.C / p.G;
+  let c0 = wid.x * cg;
+  let o = wid.y * p.T * p.C;
+  let n = p.T * cg;
+  var s = 0.0;
+  for (var i = li; i < n; i += 256u) { s += x[o + (i / cg) * p.C + c0 + i % cg]; }
+  let mean = total(li, s) / f32(n);
+  var v = 0.0;
+  for (var i = li; i < n; i += 256u) { let d = x[o + (i / cg) * p.C + c0 + i % cg] - mean; v += d * d; }
+  let inv = inverseSqrt(total(li, v) / f32(n) + p.eps);
+  for (var i = li; i < n; i += 256u) {
+    let at = o + (i / cg) * p.C + c0 + i % cg;
+    let c = c0 + i % cg;
+    let r = (x[at] - mean) * inv * w[c] + b[c];
+    y[at] = ${relu ? "max(r, 0.0)" : "r"};
+  }
+}`);
+}
+
+/**
+ * A batch of images x [N, H·W, C] upsampled by nearest neighbour to Ho × Wo (torch's "nearest":
+ * source = floor(dst · in / out)) and added to one shared image f [Ho·Wo, C]: y [N, Ho·Wo, C].
+ */
+export function nearestAddSpec(): KernelSpec {
+  return spec("nearest_add", ["uniform", "read", "read", "rw"], cpu.cpuNearestAdd, () => /* wgsl */ `
+struct P { H: u32, W: u32, C: u32, Ho: u32, Wo: u32, N: u32, _a: u32, _b: u32 }
+@group(0) @binding(0) var<uniform> p: P;
+@group(0) @binding(1) var<storage, read> x: array<f32>;
+@group(0) @binding(2) var<storage, read> f: array<f32>;
+@group(0) @binding(3) var<storage, read_write> y: array<f32>;
+
+@compute @workgroup_size(${EW})
+fn main(${EW_ARGS}) {
+  ${FLAT}
+  let plane = p.Ho * p.Wo * p.C;
+  if (idx >= p.N * plane) { return; }
+  let n = idx / plane;
+  let r = idx % plane;
+  let c = r % p.C;
+  let t = r / p.C;
+  let sy = min(u32(floor(f32(t / p.Wo) * (f32(p.H) / f32(p.Ho)))), p.H - 1u);
+  let sx = min(u32(floor(f32(t % p.Wo) * (f32(p.W) / f32(p.Wo)))), p.W - 1u);
+  y[idx] = f[r] + x[(n * p.H * p.W + sy * p.W + sx) * p.C + c];
+}`);
+}
+
+/**
+ * DETR's box attention map (DetrMHAttentionMap): for each selected query row sel[i] of q [Q, H·D]
+ * and every pixel of k [S, H·D], the per-head score (q · scale) · k, softmaxed over all heads and
+ * pixels together: out [n, S, H]. One workgroup per selected query.
+ */
+export function bboxAttentionSpec(): KernelSpec {
+  return spec("bbox_attention", ["uniform", "read", "read", "read", "rw"], cpu.cpuBboxAttention, () => /* wgsl */ `
+struct P { S: u32, H: u32, D: u32, scale: f32, n: u32, _a: u32, _b: u32, _c: u32 }
+@group(0) @binding(0) var<uniform> p: P;
+@group(0) @binding(1) var<storage, read> q: array<f32>;
+@group(0) @binding(2) var<storage, read> k: array<f32>;
+@group(0) @binding(3) var<storage, read> sel: array<u32>;
+@group(0) @binding(4) var<storage, read_write> o: array<f32>;
+var<workgroup> red: array<f32, 256>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) li: u32) {
+  let row = p.H * p.D;
+  let qo = sel[wid.x] * row;
+  let base = wid.x * p.S * p.H;
+  let n = p.S * p.H;
+  var m = -3.4e38;
+  for (var j = li; j < n; j += 256u) {
+    let px = j / p.H;
+    let h = j % p.H;
+    var s = 0.0;
+    for (var d = 0u; d < p.D; d++) { s += (q[qo + h * p.D + d] * p.scale) * k[px * row + h * p.D + d]; }
+    o[base + j] = s;
+    m = max(m, s);
+  }
+  red[li] = m;
+  workgroupBarrier();
+  for (var s = 128u; s > 0u; s >>= 1u) {
+    if (li < s) { red[li] = max(red[li], red[li + s]); }
+    workgroupBarrier();
+  }
+  let mx = red[0];
+  workgroupBarrier();
+  var z = 0.0;
+  for (var j = li; j < n; j += 256u) { let e = exp(o[base + j] - mx); o[base + j] = e; z += e; }
+  red[li] = z;
+  workgroupBarrier();
+  for (var s = 128u; s > 0u; s >>= 1u) {
+    if (li < s) { red[li] += red[li + s]; }
+    workgroupBarrier();
+  }
+  let inv = 1.0 / red[0];
+  for (var j = li; j < n; j += 256u) { o[base + j] *= inv; }
 }`);
 }
 

@@ -526,6 +526,7 @@ K/V; each decoder step reads them through a step block whose span covers every p
 | wav2vec2 classifier (`superb/wav2vec2-base-superb-ks`, weighted layer sum) | transformers.js (`Xenova/wav2vec2-base-superb-ks`, fp32) | the same five labels, scores within 2e-7 |
 | Image preprocessing (all six PIL filters; DeiT and CLIP pipelines) | PIL 8 + numpy | resized bytes identical; pixel values identical (float32) |
 | CLIP tokenizer (`openai/clip-vit-base-patch32`) | transformers.js | the same ids for 8 texts (punctuation, accents, CJK, emoji, long words) |
+| DETR panoptic (`facebook/detr-resnet-50-panoptic`) | transformers.js (`Xenova/detr-resnet-50-panoptic`, fp32) on the same pixel values | the same five segments on the cats photo, scores within 1.4e-6, one pixel of 307,200 assigned differently; 2.4 s end to end against 28.2 s |
 | Depth Anything V2 (`depth-anything/Depth-Anything-V2-Small-hf`) | transformers.js (`onnx-community/depth-anything-v2-small`, fp32) on the same pixel values | depth within 1.7e-5 relative on the cats photo; 20 of 307,200 grey bytes one level apart; 3.1 s end to end against 7.4 s |
 | DETR (`facebook/detr-resnet-50`) | transformers.js (`Xenova/detr-resnet-50`, fp32) on the same pixel values | the same five detections and labels on the cats photo; scores within 2.8e-7, boxes within 2.3e-6; 1.57 s end to end against 4.02 s |
 | YOLOS (`hustvl/yolos-tiny`, `yolos-small`) | transformers.js (`Xenova/yolos-*`, fp32) on the same pixel values | the same detections and labels on the cats photo; scores within 8.2e-6, boxes within 3e-7 |
@@ -657,6 +658,22 @@ transformers.js (`onnx-community/depth-anything-v2-small`, fp32) and post-proces
 code: depth within 1.7e-5 of its range, and 20 of 307,200 pixels a grey level apart. Both pipelines
 end to end (median of five warm calls, WebGPU, backgrounded pane): 3.1 s in Kiln against 7.4 s for
 transformers.js.
+
+Image segmentation (`image-segmentation`) runs DETR's panoptic model
+(`facebook/detr-resnet-50-panoptic`, the default, as in transformers.js; its `pytorch_model.bin`
+read by Kiln's own zip and pickle reader). The mask head is recorded in the DETR plan, so the
+planner keeps the backbone features it reads, but it runs only for the queries that pass the score
+threshold, in batches of eight, instead of for all 100: each query's box attention map (softmax
+over heads and pixels together), a first convolution split in two so its large shared half runs
+once, convolutions with GroupNorm (new kernel) and ReLU, and nearest upsampling added to the
+backbone's stride-16, 8 and 4 features (new kernel). Post-processing is transformers.js's panoptic
+one: mask probabilities resized to the image and weighted by score, each pixel to the strongest
+segment, segments that lose too much of their own mask dropped. Output: `{ score, label, mask }`,
+the mask 255 inside, 0 outside. On the cats photo, fed the same pixel values as transformers.js
+(`Xenova/detr-resnet-50-panoptic`, fp32) and post-processed by its own code: the same five segments
+in the same order, scores within 1.4e-6, and one pixel of the 307,200 assigned differently. Both
+pipelines end to end (median of five warm calls, WebGPU, backgrounded pane): 2.4 s in Kiln against
+28.2 s for transformers.js, which runs the mask head for every query.
 
 T5's learned relative position bias is added to each score by the per-row attention kernels (GPU
 and CPU, buckets computed in the kernel; bucket function equal to transformers' over ±300

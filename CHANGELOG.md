@@ -63,7 +63,10 @@ sine position embeddings. `startProfile` / `stopProfile` work for every model ty
 language models. Depth Anything (`depth-anything/Depth-Anything-V2-*-hf`): `depth-estimation`
 with transformers.js's output (`predicted_depth` at the image size, `depth` as grey bytes),
 DINOv2 encoder with position embeddings fitted to each grid, DPT neck and head on new transposed
-convolution and bilinear resize kernels; DPT's aspect-keeping resize to multiples of 14.
+convolution and bilinear resize kernels; DPT's aspect-keeping resize to multiples of 14. DETR
+panoptic (`facebook/detr-resnet-50-panoptic`): `image-segmentation` with transformers.js's panoptic
+post-processing, the mask head run only for the queries kept (GroupNorm, nearest-upsample-and-add
+and box attention kernels; the conv kernel takes a batch of images).
 
 **Loading.** Reads ahead of a download in progress are fetched on their own instead of waiting
 (a `pytorch_model.bin` keeps its zip directory at the end, so large checkpoints showed no progress

@@ -1,4 +1,4 @@
-import { ActivationPool, Ctx, STEP_BYTES, packStep, physical, type Backend, type Buf, type Dispatch, type Tensor } from "@kiln/core";
+import { ActivationPool, Ctx, STEP_BYTES, lastDim, packStep, physical, type Backend, type Buf, type Dispatch, type Tensor } from "@kiln/core";
 import { ops } from "@kiln/kernels";
 import { UnsupportedModelError } from "./config";
 
@@ -45,6 +45,9 @@ export function detrConfigFromHF(config: Record<string, unknown>): DetrConfig {
  * projection and the query embeddings (loaded otherwise).
  */
 export function detrName(name: string): string | undefined {
+  name = name.replace(/^detr\./, "");
+  if (name === "bbox_attention.q_linear.weight" || name === "bbox_attention.q_linear.bias") return `mask.q.${name.split(".").pop()}`;
+  if (name === "bbox_attention.k_linear.weight" || name === "bbox_attention.k_linear.bias") return `mask.k.${name.split(".").pop()}`;
   let m = /^model\.(encoder|decoder)\.layers\.(\d+)\.(.+)\.(weight|bias)$/.exec(name);
   if (m) {
     const part: Record<string, string> = {
@@ -127,6 +130,9 @@ interface DetrPlan {
   boxes: Tensor;
   ctx: Ctx;
   owned: Buf[];
+  /** Panoptic: the detection dispatches, then the mask head's (replayed per batch of selected queries). */
+  det: readonly Dispatch[];
+  mask?: { dispatches: readonly Dispatch[]; sel: Buf; out: Tensor; H: number; W: number };
 }
 
 /**
@@ -135,8 +141,16 @@ interface DetrPlan {
  * added to queries and keys → post-norm decoder of `queries` learned query embeddings (self- and
  * cross-attention, the encoder keys again with positions) → final LayerNorm → class and box MLPs.
  * One plan per image size (two kept).
+ *
+ * Panoptic models (DetrForSegmentation, weights "mask.*") add the mask head, recorded in the same
+ * plan so the planner keeps the backbone features it reads, but replayed on its own for batches of
+ * MASK_BATCH selected queries: each query's box attention map over the encoder memory, joined to the
+ * projected feature map (lay1 split in two: the feature-map part runs once and is broadcast), then
+ * convolutions with GroupNorm and ReLU, upsampled (nearest) and added to adapted backbone features at
+ * strides 16, 8 and 4, to one mask logit per pixel at stride 4.
  */
 export class DetrModel {
+  static readonly MASK_BATCH = 8;
   private readonly plans = new Map<string, DetrPlan>();
   private readonly pool: ActivationPool;
 
@@ -183,6 +197,7 @@ export class DetrModel {
       ops.conv2d(ctx, x.y, this.w(`${p}.weight`), this.w(`${p}.bias`), { H: x.H, W: x.W, k, stride, pad: (k - 1) / 2, relu, residual });
     let x = conv({ y: { shape: [H * W, DETR_IN_CHANNELS], dtype: "f32", buf: input }, H, W }, "bb.conv1", 7, 2, true);
     x = ops.maxPool2d(ctx, x.y, { H: x.H, W: x.W, k: 3, stride: 2, pad: 1 });
+    const stageOut: { y: Tensor; H: number; W: number }[] = [];
     c.stages.forEach((blocks, s) => {
       for (let b = 0; b < blocks; b++) {
         const p = `bb.layer${s + 1}.${b}`;
@@ -192,6 +207,7 @@ export class DetrModel {
         const h2 = conv(h1, `${p}.conv2`, 3, stride, true);
         x = conv(h2, `${p}.conv3`, 1, 1, true, identity);
       }
+      stageOut.push(x);
     });
 
     // Transformer.
@@ -208,7 +224,14 @@ export class DetrModel {
       const hd = D / heads;
       return ops.attention(ctx, q, kc, vc, { T, H: heads, Hkv: heads, D: hd, maxSeq: keys, kv: "f32", scale: hd ** -0.5, span: true });
     };
+    const panoptic = this.weights.has("mask.lay1a.weight");
     let h = this.lin(ctx, x.y, "proj");
+    // The encoder adds into h in place; the mask head needs the projection itself.
+    let projected: Tensor | undefined;
+    if (panoptic) {
+      projected = ctx.alloc(h.shape);
+      ops.scaleAdd(ctx, projected, h, 1, false);
+    }
     for (let l = 0; l < c.encLayers; l++) {
       const p = `e${l}`;
       const qk = ops.add(ctx, h, pos);
@@ -244,7 +267,42 @@ export class DetrModel {
       if (i) ops.act(ctx, boxes, "relu");
       boxes = this.lin(ctx, boxes, `det.box.${i}`);
     }
-    return { dispatches: ctx.dispatches, input, logits, boxes, ctx, owned };
+    const detEnd = ctx.size;
+    let mask: { sel: Buf; out: Tensor; H: number; W: number } | undefined;
+    if (panoptic) {
+      const n = DetrModel.MASK_BATCH;
+      const sel = own(new Uint32Array(n), "detr/sel");
+      const heads = c.encHeads;
+      const att = ops.bboxAttention(ctx, this.lin(ctx, out, "mask.q"), this.lin(ctx, memory, "mask.k"), sel, { n, heads, scale: (D / heads) ** -0.5 });
+      const mc = (m: { y: Tensor; H: number; W: number }, p: string, k: number, imgs = n) =>
+        ops.conv2d(ctx, m.y, this.w(`${p}.weight`), this.w(`${p}.bias`), { H: m.H, W: m.W, k, stride: 1, pad: (k - 1) / 2, n: imgs });
+      const gn = (y: Tensor, p: string) => ops.groupNorm(ctx, y, this.w(`${p}.weight`), this.w(`${p}.bias`), { n, groups: Math.min(8, lastDim(y)), eps: 1e-5, relu: true });
+      const [fh, fw] = [x.H, x.W];
+      // lay1 over [projection | box attention]: the projection's half once, broadcast to every query.
+      const shared = mc({ y: projected!, H: fh, W: fw }, "mask.lay1a", 3, 1).y;
+      const per = mc({ y: att, H: fh, W: fw }, "mask.lay1b", 3).y;
+      ops.addInPlace(ctx, per, shared);
+      let m = { y: gn(per, "mask.gn1"), H: fh, W: fw };
+      m = { ...m, y: gn(mc(m, "mask.lay2", 3).y, "mask.gn2") };
+      for (const [i, s] of [[1, 2], [2, 1], [3, 0]] as const) {
+        const f = stageOut[s]!;
+        const fpn = mc(f, `mask.adapter${i}`, 1, 1).y;
+        m = { y: ops.nearestAdd(ctx, m.y, fpn, { n, H: m.H, W: m.W, Ho: f.H, Wo: f.W }), H: f.H, W: f.W };
+        m = { ...m, y: gn(mc(m, `mask.lay${i + 2}`, 3).y, `mask.gn${i + 2}`) };
+      }
+      mask = { sel, out: mc(m, "mask.out", 3).y, H: m.H, W: m.W };
+    }
+    const dispatches = ctx.dispatches;
+    return {
+      dispatches,
+      input,
+      logits,
+      boxes,
+      ctx,
+      owned,
+      det: dispatches.slice(0, detEnd),
+      mask: mask && { ...mask, dispatches: dispatches.slice(detEnd) },
+    };
   }
 
   /**
@@ -252,6 +310,40 @@ export class DetrModel {
    * sigmoid) for pixel values [3, height, width].
    */
   async detect(pixels: Float32Array, width: number, height: number): Promise<{ logits: Float32Array; boxes: Float32Array; classes: number }> {
+    return (await this.runDetect(pixels, width, height)).result;
+  }
+
+  /**
+   * Panoptic: detection as `detect`, then the mask logits [maskH, maskW] (stride 4) of the queries
+   * `pick` chooses from the class logits, in the order given.
+   */
+  async segment(
+    pixels: Float32Array,
+    width: number,
+    height: number,
+    pick: (logits: Float32Array, classes: number) => number[],
+  ): Promise<{ logits: Float32Array; classes: number; picked: number[]; masks: Float32Array[]; maskW: number; maskH: number }> {
+    const { plan, result } = await this.runDetect(pixels, width, height);
+    const m = plan.mask;
+    if (!m) throw new Error("this DETR model has no mask head (use a DetrForSegmentation checkpoint)");
+    const picked = pick(result.logits, result.classes);
+    const n = DetrModel.MASK_BATCH;
+    const area = m.H * m.W;
+    const masks: Float32Array[] = [];
+    const be = this.backend;
+    for (let at = 0; at < picked.length; at += n) {
+      const chunk = picked.slice(at, at + n);
+      const sel = new Uint32Array(n).fill(chunk[0]!);
+      sel.set(chunk);
+      be.write(m.sel, 0, sel);
+      be.submit(m.dispatches);
+      const out = new Float32Array(await be.readback(physical(m.out.buf), 0, chunk.length * area * 4));
+      chunk.forEach((_, i) => masks.push(out.slice(i * area, (i + 1) * area)));
+    }
+    return { logits: result.logits, classes: result.classes, picked, masks, maskW: m.W, maskH: m.H };
+  }
+
+  private async runDetect(pixels: Float32Array, width: number, height: number): Promise<{ plan: DetrPlan; result: { logits: Float32Array; boxes: Float32Array; classes: number } }> {
     const n = width * height;
     if (pixels.length !== 3 * n) throw new Error(`DETR: expected 3 × ${height} × ${width} pixel values, got ${pixels.length}`);
     if (width < 32 || height < 32) throw new Error(`DETR: a ${width} × ${height} image is smaller than the backbone's 32-pixel stride`);
@@ -270,11 +362,11 @@ export class DetrModel {
     for (let ch = 0; ch < 3; ch++) for (let i = 0; i < n; i++) nhwc[i * DETR_IN_CHANNELS + ch] = pixels[ch * n + i]!;
     const be = this.backend;
     be.write(plan.input, 0, nhwc);
-    be.submit(plan.dispatches);
+    be.submit(plan.det);
     const Q = this.cfg.queries;
     const classes = plan.logits.shape[1]!;
     const [logits, boxes] = await Promise.all([be.readback(physical(plan.logits.buf), 0, Q * classes * 4), be.readback(physical(plan.boxes.buf), 0, Q * 4 * 4)]);
-    return { logits: new Float32Array(logits), boxes: new Float32Array(boxes), classes };
+    return { plan, result: { logits: new Float32Array(logits), boxes: new Float32Array(boxes), classes } };
   }
 
   private free(p: DetrPlan): void {

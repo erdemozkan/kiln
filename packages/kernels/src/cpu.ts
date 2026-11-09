@@ -770,6 +770,7 @@ export const cpuBlockAttention: CpuKernel = (b) => {
 export function cpuConv2d(v: { relu: boolean; residual: boolean; reluIn?: boolean }): CpuKernel {
   return (b) => {
     const [H, W, C, O, Ho, Wo, kh, kw, stride, pad, K, M] = Array.from(b[0]!.u32.subarray(0, 12)) as number[];
+    const plane = Ho! * Wo!;
     const x = b[1]!.f32;
     const w = b[2]!.f32;
     const bias = b[3]!.f32;
@@ -778,15 +779,17 @@ export function cpuConv2d(v: { relu: boolean; residual: boolean; reluIn?: boolea
     const acc = new Float32Array(O!);
     for (let m = 0; m < M!; m++) {
       acc.set(bias.subarray(0, O!));
-      const oy = Math.floor(m / Wo!) * stride! - pad!;
-      const ox = (m % Wo!) * stride! - pad!;
+      const img = Math.floor(m / plane) * H! * W!;
+      const r = m % plane;
+      const oy = Math.floor(r / Wo!) * stride! - pad!;
+      const ox = (r % Wo!) * stride! - pad!;
       for (let ky = 0; ky < kh!; ky++) {
         const iy = oy + ky;
         if (iy < 0 || iy >= H!) continue;
         for (let kx = 0; kx < kw!; kx++) {
           const ix = ox + kx;
           if (ix < 0 || ix >= W!) continue;
-          const xo = (iy * W! + ix) * C!;
+          const xo = (img + iy * W! + ix) * C!;
           const ko = (ky * kw! + kx) * C!;
           for (let o = 0; o < O!; o++) {
             let s = 0;
@@ -801,9 +804,69 @@ export function cpuConv2d(v: { relu: boolean; residual: boolean; reluIn?: boolea
         y[m * O! + o] = v.relu ? Math.max(val, 0) : val;
       }
     }
-    void Ho;
   };
 }
+
+export function cpuGroupNorm(relu: boolean): CpuKernel {
+  return (b) => {
+    const [T, C, G] = [b[0]!.u32[0]!, b[0]!.u32[1]!, b[0]!.u32[2]!];
+    const eps = b[0]!.f32[3]!;
+    const [x, w, bias, y] = [b[1]!.f32, b[2]!.f32, b[3]!.f32, b[4]!.f32];
+    const cg = C / G;
+    const N = b[0]!.u32[4]!;
+    for (let n = 0; n < N; n++)
+      for (let g = 0; g < G; g++) {
+        const at = (t: number, c: number) => n * T * C + t * C + g * cg + c;
+        let s = 0;
+        for (let t = 0; t < T; t++) for (let c = 0; c < cg; c++) s += x[at(t, c)]!;
+        const mean = s / (T * cg);
+        let v = 0;
+        for (let t = 0; t < T; t++) for (let c = 0; c < cg; c++) v += (x[at(t, c)]! - mean) ** 2;
+        const inv = 1 / Math.sqrt(v / (T * cg) + eps);
+        for (let t = 0; t < T; t++)
+          for (let c = 0; c < cg; c++) {
+            const r = (x[at(t, c)]! - mean) * inv * w[g * cg + c]! + bias[g * cg + c]!;
+            y[at(t, c)] = relu ? Math.max(r, 0) : r;
+          }
+      }
+  };
+}
+
+export const cpuNearestAdd: CpuKernel = (b) => {
+  const [H, W, C, Ho, Wo, N] = Array.from(b[0]!.u32.subarray(0, 6)) as number[];
+  const [x, f, y] = [b[1]!.f32, b[2]!.f32, b[3]!.f32];
+  const fy = Math.fround(H! / Ho!);
+  const fx = Math.fround(W! / Wo!);
+  for (let n = 0; n < N!; n++)
+    for (let t = 0; t < Ho! * Wo!; t++) {
+      const sy = Math.min(Math.floor(Math.fround(Math.floor(t / Wo!) * fy)), H! - 1);
+      const sx = Math.min(Math.floor(Math.fround((t % Wo!) * fx)), W! - 1);
+      for (let c = 0; c < C!; c++) y[(n * Ho! * Wo! + t) * C! + c] = f[t * C! + c]! + x[(n * H! * W! + sy * W! + sx) * C! + c]!;
+    }
+};
+
+export const cpuBboxAttention: CpuKernel = (b) => {
+  const [S, H, D] = [b[0]!.u32[0]!, b[0]!.u32[1]!, b[0]!.u32[2]!];
+  const scale = b[0]!.f32[3]!;
+  const [q, k, sel, o] = [b[1]!.f32, b[2]!.f32, b[3]!.u32, b[4]!.f32];
+  const row = H * D;
+  const n = b[0]!.u32[4]!;
+  for (let i = 0; i < n; i++) {
+    const base = i * S * H;
+    let m = -Infinity;
+    for (let j = 0; j < S * H; j++) {
+      const px = Math.floor(j / H);
+      const h = j % H;
+      let s = 0;
+      for (let d = 0; d < D; d++) s += Math.fround(q[sel[i]! * row + h * D + d]! * scale) * k[px * row + h * D + d]!;
+      o[base + j] = s;
+      m = Math.max(m, s);
+    }
+    let z = 0;
+    for (let j = 0; j < S * H; j++) z += o[base + j] = Math.exp(o[base + j]! - m);
+    for (let j = 0; j < S * H; j++) o[base + j] = o[base + j]! / z;
+  }
+};
 
 export const cpuResizeBilinear: CpuKernel = (b) => {
   const [H, W, C, Ho, Wo, align] = Array.from(b[0]!.u32.subarray(0, 6)) as number[];

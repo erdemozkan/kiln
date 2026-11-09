@@ -64,4 +64,12 @@ describe("DETR", () => {
     expect(detrName("model.backbone.conv_encoder.model.layer1.0.conv1.weight")).toBeUndefined();
     expect(detrName("model.input_projection.weight")).toBeUndefined();
   });
+
+  it("reads a panoptic checkpoint's names: the detr. prefix and the box attention projections", () => {
+    expect(detrName("detr.model.encoder.layers.0.fc1.weight")).toBe("e0.up.weight");
+    expect(detrName("detr.class_labels_classifier.bias")).toBe("det.cls.0.bias");
+    expect(detrName("bbox_attention.q_linear.weight")).toBe("mask.q.weight");
+    expect(detrName("bbox_attention.k_linear.bias")).toBe("mask.k.bias");
+    expect(detrName("mask_head.lay1.weight")).toBeUndefined();
+  });
 });

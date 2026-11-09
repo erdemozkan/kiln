@@ -292,4 +292,80 @@ describe("image convolution kernels (CPU)", () => {
         expect(y[t * O + o]).toBeCloseTo(s, 5);
       }
   });
+
+  it("conv2d convolves a batch of stacked images as each alone", async () => {
+    const [n, H, W, C, O] = [3, 5, 4, 4, 6];
+    const x = randn(n * H * W * C);
+    const K = 64;
+    const w = randn(O * K);
+    for (let o = 0; o < O; o++) w.fill(0, o * K + 9 * C, (o + 1) * K);
+    const bias = randn(O);
+    const opts = { H, W, k: 3, stride: 1, pad: 1 };
+    const all = await run((ctx) => ops.conv2d(ctx, upload(x, [n * H * W, C]), upload(w, [O, K]), upload(bias, [O]), { ...opts, n }).y, n * H * W * O);
+    for (let i = 0; i < n; i++) {
+      const one = await run((ctx) => ops.conv2d(ctx, upload(x.slice(i * H * W * C, (i + 1) * H * W * C), [H * W, C]), upload(w, [O, K]), upload(bias, [O]), opts).y, H * W * O);
+      one.forEach((v, j) => expect(all[i * H * W * O + j]).toBeCloseTo(v, 5));
+    }
+  });
+
+  it("groupNorm normalizes each image's channel groups (GroupNorm), with ReLU", async () => {
+    const [n, T, C, G] = [2, 7, 12, 3];
+    const x = randn(n * T * C);
+    const w = randn(C);
+    const b = randn(C);
+    const y = await run((ctx) => ops.groupNorm(ctx, upload(x, [n * T, C]), upload(w, [C]), upload(b, [C]), { n, groups: G, eps: 1e-5, relu: true }), n * T * C);
+    const cg = C / G;
+    for (let i = 0; i < n; i++)
+      for (let g = 0; g < G; g++) {
+        const vals: number[] = [];
+        for (let t = 0; t < T; t++) for (let c = 0; c < cg; c++) vals.push(x[(i * T + t) * C + g * cg + c]!);
+        const m = vals.reduce((a, v) => a + v, 0) / vals.length;
+        const inv = 1 / Math.sqrt(vals.reduce((a, v) => a + (v - m) ** 2, 0) / vals.length + 1e-5);
+        for (let t = 0; t < T; t++)
+          for (let c = 0; c < cg; c++) {
+            const k = g * cg + c;
+            expect(y[(i * T + t) * C + k]).toBeCloseTo(Math.max((x[(i * T + t) * C + k]! - m) * inv * w[k]! + b[k]!, 0), 5);
+          }
+      }
+  });
+
+  it("nearestAdd picks torch's nearest source pixels (3×5 → 7×11) and adds the shared image", async () => {
+    // torch.nn.functional.interpolate(size=(7, 11), mode="nearest") source rows and columns.
+    const rows = [0, 0, 0, 1, 1, 2, 2];
+    const cols = [0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4];
+    const [n, H, W, C, Ho, Wo] = [2, 3, 5, 3, 7, 11];
+    const x = randn(n * H * W * C);
+    const f = randn(Ho * Wo * C);
+    const y = await run((ctx) => ops.nearestAdd(ctx, upload(x, [n * H * W, C]), upload(f, [Ho * Wo, C]), { n, H, W, Ho, Wo }), n * Ho * Wo * C);
+    for (let i = 0; i < n; i++)
+      for (let oy = 0; oy < Ho; oy++)
+        for (let ox = 0; ox < Wo; ox++)
+          for (let c = 0; c < C; c++) {
+            const t = oy * Wo + ox;
+            expect(y[(i * Ho * Wo + t) * C + c]).toBeCloseTo(f[t * C + c]! + x[(i * H * W + rows[oy]! * W + cols[ox]!) * C + c]!, 6);
+          }
+  });
+
+  it("bboxAttention softmaxes each selected query's head scores over all heads and pixels together", async () => {
+    const [Q, S, Hh, D] = [4, 5, 2, 3];
+    const q = randn(Q * Hh * D);
+    const k = randn(S * Hh * D);
+    const sel = new Uint32Array([2, 0]);
+    const selBuf = be.alloc(sel.byteLength);
+    be.write(selBuf, 0, sel);
+    const scale = D ** -0.5;
+    const y = await run((ctx) => ops.bboxAttention(ctx, upload(q, [Q, Hh * D]), upload(k, [S, Hh * D]), selBuf, { n: 2, heads: Hh, scale }), 2 * S * Hh);
+    sel.forEach((row, i) => {
+      const s: number[] = [];
+      for (let p = 0; p < S; p++)
+        for (let h = 0; h < Hh; h++) {
+          let d = 0;
+          for (let e = 0; e < D; e++) d += q[row * Hh * D + h * D + e]! * scale * k[p * Hh * D + h * D + e]!;
+          s.push(d);
+        }
+      const m = Math.max(...s);
+      const z = s.reduce((a, v) => a + Math.exp(v - m), 0);
+      s.forEach((v, j) => expect(y[i * S * Hh + j]).toBeCloseTo(Math.exp(v - m) / z, 6));
+    });
+  });
 });

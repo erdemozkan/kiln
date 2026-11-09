@@ -27,7 +27,8 @@ export type PipelineTask =
   | "image-feature-extraction"
   | "zero-shot-image-classification"
   | "object-detection"
-  | "depth-estimation";
+  | "depth-estimation"
+  | "image-segmentation";
 
 const SEQ2SEQ = new Set<string>(["summarization", "translation", "text2text-generation", "automatic-speech-recognition"]);
 
@@ -52,9 +53,10 @@ export const DEFAULT_MODELS: Record<string, string> = {
   "zero-shot-image-classification": "openai/clip-vit-base-patch32",
   "object-detection": "facebook/detr-resnet-50",
   "depth-estimation": "depth-anything/Depth-Anything-V2-Small-hf",
+  "image-segmentation": "facebook/detr-resnet-50-panoptic",
 };
 
-const VISION = new Set<string>(["image-classification", "image-feature-extraction", "zero-shot-image-classification", "object-detection", "depth-estimation"]);
+const VISION = new Set<string>(["image-classification", "image-feature-extraction", "zero-shot-image-classification", "object-detection", "depth-estimation", "image-segmentation"]);
 
 /** Speech encoders run on raw samples (CTC or a classifier) rather than as encoder-decoders. */
 const AUDIO_ENCODERS = new Set(["wav2vec2", "hubert"]);
@@ -486,6 +488,29 @@ export interface DepthEstimationPipeline {
   (images: ImageInput[]): Promise<DepthEstimationResult[]>;
 }
 
+export interface ImageSegmentationOptions {
+  /** Least class score a query needs to become a segment (default 0.5). */
+  threshold?: number;
+  /** Mask probability a pixel needs to count toward a segment's own area (default 0.5). */
+  mask_threshold?: number;
+  /** Share of that area a segment must keep after overlaps are resolved (default 0.8). */
+  overlap_mask_area_threshold?: number;
+}
+/** A segment: class, score, and mask (255 inside, 0 outside) at the image's size. */
+export interface ImageSegmentationResult {
+  score: number;
+  label: string;
+  mask: { width: number; height: number; channels: 1; data: Uint8Array };
+}
+export interface ImageSegmentationPipeline {
+  readonly task: PipelineTask;
+  readonly model: KilnVision;
+  readonly info: VisionInfo;
+  dispose(): Promise<void>;
+  (image: ImageInput, options?: ImageSegmentationOptions): Promise<ImageSegmentationResult[]>;
+  (images: ImageInput[], options?: ImageSegmentationOptions): Promise<ImageSegmentationResult[][]>;
+}
+
 /** An image in a form the worker can receive and decode: relative URLs resolved, DOM images drawn to bitmaps. */
 async function toWorkerImage(x: ImageInput): Promise<unknown> {
   if (typeof x === "string") return typeof location !== "undefined" ? new URL(x, location.href).href : x;
@@ -542,6 +567,7 @@ export async function pipeline(task: "image-feature-extraction", model?: string,
 export async function pipeline(task: "zero-shot-image-classification", model?: string, options?: PipelineOptions): Promise<ZeroShotImageClassificationPipeline>;
 export async function pipeline(task: "object-detection", model?: string, options?: PipelineOptions): Promise<ObjectDetectionPipeline>;
 export async function pipeline(task: "depth-estimation", model?: string, options?: PipelineOptions): Promise<DepthEstimationPipeline>;
+export async function pipeline(task: "image-segmentation", model?: string, options?: PipelineOptions): Promise<ImageSegmentationPipeline>;
 export async function pipeline(task: PipelineTask, model?: string, options: PipelineOptions = {}): Promise<unknown> {
   const t = ALIASES[task] ?? task;
   const id = model ?? DEFAULT_MODELS[t];
@@ -565,7 +591,7 @@ export async function pipeline(task: PipelineTask, model?: string, options: Pipe
     const one = async (x: ImageInput, a?: unknown, b?: object) => {
       const img = await toWorkerImage(x);
       if (zeroShot) return m.run<unknown>("zero-shot-image-classification", img, a, { ...b });
-      const r = await m.run<unknown>(t as "image-classification" | "image-feature-extraction" | "object-detection" | "depth-estimation", img, { ...(a as object) });
+      const r = await m.run<unknown>(t as "image-classification" | "image-feature-extraction" | "object-detection" | "depth-estimation" | "image-segmentation", img, { ...(a as object) });
       if (t === "image-feature-extraction") {
         const f = r as { data: Float32Array; dims: number[] };
         return new Tensor("float32", f.data, f.dims);

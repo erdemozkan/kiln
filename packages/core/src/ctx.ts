@@ -139,6 +139,11 @@ export class Ctx {
     this.pending.push({ pipeline: this.backend.pipeline(spec), buffers, kinds: spec.bindings, grid, label });
   }
 
+  /** Dispatches recorded so far (the index the next one will have). */
+  get size(): number {
+    return this.pending.length;
+  }
+
   /** Bytes of pool buffers this plan binds. */
   get activationBytes(): number {
     const used = new Set<Buf>();

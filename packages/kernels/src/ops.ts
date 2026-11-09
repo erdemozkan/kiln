@@ -27,6 +27,9 @@ import {
   attnProbsSpec,
   blockAttentionSpec,
   conv2dSpec,
+  groupNormSpec,
+  nearestAddSpec,
+  bboxAttentionSpec,
   convTransposeSpec,
   maxPool2dSpec,
   resizeBilinearSpec,
@@ -470,24 +473,52 @@ export const convOut = (n: number, k: number, stride: number, pad: number): numb
  * 2-D convolution of an image x [H·W, C] (raster order, channels last, C a multiple of 4) with
  * w [O, K] (taps (ky, kx) major, then channels, K = kh·kw·C rounded up to a multiple of 32): y
  * [Ho·Wo, O] = bias + conv (+ residual), then ReLU with `relu`; `reluIn` applies ReLU to the input
- * as it is read (see conv2dSpec).
+ * as it is read; `n` images stacked in x convolve as one batch (see conv2dSpec).
  */
-export function conv2d(ctx: Ctx, x: Tensor, w: Tensor, bias: Tensor, o: { H: number; W: number; k: number; stride: number; pad: number; relu?: boolean; reluIn?: boolean; residual?: Tensor }): { y: Tensor; H: number; W: number } {
+export function conv2d(ctx: Ctx, x: Tensor, w: Tensor, bias: Tensor, o: { H: number; W: number; k: number; stride: number; pad: number; relu?: boolean; reluIn?: boolean; residual?: Tensor; n?: number }): { y: Tensor; H: number; W: number } {
   const C = lastDim(x);
   const [O, K] = w.shape as [number, number];
-  if (C % 4 !== 0 || numel(x.shape) !== o.H * o.W * C) throw new Error(`conv2d: [${x.shape}] is not a ${o.H}×${o.W} image with a multiple of 4 channels`);
+  const n = o.n ?? 1;
+  if (C % 4 !== 0 || numel(x.shape) !== n * o.H * o.W * C) throw new Error(`conv2d: [${x.shape}] is not ${n} ${o.H}×${o.W} image(s) with a multiple of 4 channels`);
   if (K !== Math.ceil((o.k * o.k * C) / 32) * 32) throw new Error(`conv2d: weight [${w.shape}] does not fit ${o.k}×${o.k} taps of ${C} channels`);
   const Ho = convOut(o.H, o.k, o.stride, o.pad);
   const Wo = convOut(o.W, o.k, o.stride, o.pad);
-  const M = Ho * Wo;
+  const M = n * Ho * Wo;
   const y = ctx.alloc([M, O]);
   const groups = Math.ceil(O / 64);
-  const params = ctx.uniform([o.H, o.W, C, O, Ho, Wo, o.k, o.k, o.stride, o.pad, K, M, 0, 0, 0, 0].map(u32));
+  const params = ctx.uniform([o.H, o.W, C, O, Ho, Wo, o.k, o.k, o.stride, o.pad, K, M, n, 0, 0, 0].map(u32));
   const bufs = [params, x.buf, w.buf, bias.buf];
   if (o.residual) bufs.push(o.residual.buf);
   bufs.push(y.buf);
   ctx.run(conv2dSpec({ relu: !!o.relu, residual: !!o.residual, reluIn: !!o.reluIn }), bufs, [Math.min(groups, MM_SLICE), Math.ceil(M / 64), Math.ceil(groups / MM_SLICE)], `conv2d ${o.k}x${o.k}/${o.stride} ${C}→${O}`);
   return { y, H: Ho, W: Wo };
+}
+
+/** GroupNorm of n images x [n·T, C] in G groups, ReLU after with `relu` (see groupNormSpec). */
+export function groupNorm(ctx: Ctx, x: Tensor, w: Tensor, b: Tensor, o: { n: number; groups: number; eps: number; relu?: boolean }): Tensor {
+  const C = lastDim(x);
+  const T = numel(x.shape) / C / o.n;
+  if (C % o.groups !== 0 || !Number.isInteger(T)) throw new Error(`groupNorm: [${x.shape}] is not ${o.n} images in ${o.groups} groups`);
+  const y = ctx.alloc(x.shape);
+  ctx.run(groupNormSpec(!!o.relu), [ctx.uniform([u32(T), u32(C), u32(o.groups), f32(o.eps), u32(o.n), u32(0), u32(0), u32(0)]), x.buf, w.buf, b.buf, y.buf], [o.groups, o.n, 1]);
+  return y;
+}
+
+/** n images x [n·H·W, C] upsampled (nearest) to Ho × Wo, each plus the image f [Ho·Wo, C] (see nearestAddSpec). */
+export function nearestAdd(ctx: Ctx, x: Tensor, f: Tensor, o: { n: number; H: number; W: number; Ho: number; Wo: number }): Tensor {
+  const C = lastDim(x);
+  const y = ctx.alloc([o.n * o.Ho * o.Wo, C]);
+  ctx.run(nearestAddSpec(), [ctx.uniform([o.H, o.W, C, o.Ho, o.Wo, o.n, 0, 0].map(u32)), x.buf, f.buf, y.buf], grid1d(o.n * o.Ho * o.Wo * C));
+  return y;
+}
+
+/** DETR's box attention maps of `n` selected query rows (indices in `sel`) over the S pixels of k: [n·S, H] (see bboxAttentionSpec). */
+export function bboxAttention(ctx: Ctx, q: Tensor, k: Tensor, sel: Buf, o: { n: number; heads: number; scale: number }): Tensor {
+  const row = lastDim(q);
+  const S = numel(k.shape) / row;
+  const y = ctx.alloc([o.n * S, o.heads]);
+  ctx.run(bboxAttentionSpec(), [ctx.uniform([u32(S), u32(o.heads), u32(row / o.heads), f32(o.scale), u32(o.n), u32(0), u32(0), u32(0)]), q.buf, k.buf, sel, y.buf], [o.n, 1, 1]);
+  return y;
 }
 
 /** Bilinear resize of an image x [H·W, C] → [Ho·Wo, C], torch's align_corners convention as asked (see resizeBilinearSpec). */

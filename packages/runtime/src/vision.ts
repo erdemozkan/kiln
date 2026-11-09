@@ -1,6 +1,6 @@
 // Image models from transformers checkpoints (ViT, DeiT, CLIP, YOLOS, DETR, Depth Anything): image
-// classification, image features, zero-shot classification, object detection and depth estimation,
-// with transformers' image preprocessing (PIL-exact resizing).
+// classification, image features, zero-shot classification, object detection, panoptic segmentation
+// and depth estimation, with transformers' image preprocessing (PIL-exact resizing).
 import type { Backend, Tensor } from "@kiln/core";
 import { fetchJSON, fileUrl, listRepoFiles, parseModelId, preprocessImage, readPytorchHeader, readSafetensorsHeader, toF32, weightFiles, type ByteSource, type ImageProcessorConfig, type RgbImage, type TensorEntry } from "@kiln/loader";
 import { ClipTextModel, DETR_IN_CHANNELS, DepthAnythingModel, DetrModel, VitModel, bicubicResize, convMatrix, convTransposeMatrix, depthConfigFromHF, depthName, detrConfigFromHF, detrName, dinov2Positions, foldConvBn, clipPoolIndex, clipTextConfigFromHF, clipTextName, vitConfigFromHF, vitGrid, vitName, vitPatchK, type DepthAnythingConfig, type DetrConfig, type VitConfig, type VitEmbeddings } from "@kiln/models";
@@ -43,6 +43,22 @@ export interface DepthEstimate {
   predicted_depth: { data: Float32Array; dims: number[] };
   /** The same map scaled to 0…255, one byte per pixel. */
   depth: { width: number; height: number; channels: 1; data: Uint8Array };
+}
+
+export interface ImageSegmentationOptions {
+  /** Least class score a query needs to become a segment (default 0.5). */
+  threshold?: number;
+  /** Mask probability a pixel needs to count toward a segment's own area (default 0.5). */
+  mask_threshold?: number;
+  /** Share of that area a segment must keep after overlaps are resolved (default 0.8). */
+  overlap_mask_area_threshold?: number;
+}
+
+/** A segment: its class, score, and mask (255 inside, 0 outside) at the image's size. */
+export interface ImageSegment {
+  score: number;
+  label: string;
+  mask: { width: number; height: number; channels: 1; data: Uint8Array };
 }
 
 export interface ZeroShotImageOptions {
@@ -276,6 +292,89 @@ export class VisionEngine {
     return { predicted_depth: { data: out, dims: [H, W] }, depth: { width: W, height: H, channels: 1, data: bytes } };
   }
 
+  /**
+   * Panoptic segmentation (DETR), post-processed as transformers.js does it: queries whose best class
+   * is not "no object" and scores above `threshold`; their mask probabilities (sigmoid) resized
+   * bilinearly to the image and weighted by the score; each pixel to the strongest query; a segment
+   * kept when it holds more than `overlap_mask_area_threshold` of the pixels its own mask passes
+   * `mask_threshold` on. Masks run only for the kept queries.
+   */
+  async segment(img: RgbImage, options: ImageSegmentationOptions = {}): Promise<ImageSegment[]> {
+    if (!this.detr) throw new Error("this model does not segment images");
+    const threshold = options.threshold ?? 0.5;
+    const maskThreshold = options.mask_threshold ?? 0.5;
+    const overlap = options.overlap_mask_area_threshold ?? 0.8;
+    const p = preprocessImage(img, this.processor);
+    const scores = new Map<number, { score: number; label: number }>();
+    const pick = (logits: Float32Array, classes: number) => {
+      const picked: number[] = [];
+      for (let q = 0; q < logits.length / classes; q++) {
+        const l = logits.subarray(q * classes, (q + 1) * classes);
+        let best = 0;
+        for (let k = 1; k < classes; k++) if (l[k]! > l[best]!) best = k;
+        if (best === classes - 1) continue;
+        let z = 0;
+        for (const v of l) z += Math.exp(v - l[best]!);
+        const score = 1 / z;
+        if (score > threshold) {
+          picked.push(q);
+          scores.set(q, { score, label: best });
+        }
+      }
+      return picked;
+    };
+    const r = await this.detr.model.segment(p.data, p.width, p.height, pick);
+    const [W, H] = [img.width, img.height];
+    if (!r.picked.length) return [];
+    // Each mask: sigmoid, bilinear to the image (transformers.js's interpolate), times its score.
+    const probs = r.masks.map((m, i) => {
+      const score = scores.get(r.picked[i]!)!.score;
+      const sig = m.map((v) => 1 / (1 + Math.exp(-v)));
+      const out = new Float32Array(W * H);
+      const sx = W / r.maskW;
+      const sy = H / r.maskH;
+      for (let y = 0; y < H; y++) {
+        const fy = (y + 0.5) / sy - 0.5;
+        const y1 = Math.max(Math.floor(fy), 0);
+        const y2 = Math.min(Math.floor(fy) + 1, r.maskH - 1);
+        const t = fy - y1;
+        for (let x = 0; x < W; x++) {
+          const fx = (x + 0.5) / sx - 0.5;
+          const x1 = Math.max(Math.floor(fx), 0);
+          const x2 = Math.min(Math.floor(fx) + 1, r.maskW - 1);
+          const s = fx - x1;
+          const v = (1 - s) * (1 - t) * sig[y1 * r.maskW + x1]! + s * (1 - t) * sig[y1 * r.maskW + x2]! + (1 - s) * t * sig[y2 * r.maskW + x1]! + s * t * sig[y2 * r.maskW + x2]!;
+          out[y * W + x] = Math.fround(Math.fround(v) * score);
+        }
+      }
+      return out;
+    });
+    const owner = new Int32Array(W * H);
+    const best = new Float32Array(W * H);
+    probs.forEach((pr, i) => {
+      for (let j = 0; j < pr.length; j++)
+        if (pr[j]! > best[j]!) {
+          owner[j] = i;
+          best[j] = pr[j]!;
+        }
+    });
+    const out: ImageSegment[] = [];
+    probs.forEach((pr, i) => {
+      let area = 0;
+      let own = 0;
+      for (let j = 0; j < pr.length; j++) {
+        if (owner[j] === i) own++;
+        if (pr[j]! >= maskThreshold) area++;
+      }
+      if (!own || !area || own / area <= overlap) return;
+      const data = new Uint8Array(W * H);
+      for (let j = 0; j < data.length; j++) if (owner[j] === i) data[j] = 255;
+      const { score, label } = scores.get(r.picked[i]!)!;
+      out.push({ score, label: this.detr!.cfg.labels[label] ?? `LABEL_${label}`, mask: { width: W, height: H, channels: 1, data } });
+    });
+    return out;
+  }
+
   /** Class logits of an image (DeiT with a teacher: the mean of the CLS and distillation heads). */
   async logits(img: RgbImage): Promise<Float32Array> {
     if (!this.heads.cls) throw new Error("this model has no classification head");
@@ -504,7 +603,8 @@ async function createDetr(
     for (const name of names.names) {
       const { source, header } = await openParsed(ref, name, ep, names.format === "safetensors" ? readSafetensorsHeader : readPytorchHeader);
       sources.push(source);
-      for (const t of header.tensors) located.set(t.name, { source, entry: t });
+      // Panoptic checkpoints wrap the detector as "detr.".
+      for (const t of header.tensors) located.set(t.name.replace(/^detr\./, ""), { source, entry: t });
       files.push({ name, source, tensors: header.tensors.filter((t) => detrName(t.name) !== undefined), rename: detrName });
     }
     const need = async (name: string) => {
@@ -540,6 +640,37 @@ async function createDetr(
     upload("proj.bias", [proj.shape[0]!], (await need("model.input_projection.bias")).data);
     const qpos = await need("model.query_position_embeddings.weight");
     upload("query.pos", qpos.shape, qpos.data);
+    if (located.has("mask_head.lay1.weight")) {
+      const mh = "mask_head.";
+      const conv = async (from: string, to: string) => {
+        const w = await need(`${mh}${from}.weight`);
+        const m = convMatrix(w.data, w.shape);
+        upload(`${to}.weight`, [w.shape[0]!, m.K], m.w);
+        upload(`${to}.bias`, [w.shape[0]!], (await need(`${mh}${from}.bias`)).data);
+      };
+      // lay1 reads [projected features (dModel) | box attention (heads)]: split along its input channels.
+      const l1 = await need(mh + "lay1.weight");
+      const [O, Cin, k] = l1.shape as [number, number, number];
+      const D = cfg.dModel;
+      const part = (c0: number, c1: number) => {
+        const out = new Float32Array(O * (c1 - c0) * k * k);
+        for (let o = 0; o < O; o++) out.set(l1.data.subarray((o * Cin + c0) * k * k, (o * Cin + c1) * k * k), o * (c1 - c0) * k * k);
+        return convMatrix(out, [O, c1 - c0, k, k]);
+      };
+      const a = part(0, D);
+      const b = part(D, Cin);
+      upload("mask.lay1a.weight", [O, a.K], a.w);
+      upload("mask.lay1a.bias", [O], (await need(mh + "lay1.bias")).data);
+      upload("mask.lay1b.weight", [O, b.K], b.w);
+      upload("mask.lay1b.bias", [O], new Float32Array(O));
+      for (const i of [2, 3, 4, 5]) await conv(`lay${i}`, `mask.lay${i}`);
+      for (const i of [1, 2, 3]) await conv(`adapter${i}`, `mask.adapter${i}`);
+      await conv("out_lay", "mask.out");
+      for (const i of [1, 2, 3, 4, 5]) for (const f of ["weight", "bias"]) {
+        const t = await need(`${mh}gn${i}.${f}`);
+        upload(`mask.gn${i}.${f}`, t.shape, t.data);
+      }
+    }
     return new VisionEngine(backend, undefined, prep, {}, undefined, { cfg, model: new DetrModel(backend, cfg, weights) });
   } finally {
     for (const s of sources) s.close?.();

@@ -159,6 +159,10 @@ await detector("cats.jpg", { threshold: 0.9 }); // [{ score: 0.998, label: "remo
 // Depth Anything V2: relative depth at the image's size, and as grey bytes.
 const depth = await pipeline("depth-estimation"); // depth-anything/Depth-Anything-V2-Small-hf
 const { predicted_depth, depth: grey } = await depth("cats.jpg"); // Tensor [480, 640]; { width, height, channels: 1, data }
+
+// DETR panoptic: one mask per segment, 255 inside.
+const segmenter = await pipeline("image-segmentation"); // facebook/detr-resnet-50-panoptic
+await segmenter("cats.jpg"); // [{ score: 0.994, label: "cat", mask: { width: 640, height: 480, channels: 1, data } }, ...]
 ```
 
 With a CLIP model, `image-feature-extraction` returns the image embedding (the visual projection's

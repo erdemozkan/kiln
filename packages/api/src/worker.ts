@@ -258,6 +258,8 @@ scope.onmessage = async (e: MessageEvent<Request>) => {
                     ? await v.detect(img, msg.args[1] as Record<string, unknown> | undefined)
                     : task === "depth-estimation"
                       ? await v.estimateDepth(img)
+                      : task === "image-segmentation"
+                        ? await v.segment(img, msg.args[1] as Record<string, unknown> | undefined)
                       : await v.features(img, msg.args[1] as Record<string, unknown> | undefined);
             post({ id: msg.id, type: "result", result });
           } catch (err) {
