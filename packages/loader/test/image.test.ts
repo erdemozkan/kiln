@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { centerCrop, detrResizeSize, preprocessImage, resizeImage } from "../src/image";
+import { centerCrop, detrResizeSize, dptResizeSize, preprocessImage, resizeImage } from "../src/image";
 
 // A 5 × 4 RGB image and PIL 8's Image.resize of it (checked byte for byte; the 97 × 61 case and
 // whole DeiT / CLIP pipelines were also checked against PIL + numpy, all exact).
@@ -41,5 +41,20 @@ describe("DETR-family resize sizes", () => {
   });
   it("rounds a capped short side half to even, as Python's round does", () => {
     expect(detrResizeSize(2, 1, 3, 5, false)).toEqual([5, 2]);
+  });
+});
+
+describe("DPT resize (keep_aspect_ratio, ensure_multiple_of)", () => {
+  it("matches DPTImageProcessor's get_resize_output_image_size for a 518 × 518 target, multiples of 14", () => {
+    const cases: [number, number, [number, number]][] = [
+      [640, 480, [686, 518]],
+      [480, 640, [518, 686]],
+      [1000, 1000, [518, 518]],
+      [300, 200, [518, 350]],
+      [1920, 1080, [924, 518]],
+      [91, 700, [70, 518]],
+    ];
+    for (const [w, h, out] of cases) expect(dptResizeSize(w, h, 518, 518, true, 14)).toEqual(out);
+    expect(dptResizeSize(640, 480, 384, 384, false, 1)).toEqual([384, 384]);
   });
 });

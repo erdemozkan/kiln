@@ -1870,8 +1870,9 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid:
  * The tiling is gemm's (64 pixels × 64 channels per 128-thread workgroup, 8 × 4 per thread, K one
  * 32-element block at a time); only the x tile's loads differ, gathering each pixel's patch from the
  * image instead of reading a stored im2col row. Batch-norm is folded into w and bias at load time.
+ * With `reluIn` the input goes through ReLU as it is read (pre-activation residual blocks).
  */
-export function conv2dSpec(v: { relu: boolean; residual: boolean }): KernelSpec {
+export function conv2dSpec(v: { relu: boolean; residual: boolean; reluIn?: boolean }): KernelSpec {
   const R8 = [0, 1, 2, 3, 4, 5, 6, 7];
   const bindings: BindingKind[] = ["uniform", "read", "read", "read"];
   if (v.residual) bindings.push("read");
@@ -1883,7 +1884,7 @@ export function conv2dSpec(v: { relu: boolean; residual: boolean }): KernelSpec 
 ${[0, 1, 2, 3].map((j) => `    if (n0 + tn * 4u + ${j}u < p.O) { let n = n0 + tn * 4u + ${j}u; y[m * p.O + n] = ${out(`acc${i}[${j}] + bias[n]${v.residual ? " + res[m * p.O + n]" : ""}`)}; }`).join("\n")}
   }`,
   ).join("\n");
-  return spec(`conv2d${v.relu ? "/relu" : ""}${v.residual ? "/res" : ""}`, bindings, cpu.cpuConv2d(v), () => /* wgsl */ `
+  return spec(`conv2d${v.reluIn ? "/relu-in" : ""}${v.relu ? "/relu" : ""}${v.residual ? "/res" : ""}`, bindings, cpu.cpuConv2d(v), () => /* wgsl */ `
 struct P { H: u32, W: u32, C: u32, O: u32, Ho: u32, Wo: u32, kh: u32, kw: u32, stride: u32, pad: u32, K: u32, M: u32, _a: u32, _b: u32, _c: u32, _d: u32 }
 @group(0) @binding(0) var<uniform> p: P;
 @group(0) @binding(1) var<storage, read> x: array<vec4<f32>>;
@@ -1927,7 +1928,7 @@ ${R8.map((i) => `  var acc${i} = vec4<f32>();`).join("\n")}
       let ix = ox[c] + kx;
       let inside = live[c] && tap < taps && iy >= 0 && iy < i32(p.H) && ix >= 0 && ix < i32(p.W);
       let at = (u32(clamp(iy, 0, i32(p.H) - 1)) * p.W + u32(clamp(ix, 0, i32(p.W) - 1))) * C4 + min(c4, C4 - 1u);
-      xr[c] = select(vec4<f32>(0.0), x[at], inside);
+      xr[c] = select(vec4<f32>(0.0), ${v.reluIn ? "max(x[at], vec4<f32>(0.0))" : "x[at]"}, inside);
     }
     for (var c = 0u; c < 4u; c++) {
       let row = n0 + (li / 8u) * 4u + c;
@@ -1947,6 +1948,75 @@ ${R8.map((i) => `      acc${i} += a${i >> 2}.${"xyzw"[i & 3]} * bv;`).join("\n")
     workgroupBarrier();
   }
 ${store}
+}`);
+}
+
+/**
+ * Bilinear resize of an image x [H·W, C] (raster order, channels last) to y [Ho·Wo, C], as torch's
+ * interpolate(mode="bilinear") does it: with align_corners the corner pixels map onto each other
+ * (source = dst · (in − 1) / (out − 1)); without, pixel centers do (source = (dst + 0.5) · in / out
+ * − 0.5, clamped at 0). The far neighbour is clamped to the edge.
+ */
+export function resizeBilinearSpec(): KernelSpec {
+  return spec("resize_bilinear", ["uniform", "read", "rw"], cpu.cpuResizeBilinear, () => /* wgsl */ `
+struct P { H: u32, W: u32, C: u32, Ho: u32, Wo: u32, align: u32, _a: u32, _b: u32 }
+@group(0) @binding(0) var<uniform> p: P;
+@group(0) @binding(1) var<storage, read> x: array<f32>;
+@group(0) @binding(2) var<storage, read_write> y: array<f32>;
+
+fn src(d: u32, n: u32, o: u32) -> f32 {
+  if (p.align == 1u) { return select(0.0, f32(d) * (f32(n - 1u) / f32(o - 1u)), o > 1u); }
+  return max((f32(d) + 0.5) * (f32(n) / f32(o)) - 0.5, 0.0);
+}
+
+@compute @workgroup_size(${EW})
+fn main(${EW_ARGS}) {
+  ${FLAT}
+  if (idx >= p.Ho * p.Wo * p.C) { return; }
+  let c = idx % p.C;
+  let t = idx / p.C;
+  let sy = src(t / p.Wo, p.H, p.Ho);
+  let sx = src(t % p.Wo, p.W, p.Wo);
+  let y0 = min(u32(sy), p.H - 1u);
+  let x0 = min(u32(sx), p.W - 1u);
+  let y1 = min(y0 + 1u, p.H - 1u);
+  let x1 = min(x0 + 1u, p.W - 1u);
+  let ly = sy - f32(y0);
+  let lx = sx - f32(x0);
+  let top = (1.0 - lx) * x[(y0 * p.W + x0) * p.C + c] + lx * x[(y0 * p.W + x1) * p.C + c];
+  let bot = (1.0 - lx) * x[(y1 * p.W + x0) * p.C + c] + lx * x[(y1 * p.W + x1) * p.C + c];
+  y[idx] = (1.0 - ly) * top + ly * bot;
+}`);
+}
+
+/**
+ * Transposed convolution whose kernel equals its stride f (no overlap, no padding): x [H·W, C] →
+ * y [(H·f)·(W·f), O], each input pixel spreading into an f × f block, y[(oy, ox), o] = bias[o] +
+ * Σ_c x[(oy / f, ox / f), c] · w[((oy % f)·f + ox % f), o, c] (weight stored [f·f, O, C]).
+ */
+export function convTransposeSpec(): KernelSpec {
+  return spec("conv_transpose", ["uniform", "read", "read", "read", "rw"], cpu.cpuConvTranspose, () => /* wgsl */ `
+struct P { H: u32, W: u32, C: u32, O: u32, f: u32, _a: u32, _b: u32, _c: u32 }
+@group(0) @binding(0) var<uniform> p: P;
+@group(0) @binding(1) var<storage, read> x: array<f32>;
+@group(0) @binding(2) var<storage, read> w: array<f32>;
+@group(0) @binding(3) var<storage, read> bias: array<f32>;
+@group(0) @binding(4) var<storage, read_write> y: array<f32>;
+
+@compute @workgroup_size(${EW})
+fn main(${EW_ARGS}) {
+  ${FLAT}
+  let Wo = p.W * p.f;
+  if (idx >= p.H * p.f * Wo * p.O) { return; }
+  let o = idx % p.O;
+  let t = idx / p.O;
+  let oy = t / Wo;
+  let ox = t % Wo;
+  let xo = ((oy / p.f) * p.W + ox / p.f) * p.C;
+  let wo = (((oy % p.f) * p.f + ox % p.f) * p.O + o) * p.C;
+  var s = bias[o];
+  for (var c = 0u; c < p.C; c++) { s += x[xo + c] * w[wo + c]; }
+  y[idx] = s;
 }`);
 }
 

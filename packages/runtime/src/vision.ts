@@ -1,9 +1,9 @@
-// Image models from transformers checkpoints (ViT, DeiT, CLIP, YOLOS, DETR): image classification, image
-// features, zero-shot classification and object detection, with transformers' image preprocessing
-// (PIL-exact resizing).
+// Image models from transformers checkpoints (ViT, DeiT, CLIP, YOLOS, DETR, Depth Anything): image
+// classification, image features, zero-shot classification, object detection and depth estimation,
+// with transformers' image preprocessing (PIL-exact resizing).
 import type { Backend, Tensor } from "@kiln/core";
 import { fetchJSON, fileUrl, listRepoFiles, parseModelId, preprocessImage, readPytorchHeader, readSafetensorsHeader, toF32, weightFiles, type ByteSource, type ImageProcessorConfig, type RgbImage, type TensorEntry } from "@kiln/loader";
-import { ClipTextModel, DETR_IN_CHANNELS, DetrModel, VitModel, bicubicResize, detrConfigFromHF, detrName, foldConvBn, clipPoolIndex, clipTextConfigFromHF, clipTextName, vitConfigFromHF, vitGrid, vitName, vitPatchK, type DetrConfig, type VitConfig, type VitEmbeddings } from "@kiln/models";
+import { ClipTextModel, DETR_IN_CHANNELS, DepthAnythingModel, DetrModel, VitModel, bicubicResize, convMatrix, convTransposeMatrix, depthConfigFromHF, depthName, detrConfigFromHF, detrName, dinov2Positions, foldConvBn, clipPoolIndex, clipTextConfigFromHF, clipTextName, vitConfigFromHF, vitGrid, vitName, vitPatchK, type DepthAnythingConfig, type DetrConfig, type VitConfig, type VitEmbeddings } from "@kiln/models";
 import { ClipTokenizer, type ClipTokenizerJSON } from "@kiln/tokenizers";
 import { openBackend, openParsed } from "./load";
 import { loadWeights, type LoadProgress, type WeightFile } from "./weights";
@@ -35,6 +35,14 @@ export interface DetectedObject {
   score: number;
   label: string;
   box: { xmin: number; ymin: number; xmax: number; ymax: number };
+}
+
+/** A depth map, as transformers.js's depth-estimation pipeline returns it. */
+export interface DepthEstimate {
+  /** Relative depth (larger is nearer) [height, width] at the original image size. */
+  predicted_depth: { data: Float32Array; dims: number[] };
+  /** The same map scaled to 0…255, one byte per pixel. */
+  depth: { width: number; height: number; channels: 1; data: Uint8Array };
 }
 
 export interface ZeroShotImageOptions {
@@ -115,6 +123,7 @@ export class VisionEngine {
     private readonly heads: { cls?: Head; distill?: Head; pooler?: Head },
     private readonly clip?: ClipParts,
     private readonly detr?: { cfg: DetrConfig; model: DetrModel },
+    private readonly depthModel?: { cfg: DepthAnythingConfig; model: DepthAnythingModel },
   ) {}
 
   get cfg(): VitConfig {
@@ -130,6 +139,10 @@ export class VisionEngine {
   /** Family, depth, width, input size and labels, for the model info. */
   summary(): { family: string; layers: number; hiddenSize: number; imageSize: number; labels: Record<number, string> } {
     const labels = (l: string[]) => Object.fromEntries(l.map((v, i) => [i, v]));
+    if (this.depthModel) {
+      const c = this.depthModel.cfg;
+      return { family: "depth_anything", layers: c.layers, hiddenSize: c.hidden, imageSize: c.imageSize, labels: {} };
+    }
     if (this.detr) {
       const c = this.detr.cfg;
       const size = this.processor.size as { shortest_edge?: number } | undefined;
@@ -223,6 +236,46 @@ export class VisionEngine {
     return res;
   }
 
+  /**
+   * Depth estimation (Depth Anything), post-processed as transformers.js does it: the predicted depth
+   * resized bilinearly (pixel centers aligned) to the original image size, and that map scaled
+   * from its minimum and maximum to 0…255 (truncated to bytes).
+   */
+  async estimateDepth(img: RgbImage): Promise<DepthEstimate> {
+    if (!this.depthModel) throw new Error("this model does not estimate depth");
+    const p = preprocessImage(img, this.processor);
+    const d = await this.depthModel.model.predict(p.data, p.width, p.height);
+    const [W, H] = [img.width, img.height];
+    const out = new Float32Array(W * H);
+    const f = Math.fround;
+    const src = (i: number, inSize: number, outSize: number) => Math.max(f(f((i + 0.5) * f(inSize / outSize)) - 0.5), 0);
+    for (let y = 0; y < H; y++) {
+      const sy = src(y, d.height, H);
+      const y0 = Math.min(Math.floor(sy), d.height - 1);
+      const y1 = Math.min(y0 + 1, d.height - 1);
+      const ly = sy - y0;
+      for (let x = 0; x < W; x++) {
+        const sx = src(x, d.width, W);
+        const x0 = Math.min(Math.floor(sx), d.width - 1);
+        const x1 = Math.min(x0 + 1, d.width - 1);
+        const lx = sx - x0;
+        const top = (1 - lx) * d.depth[y0 * d.width + x0]! + lx * d.depth[y0 * d.width + x1]!;
+        const bot = (1 - lx) * d.depth[y1 * d.width + x0]! + lx * d.depth[y1 * d.width + x1]!;
+        out[y * W + x] = (1 - ly) * top + ly * bot;
+      }
+    }
+    let lo = Infinity;
+    let hi = -Infinity;
+    for (const v of out) {
+      if (v < lo) lo = v;
+      if (v > hi) hi = v;
+    }
+    const range = f(hi - lo);
+    const bytes = new Uint8Array(W * H);
+    for (let i = 0; i < out.length; i++) bytes[i] = f(f(f(out[i]! - lo) / range) * 255);
+    return { predicted_depth: { data: out, dims: [H, W] }, depth: { width: W, height: H, channels: 1, data: bytes } };
+  }
+
   /** Class logits of an image (DeiT with a teacher: the mean of the CLS and distillation heads). */
   async logits(img: RgbImage): Promise<Float32Array> {
     if (!this.heads.cls) throw new Error("this model has no classification head");
@@ -256,6 +309,7 @@ export class VisionEngine {
   destroy(): void {
     this.vit?.model.destroy();
     this.detr?.model.destroy();
+    this.depthModel?.model.destroy();
     this.clip?.text.destroy();
   }
 }
@@ -277,6 +331,7 @@ export async function createVision(modelId: string, opts: VisionLoadOptions = {}
     has("tokenizer.json").then((y) => (y ? fetchJSON<ClipTokenizerJSON>(fileUrl(ref, "tokenizer.json", ep), true) : undefined)),
   ]);
   if (config!.model_type === "detr") return createDetr(modelId, ref, config!, prep, names, opts);
+  if (config!.model_type === "depth_anything") return createDepth(modelId, ref, config!, prep, names, opts);
   const cfg = vitConfigFromHF(config!);
   const clip = cfg.modelType === "clip";
   if (clip && config!.model_type !== "clip") throw new Error(`${modelId}: a CLIP vision tower alone; zero-shot classification needs the full CLIP model`);
@@ -486,6 +541,113 @@ async function createDetr(
     const qpos = await need("model.query_position_embeddings.weight");
     upload("query.pos", qpos.shape, qpos.data);
     return new VisionEngine(backend, undefined, prep, {}, undefined, { cfg, model: new DetrModel(backend, cfg, weights) });
+  } finally {
+    for (const s of sources) s.close?.();
+  }
+}
+
+/**
+ * Depth Anything: DINOv2's attention, MLP-in and norms load as weights; the patch convolution
+ * becomes a matrix, the layer scales are folded into the attention output and MLP-out projections,
+ * the position embeddings are fitted to each grid, and the neck and head convolutions are reshaped
+ * for the conv kernels.
+ */
+async function createDepth(
+  modelId: string,
+  ref: ReturnType<typeof parseModelId>,
+  config: Record<string, unknown>,
+  prep: ImageProcessorConfig | undefined,
+  names: Awaited<ReturnType<typeof weightFiles>>,
+  opts: VisionLoadOptions,
+): Promise<VisionEngine> {
+  const cfg = depthConfigFromHF(config);
+  if (!prep) throw new Error(`${modelId}: no preprocessor_config.json`);
+  const ep = opts.endpoint;
+  const backend = opts.backend ?? (await openBackend(opts.device ?? "auto", opts.cpuThreads));
+  const sources: ByteSource[] = [];
+  const located = new Map<string, { source: ByteSource; entry: TensorEntry }>();
+  try {
+    const files: WeightFile[] = [];
+    for (const name of names.names) {
+      const { source, header } = await openParsed(ref, name, ep, names.format === "safetensors" ? readSafetensorsHeader : readPytorchHeader);
+      sources.push(source);
+      for (const t of header.tensors) located.set(t.name, { source, entry: t });
+      files.push({ name, source, tensors: header.tensors.filter((t) => depthName(t.name) !== undefined), rename: depthName });
+    }
+    const need = async (name: string) => {
+      const t = located.get(name);
+      if (!t) throw new Error(`${modelId}: "${name}" is missing`);
+      const count = t.entry.shape.reduce((a, b) => a * b, 1);
+      return { shape: t.entry.shape, data: toF32(t.entry.type as Parameters<typeof toF32>[0], await t.source.read(t.entry.offset, t.entry.byteLength), count) };
+    };
+    const weights = await loadWeights(backend, files, opts.quant ?? "f32", opts.onProgress);
+    const upload = (name: string, shape: number[], data: Float32Array) => {
+      const buf = backend.alloc(data.byteLength, "storage", `depth/${name}`);
+      backend.write(buf, 0, data);
+      weights.set(name, { shape, dtype: "f32", buf } as Tensor);
+    };
+    const H = cfg.hidden;
+    const e = "backbone.embeddings.";
+    const pw = await need(e + "patch_embeddings.projection.weight");
+    const K = Math.ceil((3 * cfg.patchSize ** 2) / 32) * 32;
+    const row = 3 * cfg.patchSize ** 2;
+    const patch = new Float32Array(H * K);
+    for (let o = 0; o < H; o++) patch.set(pw.data.subarray(o * row, (o + 1) * row), o * K);
+    upload("patch.weight", [H, K], patch);
+    // Layer scale γ folded into the projection before it: γ ⊙ (W x + b).
+    const scaled = async (from: string, gamma: string, to: string) => {
+      const [w, b, g] = await Promise.all([need(`${from}.weight`), need(`${from}.bias`), need(gamma)]);
+      const [rows, cols] = w.shape as [number, number];
+      for (let r = 0; r < rows; r++) {
+        for (let c = 0; c < cols; c++) w.data[r * cols + c] = w.data[r * cols + c]! * g.data[r]!;
+        b.data[r] = b.data[r]! * g.data[r]!;
+      }
+      upload(`${to}.weight`, [rows, cols], w.data);
+      upload(`${to}.bias`, [rows], b.data);
+    };
+    for (let l = 0; l < cfg.layers; l++) {
+      const p = `backbone.encoder.layer.${l}.`;
+      await scaled(p + "attention.output.dense", p + "layer_scale1.lambda1", `l${l}.o`);
+      await scaled(p + "mlp.fc2", p + "layer_scale2.lambda1", `l${l}.down`);
+    }
+    const conv = async (from: string, to: string, bias = true) => {
+      const w = await need(`${from}.weight`);
+      const m = convMatrix(w.data, w.shape);
+      upload(`${to}.weight`, [w.shape[0]!, m.K], m.w);
+      upload(`${to}.bias`, [w.shape[0]!], bias ? (await need(`${from}.bias`)).data : new Float32Array(w.shape[0]!));
+    };
+    const n = "neck.";
+    for (let i = 0; i < cfg.neck.length; i++) {
+      const r = `${n}reassemble_stage.layers.${i}.`;
+      await conv(r + "projection", `neck.re${i}.proj`);
+      const f = cfg.factors[i]!;
+      if (f > 1) {
+        const w = await need(r + "resize.weight");
+        upload(`neck.re${i}.resize.weight`, [f * f, w.shape[1]!, w.shape[0]!], convTransposeMatrix(w.data, w.shape));
+        upload(`neck.re${i}.resize.bias`, [w.shape[1]!], (await need(r + "resize.bias")).data);
+      } else if (f < 1) await conv(r + "resize", `neck.re${i}.resize`);
+      await conv(`${n}convs.${i}`, `neck.conv${i}`, false);
+      const u = `${n}fusion_stage.layers.${i}.`;
+      for (const k of [1, 2]) for (const c of [1, 2]) await conv(`${u}residual_layer${k}.convolution${c}`, `neck.fu${i}.res${k}.c${c}`);
+      await conv(u + "projection", `neck.fu${i}.proj`);
+    }
+    for (const k of [1, 2, 3]) await conv(`head.conv${k}`, `head.conv${k}`);
+
+    const pos = await need(e + "position_embeddings");
+    const cls = (await need(e + "cls_token")).data;
+    const pb = (await need(e + "patch_embeddings.projection.bias")).data;
+    const n0 = Math.round(Math.sqrt(pos.data.length / H - 1));
+    const grid = pos.data.subarray(H);
+    const addend = (gh: number, gw: number) => {
+      const P = gh * gw;
+      const out = new Float32Array((P + 1) * H);
+      out.set(gh === n0 && gw === n0 ? grid : dinov2Positions(grid, H, n0, gh, gw), 0);
+      for (let t = 0; t < P; t++) for (let i = 0; i < H; i++) out[t * H + i] += pb[i]!;
+      for (let i = 0; i < H; i++) out[P * H + i] = cls[i]! + pos.data[i]!;
+      return out;
+    };
+    const model = new DepthAnythingModel(backend, cfg, weights, addend);
+    return new VisionEngine(backend, undefined, prep, {}, undefined, undefined, { cfg, model });
   } finally {
     for (const s of sources) s.close?.();
   }

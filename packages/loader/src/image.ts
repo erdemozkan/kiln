@@ -187,6 +187,10 @@ export interface ImageProcessorConfig {
   image_mean?: number | number[];
   image_std?: number | number[];
   do_convert_rgb?: boolean;
+  /** DPT: scale both sides by the same factor (the one nearer 1) instead of squashing to `size`. */
+  keep_aspect_ratio?: boolean;
+  /** DPT: round each output side to a multiple of this. */
+  ensure_multiple_of?: number;
 }
 
 /** Processors whose integer `size` means the shortest edge (transformers' default_to_square=False). */
@@ -212,6 +216,25 @@ function roundHalfEven(x: number): number {
   const f = Math.floor(x);
   const d = x - f;
   return d > 0.5 || (d === 0.5 && f % 2 !== 0) ? f + 1 : f;
+}
+
+/**
+ * Output [width, height] of DPT's resize (transformers' DPTImageProcessor): to `width` × `height`,
+ * or with `keep` both sides scaled by whichever factor is nearer 1; each side then rounded
+ * (half to even) to a multiple of `multiple`.
+ */
+export function dptResizeSize(w: number, h: number, width: number, height: number, keep: boolean, multiple: number): [number, number] {
+  let sh = height / h;
+  let sw = width / w;
+  if (keep) {
+    if (Math.abs(1 - sw) < Math.abs(1 - sh)) sh = sw;
+    else sw = sh;
+  }
+  const fit = (v: number) => {
+    const x = roundHalfEven(v / multiple) * multiple;
+    return x < 0 ? Math.ceil(v / multiple) * multiple : x;
+  };
+  return [fit(sw * w), fit(sh * h)];
 }
 
 /**
@@ -264,6 +287,8 @@ export function preprocessImage(img: RgbImage, cfg: ImageProcessorConfig): { dat
       if (cfg.crop_pct !== undefined && /ConvNext/.test(kind) && edge < 384) edge = Math.trunc(edge / cfg.crop_pct);
       if (/Yolos|Detr/.test(kind)) [w, h] = detrResizeSize(im.width, im.height, edge, s.longest_edge, /Yolos/.test(kind));
       else [w, h] = shortestEdge(im.width, im.height, edge, s.longest_edge);
+    } else if (/DPT/.test(kind)) {
+      [w, h] = dptResizeSize(im.width, im.height, s.width ?? s.height!, s.height ?? s.width!, cfg.keep_aspect_ratio === true, cfg.ensure_multiple_of ?? 1);
     } else [w, h] = [s.width ?? s.height!, s.height ?? s.width!];
     im = resizeImage(im, w, h, resample);
     if (/ConvNext/.test(kind) && typeof s === "object" && s.shortest_edge !== undefined && s.shortest_edge < 384 && cfg.crop_pct !== undefined) {

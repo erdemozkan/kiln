@@ -60,7 +60,10 @@ detection heads on the GPU. DETR (`facebook/detr-resnet-50`, `-101`, the `object
 default): a ResNet backbone on a new implicit-GEMM 2-D convolution kernel (bias, residual and ReLU
 fused; frozen batch norms folded in when loading) and max pooling, DETR's encoder and decoder with
 sine position embeddings. `startProfile` / `stopProfile` work for every model type, not only
-language models.
+language models. Depth Anything (`depth-anything/Depth-Anything-V2-*-hf`): `depth-estimation`
+with transformers.js's output (`predicted_depth` at the image size, `depth` as grey bytes),
+DINOv2 encoder with position embeddings fitted to each grid, DPT neck and head on new transposed
+convolution and bilinear resize kernels; DPT's aspect-keeping resize to multiples of 14.
 
 **Loading.** Reads ahead of a download in progress are fetched on their own instead of waiting
 (a `pytorch_model.bin` keeps its zip directory at the end, so large checkpoints showed no progress

@@ -27,7 +27,9 @@ import {
   attnProbsSpec,
   blockAttentionSpec,
   conv2dSpec,
+  convTransposeSpec,
   maxPool2dSpec,
+  resizeBilinearSpec,
   type Activation,
   layernormSpec,
   gatedActSpec,
@@ -467,9 +469,10 @@ export const convOut = (n: number, k: number, stride: number, pad: number): numb
 /**
  * 2-D convolution of an image x [H·W, C] (raster order, channels last, C a multiple of 4) with
  * w [O, K] (taps (ky, kx) major, then channels, K = kh·kw·C rounded up to a multiple of 32): y
- * [Ho·Wo, O] = bias + conv (+ residual), then ReLU with `relu` (see conv2dSpec).
+ * [Ho·Wo, O] = bias + conv (+ residual), then ReLU with `relu`; `reluIn` applies ReLU to the input
+ * as it is read (see conv2dSpec).
  */
-export function conv2d(ctx: Ctx, x: Tensor, w: Tensor, bias: Tensor, o: { H: number; W: number; k: number; stride: number; pad: number; relu?: boolean; residual?: Tensor }): { y: Tensor; H: number; W: number } {
+export function conv2d(ctx: Ctx, x: Tensor, w: Tensor, bias: Tensor, o: { H: number; W: number; k: number; stride: number; pad: number; relu?: boolean; reluIn?: boolean; residual?: Tensor }): { y: Tensor; H: number; W: number } {
   const C = lastDim(x);
   const [O, K] = w.shape as [number, number];
   if (C % 4 !== 0 || numel(x.shape) !== o.H * o.W * C) throw new Error(`conv2d: [${x.shape}] is not a ${o.H}×${o.W} image with a multiple of 4 channels`);
@@ -483,8 +486,27 @@ export function conv2d(ctx: Ctx, x: Tensor, w: Tensor, bias: Tensor, o: { H: num
   const bufs = [params, x.buf, w.buf, bias.buf];
   if (o.residual) bufs.push(o.residual.buf);
   bufs.push(y.buf);
-  ctx.run(conv2dSpec({ relu: !!o.relu, residual: !!o.residual }), bufs, [Math.min(groups, MM_SLICE), Math.ceil(M / 64), Math.ceil(groups / MM_SLICE)], `conv2d ${o.k}x${o.k}/${o.stride} ${C}→${O}`);
+  ctx.run(conv2dSpec({ relu: !!o.relu, residual: !!o.residual, reluIn: !!o.reluIn }), bufs, [Math.min(groups, MM_SLICE), Math.ceil(M / 64), Math.ceil(groups / MM_SLICE)], `conv2d ${o.k}x${o.k}/${o.stride} ${C}→${O}`);
   return { y, H: Ho, W: Wo };
+}
+
+/** Bilinear resize of an image x [H·W, C] → [Ho·Wo, C], torch's align_corners convention as asked (see resizeBilinearSpec). */
+export function resizeBilinear(ctx: Ctx, x: Tensor, o: { H: number; W: number; Ho: number; Wo: number; alignCorners: boolean }): Tensor {
+  const C = lastDim(x);
+  const y = ctx.alloc([o.Ho * o.Wo, C]);
+  ctx.run(resizeBilinearSpec(), [ctx.uniform([o.H, o.W, C, o.Ho, o.Wo, o.alignCorners ? 1 : 0, 0, 0].map(u32)), x.buf, y.buf], grid1d(o.Ho * o.Wo * C));
+  return y;
+}
+
+/** Transposed convolution with kernel = stride = f of x [H·W, C], weight [f·f, O, C] → [(H·f)·(W·f), O] (see convTransposeSpec). */
+export function convTranspose(ctx: Ctx, x: Tensor, w: Tensor, bias: Tensor, o: { H: number; W: number; f: number }): { y: Tensor; H: number; W: number } {
+  const C = lastDim(x);
+  const O = w.shape[1]!;
+  if (w.shape[0] !== o.f * o.f || w.shape[2] !== C) throw new Error(`convTranspose: weight [${w.shape}] is not [${o.f * o.f}, O, ${C}]`);
+  const n = o.H * o.f * o.W * o.f;
+  const y = ctx.alloc([n, O]);
+  ctx.run(convTransposeSpec(), [ctx.uniform([o.H, o.W, C, O, o.f, 0, 0, 0].map(u32)), x.buf, w.buf, bias.buf, y.buf], grid1d(n * O));
+  return { y, H: o.H * o.f, W: o.W * o.f };
 }
 
 /** k × k max pooling of an image x [H·W, C] → [Ho·Wo, C]. */

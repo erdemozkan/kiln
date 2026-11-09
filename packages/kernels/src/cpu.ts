@@ -767,7 +767,7 @@ export const cpuBlockAttention: CpuKernel = (b) => {
   }
 };
 
-export function cpuConv2d(v: { relu: boolean; residual: boolean }): CpuKernel {
+export function cpuConv2d(v: { relu: boolean; residual: boolean; reluIn?: boolean }): CpuKernel {
   return (b) => {
     const [H, W, C, O, Ho, Wo, kh, kw, stride, pad, K, M] = Array.from(b[0]!.u32.subarray(0, 12)) as number[];
     const x = b[1]!.f32;
@@ -791,7 +791,7 @@ export function cpuConv2d(v: { relu: boolean; residual: boolean }): CpuKernel {
           for (let o = 0; o < O!; o++) {
             let s = 0;
             const wo = o * K! + ko;
-            for (let c = 0; c < C!; c++) s += x[xo + c]! * w[wo + c]!;
+            for (let c = 0; c < C!; c++) s += (v.reluIn ? Math.max(x[xo + c]!, 0) : x[xo + c]!) * w[wo + c]!;
             acc[o] += s;
           }
         }
@@ -804,6 +804,44 @@ export function cpuConv2d(v: { relu: boolean; residual: boolean }): CpuKernel {
     void Ho;
   };
 }
+
+export const cpuResizeBilinear: CpuKernel = (b) => {
+  const [H, W, C, Ho, Wo, align] = Array.from(b[0]!.u32.subarray(0, 6)) as number[];
+  const x = b[1]!.f32;
+  const y = b[2]!.f32;
+  const f = Math.fround;
+  const src = (d: number, n: number, o: number) => (align ? (o > 1 ? f(d * f((n - 1) / (o - 1))) : 0) : Math.max(f(f((d + 0.5) * f(n / o)) - 0.5), 0));
+  for (let t = 0; t < Ho! * Wo!; t++) {
+    const sy = src(Math.floor(t / Wo!), H!, Ho!);
+    const sx = src(t % Wo!, W!, Wo!);
+    const y0 = Math.min(Math.floor(sy), H! - 1);
+    const x0 = Math.min(Math.floor(sx), W! - 1);
+    const y1 = Math.min(y0 + 1, H! - 1);
+    const x1 = Math.min(x0 + 1, W! - 1);
+    const ly = sy - y0;
+    const lx = sx - x0;
+    for (let c = 0; c < C!; c++) {
+      const top = (1 - lx) * x[(y0 * W! + x0) * C! + c]! + lx * x[(y0 * W! + x1) * C! + c]!;
+      const bot = (1 - lx) * x[(y1 * W! + x0) * C! + c]! + lx * x[(y1 * W! + x1) * C! + c]!;
+      y[t * C! + c] = (1 - ly) * top + ly * bot;
+    }
+  }
+};
+
+export const cpuConvTranspose: CpuKernel = (b) => {
+  const [H, W, C, O, f] = Array.from(b[0]!.u32.subarray(0, 5)) as number[];
+  const [x, w, bias, y] = [b[1]!.f32, b[2]!.f32, b[3]!.f32, b[4]!.f32];
+  const Wo = W! * f!;
+  for (let oy = 0; oy < H! * f!; oy++)
+    for (let ox = 0; ox < Wo; ox++)
+      for (let o = 0; o < O!; o++) {
+        const xo = (Math.floor(oy / f!) * W! + Math.floor(ox / f!)) * C!;
+        const wo = (((oy % f!) * f! + (ox % f!)) * O! + o) * C!;
+        let s = bias[o]!;
+        for (let c = 0; c < C!; c++) s += x[xo + c]! * w[wo + c]!;
+        y[(oy * Wo + ox) * O! + o] = s;
+      }
+};
 
 export const cpuMaxPool2d: CpuKernel = (b) => {
   const [H, W, C, Ho, Wo, k, stride, pad] = Array.from(b[0]!.u32.subarray(0, 8)) as number[];

@@ -9,3 +9,4 @@ export * from "./wav2vec2";
 export * from "./vit";
 export * from "./clip";
 export * from "./detr";
+export * from "./depth";

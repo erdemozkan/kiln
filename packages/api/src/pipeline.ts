@@ -26,7 +26,8 @@ export type PipelineTask =
   | "image-classification"
   | "image-feature-extraction"
   | "zero-shot-image-classification"
-  | "object-detection";
+  | "object-detection"
+  | "depth-estimation";
 
 const SEQ2SEQ = new Set<string>(["summarization", "translation", "text2text-generation", "automatic-speech-recognition"]);
 
@@ -50,9 +51,10 @@ export const DEFAULT_MODELS: Record<string, string> = {
   "image-feature-extraction": "google/vit-base-patch16-224-in21k",
   "zero-shot-image-classification": "openai/clip-vit-base-patch32",
   "object-detection": "facebook/detr-resnet-50",
+  "depth-estimation": "depth-anything/Depth-Anything-V2-Small-hf",
 };
 
-const VISION = new Set<string>(["image-classification", "image-feature-extraction", "zero-shot-image-classification", "object-detection"]);
+const VISION = new Set<string>(["image-classification", "image-feature-extraction", "zero-shot-image-classification", "object-detection", "depth-estimation"]);
 
 /** Speech encoders run on raw samples (CTC or a classifier) rather than as encoder-decoders. */
 const AUDIO_ENCODERS = new Set(["wav2vec2", "hubert"]);
@@ -470,6 +472,20 @@ export interface ObjectDetectionPipeline {
   (images: ImageInput[], options?: ObjectDetectionOptions): Promise<ObjectDetectionResult[][]>;
 }
 
+/** A depth map: `predicted_depth` [height, width] at the original image size, and `depth`, the map as 0…255 grey bytes. */
+export interface DepthEstimationResult {
+  predicted_depth: Tensor;
+  depth: { width: number; height: number; channels: 1; data: Uint8Array };
+}
+export interface DepthEstimationPipeline {
+  readonly task: PipelineTask;
+  readonly model: KilnVision;
+  readonly info: VisionInfo;
+  dispose(): Promise<void>;
+  (image: ImageInput): Promise<DepthEstimationResult>;
+  (images: ImageInput[]): Promise<DepthEstimationResult[]>;
+}
+
 /** An image in a form the worker can receive and decode: relative URLs resolved, DOM images drawn to bitmaps. */
 async function toWorkerImage(x: ImageInput): Promise<unknown> {
   if (typeof x === "string") return typeof location !== "undefined" ? new URL(x, location.href).href : x;
@@ -525,6 +541,7 @@ export async function pipeline(task: "image-classification", model?: string, opt
 export async function pipeline(task: "image-feature-extraction", model?: string, options?: PipelineOptions): Promise<ImageFeatureExtractionPipeline>;
 export async function pipeline(task: "zero-shot-image-classification", model?: string, options?: PipelineOptions): Promise<ZeroShotImageClassificationPipeline>;
 export async function pipeline(task: "object-detection", model?: string, options?: PipelineOptions): Promise<ObjectDetectionPipeline>;
+export async function pipeline(task: "depth-estimation", model?: string, options?: PipelineOptions): Promise<DepthEstimationPipeline>;
 export async function pipeline(task: PipelineTask, model?: string, options: PipelineOptions = {}): Promise<unknown> {
   const t = ALIASES[task] ?? task;
   const id = model ?? DEFAULT_MODELS[t];
@@ -548,10 +565,14 @@ export async function pipeline(task: PipelineTask, model?: string, options: Pipe
     const one = async (x: ImageInput, a?: unknown, b?: object) => {
       const img = await toWorkerImage(x);
       if (zeroShot) return m.run<unknown>("zero-shot-image-classification", img, a, { ...b });
-      const r = await m.run<unknown>(t as "image-classification" | "image-feature-extraction" | "object-detection", img, { ...(a as object) });
+      const r = await m.run<unknown>(t as "image-classification" | "image-feature-extraction" | "object-detection" | "depth-estimation", img, { ...(a as object) });
       if (t === "image-feature-extraction") {
         const f = r as { data: Float32Array; dims: number[] };
         return new Tensor("float32", f.data, f.dims);
+      }
+      if (t === "depth-estimation") {
+        const d = r as { predicted_depth: { data: Float32Array; dims: number[] }; depth: DepthEstimationResult["depth"] };
+        return { predicted_depth: new Tensor("float32", d.predicted_depth.data, d.predicted_depth.dims), depth: d.depth };
       }
       return r;
     };

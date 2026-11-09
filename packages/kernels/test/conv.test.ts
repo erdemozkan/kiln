@@ -236,4 +236,60 @@ describe("image convolution kernels (CPU)", () => {
           expect(y[(oy * 3 + ox) * C + c]).toBe(m);
         }
   });
+
+  it("resizeBilinear matches torch's bilinear interpolate, with and without align_corners", async () => {
+    // x [2, 3, 4] (channels, rows, columns) and torch's outputs, channels last.
+    const [H, W, C] = [3, 4, 2];
+    const x = new Float32Array(H * W * C);
+    for (let c = 0; c < C; c++) for (let i = 0; i < H * W; i++) x[i * C + c] = ((i * 7) % 11) - 5 + 0.25 * c;
+    const torch: Record<string, number[]> = {
+      "true-5x7": [-5.0, -4.75, -1.5, -1.25, 2.0, 2.25, 0.0, 0.25, -2.0, -1.75, 1.5, 1.75, 5.0, 5.25, -2.0, -1.75, -1.25, -1.0, -0.5, -0.25, 0.25, 0.5, 1.0, 1.25, 1.75, 2.0, 2.5, 2.75, 1.0, 1.25, -1.0, -0.75, -3.0, -2.75, 0.5, 0.75, 4.0, 4.25, 2.0, 2.25, 0.0, 0.25, -1.5, -1.25, -0.75, -0.5, 0.0, 0.25, 0.75, 1.0, 1.5, 1.75, -0.5, -0.25, -2.5, -2.25, -4.0, -3.75, -0.5, -0.25, 3.0, 3.25, 1.0, 1.25, -1.0, -0.75, -3.0, -2.75, -5.0, -4.75],
+      "true-2x3": [-5.0, -4.75, 0.0, 0.25, 5.0, 5.25, -4.0, -3.75, 1.0, 1.25, -5.0, -4.75],
+      "false-5x7": [-5.0, -4.75, -2.5, -2.25, 1.5, 1.75, -0.0, 0.25, -1.499999, -1.249999, 2.500001, 2.750001, 5.0, 5.25, -2.6, -2.35, -1.671428, -1.421428, -0.185714, 0.064286, 0.2, 0.45, 0.585715, 0.835715, 2.071429, 2.321429, 3.0, 3.25, 1.0, 1.25, -0.428572, -0.178572, -2.714286, -2.464286, 0.500001, 0.750001, 3.714285, 3.964285, 1.428571, 1.678571, 0.0, 0.25, -2.000001, -1.750001, -1.071429, -0.821428, 0.414287, 0.664287, 0.8, 1.05, 0.714284, 0.964284, -1.57143, -1.32143, -3.0, -2.750001, -4.0, -3.75, -1.5, -1.25, 2.5, 2.75, 1.0, 1.25, -1.285715, -1.035715, -3.571429, -3.321429, -5.0, -4.75],
+      "false-2x3": [-2.791667, -2.541667, 0.125, 0.375, 3.041667, 3.291667, -2.041667, -1.791667, 0.875, 1.125, -3.083334, -2.833334],
+    };
+    for (const [key, ref] of Object.entries(torch)) {
+      const [ac, size] = key.split("-") as [string, string];
+      const [Ho, Wo] = size.split("x").map(Number) as [number, number];
+      const y = await run((ctx) => ops.resizeBilinear(ctx, upload(x, [H * W, C]), { H, W, Ho, Wo, alignCorners: ac === "true" }), Ho * Wo * C);
+      ref.forEach((v, i) => expect(Math.abs(y[i]! - v)).toBeLessThan(1e-5));
+    }
+  });
+
+  it("convTranspose matches PyTorch's ConvTranspose2d with kernel = stride", async () => {
+    const [H, W, C, O, f] = [3, 2, 5, 4, 2];
+    const x = randn(H * W * C);
+    const wt = randn(C * O * f * f); // PyTorch layout [C, O, f, f]
+    const bias = randn(O);
+    const w = new Float32Array(f * f * O * C);
+    for (let c = 0; c < C; c++) for (let o = 0; o < O; o++) for (let t = 0; t < f * f; t++) w[(t * O + o) * C + c] = wt[(c * O + o) * f * f + t]!;
+    const y = await run((ctx) => ops.convTranspose(ctx, upload(x, [H * W, C]), upload(w, [f * f, O, C]), upload(bias, [O]), { H, W, f }).y, H * f * W * f * O);
+    for (let iy = 0; iy < H; iy++)
+      for (let ix = 0; ix < W; ix++)
+        for (let ky = 0; ky < f; ky++)
+          for (let kx = 0; kx < f; kx++)
+            for (let o = 0; o < O; o++) {
+              let s = bias[o]!;
+              for (let c = 0; c < C; c++) s += x[(iy * W + ix) * C + c]! * wt[((c * O + o) * f + ky) * f + kx]!;
+              expect(y[((iy * f + ky) * W * f + ix * f + kx) * O + o]).toBeCloseTo(s, 5);
+            }
+  });
+
+  it("conv2d with reluIn convolves the rectified input", async () => {
+    const [H, W, C, O] = [4, 3, 4, 3];
+    const x = randn(H * W * C);
+    const K = 32;
+    const w = new Float32Array(O * K);
+    w.set(randn(O * C * 1).map((v) => v), 0);
+    const wl = new Float32Array(O * K);
+    for (let o = 0; o < O; o++) for (let c = 0; c < C; c++) wl[o * K + c] = w[o * C + c]!;
+    const bias = randn(O);
+    const y = await run((ctx) => ops.conv2d(ctx, upload(x, [H * W, C]), upload(wl, [O, K]), upload(bias, [O]), { H, W, k: 1, stride: 1, pad: 0, reluIn: true }).y, H * W * O);
+    for (let t = 0; t < H * W; t++)
+      for (let o = 0; o < O; o++) {
+        let s = bias[o]!;
+        for (let c = 0; c < C; c++) s += Math.max(x[t * C + c]!, 0) * w[o * C + c]!;
+        expect(y[t * O + o]).toBeCloseTo(s, 5);
+      }
+  });
 });

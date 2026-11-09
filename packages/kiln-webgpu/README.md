@@ -155,6 +155,10 @@ await zeroShot(image, ["tiger", "cat", "dog"]); // [{ score: 0.996, label: "tige
 // DETR (or YOLOS, "hustvl/yolos-tiny"): boxes in pixels of the original image.
 const detector = await pipeline("object-detection"); // facebook/detr-resnet-50
 await detector("cats.jpg", { threshold: 0.9 }); // [{ score: 0.998, label: "remote", box: { xmin: 40, ymin: 70, xmax: 175, ymax: 117 } }, ...]
+
+// Depth Anything V2: relative depth at the image's size, and as grey bytes.
+const depth = await pipeline("depth-estimation"); // depth-anything/Depth-Anything-V2-Small-hf
+const { predicted_depth, depth: grey } = await depth("cats.jpg"); // Tensor [480, 640]; { width, height, channels: 1, data }
 ```
 
 With a CLIP model, `image-feature-extraction` returns the image embedding (the visual projection's

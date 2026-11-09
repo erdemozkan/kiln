@@ -526,6 +526,7 @@ K/V; each decoder step reads them through a step block whose span covers every p
 | wav2vec2 classifier (`superb/wav2vec2-base-superb-ks`, weighted layer sum) | transformers.js (`Xenova/wav2vec2-base-superb-ks`, fp32) | the same five labels, scores within 2e-7 |
 | Image preprocessing (all six PIL filters; DeiT and CLIP pipelines) | PIL 8 + numpy | resized bytes identical; pixel values identical (float32) |
 | CLIP tokenizer (`openai/clip-vit-base-patch32`) | transformers.js | the same ids for 8 texts (punctuation, accents, CJK, emoji, long words) |
+| Depth Anything V2 (`depth-anything/Depth-Anything-V2-Small-hf`) | transformers.js (`onnx-community/depth-anything-v2-small`, fp32) on the same pixel values | depth within 1.7e-5 relative on the cats photo; 20 of 307,200 grey bytes one level apart; 3.1 s end to end against 7.4 s |
 | DETR (`facebook/detr-resnet-50`) | transformers.js (`Xenova/detr-resnet-50`, fp32) on the same pixel values | the same five detections and labels on the cats photo; scores within 2.8e-7, boxes within 2.3e-6; 1.57 s end to end against 4.02 s |
 | YOLOS (`hustvl/yolos-tiny`, `yolos-small`) | transformers.js (`Xenova/yolos-*`, fp32) on the same pixel values | the same detections and labels on the cats photo; scores within 8.2e-6, boxes within 3e-7 |
 | Position-embedding interpolation | torch 1.7.1 `interpolate(mode="bicubic")` | within 1e-5 |
@@ -641,6 +642,21 @@ each feature-map size. The image is resized as transformers' DETR processor does
 within 2.3e-6 of the image size. Both pipelines end to end (median of five warm calls, WebGPU,
 same backgrounded pane): 1.57 s in Kiln against 4.02 s for transformers.js. Of Kiln's 1.18 s of GPU
 time, about 1 s is the backbone's convolutions, which run at the matmul kernel's rate.
+
+Depth estimation (`depth-estimation`) runs Depth Anything (`depth-anything/Depth-Anything-V2-Small-hf`,
+the default, as in transformers.js; base and large load the same way). Its DINOv2 encoder is the
+ViT code's layers with the layer scales folded into the projections before them, the position
+embeddings fitted to each patch grid with torch's bicubic interpolation (as transformers does it),
+and the CLS token placed last so the patch rows are a prefix. The neck and head run on the
+convolution kernel (a ReLU on the input as it loads, for the pre-activation residual blocks), a
+transposed convolution kernel and a bilinear resize kernel (torch's align_corners conventions,
+checked against torch). The image is resized as DPTImageProcessor does it (aspect ratio kept,
+sides rounded to multiples of 14). Output is transformers.js's: `predicted_depth` resized to the
+image and `depth`, that map as 0–255 grey bytes. On the cats photo, fed the same pixel values as
+transformers.js (`onnx-community/depth-anything-v2-small`, fp32) and post-processed by its own
+code: depth within 1.7e-5 of its range, and 20 of 307,200 pixels a grey level apart. Both pipelines
+end to end (median of five warm calls, WebGPU, backgrounded pane): 3.1 s in Kiln against 7.4 s for
+transformers.js.
 
 T5's learned relative position bias is added to each score by the per-row attention kernels (GPU
 and CPU, buckets computed in the kernel; bucket function equal to transformers' over ±300

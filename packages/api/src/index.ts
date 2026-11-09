@@ -40,6 +40,8 @@ export {
   type ObjectDetectionPipeline,
   type ObjectDetectionOptions,
   type ObjectDetectionResult,
+  type DepthEstimationPipeline,
+  type DepthEstimationResult,
   type ZeroShotImageClassificationOptions,
   type PipelineOptions,
   type PipelineTask,

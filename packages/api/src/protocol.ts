@@ -107,7 +107,7 @@ export interface AudioInfo {
 }
 
 /** Tasks of image models (ViT, DeiT, CLIP). */
-export type VisionTask = "image-classification" | "image-feature-extraction" | "zero-shot-image-classification" | "object-detection";
+export type VisionTask = "image-classification" | "image-feature-extraction" | "zero-shot-image-classification" | "object-detection" | "depth-estimation";
 
 export interface VisionInfo {
   model: string;
