@@ -235,13 +235,9 @@ scope.onmessage = async (e: MessageEvent<Request>) => {
           type: "visionLoaded",
           info: {
             model: msg.model,
-            family: v.cfg.modelType,
-            layers: v.cfg.layers,
-            hiddenSize: v.cfg.hidden,
-            imageSize: v.cfg.imageSize,
+            ...v.summary(),
             backend: v.backend.name,
             cpuThreads: v.backend.name === "cpu" ? (v.backend as { threads?: number }).threads : undefined,
-            labels: Object.fromEntries(v.cfg.labels.map((l, i) => [i, l])),
           },
         });
         break;
@@ -317,14 +313,16 @@ scope.onmessage = async (e: MessageEvent<Request>) => {
         aborts.get(msg.target)?.abort();
         break;
       case "profile": {
-        if (!engine) throw new Error("no model loaded");
+        const be = (engine ?? vision ?? audio ?? encoder ?? seq2seq)?.backend;
+        if (!be) throw new Error("no model loaded");
+        if (!be.startProfile || !be.stopProfile) throw new Error(`[kiln] the ${be.name} backend cannot profile`);
         if (msg.on) {
-          engine.startProfile();
+          be.startProfile();
           post({ id: msg.id, type: "profiled", profile: undefined });
         } else {
           // After the calls already queued, so their kernels are counted.
           await queue;
-          post({ id: msg.id, type: "profiled", profile: await engine.stopProfile() });
+          post({ id: msg.id, type: "profiled", profile: await be.stopProfile() });
         }
         break;
       }

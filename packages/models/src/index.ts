@@ -8,3 +8,4 @@ export * from "./t5";
 export * from "./wav2vec2";
 export * from "./vit";
 export * from "./clip";
+export * from "./detr";

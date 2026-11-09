@@ -49,7 +49,7 @@ export const DEFAULT_MODELS: Record<string, string> = {
   "image-classification": "google/vit-base-patch16-224",
   "image-feature-extraction": "google/vit-base-patch16-224-in21k",
   "zero-shot-image-classification": "openai/clip-vit-base-patch32",
-  "object-detection": "hustvl/yolos-tiny",
+  "object-detection": "facebook/detr-resnet-50",
 };
 
 const VISION = new Set<string>(["image-classification", "image-feature-extraction", "zero-shot-image-classification", "object-detection"]);

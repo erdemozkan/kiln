@@ -767,6 +767,64 @@ export const cpuBlockAttention: CpuKernel = (b) => {
   }
 };
 
+export function cpuConv2d(v: { relu: boolean; residual: boolean }): CpuKernel {
+  return (b) => {
+    const [H, W, C, O, Ho, Wo, kh, kw, stride, pad, K, M] = Array.from(b[0]!.u32.subarray(0, 12)) as number[];
+    const x = b[1]!.f32;
+    const w = b[2]!.f32;
+    const bias = b[3]!.f32;
+    const res = v.residual ? b[4]!.f32 : undefined;
+    const y = b[v.residual ? 5 : 4]!.f32;
+    const acc = new Float32Array(O!);
+    for (let m = 0; m < M!; m++) {
+      acc.set(bias.subarray(0, O!));
+      const oy = Math.floor(m / Wo!) * stride! - pad!;
+      const ox = (m % Wo!) * stride! - pad!;
+      for (let ky = 0; ky < kh!; ky++) {
+        const iy = oy + ky;
+        if (iy < 0 || iy >= H!) continue;
+        for (let kx = 0; kx < kw!; kx++) {
+          const ix = ox + kx;
+          if (ix < 0 || ix >= W!) continue;
+          const xo = (iy * W! + ix) * C!;
+          const ko = (ky * kw! + kx) * C!;
+          for (let o = 0; o < O!; o++) {
+            let s = 0;
+            const wo = o * K! + ko;
+            for (let c = 0; c < C!; c++) s += x[xo + c]! * w[wo + c]!;
+            acc[o] += s;
+          }
+        }
+      }
+      for (let o = 0; o < O!; o++) {
+        const val = acc[o]! + (res ? res[m * O! + o]! : 0);
+        y[m * O! + o] = v.relu ? Math.max(val, 0) : val;
+      }
+    }
+    void Ho;
+  };
+}
+
+export const cpuMaxPool2d: CpuKernel = (b) => {
+  const [H, W, C, Ho, Wo, k, stride, pad] = Array.from(b[0]!.u32.subarray(0, 8)) as number[];
+  const x = b[1]!.f32;
+  const y = b[2]!.f32;
+  for (let t = 0; t < Ho! * Wo!; t++) {
+    const y0 = Math.floor(t / Wo!) * stride! - pad!;
+    const x0 = (t % Wo!) * stride! - pad!;
+    for (let c = 0; c < C!; c++) {
+      let m = -3.4e38;
+      for (let dy = 0; dy < k!; dy++)
+        for (let dx = 0; dx < k!; dx++) {
+          const iy = y0 + dy;
+          const ix = x0 + dx;
+          if (iy >= 0 && iy < H! && ix >= 0 && ix < W!) m = Math.max(m, x[(iy * W! + ix) * C! + c]!);
+        }
+      y[t * C! + c] = m;
+    }
+  }
+};
+
 export const cpuScaleAdd: CpuKernel = (b) => {
   const [n, accumulate] = [b[0]!.u32[0]!, b[0]!.u32[1]!];
   const a = b[0]!.f32[2]!;

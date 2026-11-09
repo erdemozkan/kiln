@@ -1862,6 +1862,122 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid:
 }`);
 }
 
+/**
+ * 2-D convolution as an implicit GEMM: x [H·W, C] (pixels in raster order, channels last, C a
+ * multiple of 4) → y [Ho·Wo, O], y[m, n] = act(bias[n] + Σ_k patch(m)[k] · w[n, k] (+ res[m, n])),
+ * where patch row k = (ky·kw + kx)·C + c (tap-major, as the weight [O, K] is stored, K the taps' C
+ * channels rounded up to a multiple of 32 with zero columns) and taps outside the image read zero.
+ * The tiling is gemm's (64 pixels × 64 channels per 128-thread workgroup, 8 × 4 per thread, K one
+ * 32-element block at a time); only the x tile's loads differ, gathering each pixel's patch from the
+ * image instead of reading a stored im2col row. Batch-norm is folded into w and bias at load time.
+ */
+export function conv2dSpec(v: { relu: boolean; residual: boolean }): KernelSpec {
+  const R8 = [0, 1, 2, 3, 4, 5, 6, 7];
+  const bindings: BindingKind[] = ["uniform", "read", "read", "read"];
+  if (v.residual) bindings.push("read");
+  bindings.push("rw");
+  const out = (val: string) => (v.relu ? `max(${val}, 0.0)` : val);
+  const store = R8.map(
+    (i) => `  if (m0 + tm * 8u + ${i}u < p.M) {
+    let m = m0 + tm * 8u + ${i}u;
+${[0, 1, 2, 3].map((j) => `    if (n0 + tn * 4u + ${j}u < p.O) { let n = n0 + tn * 4u + ${j}u; y[m * p.O + n] = ${out(`acc${i}[${j}] + bias[n]${v.residual ? " + res[m * p.O + n]" : ""}`)}; }`).join("\n")}
+  }`,
+  ).join("\n");
+  return spec(`conv2d${v.relu ? "/relu" : ""}${v.residual ? "/res" : ""}`, bindings, cpu.cpuConv2d(v), () => /* wgsl */ `
+struct P { H: u32, W: u32, C: u32, O: u32, Ho: u32, Wo: u32, kh: u32, kw: u32, stride: u32, pad: u32, K: u32, M: u32, _a: u32, _b: u32, _c: u32, _d: u32 }
+@group(0) @binding(0) var<uniform> p: P;
+@group(0) @binding(1) var<storage, read> x: array<vec4<f32>>;
+@group(0) @binding(2) var<storage, read> w: array<vec4<f32>>;
+@group(0) @binding(3) var<storage, read> bias: array<f32>;
+${v.residual ? "@group(0) @binding(4) var<storage, read> res: array<f32>;\n@group(0) @binding(5)" : "@group(0) @binding(4)"} var<storage, read_write> y: array<f32>;
+var<workgroup> xt: array<vec4<f32>, 512>;
+var<workgroup> wt: array<vec4<f32>, 512>;
+
+@compute @workgroup_size(128)
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) li: u32) {
+  let n0 = (wid.x + wid.z * ${MM_SLICE}u) * 64u;
+  let m0 = wid.y * 64u;
+  let tn = li % 16u;
+  let tm = li / 16u;
+  let blocks = p.K / 32u;
+  let C4 = p.C / 4u;
+  let taps = p.kh * p.kw;
+  // The top-left input pixel of this thread's 4 staged output pixels.
+  var oy: array<i32, 4>;
+  var ox: array<i32, 4>;
+  var live: array<bool, 4>;
+  for (var c = 0u; c < 4u; c++) {
+    let m = m0 + (li / 8u) * 4u + c;
+    let mm = min(m, p.M - 1u);
+    live[c] = m < p.M;
+    oy[c] = i32((mm / p.Wo) * p.stride) - i32(p.pad);
+    ox[c] = i32((mm % p.Wo) * p.stride) - i32(p.pad);
+  }
+${R8.map((i) => `  var acc${i} = vec4<f32>();`).join("\n")}
+  var xr: array<vec4<f32>, 4>;
+  var wr4: array<vec4<f32>, 4>;
+  for (var kb = 0u; kb < blocks; kb++) {
+    let k = kb * 32u + (li % 8u) * 4u;
+    let tap = k / p.C;
+    let c4 = (k % p.C) / 4u;
+    let ky = i32(tap / p.kw);
+    let kx = i32(tap % p.kw);
+    for (var c = 0u; c < 4u; c++) {
+      let iy = oy[c] + ky;
+      let ix = ox[c] + kx;
+      let inside = live[c] && tap < taps && iy >= 0 && iy < i32(p.H) && ix >= 0 && ix < i32(p.W);
+      let at = (u32(clamp(iy, 0, i32(p.H) - 1)) * p.W + u32(clamp(ix, 0, i32(p.W) - 1))) * C4 + min(c4, C4 - 1u);
+      xr[c] = select(vec4<f32>(0.0), x[at], inside);
+    }
+    for (var c = 0u; c < 4u; c++) {
+      let row = n0 + (li / 8u) * 4u + c;
+      wr4[c] = select(vec4<f32>(0.0), w[(min(row, p.O - 1u) * blocks + kb) * 8u + li % 8u], row < p.O);
+    }
+    for (var e = 0u; e < 4u; e++) {
+      xt[((li % 8u) * 4u + e) * 16u + li / 8u] = vec4<f32>(xr[0][e], xr[1][e], xr[2][e], xr[3][e]);
+      wt[((li % 8u) * 4u + e) * 16u + li / 8u] = vec4<f32>(wr4[0][e], wr4[1][e], wr4[2][e], wr4[3][e]);
+    }
+    workgroupBarrier();
+    for (var kk = 0u; kk < 32u; kk++) {
+      let a0 = xt[kk * 16u + tm * 2u];
+      let a1 = xt[kk * 16u + tm * 2u + 1u];
+      let bv = wt[kk * 16u + tn];
+${R8.map((i) => `      acc${i} += a${i >> 2}.${"xyzw"[i & 3]} * bv;`).join("\n")}
+    }
+    workgroupBarrier();
+  }
+${store}
+}`);
+}
+
+/** k × k max pooling with stride and padding (padding never wins) of x [H·W, C] → y [Ho·Wo, C]. */
+export function maxPool2dSpec(): KernelSpec {
+  return spec("max_pool2d", ["uniform", "read", "rw"], cpu.cpuMaxPool2d, () => /* wgsl */ `
+struct P { H: u32, W: u32, C: u32, Ho: u32, Wo: u32, k: u32, stride: u32, pad: u32 }
+@group(0) @binding(0) var<uniform> p: P;
+@group(0) @binding(1) var<storage, read> x: array<f32>;
+@group(0) @binding(2) var<storage, read_write> y: array<f32>;
+
+@compute @workgroup_size(${EW})
+fn main(${EW_ARGS}) {
+  ${FLAT}
+  if (idx >= p.Ho * p.Wo * p.C) { return; }
+  let c = idx % p.C;
+  let t = idx / p.C;
+  let y0 = i32((t / p.Wo) * p.stride) - i32(p.pad);
+  let x0 = i32((t % p.Wo) * p.stride) - i32(p.pad);
+  var m = -3.4e38;
+  for (var dy = 0; dy < i32(p.k); dy++) {
+    for (var dx = 0; dx < i32(p.k); dx++) {
+      let iy = y0 + dy;
+      let ix = x0 + dx;
+      if (iy >= 0 && iy < i32(p.H) && ix >= 0 && ix < i32(p.W)) { m = max(m, x[(u32(iy) * p.W + u32(ix)) * p.C + c]); }
+    }
+  }
+  y[idx] = m;
+}`);
+}
+
 /** y = a·x (accumulate 0) or y += a·x (accumulate 1), elementwise. */
 export function scaleAddSpec(): KernelSpec {
   return spec("scale_add", ["uniform", "read", "rw"], cpu.cpuScaleAdd, () => /* wgsl */ `

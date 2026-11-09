@@ -150,3 +150,90 @@ describe("block attention (CPU)", () => {
     }
   });
 });
+
+describe("image convolution kernels (CPU)", () => {
+  const be = new CpuBackend({ simd: false });
+  const step = be.alloc(STEP_BYTES);
+  be.write(step, 0, packStep({ pos0: 0, lastRow: 0, seed: 1, temperature: 0 }));
+  const upload = (data: Float32Array, shape: number[]): Tensor => {
+    const buf = be.alloc(data.byteLength);
+    be.write(buf, 0, data);
+    return { shape, dtype: "f32", buf };
+  };
+  const run = async (build: (ctx: Ctx) => Tensor, n: number) => {
+    const ctx = new Ctx(be, step, "t");
+    const out = build(ctx);
+    be.submit(ctx.dispatches);
+    return new Float32Array(await be.readback(out.buf, 0, n * 4));
+  };
+
+  /** PyTorch's conv2d on planar [C, H, W] with weight [O, C, k, k], for checking. */
+  const torchConv = (x: Float32Array, C: number, H: number, W: number, w: Float32Array, O: number, k: number, stride: number, pad: number) => {
+    const Ho = Math.floor((H + 2 * pad - k) / stride) + 1;
+    const Wo = Math.floor((W + 2 * pad - k) / stride) + 1;
+    const y = new Float32Array(O * Ho * Wo);
+    for (let o = 0; o < O; o++)
+      for (let oy = 0; oy < Ho; oy++)
+        for (let ox = 0; ox < Wo; ox++) {
+          let s = 0;
+          for (let c = 0; c < C; c++)
+            for (let ky = 0; ky < k; ky++)
+              for (let kx = 0; kx < k; kx++) {
+                const iy = oy * stride - pad + ky;
+                const ix = ox * stride - pad + kx;
+                if (iy >= 0 && iy < H && ix >= 0 && ix < W) s += x[(c * H + iy) * W + ix]! * w[((o * C + c) * k + ky) * k + kx]!;
+              }
+          y[(o * Ho + oy) * Wo + ox] = s;
+        }
+    return { y, Ho, Wo };
+  };
+
+  it("conv2d matches PyTorch's convolution (stride, padding, padded K, bias, residual, ReLU)", async () => {
+    for (const [C, Cp, H, W, O, k, stride, pad] of [
+      [3, 4, 9, 11, 6, 7, 2, 3],
+      [8, 8, 7, 5, 70, 3, 1, 1],
+      [8, 8, 7, 6, 5, 1, 2, 0],
+    ] as const) {
+      const x = randn(C * H * W);
+      const wt = randn(O * C * k * k);
+      const bias = randn(O);
+      const { y: ref, Ho, Wo } = torchConv(x, C, H, W, wt, O, k, stride, pad);
+      const res = randn(Ho * Wo * O);
+      // Channels last, padded to Cp; weight [O, K] tap-major.
+      const xl = new Float32Array(H * W * Cp);
+      for (let c = 0; c < C; c++) for (let t = 0; t < H * W; t++) xl[t * Cp + c] = x[c * H * W + t]!;
+      const K = Math.ceil((k * k * Cp) / 32) * 32;
+      const wl = new Float32Array(O * K);
+      for (let o = 0; o < O; o++) for (let c = 0; c < C; c++) for (let t = 0; t < k * k; t++) wl[o * K + t * Cp + c] = wt[(o * C + c) * k * k + t]!;
+      for (const relu of [false, true]) {
+        for (const withRes of [false, true]) {
+          const y = await run((ctx) => ops.conv2d(ctx, upload(xl, [H * W, Cp]), upload(wl, [O, K]), upload(bias, [O]), { H, W, k, stride, pad, relu, residual: withRes ? upload(res, [Ho * Wo, O]) : undefined }).y, Ho * Wo * O);
+          for (let t = 0; t < Ho * Wo; t++)
+            for (let o = 0; o < O; o++) {
+              let v = ref[o * Ho * Wo + t]! + bias[o]! + (withRes ? res[t * O + o]! : 0);
+              if (relu) v = Math.max(v, 0);
+              expect(y[t * O + o]).toBeCloseTo(v, 5);
+            }
+        }
+      }
+    }
+  });
+
+  it("maxPool2d takes the window maximum, ignoring padding", async () => {
+    const [H, W, C] = [7, 6, 4];
+    const x = randn(H * W * C).map((v) => v - 3); // all negative: padding must not win
+    const y = await run((ctx) => ops.maxPool2d(ctx, upload(x, [H * W, C]), { H, W, k: 3, stride: 2, pad: 1 }).y, 4 * 3 * C);
+    for (let oy = 0; oy < 4; oy++)
+      for (let ox = 0; ox < 3; ox++)
+        for (let c = 0; c < C; c++) {
+          let m = -Infinity;
+          for (let dy = -1; dy <= 1; dy++)
+            for (let dx = -1; dx <= 1; dx++) {
+              const iy = oy * 2 + dy;
+              const ix = ox * 2 + dx;
+              if (iy >= 0 && iy < H && ix >= 0 && ix < W) m = Math.max(m, x[(iy * W + ix) * C + c]!);
+            }
+          expect(y[(oy * 3 + ox) * C + c]).toBe(m);
+        }
+  });
+});

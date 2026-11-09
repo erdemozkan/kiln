@@ -152,9 +152,9 @@ const features = await extractor(image); // Tensor [1, 197, 768]
 const zeroShot = await pipeline("zero-shot-image-classification"); // openai/clip-vit-base-patch32
 await zeroShot(image, ["tiger", "cat", "dog"]); // [{ score: 0.996, label: "tiger" }, ...]
 
-// YOLOS: boxes in pixels of the original image.
-const detector = await pipeline("object-detection"); // hustvl/yolos-tiny
-await detector("cats.jpg", { threshold: 0.9 }); // [{ score: 0.991, label: "remote", box: { xmin: 46, ymin: 72, xmax: 178, ymax: 119 } }, ...]
+// DETR (or YOLOS, "hustvl/yolos-tiny"): boxes in pixels of the original image.
+const detector = await pipeline("object-detection"); // facebook/detr-resnet-50
+await detector("cats.jpg", { threshold: 0.9 }); // [{ score: 0.998, label: "remote", box: { xmin: 40, ymin: 70, xmax: 175, ymax: 117 } }, ...]
 ```
 
 With a CLIP model, `image-feature-extraction` returns the image embedding (the visual projection's

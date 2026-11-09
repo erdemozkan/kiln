@@ -526,6 +526,7 @@ K/V; each decoder step reads them through a step block whose span covers every p
 | wav2vec2 classifier (`superb/wav2vec2-base-superb-ks`, weighted layer sum) | transformers.js (`Xenova/wav2vec2-base-superb-ks`, fp32) | the same five labels, scores within 2e-7 |
 | Image preprocessing (all six PIL filters; DeiT and CLIP pipelines) | PIL 8 + numpy | resized bytes identical; pixel values identical (float32) |
 | CLIP tokenizer (`openai/clip-vit-base-patch32`) | transformers.js | the same ids for 8 texts (punctuation, accents, CJK, emoji, long words) |
+| DETR (`facebook/detr-resnet-50`) | transformers.js (`Xenova/detr-resnet-50`, fp32) on the same pixel values | the same five detections and labels on the cats photo; scores within 2.8e-7, boxes within 2.3e-6; 1.57 s end to end against 4.02 s |
 | YOLOS (`hustvl/yolos-tiny`, `yolos-small`) | transformers.js (`Xenova/yolos-*`, fp32) on the same pixel values | the same detections and labels on the cats photo; scores within 8.2e-6, boxes within 3e-7 |
 | Position-embedding interpolation | torch 1.7.1 `interpolate(mode="bicubic")` | within 1e-5 |
 | CLIP zero-shot (`openai/clip-vit-base-patch32`) | transformers.js (`Xenova/clip-vit-base-patch32`, fp32) on the same pixel values | six labels' probabilities within 1.8e-7, the labels run as one batch |
@@ -627,9 +628,19 @@ to corners in pixels of the original image. On the COCO cats photo, fed the same
 transformers.js (`Xenova/yolos-*`, fp32): the same five detections and labels, scores within 8.2e-6
 (tiny) and 3.2e-7 (small), boxes within 3e-7. Both pipelines end to end with yolos-tiny (median of
 five warm calls, WebGPU, in the same backgrounded pane): 0.59 s in Kiln against 24.6 s for
-transformers.js, whose model call alone took 26 s at either input size. The default model is
-yolos-tiny; transformers.js's default, DETR with a ResNet-50 backbone, needs convolutions Kiln does
-not have yet.
+transformers.js, whose model call alone took 26 s at either input size.
+
+DETR (`facebook/detr-resnet-50`, `-101`) is the default detector, as it is in transformers.js. Its
+ResNet backbone runs on a 2-D convolution kernel that is the GEMM's tiling with the image patches
+gathered as the tiles load (implicit GEMM: no im2col copy), bias, residual add and ReLU in the
+epilogue, and each frozen batch norm folded into its convolution when loading. The encoder and
+decoder reuse the attention and matmul kernels, with DETR's sine position embeddings computed for
+each feature-map size. The image is resized as transformers' DETR processor does it (shortest edge
+800, longest at most 1333). On the cats photo, fed the same pixel values as transformers.js
+(`Xenova/detr-resnet-50`, fp32): the same five detections and labels, scores within 2.8e-7, boxes
+within 2.3e-6 of the image size. Both pipelines end to end (median of five warm calls, WebGPU,
+same backgrounded pane): 1.57 s in Kiln against 4.02 s for transformers.js. Of Kiln's 1.18 s of GPU
+time, about 1 s is the backbone's convolutions, which run at the matmul kernel's rate.
 
 T5's learned relative position bias is added to each score by the per-row attention kernels (GPU
 and CPU, buckets computed in the kernel; bucket function equal to transformers' over ±300

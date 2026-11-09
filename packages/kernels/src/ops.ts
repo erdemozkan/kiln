@@ -26,6 +26,8 @@ import {
   pickLogitSpec,
   attnProbsSpec,
   blockAttentionSpec,
+  conv2dSpec,
+  maxPool2dSpec,
   type Activation,
   layernormSpec,
   gatedActSpec,
@@ -457,6 +459,50 @@ export function blockAttention(ctx: Ctx, q: Tensor, k: Tensor, v: Tensor, s: { T
   const params = ctx.uniform([u32(s.T), u32(s.D), u32(s.H * s.D), f32(s.scale), u32(rows), u32(0), u32(0), u32(0)]);
   ctx.run(blockAttentionSpec(), [params, q.buf, k.buf, v.buf, out.buf], [s.H, rows, 1]);
   return out;
+}
+
+/** Output side of a convolution or pooling window. */
+export const convOut = (n: number, k: number, stride: number, pad: number): number => Math.floor((n + 2 * pad - k) / stride) + 1;
+
+/**
+ * 2-D convolution of an image x [H·W, C] (raster order, channels last, C a multiple of 4) with
+ * w [O, K] (taps (ky, kx) major, then channels, K = kh·kw·C rounded up to a multiple of 32): y
+ * [Ho·Wo, O] = bias + conv (+ residual), then ReLU with `relu` (see conv2dSpec).
+ */
+export function conv2d(ctx: Ctx, x: Tensor, w: Tensor, bias: Tensor, o: { H: number; W: number; k: number; stride: number; pad: number; relu?: boolean; residual?: Tensor }): { y: Tensor; H: number; W: number } {
+  const C = lastDim(x);
+  const [O, K] = w.shape as [number, number];
+  if (C % 4 !== 0 || numel(x.shape) !== o.H * o.W * C) throw new Error(`conv2d: [${x.shape}] is not a ${o.H}×${o.W} image with a multiple of 4 channels`);
+  if (K !== Math.ceil((o.k * o.k * C) / 32) * 32) throw new Error(`conv2d: weight [${w.shape}] does not fit ${o.k}×${o.k} taps of ${C} channels`);
+  const Ho = convOut(o.H, o.k, o.stride, o.pad);
+  const Wo = convOut(o.W, o.k, o.stride, o.pad);
+  const M = Ho * Wo;
+  const y = ctx.alloc([M, O]);
+  const groups = Math.ceil(O / 64);
+  const params = ctx.uniform([o.H, o.W, C, O, Ho, Wo, o.k, o.k, o.stride, o.pad, K, M, 0, 0, 0, 0].map(u32));
+  const bufs = [params, x.buf, w.buf, bias.buf];
+  if (o.residual) bufs.push(o.residual.buf);
+  bufs.push(y.buf);
+  ctx.run(conv2dSpec({ relu: !!o.relu, residual: !!o.residual }), bufs, [Math.min(groups, MM_SLICE), Math.ceil(M / 64), Math.ceil(groups / MM_SLICE)], `conv2d ${o.k}x${o.k}/${o.stride} ${C}→${O}`);
+  return { y, H: Ho, W: Wo };
+}
+
+/** k × k max pooling of an image x [H·W, C] → [Ho·Wo, C]. */
+export function maxPool2d(ctx: Ctx, x: Tensor, o: { H: number; W: number; k: number; stride: number; pad: number }): { y: Tensor; H: number; W: number } {
+  const C = lastDim(x);
+  const Ho = convOut(o.H, o.k, o.stride, o.pad);
+  const Wo = convOut(o.W, o.k, o.stride, o.pad);
+  const y = ctx.alloc([Ho * Wo, C]);
+  ctx.run(maxPool2dSpec(), [ctx.uniform([o.H, o.W, C, Ho, Wo, o.k, o.stride, o.pad].map(u32)), x.buf, y.buf], grid1d(Ho * Wo * C));
+  return { y, H: Ho, W: Wo };
+}
+
+/** a + b into a new tensor (same element count). */
+export function add(ctx: Ctx, a: Tensor, b: Tensor): Tensor {
+  const y = ctx.alloc(a.shape);
+  scaleAdd(ctx, y, a, 1, false);
+  addInPlace(ctx, y, b);
+  return y;
 }
 
 function popcount(m: number): number {

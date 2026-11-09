@@ -1,9 +1,9 @@
-// Image models from transformers checkpoints (ViT, DeiT, CLIP, YOLOS): image classification, image
+// Image models from transformers checkpoints (ViT, DeiT, CLIP, YOLOS, DETR): image classification, image
 // features, zero-shot classification and object detection, with transformers' image preprocessing
 // (PIL-exact resizing).
 import type { Backend, Tensor } from "@kiln/core";
 import { fetchJSON, fileUrl, listRepoFiles, parseModelId, preprocessImage, readPytorchHeader, readSafetensorsHeader, toF32, weightFiles, type ByteSource, type ImageProcessorConfig, type RgbImage, type TensorEntry } from "@kiln/loader";
-import { ClipTextModel, VitModel, bicubicResize, clipPoolIndex, clipTextConfigFromHF, clipTextName, vitConfigFromHF, vitGrid, vitName, vitPatchK, type VitConfig, type VitEmbeddings } from "@kiln/models";
+import { ClipTextModel, DETR_IN_CHANNELS, DetrModel, VitModel, bicubicResize, detrConfigFromHF, detrName, foldConvBn, clipPoolIndex, clipTextConfigFromHF, clipTextName, vitConfigFromHF, vitGrid, vitName, vitPatchK, type DetrConfig, type VitConfig, type VitEmbeddings } from "@kiln/models";
 import { ClipTokenizer, type ClipTokenizerJSON } from "@kiln/tokenizers";
 import { openBackend, openParsed } from "./load";
 import { loadWeights, type LoadProgress, type WeightFile } from "./weights";
@@ -109,12 +109,35 @@ export function topLabels(logits: Float32Array, labels: readonly string[], topK 
 export class VisionEngine {
   constructor(
     readonly backend: Backend,
-    readonly cfg: VitConfig,
-    readonly model: VitModel,
+    /** The vision transformer; DETR has none. */
+    private readonly vit: { cfg: VitConfig; model: VitModel } | undefined,
     readonly processor: ImageProcessorConfig,
     private readonly heads: { cls?: Head; distill?: Head; pooler?: Head },
     private readonly clip?: ClipParts,
+    private readonly detr?: { cfg: DetrConfig; model: DetrModel },
   ) {}
+
+  get cfg(): VitConfig {
+    if (!this.vit) throw new Error("this model only detects objects");
+    return this.vit.cfg;
+  }
+
+  get model(): VitModel {
+    if (!this.vit) throw new Error("this model only detects objects");
+    return this.vit.model;
+  }
+
+  /** Family, depth, width, input size and labels, for the model info. */
+  summary(): { family: string; layers: number; hiddenSize: number; imageSize: number; labels: Record<number, string> } {
+    const labels = (l: string[]) => Object.fromEntries(l.map((v, i) => [i, v]));
+    if (this.detr) {
+      const c = this.detr.cfg;
+      const size = this.processor.size as { shortest_edge?: number } | undefined;
+      return { family: "detr", layers: c.encLayers + c.decLayers, hiddenSize: c.dModel, imageSize: size?.shortest_edge ?? 800, labels: labels(c.labels) };
+    }
+    const c = this.cfg;
+    return { family: c.modelType, layers: c.layers, hiddenSize: c.hidden, imageSize: c.imageSize, labels: labels(c.labels) };
+  }
 
   /** CLIP's image embedding (post-LayerNorm of the CLS token, visual projection), unnormalized. */
   private async imageEmbed(img: RgbImage): Promise<Float32Array> {
@@ -170,18 +193,20 @@ export class VisionEngine {
   }
 
   /**
-   * Object detection (YOLOS), post-processed as transformers.js does it: per detection token the
-   * most likely class (skipped when it is "no object"), its softmax score against `threshold`, and
-   * the box (center, size; sigmoid) turned into corners, in pixels of the original image (truncated
-   * to integers) unless `percentage`.
+   * Object detection (YOLOS, DETR), post-processed as transformers.js does it: per detection token
+   * or query the most likely class (skipped when it is "no object"), its softmax score against
+   * `threshold`, and the box (center, size; sigmoid) turned into corners, in pixels of the original
+   * image (truncated to integers) unless `percentage`.
    */
   async detect(img: RgbImage, options: ObjectDetectionOptions = {}): Promise<DetectedObject[]> {
     const threshold = options.threshold ?? 0.9;
     const p = preprocessImage(img, this.processor);
-    const { logits, boxes, classes } = await this.model.detect(p.data, p.width, p.height);
+    const model = this.detr?.model ?? this.model;
+    const labels = this.detr?.cfg.labels ?? this.cfg.labels;
+    const { logits, boxes, classes } = await model.detect(p.data, p.width, p.height);
     const res: DetectedObject[] = [];
     const sig = (x: number) => Math.fround(1 / (1 + Math.exp(-x)));
-    for (let j = 0; j < this.cfg.detTokens; j++) {
+    for (let j = 0; j < boxes.length / 4; j++) {
       const l = logits.subarray(j * classes, (j + 1) * classes);
       let best = 0;
       for (let k = 1; k < classes; k++) if (l[k]! > l[best]!) best = k;
@@ -193,7 +218,7 @@ export class VisionEngine {
       const [cx, cy, w, h] = [0, 1, 2, 3].map((i) => sig(boxes[j * 4 + i]!)) as [number, number, number, number];
       let box = [cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2];
       if (!options.percentage) box = box.map((v, i) => (v * (i % 2 ? img.height : img.width)) | 0);
-      res.push({ score, label: this.cfg.labels[best] ?? `LABEL_${best}`, box: { xmin: box[0]!, ymin: box[1]!, xmax: box[2]!, ymax: box[3]! } });
+      res.push({ score, label: labels[best] ?? `LABEL_${best}`, box: { xmin: box[0]!, ymin: box[1]!, xmax: box[2]!, ymax: box[3]! } });
     }
     return res;
   }
@@ -229,12 +254,13 @@ export class VisionEngine {
   }
 
   destroy(): void {
-    this.model.destroy();
+    this.vit?.model.destroy();
+    this.detr?.model.destroy();
     this.clip?.text.destroy();
   }
 }
 
-/** Loads a ViT, DeiT or CLIP checkpoint (safetensors or pytorch_model.bin) from the Hugging Face Hub. */
+/** Loads a ViT, DeiT, CLIP, YOLOS or DETR checkpoint (safetensors or pytorch_model.bin) from the Hugging Face Hub. */
 export async function createVision(modelId: string, opts: VisionLoadOptions = {}): Promise<VisionEngine> {
   const ref = parseModelId(modelId, opts.revision);
   if (ref.gguf) throw new Error("vision models load from safetensors or PyTorch repos, not GGUF files");
@@ -250,6 +276,7 @@ export async function createVision(modelId: string, opts: VisionLoadOptions = {}
     listing.then((files) => weightFiles(ref, ep, files)),
     has("tokenizer.json").then((y) => (y ? fetchJSON<ClipTokenizerJSON>(fileUrl(ref, "tokenizer.json", ep), true) : undefined)),
   ]);
+  if (config!.model_type === "detr") return createDetr(modelId, ref, config!, prep, names, opts);
   const cfg = vitConfigFromHF(config!);
   const clip = cfg.modelType === "clip";
   if (clip && config!.model_type !== "clip") throw new Error(`${modelId}: a CLIP vision tower alone; zero-shot classification needs the full CLIP model`);
@@ -352,7 +379,7 @@ export async function createVision(modelId: string, opts: VisionLoadOptions = {}
     }
     const model = new VitModel(backend, cfg, weights, embeddings);
     const processor: ImageProcessorConfig = prep ?? { size: { height: cfg.imageSize, width: cfg.imageSize } };
-    return new VisionEngine(backend, cfg, model, processor, heads, parts);
+    return new VisionEngine(backend, { cfg, model }, processor, heads, parts);
   } finally {
     for (const s of sources) s.close?.();
   }
@@ -396,4 +423,70 @@ async function yolosEmbeddings(cfg: VitConfig, need: (n: string) => Promise<{ sh
     const mid = midAll ? Array.from({ length: cfg.layers - 1 }, (_, l) => fit(midAll.subarray(l * T0 * H, (l + 1) * T0 * H), gh, gw)) : undefined;
     return { add, mid };
   };
+}
+
+/**
+ * DETR: the transformer and heads load as weights; the backbone's convolutions are read, their
+ * frozen batch norms folded in (eps 1e-5, as DetrFrozenBatchNorm2d) and uploaded as the conv kernel
+ * takes them; the 1×1 input projection becomes a matrix.
+ */
+async function createDetr(
+  modelId: string,
+  ref: ReturnType<typeof parseModelId>,
+  config: Record<string, unknown>,
+  prep: ImageProcessorConfig | undefined,
+  names: Awaited<ReturnType<typeof weightFiles>>,
+  opts: VisionLoadOptions,
+): Promise<VisionEngine> {
+  const cfg = detrConfigFromHF(config);
+  if (!prep) throw new Error(`${modelId}: no preprocessor_config.json`);
+  const ep = opts.endpoint;
+  const backend = opts.backend ?? (await openBackend(opts.device ?? "auto", opts.cpuThreads));
+  const sources: ByteSource[] = [];
+  const located = new Map<string, { source: ByteSource; entry: TensorEntry }>();
+  try {
+    const files: WeightFile[] = [];
+    for (const name of names.names) {
+      const { source, header } = await openParsed(ref, name, ep, names.format === "safetensors" ? readSafetensorsHeader : readPytorchHeader);
+      sources.push(source);
+      for (const t of header.tensors) located.set(t.name, { source, entry: t });
+      files.push({ name, source, tensors: header.tensors.filter((t) => detrName(t.name) !== undefined), rename: detrName });
+    }
+    const need = async (name: string) => {
+      const t = located.get(name);
+      if (!t) throw new Error(`${modelId}: "${name}" is missing`);
+      const count = t.entry.shape.reduce((a, b) => a * b, 1);
+      return { shape: t.entry.shape, data: toF32(t.entry.type as Parameters<typeof toF32>[0], await t.source.read(t.entry.offset, t.entry.byteLength), count) };
+    };
+    const weights = await loadWeights(backend, files, opts.quant ?? "f32", opts.onProgress);
+    const upload = (name: string, shape: number[], data: Float32Array) => {
+      const buf = backend.alloc(data.byteLength, "storage", `detr/${name}`);
+      backend.write(buf, 0, data);
+      weights.set(name, { shape, dtype: "f32", buf } as Tensor);
+    };
+    const bb = "model.backbone.conv_encoder.model.";
+    const convBn = async (conv: string, bn: string, to: string, cp?: number) => {
+      const w = await need(`${bb}${conv}.weight`);
+      const [weight, bias, mean, variance] = await Promise.all(["weight", "bias", "running_mean", "running_var"].map((k) => need(`${bb}${bn}.${k}`)));
+      const f = foldConvBn(w.data, w.shape, { weight: weight.data, bias: bias.data, mean: mean.data, var: variance.data }, cp);
+      upload(`${to}.weight`, [w.shape[0]!, f.K], f.w);
+      upload(`${to}.bias`, [w.shape[0]!], f.b);
+    };
+    await convBn("conv1", "bn1", "bb.conv1", DETR_IN_CHANNELS);
+    for (let s = 0; s < cfg.stages.length; s++) {
+      for (let b = 0; b < cfg.stages[s]!; b++) {
+        const p = `layer${s + 1}.${b}`;
+        for (const i of [1, 2, 3]) await convBn(`${p}.conv${i}`, `${p}.bn${i}`, `bb.${p}.conv${i}`);
+        if (b === 0) await convBn(`${p}.downsample.0`, `${p}.downsample.1`, `bb.${p}.down`);
+      }
+    }
+    const proj = await need("model.input_projection.weight");
+    upload("proj.weight", [proj.shape[0]!, proj.shape[1]!], proj.data);
+    upload("proj.bias", [proj.shape[0]!], (await need("model.input_projection.bias")).data);
+    const qpos = await need("model.query_position_embeddings.weight");
+    upload("query.pos", qpos.shape, qpos.data);
+    return new VisionEngine(backend, undefined, prep, {}, undefined, { cfg, model: new DetrModel(backend, cfg, weights) });
+  } finally {
+    for (const s of sources) s.close?.();
+  }
 }
