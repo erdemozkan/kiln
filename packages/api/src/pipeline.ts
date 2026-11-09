@@ -25,7 +25,8 @@ export type PipelineTask =
   | "audio-classification"
   | "image-classification"
   | "image-feature-extraction"
-  | "zero-shot-image-classification";
+  | "zero-shot-image-classification"
+  | "object-detection";
 
 const SEQ2SEQ = new Set<string>(["summarization", "translation", "text2text-generation", "automatic-speech-recognition"]);
 
@@ -48,9 +49,10 @@ export const DEFAULT_MODELS: Record<string, string> = {
   "image-classification": "google/vit-base-patch16-224",
   "image-feature-extraction": "google/vit-base-patch16-224-in21k",
   "zero-shot-image-classification": "openai/clip-vit-base-patch32",
+  "object-detection": "hustvl/yolos-tiny",
 };
 
-const VISION = new Set<string>(["image-classification", "image-feature-extraction", "zero-shot-image-classification"]);
+const VISION = new Set<string>(["image-classification", "image-feature-extraction", "zero-shot-image-classification", "object-detection"]);
 
 /** Speech encoders run on raw samples (CTC or a classifier) rather than as encoder-decoders. */
 const AUDIO_ENCODERS = new Set(["wav2vec2", "hubert"]);
@@ -448,6 +450,26 @@ export interface ZeroShotImageClassificationPipeline {
   (images: ImageInput[], candidate_labels: string[], options?: ZeroShotImageClassificationOptions): Promise<{ score: number; label: string }[][]>;
 }
 
+export interface ObjectDetectionOptions {
+  /** Least score a detection needs (default 0.9). */
+  threshold?: number;
+  /** Boxes as fractions of the image instead of whole pixels (default false). */
+  percentage?: boolean;
+}
+export interface ObjectDetectionResult {
+  score: number;
+  label: string;
+  box: { xmin: number; ymin: number; xmax: number; ymax: number };
+}
+export interface ObjectDetectionPipeline {
+  readonly task: PipelineTask;
+  readonly model: KilnVision;
+  readonly info: VisionInfo;
+  dispose(): Promise<void>;
+  (image: ImageInput, options?: ObjectDetectionOptions): Promise<ObjectDetectionResult[]>;
+  (images: ImageInput[], options?: ObjectDetectionOptions): Promise<ObjectDetectionResult[][]>;
+}
+
 /** An image in a form the worker can receive and decode: relative URLs resolved, DOM images drawn to bitmaps. */
 async function toWorkerImage(x: ImageInput): Promise<unknown> {
   if (typeof x === "string") return typeof location !== "undefined" ? new URL(x, location.href).href : x;
@@ -502,6 +524,7 @@ export async function pipeline(task: "audio-classification", model?: string, opt
 export async function pipeline(task: "image-classification", model?: string, options?: PipelineOptions): Promise<ImageClassificationPipeline>;
 export async function pipeline(task: "image-feature-extraction", model?: string, options?: PipelineOptions): Promise<ImageFeatureExtractionPipeline>;
 export async function pipeline(task: "zero-shot-image-classification", model?: string, options?: PipelineOptions): Promise<ZeroShotImageClassificationPipeline>;
+export async function pipeline(task: "object-detection", model?: string, options?: PipelineOptions): Promise<ObjectDetectionPipeline>;
 export async function pipeline(task: PipelineTask, model?: string, options: PipelineOptions = {}): Promise<unknown> {
   const t = ALIASES[task] ?? task;
   const id = model ?? DEFAULT_MODELS[t];
@@ -525,7 +548,7 @@ export async function pipeline(task: PipelineTask, model?: string, options: Pipe
     const one = async (x: ImageInput, a?: unknown, b?: object) => {
       const img = await toWorkerImage(x);
       if (zeroShot) return m.run<unknown>("zero-shot-image-classification", img, a, { ...b });
-      const r = await m.run<unknown>(t as "image-classification" | "image-feature-extraction", img, { ...(a as object) });
+      const r = await m.run<unknown>(t as "image-classification" | "image-feature-extraction" | "object-detection", img, { ...(a as object) });
       if (t === "image-feature-extraction") {
         const f = r as { data: Float32Array; dims: number[] };
         return new Tensor("float32", f.data, f.dims);

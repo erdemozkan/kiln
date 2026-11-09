@@ -258,7 +258,9 @@ scope.onmessage = async (e: MessageEvent<Request>) => {
                 ? await v.zeroShot(img, msg.args[1] as string[], msg.args[2] as { hypothesis_template?: string } | undefined)
                 : task === "image-classification"
                   ? await v.classify(img, msg.args[1] as Record<string, unknown> | undefined)
-                  : await v.features(img, msg.args[1] as Record<string, unknown> | undefined);
+                  : task === "object-detection"
+                    ? await v.detect(img, msg.args[1] as Record<string, unknown> | undefined)
+                    : await v.features(img, msg.args[1] as Record<string, unknown> | undefined);
             post({ id: msg.id, type: "result", result });
           } catch (err) {
             post({ id: msg.id, type: "error", message: err instanceof Error ? err.message : String(err) });

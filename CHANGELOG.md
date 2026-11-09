@@ -53,7 +53,10 @@ rescale and normalize as numpy does them. `quick_gelu` activation. CLIP (`openai
 the vision tower on the ViT code (pre-LayerNorm, post-LayerNorm of the pooled token), a causal text
 tower that encodes all labels in one batch (block-causal attention kernel) alongside the image,
 CLIP's tokenizer (lowercasing, whitespace-dropping split, `</w>` word ends), text embeddings
-cached per text; `image-feature-extraction` on CLIP returns the image embedding.
+cached per text; `image-feature-extraction` on CLIP returns the image embedding. YOLOS
+(`hustvl/yolos-*`): `object-detection` with transformers.js's post-processing, at the image's own
+aspect ratio (position embeddings fitted to each patch grid by torch's bicubic interpolation),
+detection heads on the GPU.
 
 **Loading.** Reads ahead of a download in progress are fetched on their own instead of waiting
 (a `pytorch_model.bin` keeps its zip directory at the end, so large checkpoints showed no progress

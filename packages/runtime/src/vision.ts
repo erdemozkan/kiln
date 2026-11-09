@@ -1,8 +1,9 @@
-// Image models from transformers checkpoints (ViT, DeiT): image classification and image features,
-// with transformers' image preprocessing (PIL-exact resizing).
+// Image models from transformers checkpoints (ViT, DeiT, CLIP, YOLOS): image classification, image
+// features, zero-shot classification and object detection, with transformers' image preprocessing
+// (PIL-exact resizing).
 import type { Backend, Tensor } from "@kiln/core";
 import { fetchJSON, fileUrl, listRepoFiles, parseModelId, preprocessImage, readPytorchHeader, readSafetensorsHeader, toF32, weightFiles, type ByteSource, type ImageProcessorConfig, type RgbImage, type TensorEntry } from "@kiln/loader";
-import { ClipTextModel, VitModel, clipPoolIndex, clipTextConfigFromHF, clipTextName, vitConfigFromHF, vitName, vitPatchK, type VitConfig } from "@kiln/models";
+import { ClipTextModel, VitModel, bicubicResize, clipPoolIndex, clipTextConfigFromHF, clipTextName, vitConfigFromHF, vitGrid, vitName, vitPatchK, type VitConfig, type VitEmbeddings } from "@kiln/models";
 import { ClipTokenizer, type ClipTokenizerJSON } from "@kiln/tokenizers";
 import { openBackend, openParsed } from "./load";
 import { loadWeights, type LoadProgress, type WeightFile } from "./weights";
@@ -21,6 +22,19 @@ export interface VisionLoadOptions {
 export interface ImageClassificationOptions {
   /** Labels returned, best first (default 5; 0 or negative: all). */
   top_k?: number;
+}
+
+export interface ObjectDetectionOptions {
+  /** Least score a detection needs (default 0.9). */
+  threshold?: number;
+  /** Boxes as fractions of the image instead of whole pixels (default false). */
+  percentage?: boolean;
+}
+
+export interface DetectedObject {
+  score: number;
+  label: string;
+  box: { xmin: number; ymin: number; xmax: number; ymax: number };
 }
 
 export interface ZeroShotImageOptions {
@@ -155,6 +169,35 @@ export class VisionEngine {
     return p.data;
   }
 
+  /**
+   * Object detection (YOLOS), post-processed as transformers.js does it: per detection token the
+   * most likely class (skipped when it is "no object"), its softmax score against `threshold`, and
+   * the box (center, size; sigmoid) turned into corners, in pixels of the original image (truncated
+   * to integers) unless `percentage`.
+   */
+  async detect(img: RgbImage, options: ObjectDetectionOptions = {}): Promise<DetectedObject[]> {
+    const threshold = options.threshold ?? 0.9;
+    const p = preprocessImage(img, this.processor);
+    const { logits, boxes, classes } = await this.model.detect(p.data, p.width, p.height);
+    const res: DetectedObject[] = [];
+    const sig = (x: number) => Math.fround(1 / (1 + Math.exp(-x)));
+    for (let j = 0; j < this.cfg.detTokens; j++) {
+      const l = logits.subarray(j * classes, (j + 1) * classes);
+      let best = 0;
+      for (let k = 1; k < classes; k++) if (l[k]! > l[best]!) best = k;
+      if (best === classes - 1) continue;
+      let z = 0;
+      for (const v of l) z += Math.exp(v - l[best]!);
+      const score = 1 / z;
+      if (score < threshold) continue;
+      const [cx, cy, w, h] = [0, 1, 2, 3].map((i) => sig(boxes[j * 4 + i]!)) as [number, number, number, number];
+      let box = [cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2];
+      if (!options.percentage) box = box.map((v, i) => (v * (i % 2 ? img.height : img.width)) | 0);
+      res.push({ score, label: this.cfg.labels[best] ?? `LABEL_${best}`, box: { xmin: box[0]!, ymin: box[1]!, xmax: box[2]!, ymax: box[3]! } });
+    }
+    return res;
+  }
+
   /** Class logits of an image (DeiT with a teacher: the mean of the CLS and distillation heads). */
   async logits(img: RgbImage): Promise<Float32Array> {
     if (!this.heads.cls) throw new Error("this model has no classification head");
@@ -254,20 +297,25 @@ export async function createVision(modelId: string, opts: VisionLoadOptions = {}
     const patch = new Float32Array(H * K);
     for (let o = 0; o < H; o++) patch.set(pw.data.subarray(o * row, (o + 1) * row), o * K);
     upload("patch.weight", [H, K], patch);
-    // Constant addend: position embeddings, plus the CLS / distillation tokens on the prefix rows and
-    // the patch bias on the rest.
-    const pos = await need(clip ? v + "position_embedding.weight" : v + "position_embeddings");
-    const T = cfg.prefix + (cfg.imageSize / cfg.patchSize) ** 2;
-    if (pos.data.length !== T * H) throw new Error(`${modelId}: position embeddings hold ${pos.data.length / H} tokens, the model has ${T}`);
-    const add = Float32Array.from(pos.data);
-    const prefixTokens = [await need(clip ? v + "class_embedding" : v + "cls_token")];
-    if (cfg.prefix === 2) prefixTokens.push(await need(v + "distillation_token"));
-    prefixTokens.forEach((t, r) => {
-      for (let i = 0; i < H; i++) add[r * H + i] += t.data[i]!;
-    });
-    const pb = clip ? undefined : (await read(v + "patch_embeddings.projection.bias"))?.data;
-    if (pb) for (let r = cfg.prefix; r < T; r++) for (let i = 0; i < H; i++) add[r * H + i] += pb[i]!;
-    upload("embed.add", [T, H], add);
+    let embeddings: ((gh: number, gw: number) => VitEmbeddings) | undefined;
+    if (cfg.detTokens) {
+      embeddings = await yolosEmbeddings(cfg, need, read, v);
+    } else {
+      // Constant addend: position embeddings, plus the CLS / distillation tokens on the prefix rows and
+      // the patch bias on the rest.
+      const pos = await need(clip ? v + "position_embedding.weight" : v + "position_embeddings");
+      const T = cfg.prefix + (cfg.imageSize / cfg.patchSize) ** 2;
+      if (pos.data.length !== T * H) throw new Error(`${modelId}: position embeddings hold ${pos.data.length / H} tokens, the model has ${T}`);
+      const add = Float32Array.from(pos.data);
+      const prefixTokens = [await need(clip ? v + "class_embedding" : v + "cls_token")];
+      if (cfg.prefix === 2) prefixTokens.push(await need(v + "distillation_token"));
+      prefixTokens.forEach((t, r) => {
+        for (let i = 0; i < H; i++) add[r * H + i] += t.data[i]!;
+      });
+      const pb = clip ? undefined : (await read(v + "patch_embeddings.projection.bias"))?.data;
+      if (pb) for (let r = cfg.prefix; r < T; r++) for (let i = 0; i < H; i++) add[r * H + i] += pb[i]!;
+      upload("embed.add", [T, H], add);
+    }
 
     const head = async (p: string): Promise<Head | undefined> => {
       const w = await read(`${p}.weight`);
@@ -302,10 +350,50 @@ export async function createVision(modelId: string, opts: VisionLoadOptions = {}
         cache: new Map(),
       };
     }
-    const model = new VitModel(backend, cfg, weights);
+    const model = new VitModel(backend, cfg, weights, embeddings);
     const processor: ImageProcessorConfig = prep ?? { size: { height: cfg.imageSize, width: cfg.imageSize } };
     return new VisionEngine(backend, cfg, model, processor, heads, parts);
   } finally {
     for (const s of sources) s.close?.();
   }
+}
+
+type ReadTensor = (name: string) => Promise<{ shape: number[]; data: Float32Array } | undefined>;
+
+/**
+ * YOLOS's addends for any patch grid: the patch part of the position embeddings (and of the mid
+ * position embeddings, one set per layer but the last) fitted to the grid with torch's bicubic
+ * interpolation, as transformers' InterpolateInitialPositionEmbeddings does; rows reordered to
+ * Kiln's token order (detection tokens, CLS, patches) with the tokens and the patch bias added.
+ */
+async function yolosEmbeddings(cfg: VitConfig, need: (n: string) => Promise<{ shape: number[]; data: Float32Array }>, read: ReadTensor, v: string) {
+  const H = cfg.hidden;
+  const N = cfg.detTokens;
+  const [gh0, gw0] = vitGrid(cfg, cfg.imageHW[1], cfg.imageHW[0]);
+  const T0 = 1 + gh0 * gw0 + N;
+  const pos = await need(v + "position_embeddings");
+  if (pos.data.length !== T0 * H) throw new Error(`YOLOS: position embeddings hold ${pos.data.length / H} tokens, a ${cfg.imageHW.join(" × ")} image has ${T0}`);
+  const cls = (await need(v + "cls_token")).data;
+  const det = (await need(v + "detection_tokens")).data;
+  const bias = (await read(v + "patch_embeddings.projection.bias"))?.data;
+  const midAll = cfg.midPos ? (await need("encoder.mid_position_embeddings")).data : undefined;
+  // One [T0, H] table → Kiln's rows for a grid: detection, CLS, then the patch grid resized.
+  const fit = (table: Float32Array, gh: number, gw: number): Float32Array => {
+    const out = new Float32Array((N + 1 + gh * gw) * H);
+    out.set(table.subarray((T0 - N) * H, T0 * H), 0);
+    out.set(table.subarray(0, H), N * H);
+    const grid = new Float32Array(H * gh0 * gw0);
+    for (let t = 0; t < gh0 * gw0; t++) for (let i = 0; i < H; i++) grid[i * gh0 * gw0 + t] = table[(1 + t) * H + i]!;
+    const r = gh === gh0 && gw === gw0 ? grid : bicubicResize(grid, H, gh0, gw0, gh, gw);
+    for (let t = 0; t < gh * gw; t++) for (let i = 0; i < H; i++) out[(N + 1 + t) * H + i] = r[i * gh * gw + t]!;
+    return out;
+  };
+  return (gh: number, gw: number): VitEmbeddings => {
+    const add = fit(pos.data, gh, gw);
+    for (let i = 0; i < N * H; i++) add[i] += det[i]!;
+    for (let i = 0; i < H; i++) add[N * H + i] += cls[i]!;
+    if (bias) for (let t = N + 1; t < N + 1 + gh * gw; t++) for (let i = 0; i < H; i++) add[t * H + i] += bias[i]!;
+    const mid = midAll ? Array.from({ length: cfg.layers - 1 }, (_, l) => fit(midAll.subarray(l * T0 * H, (l + 1) * T0 * H), gh, gw)) : undefined;
+    return { add, mid };
+  };
 }

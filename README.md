@@ -526,6 +526,8 @@ K/V; each decoder step reads them through a step block whose span covers every p
 | wav2vec2 classifier (`superb/wav2vec2-base-superb-ks`, weighted layer sum) | transformers.js (`Xenova/wav2vec2-base-superb-ks`, fp32) | the same five labels, scores within 2e-7 |
 | Image preprocessing (all six PIL filters; DeiT and CLIP pipelines) | PIL 8 + numpy | resized bytes identical; pixel values identical (float32) |
 | CLIP tokenizer (`openai/clip-vit-base-patch32`) | transformers.js | the same ids for 8 texts (punctuation, accents, CJK, emoji, long words) |
+| YOLOS (`hustvl/yolos-tiny`, `yolos-small`) | transformers.js (`Xenova/yolos-*`, fp32) on the same pixel values | the same detections and labels on the cats photo; scores within 8.2e-6, boxes within 3e-7 |
+| Position-embedding interpolation | torch 1.7.1 `interpolate(mode="bicubic")` | within 1e-5 |
 | CLIP zero-shot (`openai/clip-vit-base-patch32`) | transformers.js (`Xenova/clip-vit-base-patch32`, fp32) on the same pixel values | six labels' probabilities within 1.8e-7, the labels run as one batch |
 | ViT (`google/vit-base-patch16-224`), DeiT (`facebook/deit-base-distilled-patch16-224`) | transformers.js (`Xenova/*`, fp32) on the same pixel values | all 1,000 class probabilities within 2.2e-6 (ViT) and 7.8e-7 (DeiT) |
 
@@ -612,6 +614,22 @@ download now go to the network on their own (small ones anywhere past it, large 
 it). A tensor saved as a transposed view (CLIP's projections) was refused; it is now read and
 transposed when loaded on the CPU (GPU-loaded weights still must be contiguous). And an unsupported
 tensor made the loader take the cached file for corrupt and download it again; it now fails at once.
+
+Object detection (`object-detection`) runs YOLOS (`hustvl/yolos-*`) on the same ViT code. The image
+keeps its aspect ratio (transformers' YOLOS resize: shortest edge, capped longest edge, both sides
+rounded down to multiples of 16), so each patch grid gets its own plan, and the position embeddings
+(and yolos-small's and -base's per-layer ones) are fitted to it with torch's bicubic interpolation
+(checked against torch). The 100 detection tokens go first in the sequence, since full attention
+does not depend on order, so the class and box MLPs run on the GPU over just those rows and only
+their outputs are read back. Post-processing is transformers.js's: the best class per token unless
+it is "no object", its softmax score against `threshold` (default 0.9), boxes from center and size
+to corners in pixels of the original image. On the COCO cats photo, fed the same pixel values as
+transformers.js (`Xenova/yolos-*`, fp32): the same five detections and labels, scores within 8.2e-6
+(tiny) and 3.2e-7 (small), boxes within 3e-7. Both pipelines end to end with yolos-tiny (median of
+five warm calls, WebGPU, in the same backgrounded pane): 0.59 s in Kiln against 24.6 s for
+transformers.js, whose model call alone took 26 s at either input size. The default model is
+yolos-tiny; transformers.js's default, DETR with a ResNet-50 backbone, needs convolutions Kiln does
+not have yet.
 
 T5's learned relative position bias is added to each score by the per-row attention kernels (GPU
 and CPU, buckets computed in the kernel; bucket function equal to transformers' over ±300

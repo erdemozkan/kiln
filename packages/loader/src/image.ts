@@ -207,6 +207,40 @@ function shortestEdge(w: number, h: number, size: number, longest?: number): [nu
 
 const triple = (v: number | number[] | undefined, d: number[]): number[] => (v === undefined ? d : typeof v === "number" ? [v, v, v] : v);
 
+/** Python's round(): halves go to the even neighbour. */
+function roundHalfEven(x: number): number {
+  const f = Math.floor(x);
+  const d = x - f;
+  return d > 0.5 || (d === 0.5 && f % 2 !== 0) ? f + 1 : f;
+}
+
+/**
+ * Output [width, height] of the DETR-family resize (transformers' get_size_with_aspect_ratio): the
+ * short side becomes `size` unless the long side would pass `max`, then the long side becomes about
+ * `max`. YOLOS checks the orientation first and rounds both sides down to multiples of 16.
+ */
+export function detrResizeSize(w: number, h: number, size: number, max: number | undefined, yolos: boolean): [number, number] {
+  let raw: number | undefined;
+  if (max !== undefined) {
+    const lo = Math.min(w, h);
+    const hi = Math.max(w, h);
+    if ((hi / lo) * size > max) {
+      raw = (max * lo) / hi;
+      size = roundHalfEven(raw);
+    }
+  }
+  const s = raw ?? size;
+  const keep = (h <= w && h === size) || (w <= h && w === size);
+  let ow: number;
+  let oh: number;
+  if (!yolos && keep) [ow, oh] = [w, h];
+  else if (w < h) [ow, oh] = [size, Math.trunc((s * h) / w)];
+  else if (yolos && keep) [ow, oh] = [w, h];
+  else [ow, oh] = [Math.trunc((s * w) / h), size];
+  if (yolos) [ow, oh] = [ow - (ow % 16), oh - (oh % 16)];
+  return [ow, oh];
+}
+
 /**
  * Pixel values [3, height, width] of an image as the model's image processor makes them (Python
  * transformers' slow processors: PIL resize, center crop, rescale and normalize in float32).
@@ -228,7 +262,8 @@ export function preprocessImage(img: RgbImage, cfg: ImageProcessorConfig): { dat
       let edge = s.shortest_edge;
       // ConvNeXt: below 384, resize to shortest_edge / crop_pct, then crop shortest_edge.
       if (cfg.crop_pct !== undefined && /ConvNext/.test(kind) && edge < 384) edge = Math.trunc(edge / cfg.crop_pct);
-      [w, h] = shortestEdge(im.width, im.height, edge, s.longest_edge);
+      if (/Yolos|Detr/.test(kind)) [w, h] = detrResizeSize(im.width, im.height, edge, s.longest_edge, /Yolos/.test(kind));
+      else [w, h] = shortestEdge(im.width, im.height, edge, s.longest_edge);
     } else [w, h] = [s.width ?? s.height!, s.height ?? s.width!];
     im = resizeImage(im, w, h, resample);
     if (/ConvNext/.test(kind) && typeof s === "object" && s.shortest_edge !== undefined && s.shortest_edge < 384 && cfg.crop_pct !== undefined) {
