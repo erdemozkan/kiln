@@ -2,7 +2,7 @@ import type { Profile } from "@kiln/core";
 import type { GenerateStats, LoadProgress } from "@kiln/runtime";
 import type { ChatMessage } from "@kiln/tokenizers";
 import { createWorker } from "./default-worker";
-import type { AudioInfo, AudioTask, EncoderInfo, EncoderTask, ModelInfo, Request, Response, Seq2SeqInfo, Seq2SeqTask, WireEncoderOptions, WireGenerateOptions, WireLoadOptions, WireSeq2SeqOptions } from "./protocol";
+import type { VisionInfo, VisionTask, AudioInfo, AudioTask, EncoderInfo, EncoderTask, ModelInfo, Request, Response, Seq2SeqInfo, Seq2SeqTask, WireEncoderOptions, WireGenerateOptions, WireLoadOptions, WireSeq2SeqOptions } from "./protocol";
 
 type Listener = (msg: Response) => void;
 type RequestBody = Request extends infer R ? (R extends Request ? Omit<R, "id"> : never) : never;
@@ -322,3 +322,46 @@ export class KilnAudio extends WorkerChannel {
 }
 
 export const loadAudio = KilnAudio.load;
+
+/** Main-thread handle to an image model (ViT, DeiT) running in a worker. */
+export class KilnVision extends WorkerChannel {
+  private constructor(
+    worker: Worker,
+    public info: VisionInfo,
+  ) {
+    super(worker);
+  }
+
+  static async load(model: string, opts: AudioLoadOptions = {}): Promise<KilnVision> {
+    const worker = opts.worker ?? createWorker();
+    const m = new KilnVision(worker, undefined as unknown as VisionInfo);
+    const { onProgress, worker: _w, ...wire } = opts;
+    try {
+      m.info = await new Promise<VisionInfo>((resolve, reject) => {
+        m.send({ type: "loadVision", model, opts: wire }, (msg) => {
+          if (msg.type === "progress") onProgress?.(msg.progress);
+          else if (msg.type === "visionLoaded") resolve(msg.info);
+          else if (msg.type === "error") reject(new Error(msg.message));
+          return msg.type === "visionLoaded" || msg.type === "error";
+        });
+      });
+    } catch (err) {
+      if (!opts.worker) worker.terminate();
+      throw err;
+    }
+    return m;
+  }
+
+  /** Image classification ([{ label, score }]) or image features ({ data, dims }) of an image the worker can decode. */
+  run<T>(task: VisionTask, image: unknown, options: Record<string, unknown> = {}): Promise<T> {
+    return new Promise((resolve, reject) =>
+      this.send({ type: "visionTask", task, args: [image, options] }, (msg) => {
+        if (msg.type === "result") resolve(msg.result as T);
+        else if (msg.type === "error") reject(new Error(msg.message));
+        return msg.type === "result" || msg.type === "error";
+      }),
+    );
+  }
+}
+
+export const loadVision = KilnVision.load;

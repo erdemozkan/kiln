@@ -1,5 +1,6 @@
-import { createAudio, createEncoder, createEngine, createSeq2Seq, type AudioEngine, loadPromptCache, promptCacheName, savePromptCache, type EncoderEngine, type Engine, type Seq2SeqEngine, type Seq2SeqGenerateOptions, type TextDelta } from "@kiln/runtime";
-import type { AudioTask, EncoderTask, Request, Response, Seq2SeqTask } from "./protocol";
+import { readImage, type ImageInput } from "@kiln/loader";
+import { createAudio, createVision, type VisionEngine, createEncoder, createEngine, createSeq2Seq, type AudioEngine, loadPromptCache, promptCacheName, savePromptCache, type EncoderEngine, type Engine, type Seq2SeqEngine, type Seq2SeqGenerateOptions, type TextDelta } from "@kiln/runtime";
+import type { AudioTask, VisionTask, EncoderTask, Request, Response, Seq2SeqTask } from "./protocol";
 
 /** The slice of DedicatedWorkerGlobalScope we use (lib.webworker conflicts with lib.dom in one program). */
 const scope = self as unknown as {
@@ -10,6 +11,7 @@ let engine: Engine | undefined;
 let encoder: EncoderEngine | undefined;
 let seq2seq: Seq2SeqEngine | undefined;
 let audio: AudioEngine | undefined;
+let vision: VisionEngine | undefined;
 
 const OUTPUT_KEY: Record<Seq2SeqTask, string> = { summarization: "summary_text", translation: "translation_text", "text2text-generation": "generated_text", "automatic-speech-recognition": "text" };
 
@@ -222,6 +224,43 @@ scope.onmessage = async (e: MessageEvent<Request>) => {
         });
         break;
       }
+      case "loadVision": {
+        await queue;
+        vision?.destroy();
+        vision = undefined;
+        const v = await createVision(msg.model, { ...msg.opts, onProgress: (progress) => post({ id: msg.id, type: "progress", progress }) });
+        vision = v;
+        post({
+          id: msg.id,
+          type: "visionLoaded",
+          info: {
+            model: msg.model,
+            family: v.cfg.modelType,
+            layers: v.cfg.layers,
+            hiddenSize: v.cfg.hidden,
+            imageSize: v.cfg.imageSize,
+            backend: v.backend.name,
+            cpuThreads: v.backend.name === "cpu" ? (v.backend as { threads?: number }).threads : undefined,
+            labels: Object.fromEntries(v.cfg.labels.map((l, i) => [i, l])),
+          },
+        });
+        break;
+      }
+      case "visionTask": {
+        const v = vision;
+        if (!v) throw new Error("no image model loaded");
+        queue = queue.then(async () => {
+          try {
+            const [input, opts] = msg.args as [ImageInput, Record<string, unknown> | undefined];
+            const img = await readImage(input);
+            const result = (msg.task as VisionTask) === "image-classification" ? await v.classify(img, opts) : await v.features(img, opts);
+            post({ id: msg.id, type: "result", result });
+          } catch (err) {
+            post({ id: msg.id, type: "error", message: err instanceof Error ? err.message : String(err) });
+          }
+        });
+        break;
+      }
       case "audioTask": {
         const a = audio;
         if (!a) throw new Error("no speech model loaded");
@@ -293,6 +332,8 @@ scope.onmessage = async (e: MessageEvent<Request>) => {
         seq2seq = undefined;
         audio?.destroy();
         audio = undefined;
+        vision?.destroy();
+        vision = undefined;
         post({ id: msg.id, type: "done", stats: undefined });
         break;
     }

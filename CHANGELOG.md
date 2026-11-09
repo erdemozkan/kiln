@@ -44,6 +44,12 @@ and word grouping.
 front-end variants (GroupNorm, post-LayerNorm base models; LayerNorm, pre-LayerNorm large models),
 the grouped positional convolution as one kernel.
 
+**Images.** ViT and DeiT (including the distilled model's two heads) from safetensors or
+`pytorch_model.bin`: `image-classification` and `image-feature-extraction`, with transformers' image
+preprocessing: PIL's resampling filters reimplemented with its fixed-point arithmetic, so resized
+pixels equal PIL's byte for byte, plus shortest-edge and ConvNeXt resizing, center crop, and float32
+rescale and normalize as numpy does them. `quick_gelu` activation.
+
 **Models.** Llama (including Llama 3 rope scaling), Mistral, Qwen2, Qwen3, SmolLM, Granite 3 and 4
 (350M to 2B; for Granite 4, the attention-only models) and Gemma 3 (270M to 4B and larger; images
 with the GGUF mmproj), from safetensors (F32/F16/BF16) or GGUF

@@ -524,6 +524,8 @@ K/V; each decoder step reads them through a step block whose span covers every p
 | wav2vec2 CTC (`facebook/wav2vec2-base-960h`) | an independent NumPy (float64) forward pass over the safetensors; transformers.js | logits within 6.3e-4 on all 549 frames of the JFK clip, the same token in every frame; transformers.js (fp32 WebGPU) printed "FELOW" for "FELLOW" (two L frames three blank frames apart) |
 | wav2vec2 large (`facebook/wav2vec2-large-robust-ft-libri-960h`: LayerNorm front end, pre-LayerNorm layers) | the NumPy forward pass | logits within 3.1e-4 over 149 frames, the same token in every frame |
 | wav2vec2 classifier (`superb/wav2vec2-base-superb-ks`, weighted layer sum) | transformers.js (`Xenova/wav2vec2-base-superb-ks`, fp32) | the same five labels, scores within 2e-7 |
+| Image preprocessing (all six PIL filters; DeiT and CLIP pipelines) | PIL 8 + numpy | resized bytes identical; pixel values identical (float32) |
+| ViT (`google/vit-base-patch16-224`), DeiT (`facebook/deit-base-distilled-patch16-224`) | transformers.js (`Xenova/*`, fp32) on the same pixel values | all 1,000 class probabilities within 2.2e-6 (ViT) and 7.8e-7 (DeiT) |
 
 Whisper (`automatic-speech-recognition`) takes 16 kHz samples, a URL, a Blob or encoded bytes (WAV
 parsed directly; other formats decoded and resampled by the page's Web Audio API). Its log-mel
@@ -570,6 +572,20 @@ On WebGPU in the backgrounded pane (one warm call each, so rough): the 11 s clip
 6.3 s for transformers.js, and keyword spotting on 1 s in 238 ms against 482 ms. On the CPU backend
 the clip takes 33 s, mostly in the front end's convolutions. HuBERT shares wav2vec2's layers and tensor names and loads
 through the same code, but has not been checked against a reference yet.
+
+Images (`image-classification`, `image-feature-extraction`) run ViT and DeiT checkpoints. The
+preprocessing is transformers' (Python's, not transformers.js's): resizing reimplements PIL's
+ImagingResample with its fixed-point weights and byte rounding after each pass, so a resized image
+equals PIL's byte for byte for all six filters, and rescale / normalize round to float32 as numpy
+does. transformers.js in a browser resizes with a canvas instead, so its pixels differ slightly from
+Python's. Images are decoded in the worker (createImageBitmap, no color conversion). The patch
+convolution is one matmul over patch rows; the CLS and distillation tokens, position embeddings and
+patch bias are one precomputed addend; layers are pre-norm with full span attention, and the
+classifier (DeiT with a teacher: the mean of its two heads) runs on the CPU from the CLS rows. On the
+tiger photo, fed the same pixel values: every class probability within 2.2e-6 of transformers.js for
+ViT and 7.8e-7 for DeiT. One warm call took 364 ms (ViT) and 474 ms (DeiT) in Kiln, decoding and
+preprocessing included, against 1.5 s and 0.8 s for transformers.js's model call alone (rough,
+backgrounded pane). The pooled output (`pool: true`) has not been checked against a reference.
 
 T5's learned relative position bias is added to each score by the per-row attention kernels (GPU
 and CPU, buckets computed in the kernel; bucket function equal to transformers' over ±300

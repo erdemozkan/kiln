@@ -106,6 +106,21 @@ export interface AudioInfo {
   labels?: Record<number, string>;
 }
 
+/** Tasks of image models (ViT, DeiT). */
+export type VisionTask = "image-classification" | "image-feature-extraction";
+
+export interface VisionInfo {
+  model: string;
+  /** "vit" or "deit". */
+  family: string;
+  layers: number;
+  hiddenSize: number;
+  imageSize: number;
+  backend: string;
+  cpuThreads?: number;
+  labels?: Record<number, string>;
+}
+
 export interface EncoderInfo {
   model: string;
   /** "bert", "distilbert" or "roberta". */
@@ -128,6 +143,8 @@ export type Request =
   | { id: number; type: "loadAudio"; model: string; opts: WireEncoderOptions }
   | { id: number; type: "task"; task: EncoderTask | Seq2SeqTask; args: unknown[] }
   | { id: number; type: "audioTask"; task: AudioTask; args: unknown[] }
+  | { id: number; type: "loadVision"; model: string; opts: WireEncoderOptions }
+  | { id: number; type: "visionTask"; task: VisionTask; args: unknown[] }
   | { id: number; type: "chat"; messages: ChatMessage[]; opts: WireGenerateOptions }
   | { id: number; type: "complete"; prompt: string; opts: WireGenerateOptions }
   | { id: number; type: "abort"; target: number }
@@ -140,6 +157,7 @@ export type Response =
   | { id: number; type: "encoderLoaded"; info: EncoderInfo }
   | { id: number; type: "seq2seqLoaded"; info: Seq2SeqInfo }
   | { id: number; type: "audioLoaded"; info: AudioInfo }
+  | { id: number; type: "visionLoaded"; info: VisionInfo }
   | { id: number; type: "result"; result: unknown }
   | { id: number; type: "delta"; text: string }
   | { id: number; type: "done"; stats: GenerateStats | undefined }

@@ -1560,8 +1560,8 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
 }
 
 /** x = gelu_tanh(x) in place. */
-/** Elementwise activations: GELU exact (erf) or tanh-approximated, SiLU, ReLU. */
-export type Activation = "gelu" | "gelu_tanh" | "silu" | "relu";
+/** Elementwise activations: GELU exact (erf) or tanh-approximated, SiLU, ReLU, CLIP's quick GELU (x·σ(1.702x)). */
+export type Activation = "gelu" | "gelu_tanh" | "silu" | "relu" | "quick_gelu";
 
 /**
  * An activation in place. Exact GELU takes erf from Abramowitz & Stegun 7.1.26 (absolute error under
@@ -1575,7 +1575,9 @@ export function actSpec(kind: Activation): KernelSpec {
         ? GELU_WGSL("a")
         : kind === "silu"
           ? "a / (1.0 + exp(-a))"
-          : "max(a, 0.0)";
+          : kind === "quick_gelu"
+            ? "a / (1.0 + exp(-1.702 * a))"
+            : "max(a, 0.0)";
   return spec(kind === "gelu_tanh" ? "gelu" : `act/${kind}`, ["uniform", "rw"], cpu.cpuAct(kind), () => /* wgsl */ `
 struct P { n: u32, _a: u32, _b: u32, _c: u32 }
 @group(0) @binding(0) var<uniform> p: P;

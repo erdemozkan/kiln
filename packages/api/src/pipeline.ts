@@ -2,9 +2,9 @@
 // transformers.js's text-generation pipeline runs on Kiln with little more than a new import.
 import type { LoadProgress } from "@kiln/runtime";
 import type { ChatMessage } from "@kiln/tokenizers";
-import { KilnAudio, KilnEncoder, KilnModel, KilnSeq2Seq, type GenerateOptions, type LoadOptions, type TextStream } from "./client";
+import { KilnVision, KilnAudio, KilnEncoder, KilnModel, KilnSeq2Seq, type GenerateOptions, type LoadOptions, type TextStream } from "./client";
 import { fetchJSON, fileUrl, parseModelId, readAudio, type AudioInput } from "@kiln/loader";
-import type { AudioInfo, EncoderInfo, EncoderTask, ModelInfo, Seq2SeqInfo, Seq2SeqTask } from "./protocol";
+import type { VisionInfo, AudioInfo, EncoderInfo, EncoderTask, ModelInfo, Seq2SeqInfo, Seq2SeqTask } from "./protocol";
 
 /** Task names, with transformers.js's aliases. */
 export type PipelineTask =
@@ -22,7 +22,9 @@ export type PipelineTask =
   | "translation"
   | "text2text-generation"
   | "automatic-speech-recognition"
-  | "audio-classification";
+  | "audio-classification"
+  | "image-classification"
+  | "image-feature-extraction";
 
 const SEQ2SEQ = new Set<string>(["summarization", "translation", "text2text-generation", "automatic-speech-recognition"]);
 
@@ -42,7 +44,11 @@ export const DEFAULT_MODELS: Record<string, string> = {
   "text2text-generation": "google/flan-t5-small",
   "automatic-speech-recognition": "openai/whisper-tiny.en",
   "audio-classification": "superb/wav2vec2-base-superb-ks",
+  "image-classification": "google/vit-base-patch16-224",
+  "image-feature-extraction": "google/vit-base-patch16-224-in21k",
 };
+
+const VISION = new Set<string>(["image-classification", "image-feature-extraction"]);
 
 /** Speech encoders run on raw samples (CTC or a classifier) rather than as encoder-decoders. */
 const AUDIO_ENCODERS = new Set(["wav2vec2", "hubert"]);
@@ -396,6 +402,53 @@ export interface AudioClassificationPipeline {
   (audio: AudioInput, options?: AudioClassificationOptions): Promise<{ label: string; score: number }[]>;
   (audio: AudioInput[], options?: AudioClassificationOptions): Promise<{ label: string; score: number }[][]>;
 }
+/**
+ * An image: a URL (relative to the page), a Blob / File, encoded bytes, an ImageBitmap / ImageData,
+ * an <img> / <canvas> element, or RGB(A) pixels { width, height, data } (transformers.js's RawImage
+ * with 3 or 4 channels fits).
+ */
+export type ImageInput = string | URL | Blob | ArrayBuffer | Uint8Array | ImageBitmap | ImageData | CanvasImageSource | { width: number; height: number; data: Uint8Array | Uint8ClampedArray };
+export interface ImageClassificationOptions {
+  /** Labels returned, best first (default 5; 0 or negative: all). */
+  top_k?: number;
+}
+export interface ImageClassificationPipeline {
+  readonly task: PipelineTask;
+  readonly model: KilnVision;
+  readonly info: VisionInfo;
+  dispose(): Promise<void>;
+  (image: ImageInput, options?: ImageClassificationOptions): Promise<{ label: string; score: number }[]>;
+  (images: ImageInput[], options?: ImageClassificationOptions): Promise<{ label: string; score: number }[][]>;
+}
+export interface ImageFeatureExtractionOptions {
+  /** The pooled output [1, hidden] instead of the last hidden state [1, tokens, hidden]. */
+  pool?: boolean;
+}
+export interface ImageFeatureExtractionPipeline {
+  readonly task: PipelineTask;
+  readonly model: KilnVision;
+  readonly info: VisionInfo;
+  dispose(): Promise<void>;
+  (image: ImageInput, options?: ImageFeatureExtractionOptions): Promise<Tensor>;
+  (images: ImageInput[], options?: ImageFeatureExtractionOptions): Promise<Tensor[]>;
+}
+
+/** An image in a form the worker can receive and decode: relative URLs resolved, DOM images drawn to bitmaps. */
+async function toWorkerImage(x: ImageInput): Promise<unknown> {
+  if (typeof x === "string") return typeof location !== "undefined" ? new URL(x, location.href).href : x;
+  if (x instanceof URL) return x.href;
+  if (x instanceof Blob || x instanceof ArrayBuffer || x instanceof Uint8Array) return x;
+  if (typeof ImageBitmap !== "undefined" && x instanceof ImageBitmap) return x;
+  if (typeof ImageData !== "undefined" && x instanceof ImageData) return x;
+  if ("data" in x && "width" in x) {
+    const d = x.data as Uint8Array;
+    const ch = d.length / (x.width * x.height);
+    if (ch !== 3 && ch !== 4) throw new Error(`Kiln: images need 3 or 4 channels, got ${ch}`);
+    return { width: x.width, height: x.height, data: d };
+  }
+  return createImageBitmap(x as ImageBitmapSource, { colorSpaceConversion: "none", premultiplyAlpha: "none" });
+}
+
 export interface Text2TextGenerationPipeline extends Seq2SeqPipelineBase {
   (texts: string | string[], options?: Text2TextOptions): Promise<{ generated_text: string }[]>;
 }
@@ -431,6 +484,8 @@ export async function pipeline(task: "translation", model?: string, options?: Pi
 export async function pipeline(task: "text2text-generation", model?: string, options?: PipelineOptions): Promise<Text2TextGenerationPipeline>;
 export async function pipeline(task: "automatic-speech-recognition", model?: string, options?: PipelineOptions): Promise<SpeechRecognitionPipeline>;
 export async function pipeline(task: "audio-classification", model?: string, options?: PipelineOptions): Promise<AudioClassificationPipeline>;
+export async function pipeline(task: "image-classification", model?: string, options?: PipelineOptions): Promise<ImageClassificationPipeline>;
+export async function pipeline(task: "image-feature-extraction", model?: string, options?: PipelineOptions): Promise<ImageFeatureExtractionPipeline>;
 export async function pipeline(task: PipelineTask, model?: string, options: PipelineOptions = {}): Promise<unknown> {
   const t = ALIASES[task] ?? task;
   const id = model ?? DEFAULT_MODELS[t];
@@ -447,6 +502,25 @@ export async function pipeline(task: PipelineTask, model?: string, options: Pipe
   const progress = progress_callback ? toLoadOptions(id, { progress_callback }).onProgress : undefined;
   const dev = device === "webgpu" || device === "gpu" ? "gpu" : device === "wasm" || device === "cpu" ? "cpu" : "auto";
   const q = quant === "q4" || quant === "q8" || quant === "f32" ? quant : encoderQuant(dtype);
+  if (VISION.has(t)) {
+    const m = await KilnVision.load(id, { quant: q, device: dev, cpuThreads, revision, endpoint, worker, onProgress: progress });
+    progress_callback?.({ status: "ready", task, model: id });
+    const one = async (x: ImageInput, opts?: object) => {
+      const r = await m.run<unknown>(t as "image-classification" | "image-feature-extraction", await toWorkerImage(x), { ...opts });
+      if (t === "image-feature-extraction") {
+        const f = r as { data: Float32Array; dims: number[] };
+        return new Tensor("float32", f.data, f.dims);
+      }
+      return r;
+    };
+    const call = async (images: ImageInput | ImageInput[], opts?: object) => {
+      if (!Array.isArray(images)) return one(images, opts);
+      const out: unknown[] = [];
+      for (const x of images) out.push(await one(x, opts));
+      return out;
+    };
+    return Object.assign(call, { task, model: m, info: m.info, tokenizer: {}, dispose: () => m.unload() });
+  }
   // Whisper or a CTC model? The config says.
   const speechEncoder =
     t === "audio-classification" ||

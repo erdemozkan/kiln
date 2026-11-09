@@ -1,5 +1,5 @@
-export { KilnAudio, KilnEncoder, KilnModel, KilnSeq2Seq, load, loadAudio, loadEncoder, loadSeq2Seq, type AudioLoadOptions, type EncoderLoadOptions, type Seq2SeqLoadOptions, type GenerateOptions, type LoadOptions, type TextStream } from "./client";
-export type { AudioInfo, AudioTask, EncoderInfo, EncoderTask, ModelInfo, Seq2SeqInfo, Seq2SeqTask } from "./protocol";
+export { KilnVision, loadVision, KilnAudio, KilnEncoder, KilnModel, KilnSeq2Seq, load, loadAudio, loadEncoder, loadSeq2Seq, type AudioLoadOptions, type EncoderLoadOptions, type Seq2SeqLoadOptions, type GenerateOptions, type LoadOptions, type TextStream } from "./client";
+export type { VisionInfo, VisionTask, AudioInfo, AudioTask, EncoderInfo, EncoderTask, ModelInfo, Seq2SeqInfo, Seq2SeqTask } from "./protocol";
 export { parseToolCalls, type ChatDocument, type ChatMessage, type ContentPart, type ToolCall, type ToolSpec } from "@kiln/tokenizers";
 export type { GenerateStats, LoadProgress, StopReason } from "@kiln/runtime";
 export type { Profile, ProfileEntry } from "@kiln/core";
@@ -31,6 +31,11 @@ export {
   type SpeechChunk,
   type AudioClassificationPipeline,
   type AudioClassificationOptions,
+  type ImageInput,
+  type ImageClassificationPipeline,
+  type ImageClassificationOptions,
+  type ImageFeatureExtractionPipeline,
+  type ImageFeatureExtractionOptions,
   type PipelineOptions,
   type PipelineTask,
   type ProgressInfo,
@@ -42,3 +47,4 @@ export {
   type TextStreamerOptions,
 } from "./pipeline";
 export { readAudio, type AudioInput } from "@kiln/loader";
+export { readImage, preprocessImage, resizeImage, centerCrop, type RgbImage, type ImageProcessorConfig } from "@kiln/loader";

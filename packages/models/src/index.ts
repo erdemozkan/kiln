@@ -6,3 +6,4 @@ export * from "./encoder";
 export * from "./seq2seq";
 export * from "./t5";
 export * from "./wav2vec2";
+export * from "./vit";

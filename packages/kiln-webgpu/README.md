@@ -134,6 +134,21 @@ const keywords = await pipeline("audio-classification"); // superb/wav2vec2-base
 await keywords(samples, { top_k: 3 }); // [{ label: "yes", score: 0.98 }, ...]
 ```
 
+### Images
+
+ViT and DeiT checkpoints run `image-classification` and `image-feature-extraction`. Images are
+resized, cropped and normalized exactly as Python transformers does it (PIL's resampling, reimplemented
+byte for byte), not by a canvas resize. Images can be URLs, Blobs / Files, bytes, `ImageBitmap` /
+`ImageData`, `<img>` / `<canvas>` elements, or RGB(A) pixels:
+
+```js
+const classifier = await pipeline("image-classification"); // google/vit-base-patch16-224
+await classifier("tiger.jpg"); // [{ label: "tiger, Panthera tigris", score: 0.886 }, ...]
+
+const extractor = await pipeline("image-feature-extraction", "google/vit-base-patch16-224-in21k");
+const features = await extractor(image); // Tensor [1, 197, 768]
+```
+
 ## Kiln's own API
 
 ```ts

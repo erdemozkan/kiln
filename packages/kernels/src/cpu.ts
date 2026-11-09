@@ -637,13 +637,14 @@ export const cpuGeluErf: CpuKernel = (b) => {
 };
 
 /** An activation in place (see actSpec). */
-export function cpuAct(kind: "gelu" | "gelu_tanh" | "silu" | "relu"): CpuKernel {
+export function cpuAct(kind: "gelu" | "gelu_tanh" | "silu" | "relu" | "quick_gelu"): CpuKernel {
   if (kind === "gelu") return cpuGeluErf;
   if (kind === "gelu_tanh") return cpuGelu;
   return (b) => {
     const n = b[0]!.u32[0]!;
     const x = b[1]!.f32;
     if (kind === "silu") for (let i = 0; i < n; i++) x[i] = x[i]! / (1 + Math.exp(-x[i]!));
+    else if (kind === "quick_gelu") for (let i = 0; i < n; i++) x[i] = x[i]! / (1 + Math.exp(-1.702 * x[i]!));
     else for (let i = 0; i < n; i++) x[i] = Math.max(0, x[i]!);
   };
 }
