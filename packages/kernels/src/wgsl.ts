@@ -2202,6 +2202,83 @@ fn main(${EW_ARGS}) {
 }`);
 }
 
+/**
+ * Depthwise 3 × 3 convolution (groups = channels, stride 1, padding 1) of an image x [H·W, C]:
+ * y[p, c] = bias[c] + Σ_taps x[p + tap, c] · w[tap, c], weight stored [9, C].
+ */
+export function dwConv3Spec(): KernelSpec {
+  return spec("dwconv3", ["uniform", "read", "read", "read", "rw"], cpu.cpuDwConv3, () => /* wgsl */ `
+struct P { H: u32, W: u32, C: u32, _a: u32 }
+@group(0) @binding(0) var<uniform> p: P;
+@group(0) @binding(1) var<storage, read> x: array<f32>;
+@group(0) @binding(2) var<storage, read> w: array<f32>;
+@group(0) @binding(3) var<storage, read> bias: array<f32>;
+@group(0) @binding(4) var<storage, read_write> y: array<f32>;
+
+@compute @workgroup_size(${EW})
+fn main(${EW_ARGS}) {
+  ${FLAT}
+  if (idx >= p.H * p.W * p.C) { return; }
+  let c = idx % p.C;
+  let t = idx / p.C;
+  let py = i32(t / p.W);
+  let px = i32(t % p.W);
+  var s = bias[c];
+  for (var ky = 0; ky < 3; ky++) {
+    let iy = py + ky - 1;
+    if (iy < 0 || iy >= i32(p.H)) { continue; }
+    for (var kx = 0; kx < 3; kx++) {
+      let ix = px + kx - 1;
+      if (ix < 0 || ix >= i32(p.W)) { continue; }
+      s += x[(u32(iy) * p.W + u32(ix)) * p.C + c] * w[u32(ky * 3 + kx) * p.C + c];
+    }
+  }
+  y[idx] = s;
+}`);
+}
+
+/**
+ * Semantic segmentation's last step, fused: class scores x [H·W, L] resized bilinearly to Ho × Wo
+ * as transformers.js's interpolate does it (pixel centers aligned, the near neighbour clamped before
+ * the weight is taken), and each output pixel's best class (the first on ties): y [Ho·Wo] as u32.
+ */
+export function resizeArgmaxSpec(): KernelSpec {
+  return spec("resize_argmax", ["uniform", "read", "rw"], cpu.cpuResizeArgmax, () => /* wgsl */ `
+struct P { H: u32, W: u32, L: u32, Ho: u32, Wo: u32, _a: u32, _b: u32, _c: u32 }
+@group(0) @binding(0) var<uniform> p: P;
+@group(0) @binding(1) var<storage, read> x: array<f32>;
+@group(0) @binding(2) var<storage, read_write> y: array<u32>;
+
+@compute @workgroup_size(${EW})
+fn main(${EW_ARGS}) {
+  ${FLAT}
+  if (idx >= p.Ho * p.Wo) { return; }
+  let fx = (f32(idx % p.Wo) + 0.5) / (f32(p.Wo) / f32(p.W)) - 0.5;
+  let fy = (f32(idx / p.Wo) + 0.5) / (f32(p.Ho) / f32(p.H)) - 0.5;
+  let x2 = u32(min(i32(floor(fx)) + 1, i32(p.W) - 1));
+  let y2 = u32(min(i32(floor(fy)) + 1, i32(p.H) - 1));
+  let x1 = u32(max(i32(floor(fx)), 0));
+  let y1 = u32(max(i32(floor(fy)), 0));
+  let s = fx - f32(x1);
+  let t = fy - f32(y1);
+  let w1 = (1.0 - s) * (1.0 - t);
+  let w2 = s * (1.0 - t);
+  let w3 = (1.0 - s) * t;
+  let w4 = s * t;
+  let a = (y1 * p.W + x1) * p.L;
+  let b = (y1 * p.W + x2) * p.L;
+  let c = (y2 * p.W + x1) * p.L;
+  let d = (y2 * p.W + x2) * p.L;
+  var best = 0u;
+  var top = w1 * x[a] + w2 * x[b] + w3 * x[c] + w4 * x[d];
+  for (var l = 1u; l < p.L; l++) {
+    let v = w1 * x[a + l] + w2 * x[b + l] + w3 * x[c + l] + w4 * x[d + l];
+    if (v > top) { top = v; best = l; }
+  }
+  y[idx] = best;
+}`);
+}
+
 /** k × k max pooling with stride and padding (padding never wins) of x [H·W, C] → y [Ho·Wo, C]. */
 export function maxPool2dSpec(): KernelSpec {
   return spec("max_pool2d", ["uniform", "read", "rw"], cpu.cpuMaxPool2d, () => /* wgsl */ `

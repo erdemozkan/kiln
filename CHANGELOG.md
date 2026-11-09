@@ -70,7 +70,9 @@ and box attention kernels; the conv kernel takes a batch of images). RMBG-1.4 (`
 `background-removal` (RGBA with the matte as alpha) and `image-segmentation` (the matte), IS-Net
 from one architecture description, concatenations as split convolutions; dilated convolutions,
 ceil-mode pooling, a direct kernel for convolutions with at most four outputs; `resizeImage` takes
-one-channel images.
+one-channel images. SegFormer (`nvidia/segformer-*`): semantic `image-segmentation` with
+transformers.js's output (a mask per class present), a depthwise convolution kernel, and the score
+resize and per-pixel best class fused into one kernel.
 
 **Loading.** Reads ahead of a download in progress are fetched on their own instead of waiting
 (a `pytorch_model.bin` keeps its zip directory at the end, so large checkpoints showed no progress

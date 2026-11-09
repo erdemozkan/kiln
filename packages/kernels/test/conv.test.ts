@@ -407,4 +407,58 @@ describe("image convolution kernels (CPU)", () => {
           expect(y[(oy * 3 + ox) * C + c]).toBe(m);
         }
   });
+
+  it("dwConv3 is PyTorch's depthwise 3×3 convolution (groups = channels, padding 1)", async () => {
+    const [H, W, C] = [5, 4, 6];
+    const x = randn(H * W * C);
+    const wt = randn(C * 9); // [C, 1, 3, 3]
+    const w = new Float32Array(9 * C);
+    for (let c = 0; c < C; c++) for (let t = 0; t < 9; t++) w[t * C + c] = wt[c * 9 + t]!;
+    const bias = randn(C);
+    const y = await run((ctx) => ops.dwConv3(ctx, upload(x, [H * W, C]), upload(w, [9, C]), upload(bias, [C]), { H, W }), H * W * C);
+    for (let py = 0; py < H; py++)
+      for (let px = 0; px < W; px++)
+        for (let c = 0; c < C; c++) {
+          let s = bias[c]!;
+          for (let ky = 0; ky < 3; ky++)
+            for (let kx = 0; kx < 3; kx++) {
+              const iy = py + ky - 1;
+              const ix = px + kx - 1;
+              if (iy >= 0 && iy < H && ix >= 0 && ix < W) s += x[(iy * W + ix) * C + c]! * wt[c * 9 + ky * 3 + kx]!;
+            }
+          expect(y[(py * W + px) * C + c]).toBeCloseTo(s, 5);
+        }
+  });
+
+  it("resizeArgmax picks the class transformers.js's interpolate + argmax picks", async () => {
+    const [H, W, L, Ho, Wo] = [4, 5, 7, 11, 9];
+    const x = randn(H * W * L);
+    const y = await run((ctx) => ops.resizeArgmax(ctx, upload(x, [H * W, L]), { H, W, Ho, Wo }), Ho * Wo);
+    const got = new Uint32Array(y.buffer);
+    // transformers.js's interpolate_data (planar, Float32 output), then the first maximum.
+    const planes = Array.from({ length: L }, (_, l) => {
+      const out = new Float32Array(Ho * Wo);
+      for (let i = 0; i < Ho; i++)
+        for (let j = 0; j < Wo; j++) {
+          const fx = (j + 0.5) / (Wo / W) - 0.5;
+          const fy = (i + 0.5) / (Ho / H) - 0.5;
+          let x1 = Math.floor(fx);
+          let y1 = Math.floor(fy);
+          const x2 = Math.min(x1 + 1, W - 1);
+          const y2 = Math.min(y1 + 1, H - 1);
+          x1 = Math.max(x1, 0);
+          y1 = Math.max(y1, 0);
+          const s = fx - x1;
+          const t = fy - y1;
+          const v = (a: number, b: number) => x[(a * W + b) * L + l]!;
+          out[i * Wo + j] = (1 - s) * (1 - t) * v(y1, x1) + s * (1 - t) * v(y1, x2) + (1 - s) * t * v(y2, x1) + s * t * v(y2, x2);
+        }
+      return out;
+    });
+    for (let k = 0; k < Ho * Wo; k++) {
+      let best = 0;
+      for (let l = 1; l < L; l++) if (planes[l]![k]! > planes[best]![k]!) best = l;
+      expect(got[k]).toBe(best);
+    }
+  });
 });

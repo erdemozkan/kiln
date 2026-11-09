@@ -907,6 +907,51 @@ export const cpuConvTranspose: CpuKernel = (b) => {
       }
 };
 
+export const cpuDwConv3: CpuKernel = (b) => {
+  const [H, W, C] = [b[0]!.u32[0]!, b[0]!.u32[1]!, b[0]!.u32[2]!];
+  const [x, w, bias, y] = [b[1]!.f32, b[2]!.f32, b[3]!.f32, b[4]!.f32];
+  for (let py = 0; py < H; py++)
+    for (let px = 0; px < W; px++)
+      for (let c = 0; c < C; c++) {
+        let s = bias[c]!;
+        for (let ky = 0; ky < 3; ky++) {
+          const iy = py + ky - 1;
+          if (iy < 0 || iy >= H) continue;
+          for (let kx = 0; kx < 3; kx++) {
+            const ix = px + kx - 1;
+            if (ix >= 0 && ix < W) s += x[(iy * W + ix) * C + c]! * w[(ky * 3 + kx) * C + c]!;
+          }
+        }
+        y[(py * W + px) * C + c] = s;
+      }
+};
+
+export const cpuResizeArgmax: CpuKernel = (b) => {
+  const [H, W, L, Ho, Wo] = Array.from(b[0]!.u32.subarray(0, 5)) as number[];
+  const x = b[1]!.f32;
+  const y = b[2]!.u32;
+  const f = Math.fround;
+  for (let i = 0; i < Ho! * Wo!; i++) {
+    const fx = f(f(f((i % Wo!) + 0.5) / f(Wo! / W!)) - 0.5);
+    const fy = f(f(f(Math.floor(i / Wo!) + 0.5) / f(Ho! / H!)) - 0.5);
+    const x2 = Math.min(Math.floor(fx) + 1, W! - 1);
+    const y2 = Math.min(Math.floor(fy) + 1, H! - 1);
+    const x1 = Math.max(Math.floor(fx), 0);
+    const y1 = Math.max(Math.floor(fy), 0);
+    const s = fx - x1;
+    const t = fy - y1;
+    const ws = [(1 - s) * (1 - t), s * (1 - t), (1 - s) * t, s * t];
+    const at = [(y1 * W! + x1) * L!, (y1 * W! + x2) * L!, (y2 * W! + x1) * L!, (y2 * W! + x2) * L!];
+    let best = 0;
+    let top = -Infinity;
+    for (let l = 0; l < L!; l++) {
+      const v = ws[0]! * x[at[0]! + l]! + ws[1]! * x[at[1]! + l]! + ws[2]! * x[at[2]! + l]! + ws[3]! * x[at[3]! + l]!;
+      if (v > top) [top, best] = [v, l];
+    }
+    y[i] = best;
+  }
+};
+
 export const cpuMaxPool2d: CpuKernel = (b) => {
   const [H, W, C, Ho, Wo, k, stride, pad] = Array.from(b[0]!.u32.subarray(0, 8)) as number[];
   const x = b[1]!.f32;

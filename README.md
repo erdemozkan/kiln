@@ -526,6 +526,7 @@ K/V; each decoder step reads them through a step block whose span covers every p
 | wav2vec2 classifier (`superb/wav2vec2-base-superb-ks`, weighted layer sum) | transformers.js (`Xenova/wav2vec2-base-superb-ks`, fp32) | the same five labels, scores within 2e-7 |
 | Image preprocessing (all six PIL filters; DeiT and CLIP pipelines) | PIL 8 + numpy | resized bytes identical; pixel values identical (float32) |
 | CLIP tokenizer (`openai/clip-vit-base-patch32`) | transformers.js | the same ids for 8 texts (punctuation, accents, CJK, emoji, long words) |
+| SegFormer (`nvidia/segformer-b0-finetuned-ade-512-512`) | transformers.js (`Xenova/segformer-b0-finetuned-ade-512-512`, fp32) on the same pixel values | the same 14 classes on the cats photo, all 307,200 pixels the same class; 0.75 s end to end against 3.9 s |
 | RMBG-1.4 (`briaai/RMBG-1.4`) | transformers.js (the repo's ONNX export, fp32) on the same pixel values | 3 of 1,048,576 matte bytes one level apart; 2.9 s end to end against 4.0 s |
 | DETR panoptic (`facebook/detr-resnet-50-panoptic`) | transformers.js (`Xenova/detr-resnet-50-panoptic`, fp32) on the same pixel values | the same five segments on the cats photo, scores within 1.4e-6, one pixel of 307,200 assigned differently; 2.4 s end to end against 28.2 s |
 | Depth Anything V2 (`depth-anything/Depth-Anything-V2-Small-hf`) | transformers.js (`onnx-community/depth-anything-v2-small`, fp32) on the same pixel values | depth within 1.7e-5 relative on the cats photo; 20 of 307,200 grey bytes one level apart; 3.1 s end to end against 7.4 s |
@@ -692,6 +693,19 @@ same model (fp32): 3 of the 1,048,576 matte bytes one level apart. transformers.
 background-removal pipeline rejects RMBG-1.4's config; run as its model card shows (AutoModel,
 processor, RawImage), it took 4.0 s end to end against 2.9 s in Kiln (median of five warm
 calls, WebGPU, backgrounded pane). Kiln's GPU time is the 3×3 convolutions at the GEMM's rate.
+
+`image-segmentation` also runs SegFormer (`nvidia/segformer-*-finetuned-*`), semantic segmentation.
+Each stage's overlapping patch convolution and the sequence-reduction convolution (keys and values
+from a strided convolution, so the 16,384 first-stage queries attend to 256 keys) run on the conv
+kernel; the Mix-FFN's depthwise 3×3 convolution has a kernel of its own. The decode head's fuse
+over the concatenated stages is one 1×1 convolution per stage summed, with its batch norm folded
+in. transformers.js resizes all 150 class score maps to the image size and then takes each pixel's
+best class; Kiln does both in one kernel, so the full-size score maps are never stored. Output is
+transformers.js's: one mask per class present, in class order, with null scores. On the cats photo,
+fed the same pixel values as transformers.js (`Xenova/segformer-b0-finetuned-ade-512-512`, fp32)
+and post-processed by its own code: the same 14 classes, and every one of the 307,200 pixels given
+the same class. Both pipelines end to end with b0 (median of five warm calls, WebGPU, backgrounded
+pane): 0.75 s in Kiln against 3.9 s for transformers.js.
 
 T5's learned relative position bias is added to each score by the per-row attention kernels (GPU
 and CPU, buckets computed in the kernel; bucket function equal to transformers' over ±300

@@ -27,6 +27,8 @@ import {
   attnProbsSpec,
   blockAttentionSpec,
   conv2dSpec,
+  dwConv3Spec,
+  resizeArgmaxSpec,
   conv2dNarrowSpec,
   groupNormSpec,
   nearestAddSpec,
@@ -503,6 +505,21 @@ export function conv2d(ctx: Ctx, x: Tensor, w: Tensor, bias: Tensor, o: { H: num
   }
   ctx.run(conv2dSpec({ relu: !!o.relu, residual: !!o.residual, reluIn: !!o.reluIn }), bufs, [Math.min(groups, MM_SLICE), Math.ceil(M / 64), Math.ceil(groups / MM_SLICE)], `conv2d ${o.k}x${o.k}/${o.stride} ${C}→${O}`);
   return { y, H: Ho, W: Wo };
+}
+
+/** Depthwise 3 × 3 convolution (padding 1) of an image x [H·W, C] with w [9, C] (see dwConv3Spec). */
+export function dwConv3(ctx: Ctx, x: Tensor, w: Tensor, bias: Tensor, o: { H: number; W: number }): Tensor {
+  const C = lastDim(x);
+  const y = ctx.alloc([o.H * o.W, C]);
+  ctx.run(dwConv3Spec(), [ctx.uniform([u32(o.H), u32(o.W), u32(C), u32(0)]), x.buf, w.buf, bias.buf, y.buf], grid1d(o.H * o.W * C));
+  return y;
+}
+
+/** Class scores x [H·W, L] resized to Ho × Wo and the best class per pixel: u32 [Ho·Wo] (see resizeArgmaxSpec). */
+export function resizeArgmax(ctx: Ctx, x: Tensor, o: { H: number; W: number; Ho: number; Wo: number }): Tensor {
+  const y = ctx.alloc([o.Ho * o.Wo], "u32");
+  ctx.run(resizeArgmaxSpec(), [ctx.uniform([o.H, o.W, lastDim(x), o.Ho, o.Wo, 0, 0, 0].map(u32)), x.buf, y.buf], grid1d(o.Ho * o.Wo));
+  return y;
 }
 
 /** GroupNorm of n images x [n·T, C] in G groups, ReLU after with `relu` (see groupNormSpec). */

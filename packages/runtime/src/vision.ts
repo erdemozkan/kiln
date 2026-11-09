@@ -1,10 +1,10 @@
-// Image models from transformers checkpoints (ViT, DeiT, CLIP, YOLOS, DETR, Depth Anything, RMBG):
+// Image models from transformers checkpoints (ViT, DeiT, CLIP, YOLOS, DETR, Depth Anything, RMBG, SegFormer):
 // image classification, image features, zero-shot classification, object detection, panoptic
 // segmentation, depth estimation and background removal, with transformers' image preprocessing
 // (PIL-exact resizing).
 import type { Backend, Tensor } from "@kiln/core";
 import { fetchJSON, fileUrl, listRepoFiles, parseModelId, preprocessImage, resizeImage, readPytorchHeader, readSafetensorsHeader, toF32, weightFiles, type ByteSource, type ImageProcessorConfig, type RgbImage, type TensorEntry } from "@kiln/loader";
-import { ClipTextModel, DETR_IN_CHANNELS, DepthAnythingModel, ISNET_IN_CHANNELS, IsNetModel, isnetConvs, DetrModel, VitModel, bicubicResize, convMatrix, convTransposeMatrix, depthConfigFromHF, depthName, detrConfigFromHF, detrName, dinov2Positions, foldConvBn, clipPoolIndex, clipTextConfigFromHF, clipTextName, vitConfigFromHF, vitGrid, vitName, vitPatchK, type DepthAnythingConfig, type DetrConfig, type VitConfig, type VitEmbeddings } from "@kiln/models";
+import { ClipTextModel, DETR_IN_CHANNELS, DepthAnythingModel, ISNET_IN_CHANNELS, IsNetModel, SEGFORMER_IN_CHANNELS, SegformerModel, isnetConvs, segformerConfigFromHF, segformerName, type SegformerConfig, DetrModel, VitModel, bicubicResize, convMatrix, convTransposeMatrix, depthConfigFromHF, depthName, detrConfigFromHF, detrName, dinov2Positions, foldConvBn, clipPoolIndex, clipTextConfigFromHF, clipTextName, vitConfigFromHF, vitGrid, vitName, vitPatchK, type DepthAnythingConfig, type DetrConfig, type VitConfig, type VitEmbeddings } from "@kiln/models";
 import { ClipTokenizer, type ClipTokenizerJSON } from "@kiln/tokenizers";
 import { openBackend, openParsed } from "./load";
 import { loadWeights, type LoadProgress, type WeightFile } from "./weights";
@@ -142,6 +142,7 @@ export class VisionEngine {
     private readonly detr?: { cfg: DetrConfig; model: DetrModel },
     private readonly depthModel?: { cfg: DepthAnythingConfig; model: DepthAnythingModel },
     private readonly matte?: IsNetModel,
+    private readonly semantic?: { cfg: SegformerConfig; model: SegformerModel },
   ) {}
 
   get cfg(): VitConfig {
@@ -158,6 +159,10 @@ export class VisionEngine {
   summary(): { family: string; layers: number; hiddenSize: number; imageSize: number; labels: Record<number, string> } {
     const labels = (l: string[]) => Object.fromEntries(l.map((v, i) => [i, v]));
     if (this.matte) return { family: "rmbg", layers: 0, hiddenSize: 0, imageSize: 1024, labels: {} };
+    if (this.semantic) {
+      const c = this.semantic.cfg;
+      return { family: "segformer", layers: c.depths.reduce((a, b) => a + b, 0), hiddenSize: c.hidden[c.hidden.length - 1]!, imageSize: 512, labels: Object.fromEntries(c.labels.map((v, i) => [i, v])) };
+    }
     if (this.depthModel) {
       const c = this.depthModel.cfg;
       return { family: "depth_anything", layers: c.layers, hiddenSize: c.hidden, imageSize: c.imageSize, labels: {} };
@@ -304,6 +309,18 @@ export class VisionEngine {
    */
   async segment(img: RgbImage, options: ImageSegmentationOptions = {}): Promise<ImageSegment[]> {
     if (this.matte) return [{ score: null, label: null, mask: await this.matteMask(img) }];
+    if (this.semantic) {
+      // Semantic (SegFormer), as transformers.js: scores resized to the image, each pixel's best
+      // class, one mask per class present (in class order), no score.
+      const p = preprocessImage(img, this.processor);
+      const seg = await this.semantic.model.segment(p.data, p.width, p.height, img.width, img.height);
+      const present = new Set(seg);
+      return [...present].sort((a, b) => a - b).map((l) => {
+        const data = new Uint8Array(seg.length);
+        for (let i = 0; i < seg.length; i++) if (seg[i] === l) data[i] = 255;
+        return { score: null, label: this.semantic!.cfg.labels[l] ?? `LABEL_${l}`, mask: { width: img.width, height: img.height, channels: 1 as const, data } };
+      });
+    }
     if (!this.detr) throw new Error("this model does not segment images");
     const threshold = options.threshold ?? 0.5;
     const maskThreshold = options.mask_threshold ?? 0.5;
@@ -445,6 +462,7 @@ export class VisionEngine {
     this.detr?.model.destroy();
     this.depthModel?.model.destroy();
     this.matte?.destroy();
+    this.semantic?.model.destroy();
     this.clip?.text.destroy();
   }
 }
@@ -468,6 +486,7 @@ export async function createVision(modelId: string, opts: VisionLoadOptions = {}
   if (config!.model_type === "detr") return createDetr(modelId, ref, config!, prep, names, opts);
   if (config!.model_type === "depth_anything") return createDepth(modelId, ref, config!, prep, names, opts);
   if (((config!.architectures as string[] | undefined) ?? []).includes("BriaRMBG")) return createRmbg(modelId, ref, prep, names, opts);
+  if (config!.model_type === "segformer") return createSegformer(modelId, ref, config!, prep, names, opts);
   const cfg = vitConfigFromHF(config!);
   const clip = cfg.modelType === "clip";
   if (clip && config!.model_type !== "clip") throw new Error(`${modelId}: a CLIP vision tower alone; zero-shot classification needs the full CLIP model`);
@@ -883,6 +902,94 @@ async function createRmbg(
       opts.onProgress?.({ file: names.names[0]!, loaded: ++done, total: convs.length });
     }
     return new VisionEngine(backend, undefined, prep, {}, undefined, undefined, undefined, new IsNetModel(backend, weights));
+  } finally {
+    for (const s of sources) s.close?.();
+  }
+}
+
+/**
+ * SegFormer: matrices, biases and norms load as weights; the patch, sequence-reduction and depthwise
+ * convolutions are reshaped for their kernels; the decode head's fuse convolution is split by stage
+ * with its batch norm (eps 1e-5) folded in, and the classifier becomes a matrix.
+ */
+async function createSegformer(
+  modelId: string,
+  ref: ReturnType<typeof parseModelId>,
+  config: Record<string, unknown>,
+  prep: ImageProcessorConfig | undefined,
+  names: Awaited<ReturnType<typeof weightFiles>>,
+  opts: VisionLoadOptions,
+): Promise<VisionEngine> {
+  const cfg = segformerConfigFromHF(config);
+  if (!prep) throw new Error(`${modelId}: no preprocessor_config.json`);
+  const ep = opts.endpoint;
+  const backend = opts.backend ?? (await openBackend(opts.device ?? "auto", opts.cpuThreads));
+  const sources: ByteSource[] = [];
+  const located = new Map<string, { source: ByteSource; entry: TensorEntry }>();
+  try {
+    const files: WeightFile[] = [];
+    for (const name of names.names) {
+      const { source, header } = await openParsed(ref, name, ep, names.format === "safetensors" ? readSafetensorsHeader : readPytorchHeader);
+      sources.push(source);
+      for (const t of header.tensors) located.set(t.name, { source, entry: t });
+      files.push({ name, source, tensors: header.tensors.filter((t) => segformerName(t.name) !== undefined), rename: segformerName });
+    }
+    const need = async (name: string) => {
+      const t = located.get(name);
+      if (!t) throw new Error(`${modelId}: "${name}" is missing`);
+      const count = t.entry.shape.reduce((a, b) => a * b, 1);
+      return { shape: t.entry.shape, data: toF32(t.entry.type as Parameters<typeof toF32>[0], await t.source.read(t.entry.offset, t.entry.byteLength), count) };
+    };
+    const weights = await loadWeights(backend, files, opts.quant ?? "f32", opts.onProgress);
+    const upload = (name: string, shape: number[], data: Float32Array) => {
+      const buf = backend.alloc(data.byteLength, "storage", `segformer/${name}`);
+      backend.write(buf, 0, data);
+      weights.set(name, { shape, dtype: "f32", buf } as Tensor);
+    };
+    const conv = async (from: string, to: string, cp?: number) => {
+      const w = await need(`${from}.weight`);
+      const m = convMatrix(w.data, w.shape, cp);
+      upload(`${to}.weight`, [w.shape[0]!, m.K], m.w);
+      upload(`${to}.bias`, [w.shape[0]!], (await need(`${from}.bias`)).data);
+    };
+    const e = "segformer.encoder.";
+    for (let s = 0; s < cfg.hidden.length; s++) {
+      await conv(`${e}patch_embeddings.${s}.proj`, `s${s}.patch`, s === 0 ? SEGFORMER_IN_CHANNELS : undefined);
+      for (let j = 0; j < cfg.depths[s]!; j++) {
+        const b = `${e}block.${s}.${j}.`;
+        if (cfg.srRatios[s]! > 1) await conv(b + "attention.self.sr", `b${s}.${j}.sr`);
+        const dw = await need(b + "mlp.dwconv.dwconv.weight");
+        const C = dw.shape[0]!;
+        const w9 = new Float32Array(9 * C);
+        for (let c = 0; c < C; c++) for (let t = 0; t < 9; t++) w9[t * C + c] = dw.data[c * 9 + t]!;
+        upload(`b${s}.${j}.dw.weight`, [9, C], w9);
+        upload(`b${s}.${j}.dw.bias`, [C], (await need(b + "mlp.dwconv.dwconv.bias")).data);
+      }
+    }
+    // linear_fuse over the concatenation [stage n-1 … stage 0] of decoder-width maps, BN folded.
+    const d = "decode_head.";
+    const fuse = await need(d + "linear_fuse.weight");
+    const [O, Cin] = fuse.shape as [number, number];
+    const [g, beta, mean, variance] = await Promise.all(["weight", "bias", "running_mean", "running_var"].map((f) => need(`${d}batch_norm.${f}`)));
+    const parts = cfg.hidden.length;
+    const Cp = Cin / parts;
+    const bias = new Float32Array(O);
+    const scale = new Float32Array(O);
+    for (let o = 0; o < O; o++) {
+      scale[o] = Math.fround(g.data[o]! / Math.sqrt(variance.data[o]! + 1e-5));
+      bias[o] = beta.data[o]! - mean.data[o]! * scale[o]!;
+    }
+    for (let k = 0; k < parts; k++) {
+      const w = new Float32Array(O * Cp);
+      for (let o = 0; o < O; o++) for (let c = 0; c < Cp; c++) w[o * Cp + c] = fuse.data[o * Cin + k * Cp + c]! * scale[o]!;
+      upload(`dec.fuse.p${k}.weight`, [O, Cp], w);
+      upload(`dec.fuse.p${k}.bias`, [O], k === 0 ? bias : new Float32Array(O));
+    }
+    const cls = await need(d + "classifier.weight");
+    upload("dec.cls.weight", [cls.shape[0]!, cls.shape[1]!], cls.data);
+    upload("dec.cls.bias", [cls.shape[0]!], (await need(d + "classifier.bias")).data);
+    const model = new SegformerModel(backend, cfg, weights);
+    return new VisionEngine(backend, undefined, prep, {}, undefined, undefined, undefined, undefined, { cfg, model });
   } finally {
     for (const s of sources) s.close?.();
   }
