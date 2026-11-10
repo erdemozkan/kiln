@@ -15,3 +15,5 @@ export * from "./segformer";
 export * from "./swin2sr";
 export * from "./convnets";
 export * from "./vits";
+export * from "./hifigan";
+export * from "./speecht5";

@@ -7,7 +7,7 @@ import { UnsupportedModelError } from "./config";
  * "gpt2", the GPT-2 decoder with cross-attention of a VisionEncoderDecoder, whose "encoder" output
  * is given (an image model's hidden states).
  */
-export type Seq2SeqFamily = "bart" | "marian" | "m2m100" | "t5" | "whisper" | "gpt2";
+export type Seq2SeqFamily = "bart" | "marian" | "m2m100" | "t5" | "whisper" | "gpt2" | "speecht5";
 
 export interface Seq2SeqConfig {
   family: Seq2SeqFamily;
@@ -40,6 +40,8 @@ export interface Seq2SeqConfig {
   raw: Record<string, unknown>;
   /** Whisper: log-mel input of `frames` × `mels` through two convolutions to `frames / 2` positions. */
   audio?: { mels: number; frames: number };
+  /** SpeechT5: the encoder's clamped relative-position table ("enc.relpos" [2M, head dim]) reaches ±M. */
+  relativeMax?: number;
 }
 
 const num = (c: Record<string, unknown>, k: string): number => {
@@ -311,6 +313,8 @@ export class Seq2SeqModel {
   private readonly crossStep: Buf;
   private readonly tok: Buf;
   private readonly posBuf: Buf;
+  /** SpeechT5: the decoder's input vector for the step (its speech prenet's output). */
+  private readonly decIn: Buf | undefined;
   private readonly selfK: Buf[] = [];
   private readonly selfV: Buf[] = [];
   private readonly sampler: DecoderSampler;
@@ -332,13 +336,15 @@ export class Seq2SeqModel {
     for (const [d, h] of [[cfg.dModel, cfg.encHeads], [cfg.dModel, cfg.decHeads]] as const) {
       if (d % h) throw new UnsupportedModelError(`d_model ${d} is not divisible by ${h} heads`);
     }
-    this.maxTarget = Math.min(opts.maxTarget ?? cfg.maxPositions, cfg.maxPositions);
+    // SpeechT5's decoder positions come with its input vector, so its length is not the text limit.
+    this.maxTarget = cfg.family === "speecht5" ? (opts.maxTarget ?? cfg.maxPositions) : Math.min(opts.maxTarget ?? cfg.maxPositions, cfg.maxPositions);
     this.pool = new ActivationPool(backend, "seq2seq");
     this.decStep = backend.alloc(STEP_BYTES, "storage", "seq2seq/step");
     this.crossStep = backend.alloc(STEP_BYTES, "storage", "seq2seq/cross-step");
     // Every decoder row inside the span: all S encoder keys, whatever the decoding position.
     backend.write(this.crossStep, 0, packStep({ pos0: 0, lastRow: 0, seed: 0, temperature: 0, spanLo: 0, spanHi: 0x7fffffff }));
     this.tok = backend.alloc(16, "storage", "seq2seq/token");
+    this.decIn = cfg.family === "speecht5" ? backend.alloc(cfg.dModel * 4, "storage", "seq2seq/dec-in") : undefined;
     this.posBuf = backend.alloc(16, "storage", "seq2seq/pos");
     this.sampler = new DecoderSampler(backend, cfg.vocab);
     for (let l = 0; l < cfg.decLayers; l++) {
@@ -424,6 +430,11 @@ export class Seq2SeqModel {
       const p = `enc.l${l}`;
       x = this.block(ectx, x, `${p}.ln1`, (h) => {
         const q = this.lin(ectx, h, `${p}.q`);
+        if (c.relativeMax !== undefined) {
+          // SpeechT5: full attention plus a clamped relative-position bias.
+          const rel = this.w("enc.relpos");
+          return ops.relAttention(ectx, q, this.lin(ectx, h, `${p}.k`), this.lin(ectx, h, `${p}.v`), rel, rel, { heads: c.encHeads, window: c.relativeMax, scale: De ** -0.5, clamp: true });
+        }
         ops.kvWrite(ectx, this.lin(ectx, h, `${p}.k`), this.lin(ectx, h, `${p}.v`), kc, vc, S, S, "f32");
         return ops.attention(ectx, q, kc, vc, eshape);
       }, `${p}.o`);
@@ -442,7 +453,7 @@ export class Seq2SeqModel {
 
     // Decoder: one token at the step's position.
     const dctx = new Ctx(be, this.decStep, `seq2seq/dec S${S}`, this.pool);
-    let y = this.embed(dctx, "dec", this.tok, this.posBuf, 1);
+    let y = this.decIn ? ({ shape: [1, d], dtype: "f32", buf: this.decIn } as Tensor) : this.embed(dctx, "dec", this.tok, this.posBuf, 1);
     const Dd = d / c.decHeads;
     const self = { T: 1, H: c.decHeads, Hkv: c.decHeads, D: Dd, maxSeq: this.maxTarget, kv: "f32" as const, scale: Dd ** -0.5 };
     const cross = { T: 1, H: c.decHeads, Hkv: c.decHeads, D: Dd, maxSeq: S, kv: "f32" as const, scale: Dd ** -0.5, step: this.crossStep };
@@ -469,10 +480,16 @@ export class Seq2SeqModel {
       y = this.ffn(dctx, y, p);
     }
     if (c.preNorm) y = this.ln(dctx, y, "dec.lnF");
-    const head = this.weights.get("lm_head.weight") ?? this.w("shared.weight");
-    const logits = ops.linear(dctx, y, head, { bias: this.weights.get("flb") });
-    ops.sample(dctx, logits, this.sampler.out, this.sampler.seen, this.sampler.allowed);
-    ops.pickLogit(dctx, logits, this.sampler.out);
+    let logits: Tensor;
+    if (this.decIn) {
+      // SpeechT5: the caller reads the hidden state (its postnet maps it to frames and a stop logit).
+      logits = y;
+    } else {
+      const head = this.weights.get("lm_head.weight") ?? this.w("shared.weight");
+      logits = ops.linear(dctx, y, head, { bias: this.weights.get("flb") });
+      ops.sample(dctx, logits, this.sampler.out, this.sampler.seen, this.sampler.allowed);
+      ops.pickLogit(dctx, logits, this.sampler.out);
+    }
     const all = dctx.dispatches;
     const plain = all.filter((x) => x.label !== "attn_probs");
     return {
@@ -539,6 +556,18 @@ export class Seq2SeqModel {
     this.backend.write(pair.hidden!, 0, hidden);
     this.backend.submit(pair.enc.dispatches);
     this.current = pair;
+  }
+
+  /** SpeechT5: feeds the decoder's input vector [d_model] at position t; resolves to its last hidden state [d_model]. */
+  async stepHidden(input: Float32Array, t: number): Promise<Float32Array> {
+    const pair = this.current;
+    if (!pair || !this.decIn) throw new Error("seq2seq: encode a source first (with a SpeechT5 decoder)");
+    if (t >= this.maxTarget) throw new Error(`seq2seq: target longer than ${this.maxTarget} steps`);
+    const be = this.backend;
+    be.write(this.decIn, 0, input);
+    be.write(this.decStep, 0, packStep({ pos0: t, lastRow: 0, seed: 0, temperature: 0 }));
+    be.submit(pair.dec.dispatches);
+    return new Float32Array(await be.readback(physical(pair.dec.logits.buf), 0, this.cfg.dModel * 4));
   }
 
   /** Feeds the target token at position t (0 = the decoder start token); resolves to the next token's logits. */
@@ -641,6 +670,7 @@ export class Seq2SeqModel {
     this.pool.destroy();
     this.sampler.destroy();
     for (const b of [this.decStep, this.crossStep, this.tok, this.posBuf, ...this.selfK, ...this.selfV]) this.backend.free(b);
+    if (this.decIn) this.backend.free(this.decIn);
     if (this.align) this.backend.free(this.align);
   }
 }

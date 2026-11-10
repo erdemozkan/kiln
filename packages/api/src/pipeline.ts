@@ -85,6 +85,8 @@ export interface PipelineOptions extends Omit<LoadOptions, "device" | "onProgres
   /** Kiln's own spelling of `dtype`; wins over it. */
   quant?: LoadOptions["quant"];
   progress_callback?: (info: ProgressInfo) => void;
+  /** text-to-audio with SpeechT5: the vocoder repo (default "microsoft/speecht5_hifigan"). */
+  vocoder?: string;
 }
 
 /** Download progress in transformers.js's shape (`progress` in percent). */
@@ -576,8 +578,17 @@ export interface TextToAudioOptions {
   noise_scale_duration?: number;
   /** Faster above 1, slower below. */
   speaking_rate?: number;
-  /** Seed for repeatable output. */
+  /** Seed for repeatable output (VITS noise, SpeechT5 prenet dropout). */
   seed?: number;
+  /**
+   * SpeechT5: the speaker's x-vector (512 values), required — a Float32Array, a tensor-like
+   * `{ data }`, or the URL of a raw float32 file (as transformers.js takes it).
+   */
+  speaker_embeddings?: Float32Array | { data: Float32Array } | string | URL;
+  /** SpeechT5: stop once a step's stop probabilities sum to this (default 0.5). */
+  threshold?: number;
+  /** SpeechT5: the prenet dropout transformers keeps on at inference, "sample" (default) or "keep" (deterministic). */
+  prenet_dropout?: "sample" | "keep";
 }
 /** Speech: mono samples in −1…1 at `sampling_rate` Hz (transformers.js's RawAudio fields). */
 export interface TextToAudioResult {
@@ -697,16 +708,34 @@ export async function pipeline(task: PipelineTask, model?: string, options: Pipe
     return Object.assign(call, { task, model: m, info: m.info, tokenizer: {}, dispose: () => m.unload() });
   }
   if (t === "text-to-audio") {
-    const m = await KilnAudio.load(id, { quant: q, device: dev, cpuThreads, revision, endpoint, worker, onProgress: progress });
+    const m = await KilnAudio.load(id, { quant: q, device: dev, cpuThreads, revision, endpoint, worker, onProgress: progress, vocoder: options.vocoder });
     progress_callback?.({ status: "ready", task, model: id });
     if (m.info.head !== "tts") {
       await m.unload();
       throw new Error(`Kiln: ${id} is not a text-to-speech model`);
     }
+    const speakers = new Map<string, Float32Array>();
+    const resolve = async (opts: TextToAudioOptions = {}) => {
+      const e = opts.speaker_embeddings;
+      if (e === undefined || e instanceof Float32Array) return { ...opts };
+      if (typeof e === "string" || e instanceof URL) {
+        const url = typeof location !== "undefined" ? new URL(e, location.href).href : String(e);
+        let v = speakers.get(url);
+        if (!v) {
+          const r = await fetch(url);
+          if (!r.ok) throw new Error(`Kiln: speaker_embeddings ${url}: HTTP ${r.status}`);
+          v = new Float32Array(await r.arrayBuffer());
+          speakers.set(url, v);
+        }
+        return { ...opts, speaker_embeddings: v };
+      }
+      return { ...opts, speaker_embeddings: Float32Array.from(e.data) };
+    };
     const call = async (text: string | string[], opts?: TextToAudioOptions) => {
-      if (!Array.isArray(text)) return m.speak(text, { ...opts });
+      const o = await resolve(opts);
+      if (!Array.isArray(text)) return m.speak(text, o);
       const out: TextToAudioResult[] = [];
-      for (const s of text) out.push(await m.speak(s, { ...opts }));
+      for (const s of text) out.push(await m.speak(s, o));
       return out;
     };
     return Object.assign(call, { task, model: m, info: m.info, tokenizer: {}, dispose: () => m.unload() });

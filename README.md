@@ -528,6 +528,7 @@ K/V; each decoder step reads them through a step block whose span covers every p
 | CLIP tokenizer (`openai/clip-vit-base-patch32`) | transformers.js | the same ids for 8 texts (punctuation, accents, CJK, emoji, long words) |
 | ResNet-50 (`microsoft/resnet-50`), ConvNeXt (`facebook/convnext-tiny-224`) | transformers.js (`Xenova/*`, fp32) on the same pixel values | every uniquely labelled class within 1.7e-8 (ResNet) and 4.7e-7 (ConvNeXt); 337 / 374 ms end to end against 370 / 434 ms |
 | VITS text-to-speech (`facebook/mms-tts-eng`) | transformers.js (`Xenova/mms-tts-eng`, fp32), its two noise nodes set to zero, Kiln at zero noise | the same 33,024 samples, within 1.4e-4 (peak 0.87); 617 ms end to end against 1.33 s (WebGPU) |
+| SpeechT5 text-to-speech (`microsoft/speecht5_tts` + `microsoft/speecht5_hifigan`) | transformers.js (`Xenova/speecht5_tts`, fp32), its prenet dropout rewritten to keep every unit, Kiln with `prenet_dropout: "keep"` | the same ids; the same 122,880 samples, within 1e-5 over the first 80 frames, then drifting as frames feed back (mean difference 3.3e-4). With dropout: 1.9 s against 6.4 s (WebGPU) for "Hello, my dog is cute.", 3.6 s against 12.7 s for a 44-character sentence |
 | ViT + GPT-2 captioning (`nlpconnect/vit-gpt2-image-captioning`) | transformers.js (`Xenova/vit-gpt2-image-captioning`, fp32) on the same pixel values | the same caption on all three photos tried |
 | DINOv2 (`facebook/dinov2-small-imagenet1k-1-layer`) | transformers.js (`Xenova/dinov2-small-imagenet1k-1-layer`, fp32) on the same pixel values | within 6e-3: its export resizes position embeddings bilinearly, Python bicubically (Kiln); with its resize, within 3.2e-7. 383 ms end to end against 683 ms |
 | Swin2SR (`caidas/swin2SR-classical-sr-x2-64`) | transformers.js (`Xenova/swin2SR-classical-sr-x2-64`, fp32) on the same pixel values | 4 of 147,456 output bytes one level apart (128 × 96 → 256 × 192); 3.4 s end to end against 10.4 s |
@@ -778,6 +779,37 @@ cute." for three seeds, and the zero-noise speech as "Hello, my dog is cute." ex
 transformers.js sample came out as "Tellomide.is Qt.". Both pipelines end to end (median of five
 warm calls, backgrounded pane): 617 ms in Kiln on WebGPU against 1.33 s for transformers.js on
 WebGPU and 4.4 s on WASM.
+
+SpeechT5 (`microsoft/speecht5_tts`, with `microsoft/speecht5_hifigan` as the vocoder, or another
+repo through the `vocoder` load option) takes a speaker's x-vector as `speaker_embeddings`: 512
+float32 values, or the URL of a raw file of them, as in transformers.js's example:
+
+```js
+const tts = await pipeline("text-to-speech", "microsoft/speecht5_tts");
+const speaker = "https://huggingface.co/datasets/Xenova/transformers.js-docs/resolve/main/speaker_embeddings.bin";
+const { audio, sampling_rate } = await tts("Hello, my dog is cute.", { speaker_embeddings: speaker });
+```
+
+The pieces: the character tokenizer (SentencePiece CHAR model behind its NFKC charsmap; the same
+ids as transformers.js), the text encoder on the seq2seq code with a clamped relative-position
+bias (the relative-attention kernel's second mode), the speech decoder one step per two frames
+with its input vector written each step, the speech prenet and the stop and frame heads on the
+CPU, then the postnet (batch norms folded into its convolutions, tanh on the conv kernel) and the
+HiFi-GAN vocoder, the same builder VITS uses, on the GPU. Generation stops as transformers'
+Python does: when a step's two stop probabilities sum to `threshold` (0.5), or at 20 steps per
+two characters; transformers.js stops when either reaches it, which can end a step or so earlier.
+
+transformers keeps the prenet's dropout on at inference (p = 0.5), so SpeechT5's output also
+differs on every run; `seed` makes Kiln's repeatable. For the check, transformers.js's decoder
+(`Xenova/speecht5_tts`, fp32) had its four random nodes rewritten to keep every unit, and Kiln ran
+with `prenet_dropout: "keep"`. Without dropout the model never stops, so both ran to the limit
+(240 steps for "Hello, my dog is cute."). The first 80 frames match within 1e-5. After that the
+difference grows as each frame feeds the next, to a mean difference of 3.3e-4. With dropout,
+Whisper tiny.en heard Kiln's speech as "Hello, my dog is cute." for five seeds out of five, and
+"For quick brown fox jumps over the lazy dog." for the pangram; transformers.js's as "Hello, my
+dog is cute." and "the quick brown fox jumps over the lazy dog." End to end with a hidden pane:
+1.9 s in Kiln against 6.4 s for transformers.js (median of 3, its decoder and vocoder on WebGPU)
+for "Hello, my dog is cute.", and 3.6 s against 12.7 s for the pangram.
 
 T5's learned relative position bias is added to each score by the per-row attention kernels (GPU
 and CPU, buckets computed in the kernel; bucket function equal to transformers' over ±300

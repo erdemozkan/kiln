@@ -768,7 +768,7 @@ export const cpuBlockAttention: CpuKernel = (b) => {
   }
 };
 
-export function cpuConv2d(v: { relu: boolean; residual: boolean; reluIn?: boolean; leaky?: number; leakyIn?: number }): CpuKernel {
+export function cpuConv2d(v: { relu: boolean; residual: boolean; reluIn?: boolean; leaky?: number; leakyIn?: number; tanh?: boolean }): CpuKernel {
   const inAct = (a: number) => (v.leakyIn !== undefined ? (a > 0 ? a : a * Math.fround(v.leakyIn)) : v.reluIn ? Math.max(a, 0) : a);
   return (b) => {
     const [H, W, C, O, Ho, Wo, kh, kw, stride, pad, K, M] = Array.from(b[0]!.u32.subarray(0, 12)) as number[];
@@ -805,7 +805,7 @@ export function cpuConv2d(v: { relu: boolean; residual: boolean; reluIn?: boolea
       }
       for (let o = 0; o < O!; o++) {
         const val = acc[o]! + (res ? res[m * O! + o]! : 0);
-        y[m * O! + o] = v.leaky !== undefined ? (val > 0 ? val : val * Math.fround(v.leaky)) : v.relu ? Math.max(val, 0) : val;
+        y[m * O! + o] = v.tanh ? Math.tanh(val) : v.leaky !== undefined ? (val > 0 ? val : val * Math.fround(v.leaky)) : v.relu ? Math.max(val, 0) : val;
       }
     }
   };
@@ -1031,6 +1031,7 @@ export function cpuConvTranspose1d(leakyIn?: number): CpuKernel {
 export const cpuRelAttention: CpuKernel = (b) => {
   const [L, D, row, W] = Array.from(b[0]!.u32.subarray(0, 4)) as number[];
   const scale = b[0]!.f32[4]!;
+  const clamped = b[0]!.u32[5]! === 1;
   const [q, k, v, ek, ev, o] = [b[1]!.f32, b[2]!.f32, b[3]!.f32, b[4]!.f32, b[5]!.f32, b[6]!.f32];
   const H = row! / D!;
   const s = new Float64Array(L!);
@@ -1041,7 +1042,10 @@ export const cpuRelAttention: CpuKernel = (b) => {
       for (let j = 0; j < L!; j++) {
         let d0 = 0;
         for (let d = 0; d < D!; d++) d0 += q[qo + d]! * k[j * row! + h * D! + d]!;
-        if (Math.abs(j - i) <= W!) for (let d = 0; d < D!; d++) d0 += q[qo + d]! * ek[(j - i + W!) * D! + d]!;
+        if (clamped) {
+          const e = Math.min(Math.max(i - j, -W!), W! - 1) + W!;
+          for (let d = 0; d < D!; d++) d0 += q[qo + d]! * ek[e * D! + d]!;
+        } else if (Math.abs(j - i) <= W!) for (let d = 0; d < D!; d++) d0 += q[qo + d]! * ek[(j - i + W!) * D! + d]!;
         s[j] = d0 * scale;
         m = Math.max(m, s[j]!);
       }
@@ -1050,7 +1054,7 @@ export const cpuRelAttention: CpuKernel = (b) => {
       for (let d = 0; d < D!; d++) {
         let acc = 0;
         for (let j = 0; j < L!; j++) acc += s[j]! * v[j * row! + h * D! + d]!;
-        for (let j = Math.max(i - W!, 0); j <= Math.min(i + W!, L! - 1); j++) acc += s[j]! * ev[(j - i + W!) * D! + d]!;
+        if (!clamped) for (let j = Math.max(i - W!, 0); j <= Math.min(i + W!, L! - 1); j++) acc += s[j]! * ev[(j - i + W!) * D! + d]!;
         o[qo + d] = acc / z;
       }
     }

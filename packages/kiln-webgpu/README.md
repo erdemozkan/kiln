@@ -180,6 +180,10 @@ await captioner("cats.jpg"); // [{ generated_text: "a cat laying on a blanket ne
 const tts = await pipeline("text-to-speech"); // facebook/mms-tts-eng
 const { audio, sampling_rate } = await tts("Hello, my dog is cute.", { seed: 1 });
 
+// SpeechT5: a voice from a speaker x-vector (512 float32 values or their URL).
+const t5 = await pipeline("text-to-speech", "microsoft/speecht5_tts");
+const speech = await t5("Hello, my dog is cute.", { speaker_embeddings: "https://huggingface.co/datasets/Xenova/transformers.js-docs/resolve/main/speaker_embeddings.bin" });
+
 // Swin2SR: 2× super-resolution.
 const upscaler = await pipeline("image-to-image"); // caidas/swin2SR-classical-sr-x2-64
 const big = await upscaler("small.png"); // { width: 2 × w, height: 2 × h, channels: 3, data }

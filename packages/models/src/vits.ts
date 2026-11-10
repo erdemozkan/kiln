@@ -1,6 +1,7 @@
 import { ActivationPool, Ctx, STEP_BYTES, packStep, physical, type Backend, type Buf, type Dispatch, type Tensor } from "@kiln/core";
 import { ops } from "@kiln/kernels";
 import { UnsupportedModelError } from "./config";
+import { hifiGan } from "./hifigan";
 
 /** VITS (VitsConfig: MMS-TTS and the original VITS checkpoints). */
 export interface VitsConfig {
@@ -405,27 +406,7 @@ export class VitsModel {
       x = flipped;
     }
     // HiFi-GAN.
-    let h = this.conv1d(ctx, x, "dec.pre", 7);
-    c.upsampleRates.forEach((s, i) => {
-      const k = c.upsampleKernels[i]!;
-      h = ops.convTranspose1d(ctx, h, this.w(`dec.up${i}.weight`), this.w(`dec.up${i}.bias`), { s, pad: (k - s) / 2, leakyIn: c.leakySlope });
-      const nk = c.resblockKernels.length;
-      const sum = ctx.alloc(h.shape);
-      c.resblockKernels.forEach((kr, r) => {
-        const p = `dec.rb${i * nk + r}`;
-        let y = h;
-        c.resblockDilations[r]!.forEach((d, j) => {
-          const t = this.conv1d(ctx, y, `${p}.c1_${j}`, kr, { dil: d, leakyIn: c.leakySlope });
-          y = this.conv1d(ctx, t, `${p}.c2_${j}`, kr, { leakyIn: c.leakySlope, residual: y });
-        });
-        if (r === 0) ops.scaleAdd(ctx, sum, y, 1, false);
-        else ops.addInPlace(ctx, sum, y);
-      });
-      const avg = ctx.alloc(h.shape);
-      ops.scaleAdd(ctx, avg, sum, 1 / nk, false);
-      h = avg;
-    });
-    const out = this.conv1d(ctx, h, "dec.post", 7, { leakyIn: 0.01 });
+    const out = hifiGan(ctx, (n) => this.w(n), c, x, "dec");
     return { dispatches: ctx.dispatches, input, out, ctx };
   }
 

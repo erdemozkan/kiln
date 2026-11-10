@@ -93,9 +93,14 @@ export interface Seq2SeqInfo {
 /** Tasks of speech encoders on raw audio (wav2vec2, HuBERT). */
 export type AudioTask = "automatic-speech-recognition" | "audio-classification" | "text-to-audio";
 
+/** Load options of a speech model; `vocoder` picks SpeechT5's vocoder repo (default microsoft/speecht5_hifigan). */
+export interface WireAudioOptions extends WireEncoderOptions {
+  vocoder?: string;
+}
+
 export interface AudioInfo {
   model: string;
-  /** "wav2vec2" or "hubert". */
+  /** "wav2vec2", "hubert", "vits" or "speecht5". */
   family: string;
   /** "ctc" (speech recognition), "classification", or "tts" (text-to-speech). */
   head: "ctc" | "classification" | "tts";
@@ -140,7 +145,7 @@ export type Request =
   | { id: number; type: "load"; model: string; opts: WireLoadOptions }
   | { id: number; type: "loadEncoder"; model: string; opts: WireEncoderOptions }
   | { id: number; type: "loadSeq2Seq"; model: string; opts: WireSeq2SeqOptions }
-  | { id: number; type: "loadAudio"; model: string; opts: WireEncoderOptions }
+  | { id: number; type: "loadAudio"; model: string; opts: WireAudioOptions }
   | { id: number; type: "task"; task: EncoderTask | Seq2SeqTask; args: unknown[] }
   | { id: number; type: "audioTask"; task: AudioTask; args: unknown[] }
   | { id: number; type: "loadVision"; model: string; opts: WireEncoderOptions }

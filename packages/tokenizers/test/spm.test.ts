@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { encoderTokenizerFromJSON, marianTokenizer, parseSentencePieceModel, type SentencePieceTokenizer } from "../src";
+import { CharTokenizer, encoderTokenizerFromJSON, marianTokenizer, parseSentencePieceModel, type SentencePieceTokenizer } from "../src";
 
 const S = "▁";
 const post = {
@@ -54,7 +54,7 @@ describe("SentencePiece BPE (NLLB-style)", () => {
 });
 
 /** A SentencePiece ModelProto: pieces (field 1) and trainer_spec.model_type = UNIGRAM (field 2.3). */
-function spmBytes(pieces: [string, number, number][]): Uint8Array {
+function spmBytes(pieces: [string, number, number][], modelType = 1): Uint8Array {
   const out: number[] = [];
   const varint = (v: number) => {
     while (v > 0x7f) {
@@ -70,7 +70,7 @@ function spmBytes(pieces: [string, number, number][]): Uint8Array {
     varint(msg.length);
     out.push(...msg);
   }
-  out.push(0x12, 2, 0x18, 1);
+  out.push(0x12, 2, 0x18, modelType);
   return Uint8Array.from(out);
 }
 
@@ -82,5 +82,15 @@ describe("Marian (.spm + vocab.json)", () => {
     const t = marianTokenizer(spm, vocab);
     expect(t.encode("Hallo Welt").ids).toEqual([9, 7, 0]);
     expect(t.decode([9, 7, 0])).toBe("Hallo Welt");
+  });
+});
+
+describe("character SentencePiece (SpeechT5)", () => {
+  it("maps characters to ids after the dummy prefix, collapses spaces, appends </s>", () => {
+    const spm = spmBytes([["<s>", 0, 3], ["<pad>", 0, 3], ["</s>", 0, 3], ["<unk>", 0, 2], [S, 0, 1], ["H", 0, 1], ["i", 0, 1], ["!", 0, 1]], 4);
+    const t = new CharTokenizer(spm);
+    expect(t.encode("Hi  Hi!")).toEqual([4, 5, 6, 4, 5, 6, 7, 2]);
+    expect(t.encode(" Hi?")).toEqual([4, 5, 6, 3, 2]);
+    expect(() => new CharTokenizer(spmBytes([["<unk>", 0, 2]], 1))).toThrow(/not a character model/);
   });
 });

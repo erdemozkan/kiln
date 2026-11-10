@@ -503,7 +503,7 @@ export function conv2d(
   x: Tensor,
   w: Tensor,
   bias: Tensor,
-  o: { H: number; W: number; k: number; kh?: number; stride: number; pad: number; padH?: number; relu?: boolean; reluIn?: boolean; leaky?: number; leakyIn?: number; residual?: Tensor; n?: number; dilation?: number },
+  o: { H: number; W: number; k: number; kh?: number; stride: number; pad: number; padH?: number; relu?: boolean; reluIn?: boolean; leaky?: number; leakyIn?: number; tanh?: boolean; residual?: Tensor; n?: number; dilation?: number },
 ): { y: Tensor; H: number; W: number } {
   const C = lastDim(x);
   const [O, K] = w.shape as [number, number];
@@ -523,11 +523,11 @@ export function conv2d(
   const bufs = [params, x.buf, w.buf, bias.buf];
   if (o.residual) bufs.push(o.residual.buf);
   bufs.push(y.buf);
-  if (O <= 4 && !o.reluIn && o.leaky === undefined) {
+  if (O <= 4 && !o.reluIn && o.leaky === undefined && !o.tanh) {
     ctx.run(conv2dNarrowSpec({ relu: !!o.relu, residual: !!o.residual, leakyIn: o.leakyIn }), bufs, grid1d(M), `conv2d narrow ${kh}x${o.k}/${o.stride} ${C}→${O}`);
     return { y, H: Ho, W: Wo };
   }
-  ctx.run(conv2dSpec({ relu: !!o.relu, residual: !!o.residual, reluIn: !!o.reluIn, leaky: o.leaky, leakyIn: o.leakyIn }), bufs, [Math.min(groups, MM_SLICE), Math.ceil(M / 64), Math.ceil(groups / MM_SLICE)], `conv2d ${kh}x${o.k}/${o.stride} ${C}→${O}`);
+  ctx.run(conv2dSpec({ relu: !!o.relu, residual: !!o.residual, reluIn: !!o.reluIn, leaky: o.leaky, leakyIn: o.leakyIn, tanh: o.tanh }), bufs, [Math.min(groups, MM_SLICE), Math.ceil(M / 64), Math.ceil(groups / MM_SLICE)], `conv2d ${kh}x${o.k}/${o.stride} ${C}→${O}`);
   return { y, H: Ho, W: Wo };
 }
 
@@ -579,12 +579,12 @@ export function convTranspose1d(ctx: Ctx, x: Tensor, w: Tensor, bias: Tensor, o:
 }
 
 /** Self-attention with windowed relative position tables eK, eV [2W + 1, D] (see relAttentionSpec): q, k, v [L, H·D] → [L, H·D]. */
-export function relAttention(ctx: Ctx, q: Tensor, k: Tensor, v: Tensor, ek: Tensor, ev: Tensor, o: { heads: number; window: number; scale: number }): Tensor {
+export function relAttention(ctx: Ctx, q: Tensor, k: Tensor, v: Tensor, ek: Tensor, ev: Tensor, o: { heads: number; window: number; scale: number; clamp?: boolean }): Tensor {
   const row = lastDim(q);
   const L = numel(q.shape) / row;
   if (L > 2048) throw new Error(`relAttention: at most 2048 positions, got ${L}`);
   const out = ctx.alloc([L, row]);
-  const params = ctx.uniform([u32(L), u32(row / o.heads), u32(row), u32(o.window), f32(o.scale), u32(0), u32(0), u32(0)]);
+  const params = ctx.uniform([u32(L), u32(row / o.heads), u32(row), u32(o.window), f32(o.scale), u32(o.clamp ? 1 : 0), u32(0), u32(0)]);
   ctx.run(relAttentionSpec(), [params, q.buf, k.buf, v.buf, ek.buf, ev.buf, out.buf], [o.heads, L, 1]);
   return out;
 }

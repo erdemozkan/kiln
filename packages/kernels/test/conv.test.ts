@@ -646,4 +646,26 @@ describe("image convolution kernels (CPU)", () => {
     for (let t = 0; t < T; t++)
       for (let j = 0; j < 5; j++) expect(y[t * 5 + j]).toBeCloseTo(base[t * 5 + j]! + (j >= 1 && j < 4 ? src[t * 6 + 2 + (2 - (j - 1))]! : 0), 6);
   });
+
+  it("relAttention with clamp adds SpeechT5's relative bias q_i · pe_k[clamp(i − j) + M] and no value term", async () => {
+    const [L, H, D, M] = [6, 2, 4, 2];
+    const row = H * D;
+    const q = randn(L * row), k = randn(L * row), v = randn(L * row);
+    const pk = randn(2 * M * D);
+    const scale = D ** -0.5;
+    const y = await run((ctx) => ops.relAttention(ctx, upload(q, [L, row]), upload(k, [L, row]), upload(v, [L, row]), upload(pk, [2 * M, D]), upload(pk, [2 * M, D]), { heads: H, window: M, scale, clamp: true }), L * row);
+    for (let h = 0; h < H; h++)
+      for (let i = 0; i < L; i++) {
+        const s = Array.from({ length: L }, (_, j) => {
+          const e = Math.min(Math.max(i - j, -M), M - 1) + M;
+          let d0 = 0;
+          for (let d = 0; d < D; d++) d0 += q[i * row + h * D + d]! * scale * (k[j * row + h * D + d]! + pk[e * D + d]!);
+          return d0;
+        });
+        const m = Math.max(...s);
+        const e = s.map((x) => Math.exp(x - m));
+        const z = e.reduce((a, b) => a + b, 0);
+        for (let d = 0; d < D; d++) expect(y[i * row + h * D + d]).toBeCloseTo(e.reduce((a, p, j) => a + p * v[j * row + h * D + d]!, 0) / z, 5);
+      }
+  });
 });

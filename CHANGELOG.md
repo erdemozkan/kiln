@@ -84,7 +84,12 @@ from the image's hidden states, greedy decoding on the GPU). Text-to-speech (`te
 `text-to-audio`): VITS / MMS-TTS with VitsTokenizer, the stochastic duration predictor on the CPU,
 the flow and HiFi-GAN vocoder on the GPU (relative attention, transposed 1-D convolution, gated
 tanh and column-copy kernels; the conv kernel takes 1-D shapes and LeakyReLU on its input);
-`seed`, `noise_scale`, `noise_scale_duration`, `speaking_rate`.
+`seed`, `noise_scale`, `noise_scale_duration`, `speaking_rate`. SpeechT5 text-to-speech (`microsoft/speecht5_tts` with
+the `microsoft/speecht5_hifigan` vocoder, or `vocoder`): `speaker_embeddings` (a Float32Array or a
+URL), the character SentencePiece tokenizer, the encoder on the seq2seq code with a clamped
+relative-position bias, the speech prenet on the CPU with its always-on dropout (`seed`, or
+`prenet_dropout: "keep"`), Python's stop rule (`threshold`), the postnet with folded batch norm and
+a tanh epilogue on the conv kernel, and the HiFi-GAN builder shared with VITS.
 
 **Loading.** Reads ahead of a download in progress are fetched on their own instead of waiting
 (a `pytorch_model.bin` keeps its zip directory at the end, so large checkpoints showed no progress

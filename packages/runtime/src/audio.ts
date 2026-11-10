@@ -6,7 +6,7 @@ import { Wav2Vec2Model, wav2vec2ConfigFromHF, wav2vec2Name, type Wav2Vec2Config 
 import { ctcTokenizer, type CtcTokenizer } from "@kiln/tokenizers";
 import { openBackend, openParsed } from "./load";
 import { loadWeights, type LoadProgress, type WeightFile } from "./weights";
-import { createTts, type TtsEngine } from "./tts";
+import { createSpeechT5, createTts, type SpeechT5LoadOptions, type TtsEngine } from "./tts";
 
 export interface AudioLoadOptions {
   /** Matrix storage: "f32" (default), "q8" or "q4". */
@@ -154,7 +154,7 @@ export function convRows(shape: readonly number[], raw: Float32Array): { data: F
 }
 
 /** Loads a wav2vec2 / HuBERT model with a CTC or sequence-classification head. */
-export async function createAudio(modelId: string, opts: AudioLoadOptions = {}): Promise<AudioEngine | TtsEngine> {
+export async function createAudio(modelId: string, opts: AudioLoadOptions & Pick<SpeechT5LoadOptions, "vocoder" | "maxSteps"> = {}): Promise<AudioEngine | TtsEngine> {
   const ref = parseModelId(modelId, opts.revision);
   if (ref.gguf) throw new Error("speech models load from safetensors or PyTorch repos, not GGUF files");
   const ep = opts.endpoint;
@@ -174,6 +174,7 @@ export async function createAudio(modelId: string, opts: AudioLoadOptions = {}):
   ]);
   // Text-to-speech models share the speech channel.
   if (config!.model_type === "vits") return createTts(modelId, ref, config!, names, opts);
+  if (config!.model_type === "speecht5") return createSpeechT5(modelId, ref, config!, names, opts);
   const cfg = wav2vec2ConfigFromHF(config!);
   const arch = cfg.architectures.join(" ");
   const classify = /ForSequenceClassification|ForAudioClassification/.test(arch);

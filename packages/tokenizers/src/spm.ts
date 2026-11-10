@@ -384,3 +384,41 @@ export function marianTokenizer(spm: Uint8Array, vocab: Record<string, number>, 
   for (const [p, id] of Object.entries(vocab)) if (!tok.token(id)) (tok as unknown as { idTo: string[] }).idTo[id] = p;
   return tok;
 }
+
+/**
+ * A character-model SentencePiece tokenizer (model_type CHAR, SpeechT5's spm_char.model): the text
+ * normalized with the model's character map, whitespace runs collapsed and trimmed, a "▁" prepended
+ * and spaces as "▁", then one piece per character (unknown characters as `<unk>`), and `</s>` appended.
+ */
+export class CharTokenizer {
+  private readonly ids = new Map<string, number>();
+  private readonly charsmap: PrecompiledCharsMap | undefined;
+  private readonly unk: number;
+  private readonly eos: number;
+
+  constructor(
+    spm: Uint8Array,
+    private readonly addEos = true,
+  ) {
+    const m = parseSentencePieceModel(spm);
+    if (m.modelType !== 4) throw new Error(`SentencePiece model type ${m.modelType} is not a character model`);
+    m.pieces.forEach((p, i) => this.ids.set(p.piece, i));
+    this.charsmap = m.charsmap?.length ? new PrecompiledCharsMap(m.charsmap) : undefined;
+    this.unk = this.ids.get("<unk>") ?? 3;
+    this.eos = this.ids.get("</s>") ?? 2;
+    this.addDummyPrefix = m.addDummyPrefix;
+    this.removeExtraWhitespaces = m.removeExtraWhitespaces;
+  }
+
+  private readonly addDummyPrefix: boolean;
+  private readonly removeExtraWhitespaces: boolean;
+
+  encode(text: string): number[] {
+    let s = this.charsmap ? this.charsmap.normalize(text) : text;
+    if (this.removeExtraWhitespaces) s = s.replace(/ +/g, " ").trim();
+    if (this.addDummyPrefix) s = " " + s;
+    const out = Array.from(s.replace(/ /g, "▁"), (ch) => this.ids.get(ch) ?? this.unk);
+    if (this.addEos) out.push(this.eos);
+    return out;
+  }
+}

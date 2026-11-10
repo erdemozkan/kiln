@@ -213,7 +213,7 @@ scope.onmessage = async (e: MessageEvent<Request>) => {
           type: "audioLoaded",
           info:
             a instanceof TtsEngine
-              ? { model: msg.model, family: "vits", head: "tts", layers: a.cfg.layers, hiddenSize: a.cfg.hidden, backend: a.backend.name, cpuThreads: a.backend.name === "cpu" ? (a.backend as { threads?: number }).threads : undefined }
+              ? { model: msg.model, family: a.info.family, head: "tts", layers: a.info.layers, hiddenSize: a.info.hidden, backend: a.backend.name, cpuThreads: a.backend.name === "cpu" ? (a.backend as { threads?: number }).threads : undefined }
               : {
                   model: msg.model,
                   family: a.cfg.modelType,

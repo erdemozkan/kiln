@@ -1926,12 +1926,12 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid:
  * N images ([N·H·W, C] → [N·Ho·Wo, O]) runs as one GEMM of N·Ho·Wo rows. Taps are `dil` pixels apart
  * (dilated convolution).
  */
-export function conv2dSpec(v: { relu: boolean; residual: boolean; reluIn?: boolean; leaky?: number; leakyIn?: number }): KernelSpec {
+export function conv2dSpec(v: { relu: boolean; residual: boolean; reluIn?: boolean; leaky?: number; leakyIn?: number; tanh?: boolean }): KernelSpec {
   const R8 = [0, 1, 2, 3, 4, 5, 6, 7];
   const bindings: BindingKind[] = ["uniform", "read", "read", "read"];
   if (v.residual) bindings.push("read");
   bindings.push("rw");
-  const out = (val: string) => (v.leaky !== undefined ? `leaky(${val})` : v.relu ? `max(${val}, 0.0)` : val);
+  const out = (val: string) => (v.tanh ? `tanh(clamp(${val}, -20.0, 20.0))` : v.leaky !== undefined ? `leaky(${val})` : v.relu ? `max(${val}, 0.0)` : val);
   const load = v.leakyIn !== undefined ? "leakyIn(x[at])" : v.reluIn ? "max(x[at], vec4<f32>(0.0))" : "x[at]";
   const store = R8.map(
     (i) => `  if (m0 + tm * 8u + ${i}u < p.M) {
@@ -1939,7 +1939,7 @@ export function conv2dSpec(v: { relu: boolean; residual: boolean; reluIn?: boole
 ${[0, 1, 2, 3].map((j) => `    if (n0 + tn * 4u + ${j}u < p.O) { let n = n0 + tn * 4u + ${j}u; y[m * p.O + n] = ${out(`acc${i}[${j}] + bias[n]${v.residual ? " + res[m * p.O + n]" : ""}`)}; }`).join("\n")}
   }`,
   ).join("\n");
-  const key = `conv2d${v.reluIn ? "/relu-in" : ""}${v.leakyIn !== undefined ? `/leaky-in${v.leakyIn}` : ""}${v.relu ? "/relu" : ""}${v.leaky !== undefined ? `/leaky${v.leaky}` : ""}${v.residual ? "/res" : ""}`;
+  const key = `conv2d${v.reluIn ? "/relu-in" : ""}${v.leakyIn !== undefined ? `/leaky-in${v.leakyIn}` : ""}${v.relu ? "/relu" : ""}${v.leaky !== undefined ? `/leaky${v.leaky}` : ""}${v.tanh ? "/tanh" : ""}${v.residual ? "/res" : ""}`;
   return spec(key, bindings, cpu.cpuConv2d(v), () => /* wgsl */ `
 struct P { H: u32, W: u32, C: u32, O: u32, Ho: u32, Wo: u32, kh: u32, kw: u32, stride: u32, pad: u32, K: u32, M: u32, N: u32, dil: u32, padH: u32, _d: u32 }
 @group(0) @binding(0) var<uniform> p: P;
@@ -2486,11 +2486,13 @@ fn main(${EW_ARGS}) {
  * Self-attention with windowed relative positions (VITS / Glow-TTS): q, k, v [L, H·D] → [L, H·D],
  * scores scale · (q_i · k_j + q_i · eK[j − i + W]) and the output Σ p_ij (v_j + eV[j − i + W]),
  * where the relative tables eK, eV [2W + 1, D] (shared by the heads) count only for |j − i| ≤ W.
- * One workgroup per (head, row); the row's scores are kept in workgroup memory (L ≤ 2048).
+ * With `clamp` set (SpeechT5) the bias is q_i · eK[clamp(i − j, −W, W − 1) + W] for every pair
+ * (eK [2W, D]) and there is no value term. One workgroup per (head, row); the row's scores are kept
+ * in workgroup memory (L ≤ 2048).
  */
 export function relAttentionSpec(): KernelSpec {
   return spec("rel_attention", ["uniform", "read", "read", "read", "read", "read", "rw"], cpu.cpuRelAttention, () => /* wgsl */ `
-struct P { L: u32, D: u32, row: u32, W: u32, scale: f32, _a: u32, _b: u32, _c: u32 }
+struct P { L: u32, D: u32, row: u32, W: u32, scale: f32, clamp: u32, _b: u32, _c: u32 }
 @group(0) @binding(0) var<uniform> p: P;
 @group(0) @binding(1) var<storage, read> q: array<f32>;
 @group(0) @binding(2) var<storage, read> k: array<f32>;
@@ -2511,8 +2513,8 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
     var s = 0.0;
     for (var d = 0u; d < p.D; d++) { s += q[qo + d] * k[j * p.row + h * p.D + d]; }
     let rel = i32(j) - i32(i);
-    if (abs(rel) <= i32(p.W)) {
-      let e = u32(rel + i32(p.W)) * p.D;
+    if (p.clamp == 1u || abs(rel) <= i32(p.W)) {
+      let e = select(u32(rel + i32(p.W)), u32(clamp(-rel, -i32(p.W), i32(p.W) - 1) + i32(p.W)), p.clamp == 1u) * p.D;
       var r = 0.0;
       for (var d = 0u; d < p.D; d++) { r += q[qo + d] * ek[e + d]; }
       s += r;
@@ -2543,7 +2545,9 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
   for (var d = li; d < p.D; d += 64u) {
     var acc = 0.0;
     for (var j = 0u; j < p.L; j++) { acc += sc[j] * v[j * p.row + h * p.D + d]; }
-    for (var j = lo; j <= hi; j++) { acc += sc[j] * ev[(j + p.W - i) * p.D + d]; }
+    if (p.clamp == 0u) {
+      for (var j = lo; j <= hi; j++) { acc += sc[j] * ev[(j + p.W - i) * p.D + d]; }
+    }
     o[qo + d] = acc * inv;
   }
 }`);
