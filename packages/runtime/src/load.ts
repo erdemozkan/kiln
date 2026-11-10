@@ -30,6 +30,10 @@ import {
   idefics3Processing,
   idefics3TextName,
   idefics3VisionName,
+  gemma3VisionName,
+  visionConfigFromGemma3,
+  type Idefics3Processing,
+  type VisionConfig,
   multimodalTextName,
   patchK,
   patchOrder,
@@ -90,6 +94,11 @@ export interface LoadOptions {
   /** Longest GPU work in one submit, in estimated ms (default 50; see `Engine.maxSubmitMs`). */
   maxSubmitMs?: number;
   /**
+   * Gemma 3 from a transformers checkpoint (4B and larger): false skips the vision tower in the same
+   * files (about 420 MB at q8), for text alone. Default: loaded, so chat messages may hold images.
+   */
+  vision?: boolean;
+  /**
    * Gemma 3's vision tower, as llama.cpp's mmproj GGUF: a file name in the model's repo
    * ("mmproj-F16.gguf") or a full id ("org/repo/mmproj.gguf"). Chat messages may then hold images.
    */
@@ -117,7 +126,7 @@ export async function createEngine(modelId: string, opts: LoadOptions = {}): Pro
   const quant = opts.quant ?? "auto";
   ops.setMatmulF16(!!opts.f16Math && backend.limits.features.has("shader-f16"));
   ops.setSubgroups(!!opts.subgroups);
-  const { cfg, tokenizer, files, idefics3 } = ref.gguf ? await openGGUF(ref, opts.endpoint) : await openSafetensors(ref, opts.endpoint);
+  const { cfg, tokenizer, files, idefics3, gemma3 } = ref.gguf ? await openGGUF(ref, opts.endpoint) : await openSafetensors(ref, opts.endpoint);
   try {
     const tuning =
       opts.tune === false || backend.name === "cpu"
@@ -131,7 +140,9 @@ export async function createEngine(modelId: string, opts: LoadOptions = {}): Pro
       ? await openIdefics3Vision(backend, files, idefics3, opts)
       : opts.mmproj
         ? await openVision(backend, opts.mmproj.split("/").length >= 3 ? parseModelId(opts.mmproj, opts.revision) : { ...ref, gguf: opts.mmproj }, opts)
-        : undefined;
+        : gemma3 && opts.vision !== false
+          ? await openGemma3Vision(backend, files, gemma3, opts)
+          : undefined;
     if (vision && vision.cfg.projectionDim !== cfg.hiddenSize) throw new Error(`mmproj projects to ${vision.cfg.projectionDim}, but the model is ${cfg.hiddenSize} wide`);
     await tuning;
     const imageTokens = vision ? (opts.imageSlots ?? 4) * vision.tokensPerImage : 0;
@@ -241,27 +252,63 @@ interface Idefics3Files {
 
 /**
  * SmolVLM's (Idefics3's) vision tower and connector from the checkpoint's safetensors, under mmproj
- * names: matmul weights as q8 (f32 with `quant: "f32"`), the rest f32; the patch convolution read as
- * a [hidden, 3·p·p] matrix padded to `patchK` columns and the position embeddings put in `patchOrder`.
+ * names (see openTower).
  */
 async function openIdefics3Vision(backend: Backend, files: WeightFile[], info: Idefics3Files, opts: LoadOptions): Promise<VisionTower> {
   const cfg = visionConfigFromIdefics3(info.config, info.preprocessor);
   const processing = idefics3Processing(info.config, info.preprocessor, cfg);
   if (opts.imageSplitting !== undefined) processing.split = opts.imageSplitting;
+  return openTower(backend, files, cfg, idefics3VisionName, opts, [], async () => {}, processing);
+}
+
+/**
+ * Gemma 3's vision tower and projector from a transformers checkpoint's safetensors (no mmproj
+ * needed): the tower as openTower loads it; the projection, stored [hidden, text width] (x @ W),
+ * transposed for the kernels, and the soft-embedding norm stored as 1 + w as the mmproj GGUF does.
+ */
+async function openGemma3Vision(backend: Backend, files: WeightFile[], info: Idefics3Files, opts: LoadOptions): Promise<VisionTower> {
+  const cfg = visionConfigFromGemma3(info.config, info.preprocessor);
+  return openTower(backend, files, cfg, gemma3VisionName, opts, ["mm.input_projection.weight", "mm.soft_emb_norm.weight"], async (read, upload, weights) => {
+    const proj = await read("mm.input_projection.weight");
+    const t = new Float32Array(proj.length);
+    for (let i = 0; i < cfg.hidden; i++) for (let j = 0; j < cfg.projectionDim; j++) t[j * cfg.hidden + i] = proj[i * cfg.projectionDim + j]!;
+    weights.set("mm.input_projection.weight", upload(t, [cfg.projectionDim, cfg.hidden]));
+    const norm = await read("mm.soft_emb_norm.weight");
+    addOne(norm);
+    weights.set("mm.soft_emb_norm.weight", upload(norm, [norm.length]));
+  });
+}
+
+/**
+ * A SigLIP vision tower from safetensors under mmproj names (`nameOf`): matmul weights as q8 (f32
+ * with `quant: "f32"`), the rest f32; an MLP width that is not a multiple of 32 padded; the patch
+ * convolution read as a [hidden, 3·p·p] matrix padded to `patchK` columns and the position
+ * embeddings put in `patchOrder`. Names in `extra` are left to `finish`.
+ */
+async function openTower(
+  backend: Backend,
+  files: WeightFile[],
+  cfg: VisionConfig,
+  nameOf: (name: string) => string | undefined,
+  opts: LoadOptions,
+  extra: string[],
+  finish: (read: (name: string) => Promise<Float32Array>, upload: (values: Float32Array, shape: number[]) => Tensor, weights: Map<string, Tensor>) => Promise<void>,
+  processing?: Idefics3Processing,
+): Promise<VisionTower> {
   const quant = opts.quant === "f32" ? "f32" : "q8";
   const linear = /^(v\.blk\.\d+\.(attn_[qkv]|attn_out|ffn_up|ffn_down)|mm\.input_projection)\.weight$/;
   const mlp = /^v\.blk\.\d+\.ffn_(up\.(weight|bias)|down\.weight)$/;
-  const manual = new Set(["v.patch_embd.weight", "v.position_embd.weight"]);
+  const manual = new Set(["v.patch_embd.weight", "v.position_embd.weight", ...extra]);
   const pad = cfg.intermediate % 32 !== 0;
   const only = (keep: (n: string) => boolean) => (name: string) => {
-    const n = idefics3VisionName(name);
+    const n = nameOf(name);
     return n && !manual.has(n) && keep(n) ? n : undefined;
   };
   const weights = new Map<string, Tensor>();
   const found = new Map<string, { file: WeightFile; entry: TensorEntry }>();
   for (const file of files) {
     for (const entry of file.tensors) {
-      const n = idefics3VisionName(entry.name);
+      const n = nameOf(entry.name);
       if (n) found.set(n, { file, entry });
     }
     const add = (m: Map<string, Tensor>) => m.forEach((t, k) => weights.set(k, t));
@@ -269,8 +316,8 @@ async function openIdefics3Vision(backend: Backend, files: WeightFile[], info: I
     add(await loadWeights(backend, [{ ...plain, rename: only((n) => linear.test(n) && !(pad && mlp.test(n))) }], quant, opts.onProgress));
     add(await loadWeights(backend, [{ ...plain, rename: only((n) => !linear.test(n) && !(pad && mlp.test(n))) }], "f32"));
     if (pad) {
-      const mine = file.tensors.filter((t) => mlp.test(idefics3VisionName(t.name) ?? ""));
-      const p = await padMlp(file.source, mine, cfg.intermediate, (n) => !idefics3VisionName(n)!.includes("ffn_down"));
+      const mine = file.tensors.filter((t) => mlp.test(nameOf(t.name) ?? ""));
+      const p = await padMlp(file.source, mine, cfg.intermediate, (n) => !nameOf(n)!.includes("ffn_down"));
       const padded = { name: file.name, source: p.source, tensors: p.tensors };
       add(await loadWeights(backend, [{ ...padded, rename: only((n) => n.endsWith(".weight")) }], quant));
       add(await loadWeights(backend, [{ ...padded, rename: only((n) => n.endsWith(".bias")) }], "f32"));
@@ -278,7 +325,7 @@ async function openIdefics3Vision(backend: Backend, files: WeightFile[], info: I
   }
   const read = async (name: string) => {
     const f = found.get(name);
-    if (!f) throw new Error(`Idefics3: the checkpoint has no ${name}`);
+    if (!f) throw new Error(`vision tower: the checkpoint has no ${name}`);
     const { entry } = f;
     const n = entry.shape.reduce((a, b) => a * b, 1);
     return toF32(entry.type as Parameters<typeof toF32>[0], await f.file.source.read(entry.offset, entry.byteLength), n);
@@ -298,6 +345,7 @@ async function openIdefics3Vision(backend: Backend, files: WeightFile[], info: I
   const permuted = new Float32Array(pos.length);
   for (let r = 0; r < order.length; r++) permuted.set(pos.subarray(order[r]! * cfg.hidden, (order[r]! + 1) * cfg.hidden), r * cfg.hidden);
   weights.set("v.position_embd.weight", upload(permuted, [order.length, cfg.hidden]));
+  await finish(read, upload, weights);
   return new VisionTower(backend, cfg, weights, processing);
 }
 
@@ -344,7 +392,7 @@ export async function openParsed<H>(ref: ModelRef, file: string, endpoint: strin
   }
 }
 
-async function openSafetensors(ref: ModelRef, endpoint?: string): Promise<{ cfg: LlamaConfig; tokenizer: Tokenizer; files: WeightFile[]; idefics3?: Idefics3Files }> {
+async function openSafetensors(ref: ModelRef, endpoint?: string): Promise<{ cfg: LlamaConfig; tokenizer: Tokenizer; files: WeightFile[]; idefics3?: Idefics3Files; gemma3?: Idefics3Files }> {
   // Required files start at once. Optional ones wait for the repo's file listing, so files that do
   // not exist are not requested (each would log a 404); without a listing they are probed.
   const listing = listRepoFiles(ref, endpoint);
@@ -383,8 +431,10 @@ async function openSafetensors(ref: ModelRef, endpoint?: string): Promise<{ cfg:
   }
   const tokenizer = Tokenizer.fromJSON(tokJson!);
   tokenizer.chatTemplate = chatTemplate(tokConfig, templateFile ?? templateJson?.chat_template);
-  const preprocessor = idefics3 ? await optionalJSON<Record<string, unknown>>("preprocessor_config.json") : undefined;
-  return { cfg, tokenizer, files, idefics3: idefics3 ? { config: config!, preprocessor } : undefined };
+  // Gemma 3 4B and up: the SigLIP tower and projector sit in the same files.
+  const gemma3 = config!.model_type === "gemma3" && !!config!.vision_config && files.some((f) => f.tensors.some((t) => gemma3VisionName(t.name) === "mm.input_projection.weight"));
+  const preprocessor = idefics3 || gemma3 ? await optionalJSON<Record<string, unknown>>("preprocessor_config.json") : undefined;
+  return { cfg, tokenizer, files, idefics3: idefics3 ? { config: config!, preprocessor } : undefined, gemma3: gemma3 ? { config: config!, preprocessor } : undefined };
 }
 
 function addOne(v: Float32Array): void {
@@ -406,7 +456,7 @@ function chatTemplate(cfg: TokenizerConfig | undefined, file: string | undefined
   return { source, bosToken: token(cfg?.bos_token), eosToken: token(cfg?.eos_token) };
 }
 
-async function openGGUF(ref: ModelRef, endpoint?: string): Promise<{ cfg: LlamaConfig; tokenizer: Tokenizer; files: WeightFile[]; idefics3?: undefined }> {
+async function openGGUF(ref: ModelRef, endpoint?: string): Promise<{ cfg: LlamaConfig; tokenizer: Tokenizer; files: WeightFile[]; idefics3?: undefined; gemma3?: undefined }> {
   const file = ref.gguf!;
   const { source, header: gguf } = await openParsed(ref, file, endpoint, readGGUFHeader);
   const cfg = configFromGGUF(gguf.metadata, gguf.tensors.map((t) => t.name));

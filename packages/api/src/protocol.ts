@@ -18,9 +18,12 @@ export interface WireLoadOptions {
   /**
    * Gemma 3's vision tower, as llama.cpp's mmproj GGUF: a file in the model's repo ("mmproj-F16.gguf")
    * or a full id. Messages may then hold `{ type: "image", image }` parts (Blob, ImageBitmap, ImageData).
+   * A transformers checkpoint (4B and up) has the tower in its own files and needs none.
    */
   mmproj?: string;
-  /** Images whose features stay on the GPU at once, with `mmproj` or for SmolVLM (default 4). */
+  /** Gemma 3 from a transformers checkpoint: false skips its vision tower (about 420 MB at q8) for text alone. */
+  vision?: boolean;
+  /** Images whose features stay on the GPU at once, with a vision tower (default 4). */
   imageSlots?: number;
   /**
    * SmolVLM: split each image into 512 × 512 tiles plus a global view, as its processor does by

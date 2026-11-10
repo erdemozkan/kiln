@@ -136,7 +136,7 @@ with the GGUF mmproj), from safetensors (F32/F16/BF16) or GGUF
 default `quant: "auto"` keeps each GGUF tensor at its own precision, every type but Q6_K exactly
 (affine q4/q8 planes for Q4_1, Q4_K, Q5_1 and Q5_K).
 
-**Images.** Gemma 3 4B and larger take images with llama.cpp's mmproj file (`load(id, { mmproj })`,
+**Images.** Gemma 3 4B and larger take images with llama.cpp's mmproj file (`load(id, { mmproj })`, or from the transformers checkpoint with no extra file, `vision: false` to skip the tower,
 then `{ type: "image", image }` message parts): SigLIP vision tower, 4 × 4 pooling projector, and
 bidirectional attention among each image's 256 tokens. The tower's attention runs as a
 register-tiled kernel with the softmax folded in (about 46 s per image on an Intel Iris Plus 650).

@@ -258,10 +258,11 @@ interrupted download resumes. `listCache()` reports what is cached and `clearCac
 `load` asks the browser to keep the cache (`navigator.storage.persist()`) so it survives low disk
 space; `llm.info.persistent` says whether it agreed, and `load(id, { persist: false })` skips asking.
 
-Gemma 3 (4B and larger) also takes images, with llama.cpp's mmproj file from the same repo:
+Gemma 3 (4B and larger) also takes images: from the transformers checkpoint, whose vision tower
+Kiln reads from the same files, or from a GGUF with llama.cpp's mmproj file:
 
 ```ts
-const llm = await load("unsloth/gemma-3-4b-it-GGUF/gemma-3-4b-it-Q4_0.gguf", { mmproj: "mmproj-F16.gguf" });
+const llm = await load("unsloth/gemma-3-4b-it"); // or load("unsloth/gemma-3-4b-it-GGUF/gemma-3-4b-it-Q4_0.gguf", { mmproj: "mmproj-F16.gguf" })
 const reply = llm.chat([{ role: "user", content: [{ type: "image", image: blob }, { type: "text", text: "What is in this picture?" }] }]);
 ```
 

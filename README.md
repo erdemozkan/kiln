@@ -483,7 +483,7 @@ Models run end to end (greedy answers to fixed questions checked by hand; tool c
 | `granite` | granite-3.3-2b-instruct (`<\|tool_call\|>` calls) | safetensors (5 GB), GGUF Q4_K_M | 5.5 tok/s (q8), 6.4 tok/s (Q4_K_M) |
 | `granitemoehybrid` | granite-4.0-350m (tool calls), with `quant: "q8"` | safetensors, GGUF Q8_0 | 26 tok/s; 38.7 tok/s (Q8_0) |
 | `granitemoehybrid` | granite-4.0-1b (tool calls) | safetensors (3.3 GB) | 11.5 tok/s (q4) |
-| `gemma3` | Gemma 3 4B-it (recalls a fact 1,100 and 3,000 tokens back; images with `mmproj`) | GGUF Q4_0 (2.4 GB) + mmproj-F16 | 177–180 ms GPU per step (about 5.5 tok/s); 24.6 tok/s on an M3 |
+| `gemma3` | Gemma 3 4B-it (recalls a fact 1,100 and 3,000 tokens back; images) | GGUF Q4_0 (2.4 GB) + mmproj-F16; safetensors (8.6 GB, the vision tower in the same files) | 177–180 ms GPU per step (about 5.5 tok/s); 24.6 tok/s on an M3 |
 | `idefics3` | SmolVLM-256M-Instruct, SmolVLM-500M-Instruct (images in chat) | safetensors | a 640 × 480 photo in about 17 s (13 tiles), 2–4 s without splitting |
 
 Encoder models (BERT, DistilBERT, RoBERTa, from safetensors) run the six text tasks transformers.js
@@ -535,6 +535,7 @@ K/V; each decoder step reads them through a step block whose span covers every p
 | Florence-2 (`microsoft/Florence-2-base-ft`) | transformers.js (`onnx-community/Florence-2-base-ft`, fp32) on the same 768 × 768 pixels | 3 of 20 outputs identical (4 photos × caption, detailed caption, detection, grounding, OCR): its export fixed the channel-attention scale at a 224 × 224 trace, 3.4× too large at 768 (see below). With that scale given to Kiln too, the image tokens agree within 2.6e-4 and all 20 outputs are identical, every location token included. 2.9 s against 5.8 s for a caption, 3.0 s against 6.1 s for detection (WebGPU) |
 | Donut DocVQA (`naver-clova-ix/donut-base-finetuned-docvqa`) | transformers.js 4.3.2 (`Xenova/donut-base-finetuned-docvqa`, fp32) on the same pixel values, and its own pipeline | the same answers in all 8 questions on 5 pages (invoice number, total, due date, receipt total and store, balance due, schedule time, book title), from both; the same prompt ids; encoder output within 8e-5 for 99% of values (median 7e-7; at most 0.11, in an outlier channel near −91). 16.9–18.3 s against 33.1–34.3 s for a new page; 1.3 s against 31–34 s for another question on the same page |
 | Donut image processing | PIL 8 + numpy (transformers v4's steps) | pixel values identical (float32), including thumbnails that PIL reduces before resampling |
+| Gemma 3 4B with images (`unsloth/gemma-3-4b-it`, the transformers checkpoint) | transformers.js (`onnx-community/gemma-3-4b-it-ONNX`: vision encoder fp32, decoder q4) on the same 896 × 896 pixels | image features at a mean cosine similarity of 0.9995 (lowest token 0.988; Kiln's tower in q8); the same sensible descriptions of 3 photos in different words (different quantizations). 36–42 s against 49–61 s for a 40-token answer with the image; its q4f16 decoder printed only `<pad>` on this GPU |
 | SmolVLM (`HuggingFaceTB/SmolVLM-256M-Instruct`) | transformers.js (the repo's ONNX export, fp32) on the same tiles and prompt | image features within 2.1e-4 (values up to 96); the same greedy replies in all 17 runs, 9 photo-question pairs with image splitting (13 to 17 tiles) and 8 without. 17.4 s against 25.0 s for a short answer with splitting, 2.3 s against 4.3 s without (WebGPU) |
 | DINOv2 (`facebook/dinov2-small-imagenet1k-1-layer`) | transformers.js (`Xenova/dinov2-small-imagenet1k-1-layer`, fp32) on the same pixel values | within 6e-3: its export resizes position embeddings bilinearly, Python bicubically (Kiln); with its resize, within 3.2e-7. 383 ms end to end against 683 ms |
 | Swin2SR (`caidas/swin2SR-classical-sr-x2-64`) | transformers.js (`Xenova/swin2SR-classical-sr-x2-64`, fp32) on the same pixel values | 4 of 147,456 output bytes one level apart (128 × 96 → 256 × 192); 3.4 s end to end against 10.4 s |
@@ -1019,9 +1020,11 @@ its greedy tokens on both prompts are the same as 1B's. The 2.4 GB file is cache
 segments) and the next load reads it from the cache in about 10 s on the test Mac (Iris Plus 650), 6 s
 of it reading; converting on the CPU instead takes about 24 s.
 
-Images work for Gemma 3 4B and larger with llama.cpp's mmproj file:
-`load("unsloth/gemma-3-4b-it-GGUF/gemma-3-4b-it-Q4_0.gguf", { mmproj: "mmproj-F16.gguf" })`, then
-messages with `{ type: "image", image }` parts (a Blob, ImageBitmap or ImageData, resized to 896 × 896
+Images work for Gemma 3 4B and larger, from the transformers checkpoint, whose vision tower and
+projector Kiln reads from the same safetensors (`load("unsloth/gemma-3-4b-it")`; `vision: false`
+skips them), or with llama.cpp's mmproj file:
+`load("unsloth/gemma-3-4b-it-GGUF/gemma-3-4b-it-Q4_0.gguf", { mmproj: "mmproj-F16.gguf" })`. Then
+messages take `{ type: "image", image }` parts (a Blob, ImageBitmap or ImageData, resized to 896 × 896
 by the browser). The vision tower is SigLIP: 4096 patches through 27 layers with full attention
 (the text model's attention kernels, given a bidirectional span over every patch), then Gemma 3's
 projector pools them 4 × 4 into 256 tokens. Its matmul weights load as q8; the MLP's width (4304) is
@@ -1037,6 +1040,17 @@ takes about 46 s per image (90 s before span attention, below); the follow-up "A
 and 290 cached prompt tokens and answered "The background is yellow." in 6 s. An image's features stay
 on the GPU (`imageSlots`, 4 by default), keyed by its pixels, so a conversation that keeps the image
 does not run the tower again.
+
+From the safetensors, on the same 896 × 896 pixels as transformers.js's export (its vision encoder
+in fp32), Kiln's 256 image features agree at a mean cosine similarity of 0.9995 (lowest token
+0.988, largest difference 1.75 for values up to 33), the tower in q8 as it loads by default. Asked
+about three photos with the text model at Kiln's default quantization, against the export's q4
+decoder, both answered sensibly in different words ("Two tabby cats are sprawled out on a bright
+pink couch, each with a remote control nearby…" and "Two tabby kittens are sprawled out on a pink
+blanket, each with a remote control resting beside them…"), in 36–42 s against 49–61 s for a
+40-token answer with the image. The export's q4f16 decoder printed only `<pad>` on this GPU
+(float16 overflow, a known Gemma 3 problem). Loading the 8.6 GB checkpoint took 15 minutes here,
+almost all of it the download.
 
 Granite 4's dense models (`granitemoehybrid` with every layer "attention" and no experts: 350M and
 1B) are Llama with four multipliers, folded in at load: the residual multiplier into o_proj and
@@ -1155,8 +1169,8 @@ Known limits, roughly in roadmap order:
   constrains the `<tool_call>` format.
 - Single storage binding per tensor: very large f32 embeddings can exceed `maxStorageBufferBindingSize`
   (use q4 or q8).
-- Images: Gemma 3 only, from llama.cpp's mmproj GGUF (the vision weights inside safetensors
-  checkpoints are still skipped), one 896 × 896 crop per image (no pan-and-scan). Span attention
+- Images: Gemma 3 (from its transformers checkpoint or llama.cpp's mmproj GGUF) and SmolVLM; for
+  Gemma 3 one 896 × 896 crop per image (no pan-and-scan). Span attention
   covers the vision tower only; the text model's image chunks (f16 cache, causal text rows, sliding
   layers) use the tiled kernel. Measured with the profiler, that attention is 16.7 ms per layer for
   a 275-token image prompt on the Intel Mac, about 0.6 s of Gemma 3 4B's 14 s to the first token

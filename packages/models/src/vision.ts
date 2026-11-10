@@ -184,6 +184,61 @@ export function idefics3VisionName(name: string): string | undefined {
   return global[n];
 }
 
+/**
+ * The vision config of a transformers Gemma 3 checkpoint (Gemma3ForConditionalGeneration):
+ * `vision_config` (SigLIP), the 4 × 4 average pooling to `mm_tokens_per_image` tokens, the text
+ * width, and the image processor's mean and std.
+ */
+export function visionConfigFromGemma3(config: Record<string, unknown>, preprocessor?: Record<string, unknown>): VisionConfig {
+  const v = config.vision_config as Record<string, unknown> | undefined;
+  const t = (config.text_config as Record<string, unknown> | undefined) ?? {};
+  if (!v) throw new UnsupportedModelError("Gemma 3: config.json has no vision_config");
+  const act = String(v.hidden_act ?? "gelu_pytorch_tanh");
+  if (act !== "gelu_pytorch_tanh") throw new UnsupportedModelError(`Gemma 3 vision activation "${act}" is not supported (gelu_pytorch_tanh)`);
+  const n = (c: Record<string, unknown>, k: string, d?: number) => {
+    const x = c[k] ?? d;
+    if (typeof x !== "number") throw new UnsupportedModelError(`Gemma 3: config is missing "${k}"`);
+    return x;
+  };
+  const imageSize = n(v, "image_size", 896);
+  const patchSize = n(v, "patch_size", 14);
+  const tokens = n(config, "mm_tokens_per_image", 256);
+  const tokensPerSide = Math.round(Math.sqrt(tokens));
+  const side = imageSize / patchSize;
+  if (tokensPerSide ** 2 !== tokens || side % tokensPerSide) throw new UnsupportedModelError(`Gemma 3: ${side} patches per side do not pool to ${tokens} tokens`);
+  const triple = (k: string): [number, number, number] => {
+    const x = preprocessor?.[k] as number[] | undefined;
+    return x && x.length === 3 ? [x[0]!, x[1]!, x[2]!] : [0.5, 0.5, 0.5];
+  };
+  return {
+    projector: "gemma3",
+    scaleFactor: side / tokensPerSide,
+    imageSize,
+    patchSize,
+    hidden: n(v, "hidden_size", 1152),
+    intermediate: n(v, "intermediate_size", 4304),
+    layers: n(v, "num_hidden_layers", 27),
+    heads: n(v, "num_attention_heads", 16),
+    eps: n(v, "layer_norm_eps", 1e-6),
+    projectionDim: n(t, "hidden_size", 2560),
+    tokensPerSide,
+    mean: triple("image_mean"),
+    std: triple("image_std"),
+  };
+}
+
+/**
+ * A transformers Gemma 3 checkpoint's vision tensors under mmproj names (as idefics3VisionName for
+ * the SigLIP tower; the projector's weight and soft-embedding norm), for both the 4.50–4.51 layout
+ * ("vision_tower.…", "multi_modal_projector.…") and the later one ("model.vision_tower.…").
+ */
+export function gemma3VisionName(name: string): string | undefined {
+  const n = name.replace(/^model\./, "");
+  if (n === "multi_modal_projector.mm_input_projection_weight") return "mm.input_projection.weight";
+  if (n === "multi_modal_projector.mm_soft_emb_norm.weight") return "mm.soft_emb_norm.weight";
+  return n.startsWith("vision_tower.") ? idefics3VisionName(n.slice("vision_tower.".length)) : undefined;
+}
+
 /** An Idefics3 (SmolVLM) checkpoint's language-model tensors under Llama's names; undefined for the rest. */
 export function idefics3TextName(name: string): string | undefined {
   if (name.startsWith("model.text_model.")) return `model.${name.slice("model.text_model.".length)}`;
