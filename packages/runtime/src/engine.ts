@@ -122,7 +122,7 @@ export function imageSpans(ids: readonly number[], vocab: number): [number, numb
 }
 
 /** FNV-1a over an image's bytes and size: the same picture gets the same slot (and so the same ids). */
-function imageKey(img: ImagePixels): string {
+export function imageKey(img: ImagePixels): string {
   let h1 = 0x811c9dc5;
   let h2 = 0x01000193 ^ img.width;
   const d = img.data;

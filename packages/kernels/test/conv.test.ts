@@ -75,6 +75,13 @@ describe("speech front-end kernels (CPU)", () => {
     }, 10);
     for (let i = 0; i < 10; i++) expect(y[i]).toBeCloseTo(0.25 * a[i]! + 0.75 * b[i]!, 6);
   });
+
+  it("mulFirstRow multiplies every row after the first by the first", async () => {
+    const [T, D] = [4, 3];
+    const x = randn(T * D);
+    const y = await run((ctx) => ops.mulFirstRow(ctx, upload(x, [T, D])), (T - 1) * D);
+    for (let t = 1; t < T; t++) for (let d = 0; d < D; d++) expect(y[(t - 1) * D + d]).toBeCloseTo(x[t * D + d]! * x[d]!, 6);
+  });
 });
 
 describe("attention probabilities (CPU)", () => {

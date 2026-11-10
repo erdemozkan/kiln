@@ -9,4 +9,5 @@ export * from "./seq2seq";
 export * from "./audio";
 export * from "./vision";
 export { Florence2, type FlorenceOptions } from "./florence";
+export { OwlDetector, owlv2Pixels, type ZeroShotDetectionOptions } from "./owl";
 export * from "./tts";

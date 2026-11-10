@@ -116,12 +116,12 @@ export interface AudioInfo {
   labels?: Record<number, string>;
 }
 
-/** Tasks of image models (ViT, DeiT, CLIP). */
-export type VisionTask = "image-classification" | "image-feature-extraction" | "zero-shot-image-classification" | "object-detection" | "depth-estimation" | "image-segmentation" | "background-removal" | "image-to-image" | "image-to-text";
+/** Tasks of image models. */
+export type VisionTask = "image-classification" | "image-feature-extraction" | "zero-shot-image-classification" | "object-detection" | "zero-shot-object-detection" | "depth-estimation" | "image-segmentation" | "background-removal" | "image-to-image" | "image-to-text";
 
 export interface VisionInfo {
   model: string;
-  /** "vit", "deit" or "clip". */
+  /** The model family, mostly as config.json's model_type names it ("vit", "clip", "detr", "owlv2", …). */
   family: string;
   layers: number;
   hiddenSize: number;

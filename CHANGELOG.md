@@ -103,7 +103,13 @@ with the pixel shuffle folded into the patch order, causal image tokens, and a f
 tile. The vision tower keeps one layer queued ahead (0.3 s less per SmolVLM tile), and the PIL
 resizer reads memory in order (the same bytes; SmolVLM's preprocessing of a 640 × 480 photo took
 370 ms instead of 575). Fixed: a prompt cache restored at load could match a new image's tokens to an old
-image's K/V; restored prefixes now stop at the first image token.
+image's K/V; restored prefixes now stop at the first image token. OWL-ViT (`google/owlvit-*`) and
+OWLv2 (`google/owlv2-*`): `zero-shot-object-detection` with Python's post-processing (each patch's
+best label, OWLv2's boxes on the padded square), `threshold`, `top_k` and `percentage`; the heads run
+in the image tower's plan (a patch-times-class-token kernel), labels meet the patches on the CPU and
+the last four images are kept, so new labels on an image skip the tower; OWLv2's processor (grey
+padding, scipy's Gaussian blur and linear zoom, identical float32 pixels); tokenizers built from
+vocab.json and merges.txt when a repo has no tokenizer.json.
 
 **Loading.** Reads ahead of a download in progress are fetched on their own instead of waiting
 (a `pytorch_model.bin` keeps its zip directory at the end, so large checkpoints showed no progress

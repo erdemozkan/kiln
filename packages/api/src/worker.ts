@@ -262,6 +262,8 @@ scope.onmessage = async (e: MessageEvent<Request>) => {
                   ? await v.classify(img, msg.args[1] as Record<string, unknown> | undefined)
                   : task === "object-detection"
                     ? await v.detect(img, msg.args[1] as Record<string, unknown> | undefined)
+                    : task === "zero-shot-object-detection"
+                      ? await v.detectZeroShot(img, msg.args[1] as string[], msg.args[2] as Record<string, unknown> | undefined)
                     : task === "depth-estimation"
                       ? await v.estimateDepth(img)
                       : task === "image-segmentation"

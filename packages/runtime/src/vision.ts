@@ -10,6 +10,7 @@ import { ClipTokenizer, encoderTokenizerFromJSON, type ClipTokenizerJSON, type E
 import { openBackend, openParsed } from "./load";
 import { loadWeights, type LoadProgress, type WeightFile } from "./weights";
 import { createFlorence, type Florence2, type FlorenceOptions } from "./florence";
+import { createOwl, type OwlDetector, type ZeroShotDetectionOptions } from "./owl";
 
 export interface VisionLoadOptions {
   /** Matrix storage: "f32" (default), "q8" or "q4". */
@@ -156,6 +157,7 @@ export class VisionEngine {
     private readonly convnet?: { cfg: ConvNetConfig; model: ConvNetModel; head: Head; norm?: { w: Float32Array; b: Float32Array; eps: number }; labels: string[] },
     private readonly captioner?: { decoder: Seq2SeqModel; tokenizer: EncoderTokenizer; maxLength: number },
     private readonly florence?: Florence2,
+    private readonly owl?: OwlDetector,
   ) {}
 
   get cfg(): VitConfig {
@@ -172,6 +174,10 @@ export class VisionEngine {
   summary(): { family: string; layers: number; hiddenSize: number; imageSize: number; labels: Record<number, string> } {
     const labels = (l: string[]) => Object.fromEntries(l.map((v, i) => [i, v]));
     if (this.matte) return { family: "rmbg", layers: 0, hiddenSize: 0, imageSize: 1024, labels: {} };
+    if (this.owl) {
+      const c = this.owl.cfg;
+      return { family: c.kind, layers: c.vision.layers + c.text.layers, hiddenSize: c.vision.hidden, imageSize: c.vision.imageSize, labels: {} };
+    }
     if (this.florence) {
       const c = this.florence.cfg;
       return { family: "florence2", layers: c.vision.depths.reduce((a, b) => a + b, 0) * 2 + c.text.encLayers + c.text.decLayers, hiddenSize: c.text.dModel, imageSize: c.imageSize, labels: {} };
@@ -287,6 +293,21 @@ export class VisionEngine {
       res.push({ score, label: labels[best] ?? `LABEL_${best}`, box: { xmin: box[0]!, ymin: box[1]!, xmax: box[2]!, ymax: box[3]! } });
     }
     return res;
+  }
+
+  /**
+   * Zero-shot object detection (OWL-ViT, OWLv2): boxes for any text labels (see OwlDetector.detect).
+   * The image side is kept for the last few images, so new labels on the same image only run the
+   * text tower.
+   */
+  async detectZeroShot(img: RgbImage, labels: readonly string[], options: ZeroShotDetectionOptions = {}): Promise<DetectedObject[]> {
+    if (!this.owl) throw new Error("zero-shot object detection needs an OWL-ViT or OWLv2 model");
+    return this.owl.detect(img, labels, options);
+  }
+
+  /** The OWL detector, for raw predictions. */
+  get detector(): OwlDetector | undefined {
+    return this.owl;
   }
 
   /**
@@ -578,6 +599,7 @@ export class VisionEngine {
   }
 
   destroy(): void {
+    this.owl?.destroy();
     this.florence?.destroy();
     this.vit?.model.destroy();
     this.detr?.model.destroy();
@@ -591,7 +613,7 @@ export class VisionEngine {
   }
 }
 
-/** Loads a ViT, DeiT, CLIP, YOLOS or DETR checkpoint (safetensors or pytorch_model.bin) from the Hugging Face Hub. */
+/** Loads a ViT, DeiT, CLIP, YOLOS, DETR, OWL-ViT or OWLv2 checkpoint (safetensors or pytorch_model.bin) from the Hugging Face Hub. */
 export async function createVision(modelId: string, opts: VisionLoadOptions = {}): Promise<VisionEngine> {
   const ref = parseModelId(modelId, opts.revision);
   if (ref.gguf) throw new Error("vision models load from safetensors or PyTorch repos, not GGUF files");
@@ -614,6 +636,9 @@ export async function createVision(modelId: string, opts: VisionLoadOptions = {}
   if (config!.model_type === "swin2sr") return createSwin2sr(modelId, ref, config!, prep, names, opts);
   if (config!.model_type === "resnet" || config!.model_type === "convnext") return createConvNet(modelId, ref, config!, prep, names, opts);
   if (config!.model_type === "vision-encoder-decoder") return createCaptioner(modelId, ref, config!, prep, names, opts, listing);
+  if (config!.model_type === "owlv2" || config!.model_type === "owlvit") {
+    return createOwl(modelId, ref, config!, prep, names, opts, listing, (o, backend) => new VisionEngine(backend, undefined, o.processor, {}, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, o));
+  }
   if (config!.model_type === "florence2") {
     return createFlorence(modelId, ref, config!, prep, names, opts, (f, backend) => new VisionEngine(backend, undefined, f.processor, {}, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, f));
   }

@@ -362,8 +362,9 @@ export class KilnVision extends WorkerChannel {
   }
 
   /**
-   * Image classification ([{ label, score }]), image features ({ data, dims }) or, with labels first,
-   * zero-shot classification ([{ score, label }]) of an image the worker can decode.
+   * A vision task on an image the worker can decode: classification ([{ label, score }]), features
+   * ({ data, dims }), or with labels first zero-shot classification ([{ score, label }]) and zero-shot
+   * detection ([{ score, label, box }]), and the rest.
    */
   run<T>(task: VisionTask, image: unknown, ...args: unknown[]): Promise<T> {
     return new Promise((resolve, reject) =>

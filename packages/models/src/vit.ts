@@ -201,11 +201,18 @@ export interface VitEmbeddings {
   mid?: Float32Array[];
 }
 
+/**
+ * Layers run after the encoder in the same plan: given the last hidden state [tokens, hidden] (after
+ * the final LayerNorm, if any) and the model's weights, the named outputs to read back.
+ */
+export type VitTail = (ctx: Ctx, hidden: Tensor, w: (name: string) => Tensor) => Record<string, Tensor>;
+
 interface VitPlan {
   dispatches: readonly Dispatch[];
   input: Buf;
   out: Tensor;
   det?: { logits: Tensor; boxes: Tensor };
+  tail?: Record<string, Tensor>;
   ctx: Ctx;
   owned: Buf[];
   tokens: number;
@@ -215,9 +222,9 @@ interface VitPlan {
  * A pre-norm vision transformer encoder: patch rows → one matmul (the patch convolution, weight
  * "patch.weight" [hidden, patchK]) plus a [tokens, hidden] addend (CLS / distillation / detection
  * tokens, position embeddings and the patch bias) → layers of LayerNorm, full attention, LayerNorm,
- * MLP → final LayerNorm, and for YOLOS the class and box MLPs on the detection tokens. One plan per
- * patch grid (a few kept): the addend is the "embed.add" weight at the trained size, or comes from
- * `embeddings` for models that take any size.
+ * MLP → final LayerNorm, and for YOLOS the class and box MLPs on the detection tokens, or a `tail`
+ * of the caller's. One plan per patch grid (a few kept): the addend is the "embed.add" weight at the
+ * trained size, or comes from `embeddings` for models that take any size.
  */
 export class VitModel {
   private readonly plans = new Map<string, VitPlan>();
@@ -228,6 +235,7 @@ export class VitModel {
     readonly cfg: VitConfig,
     private readonly weights: Map<string, Tensor>,
     private readonly embeddings?: (gh: number, gw: number) => VitEmbeddings,
+    private readonly tail?: VitTail,
   ) {
     this.pool = new ActivationPool(backend, "vit");
   }
@@ -312,7 +320,8 @@ export class VitModel {
       const tokens: Tensor = { shape: [c.detTokens, c.hidden], dtype: "f32", buf: out.buf };
       det = { logits: this.mlp(ctx, tokens, "det.cls"), boxes: this.mlp(ctx, tokens, "det.box") };
     }
-    return { dispatches: ctx.dispatches, input, out, det, ctx, owned, tokens: T };
+    const tail = this.tail?.(ctx, out, (n) => this.w(n));
+    return { dispatches: ctx.dispatches, input, out, det, tail, ctx, owned, tokens: T };
   }
 
   private run(pixels: Float32Array, width: number, height: number): VitPlan {
@@ -339,7 +348,7 @@ export class VitModel {
   /** Last hidden state [tokens, hidden] for pixel values [3, height, width] (default: the trained square size). */
   async forward(pixels: Float32Array, width = this.cfg.imageSize, height = width): Promise<Float32Array> {
     // With heads, the planner may reuse the hidden state's memory once they have read it.
-    if (this.cfg.detTokens) throw new Error("vit: a detection model's hidden state is not kept; use detect()");
+    if (this.cfg.detTokens || this.tail) throw new Error("vit: a model with heads does not keep its hidden state; use detect() or tailOutputs()");
     const plan = this.run(pixels, width, height);
     return new Float32Array(await this.backend.readback(physical(plan.out.buf), 0, plan.tokens * this.cfg.hidden * 4));
   }
@@ -356,6 +365,15 @@ export class VitModel {
       this.backend.readback(physical(d.boxes.buf), 0, n * 4 * 4),
     ]);
     return { logits: new Float32Array(logits), boxes: new Float32Array(boxes), classes };
+  }
+
+  /** The tail's outputs for pixel values [3, height, width], by name. */
+  async tailOutputs(pixels: Float32Array, width = this.cfg.imageSize, height = width): Promise<Record<string, Float32Array>> {
+    const plan = this.run(pixels, width, height);
+    if (!plan.tail) throw new Error("this model has no tail");
+    const entries = Object.entries(plan.tail);
+    const data = await Promise.all(entries.map(([, t]) => this.backend.readback(physical(t.buf), 0, t.shape.reduce((a, b) => a * b, 1) * 4)));
+    return Object.fromEntries(entries.map(([k], i) => [k, new Float32Array(data[i]!)]));
   }
 
   private free(p: VitPlan): void {

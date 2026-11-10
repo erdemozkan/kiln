@@ -541,6 +541,9 @@ K/V; each decoder step reads them through a step block whose span covers every p
 | Depth Anything V2 (`depth-anything/Depth-Anything-V2-Small-hf`) | transformers.js (`onnx-community/depth-anything-v2-small`, fp32) on the same pixel values | depth within 1.7e-5 relative on the cats photo; 20 of 307,200 grey bytes one level apart; 3.1 s end to end against 7.4 s |
 | DETR (`facebook/detr-resnet-50`) | transformers.js (`Xenova/detr-resnet-50`, fp32) on the same pixel values | the same five detections and labels on the cats photo; scores within 2.8e-7, boxes within 2.3e-6; 1.57 s end to end against 4.02 s |
 | YOLOS (`hustvl/yolos-tiny`, `yolos-small`) | transformers.js (`Xenova/yolos-*`, fp32) on the same pixel values | the same detections and labels on the cats photo; scores within 8.2e-6, boxes within 3e-7 |
+| OWLv2 (`google/owlv2-base-patch16-ensemble`) | Python transformers' documented output; transformers.js 3.8.1 (`Xenova/owlv2-base-patch16-ensemble`, fp32) on the same pixel values | cats photo: 0.665 and 0.613 against Python's 0.665 and 0.614, boxes the same to the pixel. Against transformers.js on 3 photos: logits within 0.0066 (they span −40 to 1.5; scores within 5.2e-6), boxes within 3.4e-4, the same best patch. 5.4 s against 32.7 s end to end; new labels on the same image 59 ms. transformers.js 4.3.2 cannot load either OWL export (see below) |
+| OWL-ViT (`google/owlvit-base-patch32`) | the same | cats photo: 0.716 and 0.706 against Python's 0.717 and 0.707; against transformers.js 3.8.1 on 2 photos, logits within 4.3e-4, boxes within 3.5e-5. 639 ms against 1,674 ms |
+| OWLv2 image processing | numpy + scipy 1.7 (transformers v4's steps) | pixel values identical (float32) on 7 images from 23 × 37 to 4000 × 3000 |
 | Position-embedding interpolation | torch 1.7.1 `interpolate(mode="bicubic")` | within 1e-5 |
 | CLIP zero-shot (`openai/clip-vit-base-patch32`) | transformers.js (`Xenova/clip-vit-base-patch32`, fp32) on the same pixel values | six labels' probabilities within 1.8e-7, the labels run as one batch |
 | ViT (`google/vit-base-patch16-224`), DeiT (`facebook/deit-base-distilled-patch16-224`) | transformers.js (`Xenova/*`, fp32) on the same pixel values | all 1,000 class probabilities within 2.2e-6 (ViT) and 7.8e-7 (DeiT) |
@@ -654,6 +657,39 @@ each feature-map size. The image is resized as transformers' DETR processor does
 within 2.3e-6 of the image size. Both pipelines end to end (median of five warm calls, WebGPU,
 same backgrounded pane): 1.57 s in Kiln against 4.02 s for transformers.js. Of Kiln's 1.18 s of GPU
 time, about 1 s is the backbone's convolutions, which run at the matmul kernel's rate.
+
+Zero-shot object detection (`zero-shot-object-detection`) runs OWL-ViT (`google/owlvit-*`, the
+default being `owlvit-base-patch32` as in transformers.js) and OWLv2 (`google/owlv2-*`): boxes for
+any labels.
+
+```js
+const detector = await pipeline("zero-shot-object-detection", "google/owlv2-base-patch16-ensemble");
+await detector("cats.jpg", ["a photo of a cat", "a photo of a dog"]);
+// [{ score: 0.665, label: "a photo of a cat", box: { xmin: 6, ymin: 51, xmax: 326, ymax: 473 } }, ...]
+```
+
+The image tower is a CLIP tower on the ViT code; its heads run in the same GPU plan: every token's
+post-LayerNorm, the patches times the class token (a new kernel), LayerNorm, the box MLP with the
+box bias, and the class head's three linears as one matmul. The labels go through CLIP's text
+tower in one batch, and each patch's class embedding meets them on the CPU, so new labels on an
+image seen recently (the last four are kept) skip the image: 59 ms instead of 5.4 s with OWLv2.
+OWLv2 preprocesses as transformers v4 and the original implementation do: padded at the bottom and
+right to a square with grey, a Gaussian blur when shrinking and a linear resize, both as scipy
+computes them (identical float32 pixel values; the blur runs only for the rows and columns the
+resize reads, 0.3 s for a 1280 × 853 photo, 1.3 s for 4000 × 3000). Results are Python's: one
+detection per patch at its best label, scored by the sigmoid; OWLv2's boxes are scaled to the
+padded square, so they land on the image.
+
+Python's documented results come out the same: the two cats at 0.665 and 0.613 with OWLv2 (Python
+0.665 and 0.614, boxes within a pixel) and 0.716 and 0.706 with OWL-ViT (0.717 and 0.707). Against
+transformers.js on the same pixel values, logits agree within 0.0066 (OWLv2) and 4.3e-4 (OWL-ViT).
+End to end (median of five warm calls, WebGPU, backgrounded pane), OWLv2 takes 5.4 s against
+32.7 s and OWL-ViT 639 ms against 1,674 ms. The comparison ran on transformers.js 3.8.1: 4.3.2
+fails to create a session for every OWL export tried (`Xenova/` and `onnx-community/`, OWL-ViT and
+OWLv2, WebGPU and WASM: no kernel for the Cast node `/class_head/Cast`). transformers.js also
+differs from Python in its output: it squashes OWLv2's input to 960 × 960 instead of padding it
+(the cats score 0.631 and 0.635), and it lists a box once per label above the threshold. Not yet:
+image-guided detection (a query image instead of labels).
 
 Depth estimation (`depth-estimation`) runs Depth Anything (`depth-anything/Depth-Anything-V2-Small-hf`,
 the default, as in transformers.js; base and large load the same way). Its DINOv2 encoder is the

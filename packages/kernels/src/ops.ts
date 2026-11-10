@@ -6,6 +6,7 @@ import {
   MAX_X,
   MM_SLICE,
   addSpec,
+  mulFirstRowSpec,
   advanceSpec,
   attentionCombineSpec,
   attentionSpec,
@@ -375,6 +376,15 @@ export function siluMul(ctx: Ctx, gate: Tensor, up: Tensor, act: "silu" | "gelu"
 export function addInPlace(ctx: Ctx, a: Tensor, b: Tensor): void {
   const n = numel(a.shape);
   ctx.run(addSpec(), [ctx.uniform([u32(n), u32(numel(b.shape)), u32(0), u32(0)]), a.buf, b.buf], grid1d(n));
+}
+
+/** Rows 1 … T − 1 of x [T, D], each times row 0: [T − 1, D]. */
+export function mulFirstRow(ctx: Ctx, x: Tensor): Tensor {
+  const D = lastDim(x);
+  const T = numel(x.shape) / D;
+  const y = ctx.alloc([T - 1, D]);
+  ctx.run(mulFirstRowSpec(), [ctx.uniform([u32((T - 1) * D), u32(D), u32(0), u32(0)]), x.buf, y.buf], grid1d((T - 1) * D));
+  return y;
 }
 
 /**

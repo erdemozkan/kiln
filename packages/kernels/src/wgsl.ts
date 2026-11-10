@@ -1481,6 +1481,22 @@ fn main(${EW_ARGS}) {
 }`);
 }
 
+/** y [T − 1, D] = rows 1 … T − 1 of x [T, D], each times row 0 (OWL-ViT's patch tokens times the class token). */
+export function mulFirstRowSpec(): KernelSpec {
+  return spec("mul_first_row", ["uniform", "read", "rw"], cpu.cpuMulFirstRow, () => /* wgsl */ `
+struct P { n: u32, cols: u32, _a: u32, _b: u32 }
+@group(0) @binding(0) var<uniform> p: P;
+@group(0) @binding(1) var<storage, read> x: array<f32>;
+@group(0) @binding(2) var<storage, read_write> y: array<f32>;
+
+@compute @workgroup_size(${EW})
+fn main(${EW_ARGS}) {
+  ${FLAT}
+  if (idx >= p.n) { return; }
+  y[idx] = x[idx + p.cols] * x[idx % p.cols];
+}`);
+}
+
 /** Gathers embedding rows for token ids. */
 export function embedSpec(wdtype: WeightDType, affine = false, features = false): KernelSpec {
   const quant = wdtype !== "f32";

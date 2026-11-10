@@ -27,6 +27,7 @@ export type PipelineTask =
   | "image-feature-extraction"
   | "zero-shot-image-classification"
   | "object-detection"
+  | "zero-shot-object-detection"
   | "depth-estimation"
   | "image-segmentation"
   | "background-removal"
@@ -57,6 +58,7 @@ export const DEFAULT_MODELS: Record<string, string> = {
   "image-feature-extraction": "google/vit-base-patch16-224-in21k",
   "zero-shot-image-classification": "openai/clip-vit-base-patch32",
   "object-detection": "facebook/detr-resnet-50",
+  "zero-shot-object-detection": "google/owlvit-base-patch32",
   "depth-estimation": "depth-anything/Depth-Anything-V2-Small-hf",
   "image-segmentation": "facebook/detr-resnet-50-panoptic",
   // transformers.js's default (MODNet) exists only as ONNX. RMBG-1.4's license is non-commercial.
@@ -67,7 +69,7 @@ export const DEFAULT_MODELS: Record<string, string> = {
   "text-to-audio": "facebook/mms-tts-eng",
 };
 
-const VISION = new Set<string>(["image-classification", "image-feature-extraction", "zero-shot-image-classification", "object-detection", "depth-estimation", "image-segmentation", "background-removal", "image-to-image", "image-to-text"]);
+const VISION = new Set<string>(["image-classification", "image-feature-extraction", "zero-shot-image-classification", "object-detection", "zero-shot-object-detection", "depth-estimation", "image-segmentation", "background-removal", "image-to-image", "image-to-text"]);
 
 /** Speech encoders run on raw samples (CTC or a classifier) rather than as encoder-decoders. */
 const AUDIO_ENCODERS = new Set(["wav2vec2", "hubert"]);
@@ -487,6 +489,23 @@ export interface ObjectDetectionPipeline {
   (images: ImageInput[], options?: ObjectDetectionOptions): Promise<ObjectDetectionResult[][]>;
 }
 
+export interface ZeroShotObjectDetectionOptions {
+  /** Least score a detection needs, exclusive (default 0.1). */
+  threshold?: number;
+  /** Most detections returned, best first (default: all). */
+  top_k?: number;
+  /** Boxes as fractions of the image instead of whole pixels (default false). */
+  percentage?: boolean;
+}
+export interface ZeroShotObjectDetectionPipeline {
+  readonly task: PipelineTask;
+  readonly model: KilnVision;
+  readonly info: VisionInfo;
+  dispose(): Promise<void>;
+  (image: ImageInput, candidate_labels: string[], options?: ZeroShotObjectDetectionOptions): Promise<ObjectDetectionResult[]>;
+  (images: ImageInput[], candidate_labels: string[], options?: ZeroShotObjectDetectionOptions): Promise<ObjectDetectionResult[][]>;
+}
+
 /** A depth map: `predicted_depth` [height, width] at the original image size, and `depth`, the map as 0…255 grey bytes. */
 export interface DepthEstimationResult {
   predicted_depth: Tensor;
@@ -665,6 +684,7 @@ export async function pipeline(task: "image-classification", model?: string, opt
 export async function pipeline(task: "image-feature-extraction", model?: string, options?: PipelineOptions): Promise<ImageFeatureExtractionPipeline>;
 export async function pipeline(task: "zero-shot-image-classification", model?: string, options?: PipelineOptions): Promise<ZeroShotImageClassificationPipeline>;
 export async function pipeline(task: "object-detection", model?: string, options?: PipelineOptions): Promise<ObjectDetectionPipeline>;
+export async function pipeline(task: "zero-shot-object-detection", model?: string, options?: PipelineOptions): Promise<ZeroShotObjectDetectionPipeline>;
 export async function pipeline(task: "depth-estimation", model?: string, options?: PipelineOptions): Promise<DepthEstimationPipeline>;
 export async function pipeline(task: "image-segmentation", model?: string, options?: PipelineOptions): Promise<ImageSegmentationPipeline>;
 export async function pipeline(task: "background-removal", model?: string, options?: PipelineOptions): Promise<BackgroundRemovalPipeline>;
@@ -690,10 +710,10 @@ export async function pipeline(task: PipelineTask, model?: string, options: Pipe
   if (VISION.has(t)) {
     const m = await KilnVision.load(id, { quant: q, device: dev, cpuThreads, revision, endpoint, worker, onProgress: progress });
     progress_callback?.({ status: "ready", task, model: id });
-    const zeroShot = t === "zero-shot-image-classification";
+    const zeroShot = t === "zero-shot-image-classification" || t === "zero-shot-object-detection";
     const one = async (x: ImageInput, a?: unknown, b?: object) => {
       const img = await toWorkerImage(x);
-      if (zeroShot) return m.run<unknown>("zero-shot-image-classification", img, a, { ...b });
+      if (zeroShot) return m.run<unknown>(t as "zero-shot-image-classification" | "zero-shot-object-detection", img, a, { ...b });
       const r = await m.run<unknown>(t as "image-classification" | "image-feature-extraction" | "object-detection" | "depth-estimation" | "image-segmentation" | "background-removal" | "image-to-image" | "image-to-text", img, { ...(a as object) });
       if (t === "image-feature-extraction") {
         const f = r as { data: Float32Array; dims: number[] };

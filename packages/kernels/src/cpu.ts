@@ -574,6 +574,13 @@ export const cpuAdd: CpuKernel = (b) => {
   for (let i = 0; i < n; i++) a[i]! += c[i % cols]!;
 };
 
+export const cpuMulFirstRow: CpuKernel = (b) => {
+  const [n, cols] = [b[0]!.u32[0]!, b[0]!.u32[1]!];
+  const x = b[1]!.f32;
+  const y = b[2]!.f32;
+  for (let i = 0; i < n; i++) y[i] = Math.fround(x[i + cols]! * x[i % cols]!);
+};
+
 export function cpuEmbed(wdtype: WeightDType, affine: boolean, features = false): CpuKernel {
   const quant = wdtype !== "f32";
   const aff = quant && affine;
