@@ -108,6 +108,69 @@ export function donutPixels(img: RgbImage, p: DonutProcessing): Float32Array {
   return out;
 }
 
+/** What Donut's image-to-text gives: the cleaned sequence and its parse (transformers' `token2json`). */
+export interface DonutParse {
+  generated_text: string;
+  json: unknown;
+}
+
+export interface DonutParseOptions {
+  /** The decoder prompt (default: the model's task token, e.g. "<s_cord-v2>" or "<s_rvlcdip>"). */
+  prompt?: string;
+  /** Most tokens to generate (default: up to the decoder's last position, as Donut's examples set max_length). */
+  max_new_tokens?: number;
+}
+
+/**
+ * DonutProcessor.token2json, ported: `<s_key>…</s_key>` pairs become keys (nested when the content
+ * holds pairs, a list when items are separated by `<sep/>`), categorical tokens such as
+ * `<invoice/>` become their name; text with no pair becomes `{ text_sequence }`.
+ */
+export function donutToken2Json(tokens: string, addedVocab: ReadonlySet<string>, isInner = false): unknown {
+  const output: Record<string, unknown> = {};
+  const esc = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  while (tokens) {
+    const start = /<s_(.*?)>/i.exec(tokens);
+    if (!start) break;
+    const key = start[1]!;
+    const end = new RegExp(`</s_${esc(key)}>`, "i").exec(tokens);
+    const startToken = start[0];
+    if (!end) {
+      tokens = tokens.replace(startToken, "");
+      continue;
+    }
+    const endToken = end[0];
+    const content = new RegExp(`${esc(startToken)}([\\s\\S]*?)${esc(endToken)}`, "i").exec(tokens);
+    if (content) {
+      const c = content[1]!.trim();
+      if (c.includes("<s_") && c.includes("</s_")) {
+        const value = donutToken2Json(c, addedVocab, true) as unknown[];
+        if (value.length) output[key] = value.length === 1 ? value[0] : value;
+      } else {
+        const leaves = c.split("<sep/>").map((l) => {
+          const leaf = l.trim();
+          return addedVocab.has(leaf) && leaf[0] === "<" && leaf.endsWith("/>") ? leaf.slice(1, -2) : leaf;
+        });
+        output[key] = leaves.length === 1 ? leaves[0] : leaves;
+      }
+    }
+    tokens = tokens.slice(tokens.indexOf(endToken) + endToken.length).trim();
+    if (tokens.startsWith("<sep/>")) return [output, ...(donutToken2Json(tokens.slice(6), addedVocab, true) as unknown[])];
+  }
+  if (Object.keys(output).length) return isInner ? [output] : output;
+  return isInner ? [] : { text_sequence: tokens };
+}
+
+/**
+ * The model's task token: the one `<s_…>` added token without a closing `</s_…>`, leaving out the
+ * pre-training tasks (`<s_iitcdip>`, `<s_synthdog>`); undefined when there is not exactly one.
+ */
+export function donutTaskToken(added: readonly string[]): string | undefined {
+  const set = new Set(added);
+  const tasks = added.filter((t) => /^<s_[^>]+>$/.test(t) && !set.has(`</${t.slice(1)}`) && t !== "<s_iitcdip>" && t !== "<s_synthdog>");
+  return tasks.length === 1 ? tasks[0] : undefined;
+}
+
 export class DonutDocQA {
   private readonly pages = new Map<string, Float32Array>();
 
@@ -118,7 +181,31 @@ export class DonutDocQA {
     private readonly encoder: DonutSwinModel,
     private readonly decoder: Seq2SeqModel,
     readonly tokenizer: EncoderTokenizer,
+    /** The tokenizer's added tokens (the task, field and categorical tokens). */
+    readonly added: readonly string[] = [],
   ) {}
+
+  /** The model's task token ("<s_cord-v2>", "<s_rvlcdip>", "<s_docvqa>"…), if it has one. */
+  get taskToken(): string | undefined {
+    return donutTaskToken(this.added);
+  }
+
+  /**
+   * Donut's own task on an image, as its model cards run it: the task token as the decoder prompt,
+   * greedy decoding with `<unk>` banned, up to the decoder's last position; the sequence decoded with
+   * its special tokens, end and padding tokens dropped, the first tag (the task token) removed, and
+   * parsed with token2json.
+   */
+  async parse(img: RgbImage, options: DonutParseOptions = {}): Promise<DonutParse[]> {
+    const task = options.prompt ?? this.taskToken;
+    if (!task) throw new Error("Donut: this model has no single task token; pass `prompt`");
+    const prompt = this.textIds(task);
+    const unk = this.tokenizer.tokenId("<unk>");
+    const ids = await this.generate(img, prompt, options.max_new_tokens ?? this.decoder.maxTarget, unk === undefined ? [] : [unk]);
+    let seq = this.tokenizer.decode([...prompt, ...ids], false).replaceAll("</s>", "").replaceAll("<pad>", "");
+    seq = seq.replace(/<.*?>/, "").trim();
+    return [{ generated_text: seq, json: donutToken2Json(seq, new Set(this.added)) }];
+  }
 
   /** The encoder's output [tokens, hidden] for an image (kept for the last two images). */
   async encode(img: RgbImage): Promise<Float32Array> {
@@ -142,18 +229,19 @@ export class DonutDocQA {
    * prompt fed a token at a time, then tokens until end-of-sequence, `maxNew` of them, or the
    * decoder's last position. Returns the generated ids (end-of-sequence not included).
    */
-  async generate(img: RgbImage, prompt: readonly number[], maxNew = 256): Promise<number[]> {
+  async generate(img: RgbImage, prompt: readonly number[], maxNew = 256, banned: readonly number[] = []): Promise<number[]> {
     const h = await this.encode(img);
     const dec = this.decoder;
     await dec.encodeHidden(h, h.length / dec.cfg.dModel);
     if (!prompt.length || prompt.length >= dec.maxTarget) throw new Error(`Donut: a prompt of ${prompt.length} tokens does not fit the decoder's ${dec.maxTarget} positions`);
+    const step = banned.length ? { banned } : undefined;
     let tok = 0;
-    for (let t = 0; t < prompt.length; t++) tok = await dec.next(prompt[t]!, t);
+    for (let t = 0; t < prompt.length; t++) tok = await dec.next(prompt[t]!, t, step);
     const out: number[] = [];
     for (let t = prompt.length; tok !== dec.cfg.eos && out.length < maxNew; t++) {
       out.push(tok);
       if (t >= dec.maxTarget) break;
-      tok = await dec.next(tok, t);
+      tok = await dec.next(tok, t, step);
     }
     return out;
   }
@@ -196,7 +284,9 @@ export async function createDonut(
   const ep = opts.endpoint;
   const listing = await files;
   if (listing && !listing.has("tokenizer.json")) throw new Error(`${modelId} has no tokenizer.json`);
-  const tokenizer = encoderTokenizerFromJSON((await fetchJSON<EncoderTokenizerJSON>(fileUrl(ref, "tokenizer.json", ep)))!);
+  const tokJson = (await fetchJSON<EncoderTokenizerJSON>(fileUrl(ref, "tokenizer.json", ep)))!;
+  const tokenizer = encoderTokenizerFromJSON(tokJson);
+  const added = (tokJson.added_tokens ?? []).map((t) => t.content);
   const backend = opts.backend ?? (await openBackend(opts.device ?? "auto", opts.cpuThreads));
   const sources: ByteSource[] = [];
   const located = new Map<string, { source: ByteSource; entry: TensorEntry }>();
@@ -246,7 +336,7 @@ export async function createDonut(
     const encoder = new DonutSwinModel(backend, cfg, encWeights);
     const decoder = new Seq2SeqModel(backend, dcfg, decWeights);
     const processor: ImageProcessorConfig = { ...(prep ?? {}), size: { height: processing.size[0], width: processing.size[1] } };
-    return make(new DonutDocQA(cfg, processing, processor, encoder, decoder, tokenizer), backend);
+    return make(new DonutDocQA(cfg, processing, processor, encoder, decoder, tokenizer, added), backend);
   } finally {
     for (const s of sources) s.close?.();
   }

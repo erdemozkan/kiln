@@ -855,6 +855,23 @@ against 33.1–34.3 s for transformers.js, and another question on it 1.3 s agai
 backgrounded pane). The weights come as a 2022 `pytorch_model.bin` only; Kiln reads it with its own
 zip and pickle reader.
 
+Donut's other fine-tunes run in `image-to-text`, prompted with their task token as their model cards
+do (Kiln finds it among the tokenizer's added tokens; `prompt` overrides it) and parsed with a port
+of DonutProcessor's `token2json` into `json`:
+
+```js
+const parser = await pipeline("image-to-text", "naver-clova-ix/donut-base-finetuned-cord-v2");
+const [{ json }] = await parser("receipt.png");
+// { menu: { nm: "CINNAMON SUGAR", unitprice: "17,000", cnt: "1 x", price: "17,000" }, total: { total_price: "17,000", … } }
+```
+
+The receipt parser (`donut-base-finetuned-cord-v2`, pages at 1280 × 960) gave the same sequence as
+transformers.js (`Xenova/donut-base-finetuned-cord-v2`, fp32, same pixels, `<unk>` banned as the
+model card does) on the receipt and, 1,106 characters long, on the invoice, in 5.9 s against 12.8 s
+and 13.3 s against 29.2 s. The document classifier (`donut-base-finetuned-rvlcdip`, which has no
+transformers.js export) labelled the invoice "invoice", the advertisement "advertisement" and both
+papers "scientific_report" (the receipt "budget": its 16 classes have no receipt), about 14 s a page.
+
 SmolVLM (`HuggingFaceTB/SmolVLM-256M-Instruct`, `-500M-Instruct`, and other Idefics3 checkpoints)
 answers questions about images in chat. `load(id)`, then messages with image parts, as for Gemma 3; no
 extra file is needed. Images go through Idefics3's processor with PIL's Lanczos resampling (Kiln's

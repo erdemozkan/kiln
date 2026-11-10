@@ -114,7 +114,9 @@ vocab.json and merges.txt when a repo has no tokenizer.json. Donut
 prompt and answer extraction (`max_new_tokens`), the Swin encoder on new shifted-window attention
 (relative-position bias, wrap-around mask) and patch-merging kernels, submitted a block at a time,
 the mBART decoder on the seq2seq code, DonutImageProcessor's resize, thumbnail and centered padding;
-the last two pages' encodings are kept. `resizeImage` takes PIL's `box`, and `reduceImage` /
+the last two pages' encodings are kept. Donut's other fine-tunes (receipts with
+`donut-base-finetuned-cord-v2`, document classes with `-rvlcdip`) run in `image-to-text` with their task token
+(`prompt` to override) and `json`, DonutProcessor's `token2json` ported. `resizeImage` takes PIL's `box`, and `reduceImage` /
 `resizeImageReducing` are PIL's Image.reduce and `reducing_gap`, byte for byte. Kokoro
 (`hexgrad/Kokoro-82M`, from its .pth): `text-to-speech` with `voice` (the ONNX export's voices
 by name, or a style table), `speed`, `seed` / `noise_scale: 0`, and kokoro-js's text front end

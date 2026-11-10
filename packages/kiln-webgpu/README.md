@@ -188,6 +188,10 @@ await florence("car.jpg", { task: "<OD>" }); // [{ generated_text, "<OD>": { lab
 const qa = await pipeline("document-question-answering"); // naver-clova-ix/donut-base-finetuned-docvqa
 await qa("invoice.png", "What is the invoice number?"); // [{ answer: "us-001" }]
 
+// Donut fine-tunes in image-to-text: receipts to JSON, or a document's class.
+const parser = await pipeline("image-to-text", "naver-clova-ix/donut-base-finetuned-cord-v2");
+const [{ json }] = await parser("receipt.png"); // { menu: { nm: "CINNAMON SUGAR", … }, total: { total_price: "17,000", … } }
+
 // MMS-TTS (VITS): speech from text, 16 kHz mono.
 const tts = await pipeline("text-to-speech"); // facebook/mms-tts-eng
 const { audio, sampling_rate } = await tts("Hello, my dog is cute.", { seed: 1 });

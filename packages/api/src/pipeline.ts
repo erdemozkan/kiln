@@ -599,8 +599,10 @@ export interface ImageToTextOptions {
   task?: string;
   /** Florence-2: the text input of tasks that take one ("<CAPTION_TO_PHRASE_GROUNDING>", "<OPEN_VOCABULARY_DETECTION>", …). */
   text_input?: string;
+  /** Donut: the decoder prompt (default the model's task token, such as "<s_cord-v2>" or "<s_rvlcdip>"). */
+  prompt?: string;
 }
-/** Florence-2 adds the parsed answer under its task token: text, or { labels, bboxes } in the image's pixels, … */
+/** Florence-2 adds the parsed answer under its task token: text, or { labels, bboxes } in the image's pixels, …; Donut adds `json` (token2json's parse). */
 export type ImageToTextResult = { generated_text: string; [task: string]: unknown };
 export interface ImageToTextPipeline {
   readonly task: PipelineTask;

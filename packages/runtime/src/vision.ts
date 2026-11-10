@@ -67,8 +67,10 @@ export interface ImageSegment {
 }
 
 export interface ImageToTextOptions extends Omit<FlorenceOptions, "max_new_tokens"> {
-  /** Most tokens to generate (default: up to the model's max_length, 20, counting the start token; Florence-2: 1024). */
+  /** Most tokens to generate (default: up to the model's max_length, 20, counting the start token; Florence-2: 1024; Donut: its decoder's positions). */
   max_new_tokens?: number;
+  /** Donut: the decoder prompt (default its task token, such as "<s_cord-v2>"). */
+  prompt?: string;
   /** Longest output counting the decoder start token (transformers' max_length; default 20). */
   max_length?: number;
 }
@@ -545,6 +547,7 @@ export class VisionEngine {
    */
   async caption(img: RgbImage, options: ImageToTextOptions = {}): Promise<{ generated_text: string }[]> {
     if (this.florence) return this.florence.run(img, options);
+    if (this.donut) return this.donut.parse(img, { prompt: options.prompt, max_new_tokens: options.max_new_tokens });
     const cap = this.captioner;
     if (!cap) throw new Error("this model does not caption images");
     const h = await this.model.forward(this.pixels(img));
