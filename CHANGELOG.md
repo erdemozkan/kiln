@@ -117,7 +117,7 @@ the mBART decoder on the seq2seq code, DonutImageProcessor's resize, thumbnail a
 the last two pages' encodings are kept. Donut's other fine-tunes (receipts with
 `donut-base-finetuned-cord-v2`, document classes with `-rvlcdip`) run in `image-to-text` with their task token
 (`prompt` to override) and `json`, DonutProcessor's `token2json` ported. `resizeImage` takes PIL's `box`, and `reduceImage` /
-`resizeImageReducing` are PIL's Image.reduce and `reducing_gap`, byte for byte. Kokoro
+`resizeImageReducing` are PIL's Image.reduce and `reducing_gap`, byte for byte. Image parts in chat combine with `format` (JSON Schema): a vision model reads a document into a given shape (SmolVLM-500M: 4 of 4 replies valid against 0 of 4 unconstrained). Kokoro
 (`hexgrad/Kokoro-82M`, from its .pth): `text-to-speech` with `voice` (the ONNX export's voices
 by name, or a style table), `speed`, `seed` / `noise_scale: 0`, and kokoro-js's text front end
 (`kokoroNormalize`, `kokoroPhonemes`) around a phonemizer the caller passes (`phonemize`) or

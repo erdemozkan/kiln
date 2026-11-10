@@ -286,6 +286,15 @@ As its processor does, the image is cut into 512 × 512 tiles plus a global view
 image tokens, for a 640 × 480 photo); `load(id, { imageSplitting: false })` uses one 512 × 512 view
 instead (64 tokens, several times faster, less detail).
 
+Image parts work with structured output, to read a document into a shape:
+
+```ts
+const schema = { type: "object", properties: { invoice_number: { type: "string" }, total: { type: "number" } }, required: ["invoice_number", "total"], additionalProperties: false };
+const reply = vlm.chat([{ role: "user", content: [{ type: "image", image: blob }, { type: "text", text: "Read this invoice. Reply with JSON: invoice_number and total." }] }], { format: { type: "json", schema } });
+```
+
+The reply always parses and fits the schema; whether the values are right is still up to the model.
+
 ## Models
 
 Llama, Mistral, Qwen2, Qwen3, SmolLM, Granite 3 and 4 (350M to 2B), Gemma 3 (270M to 4B and larger;

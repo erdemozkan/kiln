@@ -898,6 +898,19 @@ splitting: 2.3 s against 4.3 s, 2.1 s against 3.4 s, and 4.0 s against 11.3 s. A
 no faster. The tower now keeps one layer queued ahead instead of waiting on each layer, which
 saved 0.3 s per tile.
 
+Images combine with structured output: an image part and `format: { type: "json", schema }` read a
+document into the shape you give, which transformers.js has no way to do (it has no constrained
+decoding). With SmolVLM-500M, four requests on three documents, each with the same prompt naming the
+keys, constrained and not: all 4 constrained replies were valid and matched their schemas, against 0
+of 4 unconstrained (one not JSON at all; the others nested objects, arrays of arrays, or the CORD
+receipt format the model saw in training). On the bicycle-shop invoice the five header fields
+(number, dates, customer, total 154.06) were all right under the schema, while the free reply got the
+invoice number wrong; its three line items and the other invoice's number, date and balance due
+(2,844.80) were right too. The receipt shows the limit: under the schema the reply was valid but wrong
+(a second item made of the quantity line, the change given as the total), so the schema fixes the
+shape, not the reading. The first request on an image took 21–25 s (splitting into tiles, then the
+vision tower), the same request again 2.8–4.0 s with the same answer.
+
 transformers.js's export differs from the model. DaViT's channel attention scales queries by
 N^-½, N the number of tokens; the ONNX graph froze that number when it was traced at 224 × 224
 (1/56 at the first stage), while the processor feeds 768 × 768 images (1/192). Each of the 12
