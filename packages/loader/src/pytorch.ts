@@ -294,13 +294,22 @@ function storageRef(pid: unknown): StorageRef {
   return { kind: "storage", cls, key: String(t[2]), numel: Number(t[4]) };
 }
 
-/** Name → tensor from a state dict (nested "state_dict" / "model" wrappers unwrapped). */
+/**
+ * Name → tensor from a state dict ("state_dict" / "model" wrappers unwrapped). A dict of state dicts
+ * (Kokoro's: one per module) is flattened with its keys as prefixes: "bert.module.embeddings…".
+ */
 function tensorsOf(value: unknown): Map<string, TensorRef> {
   let v = value;
   for (const k of ["state_dict", "model"]) if (v instanceof Map && v.has(k) && v.get(k) instanceof Map) v = v.get(k);
   if (!(v instanceof Map)) throw new Error("pytorch: the checkpoint is not a state dict");
   const out = new Map<string, TensorRef>();
-  for (const [k, t] of v) if (t && (t as TensorRef).kind === "tensor") out.set(String(k), t as TensorRef);
+  const walk = (m: Map<unknown, unknown>, prefix: string) => {
+    for (const [k, t] of m) {
+      if (t instanceof Map) walk(t, `${prefix}${String(k)}.`);
+      else if (t && (t as TensorRef).kind === "tensor") out.set(prefix + String(k), t as TensorRef);
+    }
+  };
+  walk(v, "");
   return out;
 }
 

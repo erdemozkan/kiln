@@ -1,5 +1,6 @@
 // A transformers.js-shaped front end over `load` / `chat` / `complete`, so code written for
 // transformers.js's text-generation pipeline runs on Kiln with little more than a new import.
+import { kokoroPhonemes, type Phonemizer } from "./kokoro-text";
 import type { LoadProgress } from "@kiln/runtime";
 import type { ChatMessage } from "@kiln/tokenizers";
 import { KilnVision, KilnAudio, KilnEncoder, KilnModel, KilnSeq2Seq, type GenerateOptions, type LoadOptions, type TextStream } from "./client";
@@ -611,13 +612,13 @@ export interface ImageToTextPipeline {
 }
 
 export interface TextToAudioOptions {
-  /** Scale of the sampled latent noise (default the model's, 0.667); 0 is deterministic. */
+  /** Scale of the sampled latent noise (default the model's, 0.667); 0 is deterministic. Kokoro: 0 leaves out its source's random phases and noise. */
   noise_scale?: number;
   /** Scale of the duration predictor's noise (default 0.8). */
   noise_scale_duration?: number;
   /** Faster above 1, slower below. */
   speaking_rate?: number;
-  /** Seed for repeatable output (VITS noise, SpeechT5 prenet dropout). */
+  /** Seed for repeatable output (VITS and Kokoro noise, SpeechT5 prenet dropout). */
   seed?: number;
   /**
    * SpeechT5: the speaker's x-vector (512 values), required — a Float32Array, a tensor-like
@@ -628,6 +629,18 @@ export interface TextToAudioOptions {
   threshold?: number;
   /** SpeechT5: the prenet dropout transformers keeps on at inference, "sample" (default) or "keep" (deterministic). */
   prenet_dropout?: "sample" | "keep";
+  /** Kokoro: a voice name ("af_heart", the default; "b…" voices are British) or its style table (510 × 256 float32 values). */
+  voice?: string | Float32Array;
+  /** Kokoro: faster above 1, slower below (default 1). */
+  speed?: number;
+  /**
+   * Kokoro: turns text into phonemes, e.g. `phonemize` from the `phonemizer` package (espeak-ng);
+   * Kiln normalizes the text and fixes the phonemes up as kokoro-js does. Kokoro needs this, or
+   * `phonemes: true`.
+   */
+  phonemize?: Phonemizer;
+  /** Kokoro: the input is already phonemes (Kokoro's set). */
+  phonemes?: boolean;
 }
 /** Speech: mono samples in −1…1 at `sampling_rate` Hz (transformers.js's RawAudio fields). */
 export interface TextToAudioResult {
@@ -778,11 +791,20 @@ export async function pipeline(task: PipelineTask, model?: string, options: Pipe
       }
       return { ...opts, speaker_embeddings: Float32Array.from(e.data) };
     };
+    // Kokoro reads phonemes: text is phonemized here (a function cannot reach the worker).
+    const kokoro = m.info.family === "kokoro";
+    const speak = async (s: string, o: TextToAudioOptions) => {
+      const { phonemize, phonemes, ...rest } = o;
+      if (!kokoro) return m.speak(s, rest);
+      if (phonemes) return m.speak(s, rest);
+      if (!phonemize) throw new Error('Kiln: Kokoro reads phonemes; pass `phonemize` (e.g. `import { phonemize } from "phonemizer"`) or `phonemes: true`');
+      return m.speak(await kokoroPhonemes(s, phonemize, typeof rest.voice === "string" ? rest.voice : "af_heart"), rest);
+    };
     const call = async (text: string | string[], opts?: TextToAudioOptions) => {
       const o = await resolve(opts);
-      if (!Array.isArray(text)) return m.speak(text, o);
+      if (!Array.isArray(text)) return speak(text, o);
       const out: TextToAudioResult[] = [];
-      for (const s of text) out.push(await m.speak(s, o));
+      for (const s of text) out.push(await speak(s, o));
       return out;
     };
     return Object.assign(call, { task, model: m, info: m.info, tokenizer: {}, dispose: () => m.unload() });

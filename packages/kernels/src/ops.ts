@@ -36,6 +36,11 @@ import {
   swinAttentionSpec,
   swinV1AttentionSpec,
   patchMergeSpec,
+  lstmSpec,
+  snakeSpec,
+  dwConvTranspose1dSpec,
+  leakyReluSpec,
+  padReflectLeftSpec,
   windowAttentionSpec,
   channelGramSpec,
   channelApplySpec,
@@ -583,6 +588,51 @@ export function swinV1Attention(ctx: Ctx, q: Tensor, k: Tensor, v: Tensor, bias:
   const params = ctx.uniform([u32(o.H), u32(o.W), u32(C), u32(o.heads), f32(D ** -0.5), u32(o.win), u32(o.shift), u32(0)]);
   ctx.run(swinV1AttentionSpec(D, o.win), [params, q.buf, k.buf, v.buf, bias.buf, out.buf], [(o.H / o.win) * (o.W / o.win), o.heads, 1]);
   return out;
+}
+
+/**
+ * A bidirectional LSTM's recurrence (see lstmSpec): pre [T, 8H] (input projections plus biases,
+ * forward then reverse), whhT [2, H, 4H] → [T, 2H].
+ */
+export function lstm(ctx: Ctx, pre: Tensor, whhT: Tensor): Tensor {
+  const H = lastDim(pre) / 8;
+  const T = numel(pre.shape) / (8 * H);
+  if (numel(whhT.shape) !== 8 * H * H) throw new Error(`lstm: whhT [${whhT.shape}] is not [2, ${H}, ${4 * H}]`);
+  const y = ctx.alloc([T, 2 * H]);
+  ctx.run(lstmSpec(H), [ctx.uniform([u32(T), u32(0), u32(0), u32(0)]), pre.buf, whhT.buf, y.buf], [2, 1, 1]);
+  return y;
+}
+
+/** Snake in place on x [T, C] with α per channel: x + sin(α·x)² / α. */
+export function snake(ctx: Ctx, x: Tensor, alpha: Tensor): void {
+  const n = numel(x.shape);
+  ctx.run(snakeSpec(), [ctx.uniform([u32(n), u32(lastDim(x)), u32(0), u32(0)]), x.buf, alpha.buf], grid1d(n));
+}
+
+/** Depthwise transposed 1-D convolution (see dwConvTranspose1dSpec): x [Tin, C], w [K, C] → [tout, C]. */
+export function dwConvTranspose1d(ctx: Ctx, x: Tensor, w: Tensor, bias: Tensor, o: { s: number; pad: number; tout: number; leakyIn?: number }): Tensor {
+  const C = lastDim(x);
+  const Tin = numel(x.shape) / C;
+  const K = numel(w.shape) / C;
+  const y = ctx.alloc([o.tout, C]);
+  ctx.run(dwConvTranspose1dSpec(), [ctx.uniform([u32(Tin), u32(o.tout), u32(C), u32(K), u32(o.s), u32(o.pad), f32(o.leakyIn ?? 1), u32(0)]), x.buf, w.buf, bias.buf, y.buf], grid1d(o.tout * C));
+  return y;
+}
+
+/** LeakyReLU in place. */
+export function leakyRelu(ctx: Ctx, x: Tensor, slope: number): void {
+  const n = numel(x.shape);
+  ctx.run(leakyReluSpec(), [ctx.uniform([u32(n), f32(slope), u32(0), u32(0)]), x.buf], grid1d(n));
+}
+
+/** Rows of x [T, C] reflection-padded at the front by `left` (ReflectionPad1d((left, 0))): [T + left, C]. */
+export function padReflectLeft(ctx: Ctx, x: Tensor, left: number): Tensor {
+  const C = lastDim(x);
+  const T = numel(x.shape) / C;
+  if (left >= T) throw new Error(`padReflectLeft: ${left} rows of padding need more than ${T} rows`);
+  const y = ctx.alloc([T + left, C]);
+  ctx.run(padReflectLeftSpec(), [ctx.uniform([u32((T + left) * C), u32(C), u32(left), u32(0)]), x.buf, y.buf], grid1d((T + left) * C));
+  return y;
 }
 
 /** Swin's patch merging gather (see patchMergeSpec): x [H·W, C] → [(H/2)·(W/2), 4C]. */

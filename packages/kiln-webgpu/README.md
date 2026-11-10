@@ -196,6 +196,11 @@ const { audio, sampling_rate } = await tts("Hello, my dog is cute.", { seed: 1 }
 const t5 = await pipeline("text-to-speech", "microsoft/speecht5_tts");
 const speech = await t5("Hello, my dog is cute.", { speaker_embeddings: "https://huggingface.co/datasets/Xenova/transformers.js-docs/resolve/main/speaker_embeddings.bin" });
 
+// Kokoro: English voices at 24 kHz; text through your phonemizer (espeak-ng's `phonemizer` package).
+import { phonemize } from "phonemizer";
+const kokoro = await pipeline("text-to-speech", "hexgrad/Kokoro-82M");
+const voice = await kokoro("Hello, my dog is cute.", { voice: "af_heart", phonemize });
+
 // Swin2SR: 2× super-resolution.
 const upscaler = await pipeline("image-to-image"); // caidas/swin2SR-classical-sr-x2-64
 const big = await upscaler("small.png"); // { width: 2 × w, height: 2 × h, channels: 3, data }

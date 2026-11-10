@@ -529,6 +529,7 @@ K/V; each decoder step reads them through a step block whose span covers every p
 | CLIP tokenizer (`openai/clip-vit-base-patch32`) | transformers.js | the same ids for 8 texts (punctuation, accents, CJK, emoji, long words) |
 | ResNet-50 (`microsoft/resnet-50`), ConvNeXt (`facebook/convnext-tiny-224`) | transformers.js (`Xenova/*`, fp32) on the same pixel values | every uniquely labelled class within 1.7e-8 (ResNet) and 4.7e-7 (ConvNeXt); 337 / 374 ms end to end against 370 / 434 ms |
 | VITS text-to-speech (`facebook/mms-tts-eng`) | transformers.js (`Xenova/mms-tts-eng`, fp32), its two noise nodes set to zero, Kiln at zero noise | the same 33,024 samples, within 1.4e-4 (peak 0.87); 617 ms end to end against 1.33 s (WebGPU) |
+| Kokoro (`hexgrad/Kokoro-82M`) | transformers.js (`onnx-community/Kokoro-82M-v1.0-ONNX`, fp32, which has no noise), Kiln without noise, the same phonemes and style | the same durations and lengths on 3 sentences; given the export's harmonic spectrum, the vocoder within 9.1e-4 and the audio at 0.997–0.999 correlation; from the text, 0.979–0.988 (float32 phases of the sine source). The export's speech is 1.5× PyTorch's (an iSTFT normalization traced for one frame). 1.5 s against 2.5 s, 3.8 s against 6.3 s |
 | SpeechT5 text-to-speech (`microsoft/speecht5_tts` + `microsoft/speecht5_hifigan`) | transformers.js (`Xenova/speecht5_tts`, fp32), its prenet dropout rewritten to keep every unit, Kiln with `prenet_dropout: "keep"` | the same ids; the same 122,880 samples, within 1e-5 over the first 80 frames, then drifting as frames feed back (mean difference 3.3e-4). With dropout: 1.9 s against 6.4 s (WebGPU) for "Hello, my dog is cute.", 3.6 s against 12.7 s for a 44-character sentence |
 | ViT + GPT-2 captioning (`nlpconnect/vit-gpt2-image-captioning`) | transformers.js (`Xenova/vit-gpt2-image-captioning`, fp32) on the same pixel values | the same caption on all three photos tried |
 | Florence-2 (`microsoft/Florence-2-base-ft`) | transformers.js (`onnx-community/Florence-2-base-ft`, fp32) on the same 768 × 768 pixels | 3 of 20 outputs identical (4 photos × caption, detailed caption, detection, grounding, OCR): its export fixed the channel-attention scale at a 224 × 224 trace, 3.4× too large at 768 (see below). With that scale given to Kiln too, the image tokens agree within 2.6e-4 and all 20 outputs are identical, every location token included. 2.9 s against 5.8 s for a caption, 3.0 s against 6.1 s for detection (WebGPU) |
@@ -945,6 +946,47 @@ Whisper tiny.en heard Kiln's speech as "Hello, my dog is cute." for five seeds o
 dog is cute." and "the quick brown fox jumps over the lazy dog." End to end with a hidden pane:
 1.9 s in Kiln against 6.4 s for transformers.js (median of 3, its decoder and vocoder on WebGPU)
 for "Hello, my dog is cute.", and 3.6 s against 12.7 s for the pangram.
+
+Kokoro (`hexgrad/Kokoro-82M`, StyleTTS 2 with an iSTFTNet vocoder) loads from its original
+`kokoro-v1_0.pth` checkpoint, with the voices of its ONNX export by name (`voice`, default
+`af_heart`; "a…" American and "b…" British English, the other languages' voices with phonemes
+given) or as a style table. Kokoro reads phonemes, not
+text. Kiln does what kokoro-js does: it normalizes the text (numbers, money, times, titles),
+phonemizes the parts between punctuation and fixes the phonemes up. The phonemizer is espeak-ng,
+which is GPL, so Kiln does not bundle it: pass `phonemize` from the `phonemizer` package (espeak-ng
+compiled to WebAssembly), or give phonemes with `phonemes: true`.
+
+```js
+import { phonemize } from "phonemizer";
+const tts = await pipeline("text-to-speech", "hexgrad/Kokoro-82M");
+const { audio, sampling_rate } = await tts("Hello, my dog is cute.", { voice: "af_heart", phonemize }); // 24 kHz
+```
+
+The pieces: PL-BERT (ALBERT, one layer applied 12 times), the duration encoder's three
+bidirectional LSTMs with style-conditioned LayerNorm, the duration LSTM, and the text encoder on
+the GPU as one plan; durations rounded on the CPU and the encodings repeated per frame; the shared
+LSTM and the F0 and energy stacks (style-conditioned InstanceNorm residual blocks, a depthwise
+transposed convolution for the 2× upsampling) as a second plan; then the iSTFTNet decoder and
+generator (Snake activations, the harmonic source's spectrum mixed in at both upsampling stages) as
+a third, sliced across submits. New kernels: a bidirectional LSTM (one workgroup per direction, the
+state in workgroup memory), Snake, the depthwise transposed convolution, LeakyReLU and reflection
+padding. The harmonic source (nine sines from the F0 curve, in float32 as torch computes it), its
+20-point STFT and the inverse STFT run on the CPU. Python's Kokoro starts each harmonic at a random
+phase and adds a little noise; so does Kiln (`seed` repeats it, `noise_scale: 0` leaves both out),
+and the voice's style row is Python's (the phoneme count minus one; kokoro-js takes the next row).
+
+The ONNX export transformers.js and kokoro-js run (`onnx-community/Kokoro-82M-v1.0-ONNX`, fp32)
+has no noise, so Kiln without noise was compared with it, on the same phonemes, ids and style.
+The durations, and so the lengths, were identical on three sentences. The vocoder's last
+convolution agreed within 9.1e-4 (values up to 63) when given the export's own harmonic spectrum,
+and the audio then correlated at 0.997 to 0.999. From the text, the audio correlates at 0.979 to
+0.988: the sines' phase reaches millions of radians at the ninth harmonic, where float32 holds
+only a few digits, so the two sources differ by a few 1e-4, and their spectra's near-empty bins
+take different phases. The export also outputs speech 1.5× louder than PyTorch: its inverse STFT
+divides by a window sum traced for one frame, so after the first 20 samples it skips the
+normalization `torch.istft` does. Kiln follows PyTorch (the comparison scales transformers.js's
+audio by 1 / 1.5). End to end on WebGPU (median of 3, same pane): 1.5 s against 2.5 s for
+"Hello, my dog is cute.", 3.8 s against 6.3 s for an 82-character sentence.
 
 T5's learned relative position bias is added to each score by the per-row attention kernels (GPU
 and CPU, buckets computed in the kernel; bucket function equal to transformers' over ±300

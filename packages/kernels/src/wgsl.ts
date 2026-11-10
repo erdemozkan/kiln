@@ -2550,6 +2550,143 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
 }
 
 /**
+ * A bidirectional LSTM layer's recurrence (PyTorch's gate order i, f, g, o): pre [T, 8H] holds each
+ * step's input projections plus both biases, forward gates then reverse gates; whhT [2, H, 4H] is
+ * each direction's hidden-to-hidden weight transposed (column k of W_hh as a row, for coalesced
+ * reads). out [T, 2H]: the forward state at each step, then the reverse one (run from the last step).
+ * One workgroup of H threads per direction, one per hidden unit; the state stays in workgroup memory.
+ */
+export function lstmSpec(H: number): KernelSpec {
+  if (H > 256) throw new Error(`lstm: ${H} hidden units is more than 256 threads`);
+  return spec(`lstm/H${H}`, ["uniform", "read", "read", "rw"], cpu.cpuLstm, () => /* wgsl */ `
+struct P { T: u32, _a: u32, _b: u32, _c: u32 }
+@group(0) @binding(0) var<uniform> p: P;
+@group(0) @binding(1) var<storage, read> pre: array<f32>;
+@group(0) @binding(2) var<storage, read> whhT: array<f32>;
+@group(0) @binding(3) var<storage, read_write> o: array<f32>;
+const H = ${H}u;
+var<workgroup> h: array<f32, ${H}>;
+
+fn sig(x: f32) -> f32 { return 1.0 / (1.0 + exp(-x)); }
+fn th(x: f32) -> f32 { return tanh(clamp(x, -15.0, 15.0)); }
+
+@compute @workgroup_size(${H})
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) j: u32) {
+  let dir = wid.x;
+  h[j] = 0.0;
+  var c = 0.0;
+  workgroupBarrier();
+  for (var s = 0u; s < p.T; s++) {
+    let t = select(s, p.T - 1u - s, dir == 1u);
+    let base = t * 8u * H + dir * 4u * H;
+    var g0 = pre[base + j];
+    var g1 = pre[base + H + j];
+    var g2 = pre[base + 2u * H + j];
+    var g3 = pre[base + 3u * H + j];
+    for (var k = 0u; k < H; k++) {
+      let hk = h[k];
+      let r = (dir * H + k) * 4u * H + j;
+      g0 += whhT[r] * hk;
+      g1 += whhT[r + H] * hk;
+      g2 += whhT[r + 2u * H] * hk;
+      g3 += whhT[r + 3u * H] * hk;
+    }
+    workgroupBarrier();
+    c = sig(g1) * c + sig(g0) * th(g2);
+    let hn = sig(g3) * th(c);
+    h[j] = hn;
+    o[t * 2u * H + dir * H + j] = hn;
+    workgroupBarrier();
+  }
+}`);
+}
+
+/** Snake in place on x [T, C]: x + sin(α·x)² / α with α per channel (alpha [C]). */
+export function snakeSpec(): KernelSpec {
+  return spec("snake", ["uniform", "rw", "read"], cpu.cpuSnake, () => /* wgsl */ `
+struct P { n: u32, C: u32, _a: u32, _b: u32 }
+@group(0) @binding(0) var<uniform> p: P;
+@group(0) @binding(1) var<storage, read_write> x: array<f32>;
+@group(0) @binding(2) var<storage, read> alpha: array<f32>;
+
+@compute @workgroup_size(${EW})
+fn main(${EW_ARGS}) {
+  ${FLAT}
+  if (idx >= p.n) { return; }
+  let a = alpha[idx % p.C];
+  let v = x[idx];
+  let sn = sin(a * v);
+  x[idx] = v + sn * sn / a;
+}`);
+}
+
+/**
+ * Depthwise transposed 1-D convolution of x [Tin, C] (groups = C): y[t, c] = bias[c] + Σ x[i, c] ·
+ * w[k, c] over t = i·s − pad + k, for t < Tout (which can include output padding). w [K, C]. Inputs
+ * pass through a LeakyReLU of slope `leak` as they load (1: none).
+ */
+export function dwConvTranspose1dSpec(): KernelSpec {
+  return spec("dw_conv_transpose1d", ["uniform", "read", "read", "read", "rw"], cpu.cpuDwConvTranspose1d, () => /* wgsl */ `
+struct P { Tin: u32, Tout: u32, C: u32, K: u32, s: u32, pad: u32, leak: f32, _b: u32 }
+@group(0) @binding(0) var<uniform> p: P;
+@group(0) @binding(1) var<storage, read> x: array<f32>;
+@group(0) @binding(2) var<storage, read> w: array<f32>;
+@group(0) @binding(3) var<storage, read> bias: array<f32>;
+@group(0) @binding(4) var<storage, read_write> y: array<f32>;
+
+@compute @workgroup_size(${EW})
+fn main(${EW_ARGS}) {
+  ${FLAT}
+  if (idx >= p.Tout * p.C) { return; }
+  let c = idx % p.C;
+  let t = idx / p.C;
+  var acc = bias[c];
+  for (var k = 0u; k < p.K; k++) {
+    let num = i32(t + p.pad) - i32(k);
+    if (num < 0 || u32(num) % p.s != 0u) { continue; }
+    let i = u32(num) / p.s;
+    if (i >= p.Tin) { continue; }
+    let v = x[i * p.C + c];
+    acc += select(v * p.leak, v, v >= 0.0) * w[k * p.C + c];
+  }
+  y[idx] = acc;
+}`);
+}
+
+/** LeakyReLU in place: x · slope where x < 0. */
+export function leakyReluSpec(): KernelSpec {
+  return spec("leaky_relu", ["uniform", "rw"], cpu.cpuLeakyRelu, () => /* wgsl */ `
+struct P { n: u32, slope: f32, _a: u32, _b: u32 }
+@group(0) @binding(0) var<uniform> p: P;
+@group(0) @binding(1) var<storage, read_write> x: array<f32>;
+
+@compute @workgroup_size(${EW})
+fn main(${EW_ARGS}) {
+  ${FLAT}
+  if (idx >= p.n) { return; }
+  let v = x[idx];
+  x[idx] = select(v * p.slope, v, v >= 0.0);
+}`);
+}
+
+/** Rows of x [T, C] reflection-padded at the front: y [T + left, C], row r is x's row |r − left|. */
+export function padReflectLeftSpec(): KernelSpec {
+  return spec("pad_reflect_left", ["uniform", "read", "rw"], cpu.cpuPadReflectLeft, () => /* wgsl */ `
+struct P { n: u32, C: u32, left: u32, _a: u32 }
+@group(0) @binding(0) var<uniform> p: P;
+@group(0) @binding(1) var<storage, read> x: array<f32>;
+@group(0) @binding(2) var<storage, read_write> y: array<f32>;
+
+@compute @workgroup_size(${EW})
+fn main(${EW_ARGS}) {
+  ${FLAT}
+  if (idx >= p.n) { return; }
+  let r = i32(idx / p.C) - i32(p.left);
+  y[idx] = x[u32(abs(r)) * p.C + idx % p.C];
+}`);
+}
+
+/**
  * Swin's patch merging gather: x [H·W, C] (H, W even) → y [(H/2)·(W/2), 4C], each output row the
  * 2 × 2 block's tokens in transformers' order: (0, 0), (1, 0), (0, 1), (1, 1) as (row, column).
  */

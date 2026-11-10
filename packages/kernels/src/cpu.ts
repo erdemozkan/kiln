@@ -1301,6 +1301,78 @@ export const cpuSwinV1Attention: CpuKernel = (b) => {
     }
 };
 
+export const cpuLstm: CpuKernel = (b) => {
+  const T = b[0]!.u32[0]!;
+  const [pre, whhT, o] = [b[1]!.f32, b[2]!.f32, b[3]!.f32];
+  // whhT is [2, H, 4H]: 8H² values.
+  const H = Math.round(Math.sqrt(whhT.length / 8));
+  const f = Math.fround;
+  const sig = (x: number) => f(1 / (1 + Math.exp(-x)));
+  const th = (x: number) => f(Math.tanh(Math.min(Math.max(x, -15), 15)));
+  for (let dir = 0; dir < 2; dir++) {
+    let h = new Float32Array(H);
+    const c = new Float32Array(H);
+    for (let s = 0; s < T; s++) {
+      const t = dir ? T - 1 - s : s;
+      const base = t * 8 * H + dir * 4 * H;
+      const hn = new Float32Array(H);
+      for (let j = 0; j < H; j++) {
+        const g = [0, 1, 2, 3].map((q) => {
+          let acc = pre[base + q * H + j]!;
+          for (let k = 0; k < H; k++) acc += whhT[(dir * H + k) * 4 * H + q * H + j]! * h[k]!;
+          return f(acc);
+        });
+        c[j] = f(sig(g[1]!) * c[j]! + sig(g[0]!) * th(g[2]!));
+        hn[j] = f(sig(g[3]!) * th(c[j]!));
+        o[t * 2 * H + dir * H + j] = hn[j]!;
+      }
+      h = hn;
+    }
+  }
+};
+
+export const cpuSnake: CpuKernel = (b) => {
+  const [n, C] = [b[0]!.u32[0]!, b[0]!.u32[1]!];
+  const [x, alpha] = [b[1]!.f32, b[2]!.f32];
+  for (let i = 0; i < n; i++) {
+    const a = alpha[i % C]!;
+    const s = Math.sin(a * x[i]!);
+    x[i] = x[i]! + (s * s) / a;
+  }
+};
+
+export const cpuDwConvTranspose1d: CpuKernel = (b) => {
+  const [Tin, Tout, C, K, s, pad] = Array.from(b[0]!.u32.subarray(0, 6));
+  const leak = b[0]!.f32[6]!;
+  const [x, w, bias, y] = [b[1]!.f32, b[2]!.f32, b[3]!.f32, b[4]!.f32];
+  for (let t = 0; t < Tout!; t++)
+    for (let c = 0; c < C!; c++) {
+      let acc = bias[c]!;
+      for (let k = 0; k < K!; k++) {
+        const num = t + pad! - k;
+        if (num < 0 || num % s! !== 0) continue;
+        const i = num / s!;
+        if (i >= Tin!) continue;
+        const v = x[i * C! + c]!;
+        acc += (v >= 0 ? v : v * leak) * w[k * C! + c]!;
+      }
+      y[t * C! + c] = acc;
+    }
+};
+
+export const cpuLeakyRelu: CpuKernel = (b) => {
+  const n = b[0]!.u32[0]!;
+  const slope = b[0]!.f32[1]!;
+  const x = b[1]!.f32;
+  for (let i = 0; i < n; i++) if (x[i]! < 0) x[i] = Math.fround(x[i]! * slope);
+};
+
+export const cpuPadReflectLeft: CpuKernel = (b) => {
+  const [n, C, left] = [b[0]!.u32[0]!, b[0]!.u32[1]!, b[0]!.u32[2]!];
+  const [x, y] = [b[1]!.f32, b[2]!.f32];
+  for (let i = 0; i < n; i++) y[i] = x[Math.abs(Math.floor(i / C) - left) * C + (i % C)]!;
+};
+
 export const cpuPatchMerge: CpuKernel = (b) => {
   const [H, W, C] = [b[0]!.u32[0]!, b[0]!.u32[1]!, b[0]!.u32[2]!];
   const [x, y] = [b[1]!.f32, b[2]!.f32];

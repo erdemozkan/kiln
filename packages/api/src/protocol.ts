@@ -105,7 +105,7 @@ export interface WireAudioOptions extends WireEncoderOptions {
 
 export interface AudioInfo {
   model: string;
-  /** "wav2vec2", "hubert", "vits" or "speecht5". */
+  /** "wav2vec2", "hubert", "vits", "speecht5" or "kokoro". */
   family: string;
   /** "ctc" (speech recognition), "classification", or "tts" (text-to-speech). */
   head: "ctc" | "classification" | "tts";

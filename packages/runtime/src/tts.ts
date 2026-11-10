@@ -8,13 +8,13 @@ import { openBackend, openParsed } from "./load";
 import type { AudioLoadOptions } from "./audio";
 
 export interface TextToSpeechOptions {
-  /** VITS: scale of the sampled latent noise (default: the model's noise_scale, 0.667 for MMS). 0 is deterministic. */
+  /** VITS: scale of the sampled latent noise (default: the model's noise_scale, 0.667 for MMS). 0 is deterministic. Kokoro: 0 leaves out the source's random phases and noise. */
   noise_scale?: number;
   /** VITS: scale of the duration predictor's noise (default: noise_scale_duration, 0.8). */
   noise_scale_duration?: number;
   /** VITS: faster above 1, slower below (divides the durations; default the config's, 1). */
   speaking_rate?: number;
-  /** Seed for the noise (VITS) or the prenet dropout (SpeechT5), for repeatable output (default: random, as transformers samples it). */
+  /** Seed for the noise (VITS, Kokoro) or the prenet dropout (SpeechT5), for repeatable output (default: random, as transformers samples it). */
   seed?: number;
   /** SpeechT5: the speaker's x-vector (512 values), required. */
   speaker_embeddings?: Float32Array;
@@ -22,13 +22,17 @@ export interface TextToSpeechOptions {
   threshold?: number;
   /** SpeechT5: the speech prenet's dropout, "sample" (default, as transformers) or "keep" (deterministic). */
   prenet_dropout?: "sample" | "keep";
+  /** Kokoro: a voice name (default "af_heart") or a voice's style table (510 × 256 float32 values). */
+  voice?: string | Float32Array;
+  /** Kokoro: faster above 1, slower below (default 1). */
+  speed?: number;
 }
 
 /** A loaded text-to-speech model (VITS or SpeechT5 with its vocoder). */
 export class TtsEngine {
   constructor(
     readonly backend: Backend,
-    readonly info: { family: "vits" | "speecht5"; layers: number; hidden: number; samplingRate: number },
+    readonly info: { family: "vits" | "speecht5" | "kokoro"; layers: number; hidden: number; samplingRate: number },
     private readonly run: (text: string, o: TextToSpeechOptions) => Promise<Float32Array>,
     private readonly free: () => void,
   ) {}
@@ -44,7 +48,7 @@ export class TtsEngine {
 }
 
 /** Opens a repo's weight files and reads tensors from them as f32, by name. */
-async function tensorReader(modelId: string, ref: ModelRef, names: { names: string[]; format: "safetensors" | "pytorch" }, ep: string | undefined) {
+export async function tensorReader(modelId: string, ref: ModelRef, names: { names: string[]; format: "safetensors" | "pytorch" }, ep: string | undefined) {
   const sources: ByteSource[] = [];
   const located = new Map<string, { source: ByteSource; entry: TensorEntry }>();
   const close = () => {

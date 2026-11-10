@@ -115,7 +115,14 @@ prompt and answer extraction (`max_new_tokens`), the Swin encoder on new shifted
 (relative-position bias, wrap-around mask) and patch-merging kernels, submitted a block at a time,
 the mBART decoder on the seq2seq code, DonutImageProcessor's resize, thumbnail and centered padding;
 the last two pages' encodings are kept. `resizeImage` takes PIL's `box`, and `reduceImage` /
-`resizeImageReducing` are PIL's Image.reduce and `reducing_gap`, byte for byte.
+`resizeImageReducing` are PIL's Image.reduce and `reducing_gap`, byte for byte. Kokoro
+(`hexgrad/Kokoro-82M`, from its .pth): `text-to-speech` with `voice` (the ONNX export's voices
+by name, or a style table), `speed`, `seed` / `noise_scale: 0`, and kokoro-js's text front end
+(`kokoroNormalize`, `kokoroPhonemes`) around a phonemizer the caller passes (`phonemize`) or
+phonemes as input (`phonemes: true`); ALBERT, bidirectional LSTMs, style-conditioned norms and the
+iSTFTNet generator on the GPU in three plans, with new LSTM, Snake, depthwise transposed
+convolution, LeakyReLU and reflection-pad kernels; the harmonic source and the (inverse) STFT on
+the CPU. PyTorch checkpoints holding a dict of state dicts load with prefixed names.
 
 **Loading.** Reads ahead of a download in progress are fetched on their own instead of waiting
 (a `pytorch_model.bin` keeps its zip directory at the end, so large checkpoints showed no progress

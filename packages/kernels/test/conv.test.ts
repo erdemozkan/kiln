@@ -122,6 +122,59 @@ describe("speech front-end kernels (CPU)", () => {
         });
   });
 
+  it("lstm runs PyTorch's bidirectional recurrence", async () => {
+    const [T, H] = [5, 3];
+    const pre = randn(T * 8 * H);
+    // W_hh per direction [4H, H] (PyTorch's layout), given to the kernel transposed.
+    const whh = [randn(4 * H * H), randn(4 * H * H)];
+    const whhT = new Float32Array(8 * H * H);
+    for (let d = 0; d < 2; d++) for (let r = 0; r < 4 * H; r++) for (let k = 0; k < H; k++) whhT[(d * H + k) * 4 * H + r] = whh[d]![r * H + k]!;
+    const y = await run((ctx) => ops.lstm(ctx, upload(pre, [T, 8 * H]), upload(whhT, [2, H, 4 * H])), T * 2 * H);
+    const sig = (x: number) => 1 / (1 + Math.exp(-x));
+    for (let d = 0; d < 2; d++) {
+      let h = new Array(H).fill(0);
+      const c = new Array(H).fill(0);
+      for (let s = 0; s < T; s++) {
+        const t = d ? T - 1 - s : s;
+        const g = Array.from({ length: 4 * H }, (_, r) => pre[t * 8 * H + d * 4 * H + r]! + h.reduce((a, hk, k) => a + whh[d]![r * H + k]! * hk, 0));
+        h = h.map((_, j) => {
+          c[j] = sig(g[H + j]!) * c[j] + sig(g[j]!) * Math.tanh(g[2 * H + j]!);
+          return sig(g[3 * H + j]!) * Math.tanh(c[j]);
+        });
+        for (let j = 0; j < H; j++) expect(y[t * 2 * H + d * H + j]).toBeCloseTo(h[j]!, 5);
+      }
+    }
+  });
+
+  it("snake and the depthwise transposed convolution", async () => {
+    const [T, C] = [4, 3];
+    const x = randn(T * C);
+    const alpha = Float32Array.of(0.5, 1, 2);
+    const y = await run((ctx) => {
+      const t = upload(Float32Array.from(x), [T, C]);
+      ops.snake(ctx, t, upload(alpha, [C]));
+      return t;
+    }, T * C);
+    for (let i = 0; i < T * C; i++) expect(y[i]).toBeCloseTo(x[i]! + Math.sin(alpha[i % C]! * x[i]!) ** 2 / alpha[i % C]!, 6);
+    const lr = await run((ctx) => {
+      const t = upload(Float32Array.from(x), [T, C]);
+      ops.leakyRelu(ctx, t, 0.2);
+      return ops.padReflectLeft(ctx, t, 1);
+    }, (T + 1) * C);
+    const leaky = (v: number) => (v >= 0 ? v : Math.fround(v * 0.2));
+    for (let r = 0; r <= T; r++) for (let c = 0; c < C; c++) expect(lr[r * C + c]).toBeCloseTo(leaky(x[Math.abs(r - 1) * C + c]!), 6);
+    // ConvTranspose1d(C, C, 3, stride 2, padding 1, output_padding 1, groups C): 2T outputs.
+    const w = randn(3 * C);
+    const bias = randn(C);
+    const z = await run((ctx) => ops.dwConvTranspose1d(ctx, upload(x, [T, C]), upload(w, [3, C]), upload(bias, [C]), { s: 2, pad: 1, tout: 2 * T }), 2 * T * C);
+    for (let t = 0; t < 2 * T; t++)
+      for (let c = 0; c < C; c++) {
+        let want = bias[c]!;
+        for (let i = 0; i < T; i++) for (let k = 0; k < 3; k++) if (i * 2 - 1 + k === t) want += x[i * C + c]! * w[k * C + c]!;
+        expect(z[t * C + c]).toBeCloseTo(want, 6);
+      }
+  });
+
   it("mulFirstRow multiplies every row after the first by the first", async () => {
     const [T, D] = [4, 3];
     const x = randn(T * D);

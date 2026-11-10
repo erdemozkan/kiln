@@ -7,6 +7,7 @@ import { ctcTokenizer, type CtcTokenizer } from "@kiln/tokenizers";
 import { openBackend, openParsed } from "./load";
 import { loadWeights, type LoadProgress, type WeightFile } from "./weights";
 import { createSpeechT5, createTts, type SpeechT5LoadOptions, type TtsEngine } from "./tts";
+import { createKokoro, isKokoroConfig } from "./kokoro";
 
 export interface AudioLoadOptions {
   /** Matrix storage: "f32" (default), "q8" or "q4". */
@@ -170,9 +171,17 @@ export async function createAudio(modelId: string, opts: AudioLoadOptions & Pick
     optional<Parameters<typeof ctcTokenizer>[0]["tokenizerJson"]>("tokenizer.json"),
     optional<Record<string, number>>("vocab.json"),
     optional<Record<string, unknown>>("tokenizer_config.json"),
-    listing.then((files) => weightFiles(ref, ep, files)),
+    // Kokoro's checkpoint is a .pth, which weightFiles does not look for.
+    listing.then((files) => weightFiles(ref, ep, files)).catch((e: unknown) => e as Error),
   ]);
   // Text-to-speech models share the speech channel.
+  if (isKokoroConfig(config)) {
+    const files = await listing;
+    const pth = files ? [...files].filter((f) => /^kokoro.*\.pth$/.test(f)).sort()[0] : "kokoro-v1_0.pth";
+    if (!pth) throw new Error(`${modelId}: no kokoro-*.pth checkpoint`);
+    return createKokoro(modelId, ref, config!, pth, opts);
+  }
+  if (names instanceof Error) throw names;
   if (config!.model_type === "vits") return createTts(modelId, ref, config!, names, opts);
   if (config!.model_type === "speecht5") return createSpeechT5(modelId, ref, config!, names, opts);
   const cfg = wav2vec2ConfigFromHF(config!);

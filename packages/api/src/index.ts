@@ -72,3 +72,5 @@ export {
 } from "./pipeline";
 export { readAudio, type AudioInput } from "@kiln/loader";
 export { readImage, preprocessImage, resizeImage, centerCrop, type RgbImage, type ImageProcessorConfig } from "@kiln/loader";
+
+export { kokoroNormalize, kokoroPhonemes, type Phonemizer } from "./kokoro-text";
