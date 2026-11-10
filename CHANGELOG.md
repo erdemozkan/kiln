@@ -80,7 +80,11 @@ takes many short rows 8 per workgroup. Classifiers: ResNet (`microsoft/resnet-*`
 on the ViT code). Fixed: an integer `size` with `crop_pct` (ConvNeXt-style processors) now resizes
 and crops as transformers does; ConvNeXt at 384 and above resizes to a square. Image captioning
 (`image-to-text`): VisionEncoderDecoder with a ViT encoder and a GPT-2 decoder (cross-attention
-from the image's hidden states, greedy decoding on the GPU).
+from the image's hidden states, greedy decoding on the GPU). Text-to-speech (`text-to-speech`,
+`text-to-audio`): VITS / MMS-TTS with VitsTokenizer, the stochastic duration predictor on the CPU,
+the flow and HiFi-GAN vocoder on the GPU (relative attention, transposed 1-D convolution, gated
+tanh and column-copy kernels; the conv kernel takes 1-D shapes and LeakyReLU on its input);
+`seed`, `noise_scale`, `noise_scale_duration`, `speaking_rate`.
 
 **Loading.** Reads ahead of a download in progress are fetched on their own instead of waiting
 (a `pytorch_model.bin` keeps its zip directory at the end, so large checkpoints showed no progress

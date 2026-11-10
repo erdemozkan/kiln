@@ -532,4 +532,118 @@ describe("image convolution kernels (CPU)", () => {
       for (let i = 0; i < D; i++) expect(y[r * D + i]).toBeCloseTo(i < n ? (x[r * D + i]! - m) * inv * w[i]! + b[i]! : 0, 5);
     }
   });
+
+  it("conv2d as a 1-D convolution (H = 1, kh = 1) with dilation and LeakyReLU on the input", async () => {
+    const [T, C, O, k, dil, slope] = [13, 4, 6, 3, 2, 0.1];
+    const x = randn(T * C);
+    const wt = randn(O * C * k); // [O, C, k]
+    const K = 32;
+    const w = new Float32Array(O * K);
+    for (let o = 0; o < O; o++) for (let c = 0; c < C; c++) for (let j = 0; j < k; j++) w[o * K + j * C + c] = wt[(o * C + c) * k + j]!;
+    const bias = randn(O);
+    const pad = (k * dil - dil) / 2;
+    const y = await run((ctx) => ops.conv2d(ctx, upload(x, [T, C]), upload(w, [O, K]), upload(bias, [O]), { H: 1, W: T, k, kh: 1, stride: 1, pad, padH: 0, dilation: dil, leakyIn: slope }).y, T * O);
+    for (let t = 0; t < T; t++)
+      for (let o = 0; o < O; o++) {
+        let s = bias[o]!;
+        for (let j = 0; j < k; j++) {
+          const ti = t - pad + j * dil;
+          if (ti >= 0 && ti < T) for (let c = 0; c < C; c++) { const a = x[ti * C + c]!; s += (a > 0 ? a : a * slope) * wt[(o * C + c) * k + j]!; }
+        }
+        expect(y[t * O + o]).toBeCloseTo(s, 5);
+      }
+  });
+
+  it("convTranspose1d matches PyTorch's ConvTranspose1d with overlapping taps (kernel 2·stride)", async () => {
+    const [Tin, C, O, K, s, pad] = [5, 4, 3, 8, 4, 2];
+    const x = randn(Tin * C);
+    const wt = randn(C * O * K); // [C, O, K]
+    const bias = randn(O);
+    const w = new Float32Array(K * O * C);
+    for (let c = 0; c < C; c++) for (let o = 0; o < O; o++) for (let k = 0; k < K; k++) w[(k * O + o) * C + c] = wt[(c * O + o) * K + k]!;
+    const Tout = (Tin - 1) * s - 2 * pad + K;
+    const y = await run((ctx) => ops.convTranspose1d(ctx, upload(x, [Tin, C]), upload(w, [K, O, C]), upload(bias, [O]), { s, pad }), Tout * O);
+    // Scatter form: every input sample adds its kernel at t·s − pad.
+    const ref = new Float64Array(Tout * O);
+    for (let t = 0; t < Tout; t++) for (let o = 0; o < O; o++) ref[t * O + o] = bias[o]!;
+    for (let ti = 0; ti < Tin; ti++)
+      for (let k = 0; k < K; k++) {
+        const t = ti * s - pad + k;
+        if (t < 0 || t >= Tout) continue;
+        for (let o = 0; o < O; o++) for (let c = 0; c < C; c++) ref[t * O + o] += x[ti * C + c]! * wt[(c * O + o) * K + k]!;
+      }
+    ref.forEach((v, i) => expect(y[i]).toBeCloseTo(v, 5));
+  });
+
+  it("relAttention equals transformers' VitsAttention (its pad-and-reshape relative position maps)", async () => {
+    const [L, H, D, W] = [7, 2, 4, 2];
+    const row = H * D;
+    const q = randn(L * row), k = randn(L * row), v = randn(L * row);
+    const ek = randn((2 * W + 1) * D), ev = randn((2 * W + 1) * D);
+    const scale = D ** -0.5;
+    const y = await run((ctx) => ops.relAttention(ctx, upload(q, [L, row]), upload(k, [L, row]), upload(v, [L, row]), upload(ek, [2 * W + 1, D]), upload(ev, [2 * W + 1, D]), { heads: H, window: W, scale }), L * row);
+    // _get_relative_embeddings: the table padded to 2L − 1 rows, centred.
+    const rel = (e: Float32Array) => {
+      const padLen = Math.max(L - (W + 1), 0);
+      const rows: number[][] = [];
+      for (let i = 0; i < padLen; i++) rows.push(new Array(D).fill(0));
+      for (let i = 0; i < 2 * W + 1; i++) rows.push(Array.from(e.subarray(i * D, (i + 1) * D)));
+      for (let i = 0; i < padLen; i++) rows.push(new Array(D).fill(0));
+      const start = Math.max(W + 1 - L, 0);
+      return rows.slice(start, start + 2 * L - 1);
+    };
+    // _relative_position_to_absolute_position / _absolute_position_to_relative_position, literally.
+    const relToAbs = (x: number[][]) => {
+      const flat: number[] = [];
+      for (const r of x) flat.push(...r, 0);
+      for (let i = 0; i < L - 1; i++) flat.push(0);
+      const out: number[][] = [];
+      for (let i = 0; i < L; i++) out.push(flat.slice(i * (2 * L - 1), (i + 1) * (2 * L - 1)).slice(L - 1));
+      return out;
+    };
+    const absToRel = (x: number[][]) => {
+      const flat: number[] = new Array(L).fill(0);
+      for (const r of x) flat.push(...r, ...new Array(L - 1).fill(0));
+      const out: number[][] = [];
+      for (let i = 0; i < L; i++) out.push(flat.slice(i * 2 * L, (i + 1) * 2 * L).slice(1));
+      return out;
+    };
+    const rk = rel(ek), rv = rel(ev);
+    for (let h = 0; h < H; h++) {
+      const Q = Array.from({ length: L }, (_, i) => Array.from({ length: D }, (_, d) => q[i * row + h * D + d]! * scale));
+      const dot = (a: number[], b: number[]) => a.reduce((s, x, i) => s + x * b[i]!, 0);
+      const logits = Q.map((qi) => Array.from({ length: L }, (_, j) => dot(qi, Array.from({ length: D }, (_, d) => k[j * row + h * D + d]!))));
+      const bias = relToAbs(Q.map((qi) => rk.map((r) => dot(qi, r))));
+      const probs = logits.map((r, i) => {
+        const s = r.map((x, j) => x + bias[i]![j]!);
+        const m = Math.max(...s);
+        const e = s.map((x) => Math.exp(x - m));
+        const z = e.reduce((a, b) => a + b, 0);
+        return e.map((x) => x / z);
+      });
+      const relW = absToRel(probs);
+      for (let i = 0; i < L; i++)
+        for (let d = 0; d < D; d++) {
+          let want = probs[i]!.reduce((s, p, j) => s + p * v[j * row + h * D + d]!, 0);
+          want += relW[i]!.reduce((s, p, r) => s + p * rv[r]![d]!, 0);
+          expect(y[i * row + h * D + d]).toBeCloseTo(want, 5);
+        }
+    }
+  });
+
+  it("gatedTanh and cols: WaveNet's gate, channel copies, flips and adds", async () => {
+    const [T, H] = [3, 4];
+    const x = randn(T * 2 * H);
+    const g = await run((ctx) => ops.gatedTanh(ctx, upload(x, [T, 2 * H])), T * H);
+    for (let t = 0; t < T; t++) for (let c = 0; c < H; c++) expect(g[t * H + c]).toBeCloseTo(Math.tanh(x[t * 2 * H + c]!) / (1 + Math.exp(-x[t * 2 * H + H + c]!)), 6);
+    const src = randn(T * 6);
+    const base = randn(T * 5);
+    const y = await run((ctx) => {
+      const dst = upload(base, [T, 5]);
+      ops.cols(ctx, dst, upload(src, [T, 6]), { n: 3, srcStart: 2, dstStart: 1, reverse: true, accumulate: true });
+      return dst;
+    }, T * 5);
+    for (let t = 0; t < T; t++)
+      for (let j = 0; j < 5; j++) expect(y[t * 5 + j]).toBeCloseTo(base[t * 5 + j]! + (j >= 1 && j < 4 ? src[t * 6 + 2 + (2 - (j - 1))]! : 0), 6);
+  });
 });

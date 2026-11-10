@@ -768,11 +768,13 @@ export const cpuBlockAttention: CpuKernel = (b) => {
   }
 };
 
-export function cpuConv2d(v: { relu: boolean; residual: boolean; reluIn?: boolean; leaky?: boolean }): CpuKernel {
+export function cpuConv2d(v: { relu: boolean; residual: boolean; reluIn?: boolean; leaky?: number; leakyIn?: number }): CpuKernel {
+  const inAct = (a: number) => (v.leakyIn !== undefined ? (a > 0 ? a : a * Math.fround(v.leakyIn)) : v.reluIn ? Math.max(a, 0) : a);
   return (b) => {
     const [H, W, C, O, Ho, Wo, kh, kw, stride, pad, K, M] = Array.from(b[0]!.u32.subarray(0, 12)) as number[];
     const plane = Ho! * Wo!;
     const dil = b[0]!.u32[13]! || 1;
+    const padH = b[0]!.u32[14]!;
     const x = b[1]!.f32;
     const w = b[2]!.f32;
     const bias = b[3]!.f32;
@@ -783,7 +785,7 @@ export function cpuConv2d(v: { relu: boolean; residual: boolean; reluIn?: boolea
       acc.set(bias.subarray(0, O!));
       const img = Math.floor(m / plane) * H! * W!;
       const r = m % plane;
-      const oy = Math.floor(r / Wo!) * stride! - pad!;
+      const oy = Math.floor(r / Wo!) * stride! - padH;
       const ox = (r % Wo!) * stride! - pad!;
       for (let ky = 0; ky < kh!; ky++) {
         const iy = oy + ky * dil;
@@ -796,14 +798,14 @@ export function cpuConv2d(v: { relu: boolean; residual: boolean; reluIn?: boolea
           for (let o = 0; o < O!; o++) {
             let s = 0;
             const wo = o * K! + ko;
-            for (let c = 0; c < C!; c++) s += (v.reluIn ? Math.max(x[xo + c]!, 0) : x[xo + c]!) * w[wo + c]!;
+            for (let c = 0; c < C!; c++) s += inAct(x[xo + c]!) * w[wo + c]!;
             acc[o] += s;
           }
         }
       }
       for (let o = 0; o < O!; o++) {
         const val = acc[o]! + (res ? res[m * O! + o]! : 0);
-        y[m * O! + o] = v.leaky ? (val > 0 ? val : val * Math.fround(0.01)) : v.relu ? Math.max(val, 0) : val;
+        y[m * O! + o] = v.leaky !== undefined ? (val > 0 ? val : val * Math.fround(v.leaky)) : v.relu ? Math.max(val, 0) : val;
       }
     }
   };
@@ -1004,6 +1006,72 @@ export const cpuSwinAttention: CpuKernel = (b) => {
           if (h === heads! - 1) o.fill(0, at[i]! - h * D! + heads! * D!, at[i]! - h * D! + row!);
         }
       }
+};
+
+export function cpuConvTranspose1d(leakyIn?: number): CpuKernel {
+  return (b) => {
+    const [Tin, Tout, C, O, K, s, pad] = Array.from(b[0]!.u32.subarray(0, 7)) as number[];
+    const [x, w, bias, y] = [b[1]!.f32, b[2]!.f32, b[3]!.f32, b[4]!.f32];
+    const act = (a: number) => (leakyIn !== undefined && a < 0 ? a * Math.fround(leakyIn) : a);
+    for (let t = 0; t < Tout!; t++)
+      for (let o = 0; o < O!; o++) {
+        let acc = bias[o]!;
+        for (let k = (t + pad!) % s!; k < K!; k += s!) {
+          const num = t + pad! - k;
+          if (num < 0) break;
+          const ti = num / s!;
+          if (ti >= Tin!) continue;
+          for (let c = 0; c < C!; c++) acc += act(x[ti * C! + c]!) * w[(k * O! + o) * C! + c]!;
+        }
+        y[t * O! + o] = acc;
+      }
+  };
+}
+
+export const cpuRelAttention: CpuKernel = (b) => {
+  const [L, D, row, W] = Array.from(b[0]!.u32.subarray(0, 4)) as number[];
+  const scale = b[0]!.f32[4]!;
+  const [q, k, v, ek, ev, o] = [b[1]!.f32, b[2]!.f32, b[3]!.f32, b[4]!.f32, b[5]!.f32, b[6]!.f32];
+  const H = row! / D!;
+  const s = new Float64Array(L!);
+  for (let h = 0; h < H; h++)
+    for (let i = 0; i < L!; i++) {
+      const qo = i * row! + h * D!;
+      let m = -Infinity;
+      for (let j = 0; j < L!; j++) {
+        let d0 = 0;
+        for (let d = 0; d < D!; d++) d0 += q[qo + d]! * k[j * row! + h * D! + d]!;
+        if (Math.abs(j - i) <= W!) for (let d = 0; d < D!; d++) d0 += q[qo + d]! * ek[(j - i + W!) * D! + d]!;
+        s[j] = d0 * scale;
+        m = Math.max(m, s[j]!);
+      }
+      let z = 0;
+      for (let j = 0; j < L!; j++) z += s[j] = Math.exp(s[j]! - m);
+      for (let d = 0; d < D!; d++) {
+        let acc = 0;
+        for (let j = 0; j < L!; j++) acc += s[j]! * v[j * row! + h * D! + d]!;
+        for (let j = Math.max(i - W!, 0); j <= Math.min(i + W!, L! - 1); j++) acc += s[j]! * ev[(j - i + W!) * D! + d]!;
+        o[qo + d] = acc / z;
+      }
+    }
+};
+
+export const cpuGatedTanh: CpuKernel = (b) => {
+  const [T, H] = [b[0]!.u32[0]!, b[0]!.u32[1]!];
+  const [x, y] = [b[1]!.f32, b[2]!.f32];
+  for (let t = 0; t < T; t++)
+    for (let c = 0; c < H; c++) y[t * H + c] = Math.tanh(x[t * 2 * H + c]!) * (1 / (1 + Math.exp(-x[t * 2 * H + H + c]!)));
+};
+
+export const cpuCols: CpuKernel = (b) => {
+  const [T, n, srcStride, srcStart, dstStride, dstStart, reverse, accumulate] = Array.from(b[0]!.u32.subarray(0, 8)) as number[];
+  const [src, dst] = [b[1]!.f32, b[2]!.f32];
+  for (let t = 0; t < T!; t++)
+    for (let j = 0; j < n!; j++) {
+      const v = src[t * srcStride! + srcStart! + (reverse ? n! - 1 - j : j)]!;
+      const at = t * dstStride! + dstStart! + j;
+      dst[at] = accumulate ? dst[at]! + v : v;
+    }
 };
 
 export const cpuMaxPool2d: CpuKernel = (b) => {

@@ -33,6 +33,9 @@ function kvRead(kv: KvDtype): { kDecl: string; vDecl: string; k4: (i: string) =>
 }
 const KV4_FN = /* wgsl */ `fn kv4(w: vec2<u32>) -> vec4<f32> { return vec4<f32>(unpack2x16float(w.x), unpack2x16float(w.y)); }`;
 
+/** A number as a WGSL f32 literal. */
+const f32Lit = (x: number): string => (Number.isInteger(x) ? `${x}.0` : String(x));
+
 const cache = new Map<string, KernelSpec>();
 /** A kernel by key: WGSL for the GPU, and the same computation in TypeScript for the CPU backend (if any). */
 function spec(key: string, bindings: KernelSpec["bindings"], cpuImpl: CpuKernel | undefined, code: () => string): KernelSpec {
@@ -1923,20 +1926,22 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid:
  * N images ([N·H·W, C] → [N·Ho·Wo, O]) runs as one GEMM of N·Ho·Wo rows. Taps are `dil` pixels apart
  * (dilated convolution).
  */
-export function conv2dSpec(v: { relu: boolean; residual: boolean; reluIn?: boolean; leaky?: boolean }): KernelSpec {
+export function conv2dSpec(v: { relu: boolean; residual: boolean; reluIn?: boolean; leaky?: number; leakyIn?: number }): KernelSpec {
   const R8 = [0, 1, 2, 3, 4, 5, 6, 7];
   const bindings: BindingKind[] = ["uniform", "read", "read", "read"];
   if (v.residual) bindings.push("read");
   bindings.push("rw");
-  const out = (val: string) => (v.leaky ? `leaky(${val})` : v.relu ? `max(${val}, 0.0)` : val);
+  const out = (val: string) => (v.leaky !== undefined ? `leaky(${val})` : v.relu ? `max(${val}, 0.0)` : val);
+  const load = v.leakyIn !== undefined ? "leakyIn(x[at])" : v.reluIn ? "max(x[at], vec4<f32>(0.0))" : "x[at]";
   const store = R8.map(
     (i) => `  if (m0 + tm * 8u + ${i}u < p.M) {
     let m = m0 + tm * 8u + ${i}u;
 ${[0, 1, 2, 3].map((j) => `    if (n0 + tn * 4u + ${j}u < p.O) { let n = n0 + tn * 4u + ${j}u; y[m * p.O + n] = ${out(`acc${i}[${j}] + bias[n]${v.residual ? " + res[m * p.O + n]" : ""}`)}; }`).join("\n")}
   }`,
   ).join("\n");
-  return spec(`conv2d${v.reluIn ? "/relu-in" : ""}${v.relu ? "/relu" : ""}${v.leaky ? "/leaky" : ""}${v.residual ? "/res" : ""}`, bindings, cpu.cpuConv2d(v), () => /* wgsl */ `
-struct P { H: u32, W: u32, C: u32, O: u32, Ho: u32, Wo: u32, kh: u32, kw: u32, stride: u32, pad: u32, K: u32, M: u32, N: u32, dil: u32, _c: u32, _d: u32 }
+  const key = `conv2d${v.reluIn ? "/relu-in" : ""}${v.leakyIn !== undefined ? `/leaky-in${v.leakyIn}` : ""}${v.relu ? "/relu" : ""}${v.leaky !== undefined ? `/leaky${v.leaky}` : ""}${v.residual ? "/res" : ""}`;
+  return spec(key, bindings, cpu.cpuConv2d(v), () => /* wgsl */ `
+struct P { H: u32, W: u32, C: u32, O: u32, Ho: u32, Wo: u32, kh: u32, kw: u32, stride: u32, pad: u32, K: u32, M: u32, N: u32, dil: u32, padH: u32, _d: u32 }
 @group(0) @binding(0) var<uniform> p: P;
 @group(0) @binding(1) var<storage, read> x: array<vec4<f32>>;
 @group(0) @binding(2) var<storage, read> w: array<vec4<f32>>;
@@ -1945,8 +1950,8 @@ ${v.residual ? "@group(0) @binding(4) var<storage, read> res: array<f32>;\n@grou
 var<workgroup> xt: array<vec4<f32>, 512>;
 var<workgroup> wt: array<vec4<f32>, 512>;
 
-/** LeakyReLU, torch's default slope 0.01. */
-fn leaky(a: f32) -> f32 { return select(a * 0.01, a, a > 0.0); }
+fn leaky(a: f32) -> f32 { return select(a * ${f32Lit(v.leaky ?? 0.01)}, a, a > 0.0); }
+fn leakyIn(a: vec4<f32>) -> vec4<f32> { return select(a * ${f32Lit(v.leakyIn ?? 0.01)}, a, a > vec4<f32>(0.0)); }
 
 @compute @workgroup_size(128)
 fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) li: u32) {
@@ -1969,7 +1974,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
     let r = mm % plane;
     live[c] = m < p.M;
     base[c] = (mm / plane) * p.H * p.W;
-    oy[c] = i32((r / p.Wo) * p.stride) - i32(p.pad);
+    oy[c] = i32((r / p.Wo) * p.stride) - i32(p.padH);
     ox[c] = i32((r % p.Wo) * p.stride) - i32(p.pad);
   }
 ${R8.map((i) => `  var acc${i} = vec4<f32>();`).join("\n")}
@@ -1986,7 +1991,7 @@ ${R8.map((i) => `  var acc${i} = vec4<f32>();`).join("\n")}
       let ix = ox[c] + kx;
       let inside = live[c] && tap < taps && iy >= 0 && iy < i32(p.H) && ix >= 0 && ix < i32(p.W);
       let at = (base[c] + u32(clamp(iy, 0, i32(p.H) - 1)) * p.W + u32(clamp(ix, 0, i32(p.W) - 1))) * C4 + min(c4, C4 - 1u);
-      xr[c] = select(vec4<f32>(0.0), ${v.reluIn ? "max(x[at], vec4<f32>(0.0))" : "x[at]"}, inside);
+      xr[c] = select(vec4<f32>(0.0), ${load}, inside);
     }
     for (var c = 0u; c < 4u; c++) {
       let row = n0 + (li / 8u) * 4u + c;
@@ -2209,12 +2214,12 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
  * 64-channel GEMM tile would waste nearly all its work: one thread per output pixel walks the taps
  * and channels as vec4s, with up to 4 accumulators.
  */
-export function conv2dNarrowSpec(v: { relu: boolean; residual: boolean }): KernelSpec {
+export function conv2dNarrowSpec(v: { relu: boolean; residual: boolean; leakyIn?: number }): KernelSpec {
   const bindings: BindingKind[] = ["uniform", "read", "read", "read"];
   if (v.residual) bindings.push("read");
   bindings.push("rw");
-  return spec(`conv2d_narrow${v.relu ? "/relu" : ""}${v.residual ? "/res" : ""}`, bindings, cpu.cpuConv2d(v), () => /* wgsl */ `
-struct P { H: u32, W: u32, C: u32, O: u32, Ho: u32, Wo: u32, kh: u32, kw: u32, stride: u32, pad: u32, K: u32, M: u32, N: u32, dil: u32, _c: u32, _d: u32 }
+  return spec(`conv2d_narrow${v.leakyIn !== undefined ? `/leaky-in${v.leakyIn}` : ""}${v.relu ? "/relu" : ""}${v.residual ? "/res" : ""}`, bindings, cpu.cpuConv2d(v), () => /* wgsl */ `
+struct P { H: u32, W: u32, C: u32, O: u32, Ho: u32, Wo: u32, kh: u32, kw: u32, stride: u32, pad: u32, K: u32, M: u32, N: u32, dil: u32, padH: u32, _d: u32 }
 @group(0) @binding(0) var<uniform> p: P;
 @group(0) @binding(1) var<storage, read> x: array<vec4<f32>>;
 @group(0) @binding(2) var<storage, read> w: array<vec4<f32>>;
@@ -2228,7 +2233,7 @@ fn main(${EW_ARGS}) {
   let plane = p.Ho * p.Wo;
   let r = idx % plane;
   let base = (idx / plane) * p.H * p.W;
-  let oy = i32((r / p.Wo) * p.stride) - i32(p.pad);
+  let oy = i32((r / p.Wo) * p.stride) - i32(p.padH);
   let ox = i32((r % p.Wo) * p.stride) - i32(p.pad);
   let C4 = p.C / 4u;
   let K4 = p.K / 4u;
@@ -2242,7 +2247,8 @@ fn main(${EW_ARGS}) {
       let xo = (base + u32(iy) * p.W + u32(ix)) * C4;
       let wo = (ky * p.kw + kx) * C4;
       for (var c = 0u; c < C4; c++) {
-        let xv = x[xo + c];
+        let xr = x[xo + c];
+        let xv = ${v.leakyIn !== undefined ? `select(xr * ${f32Lit(v.leakyIn)}, xr, xr > vec4<f32>(0.0))` : "xr"};
         for (var o = 0u; o < p.O; o++) { acc[o] += dot(xv, w[o * K4 + wo + c]); }
       }
     }
@@ -2433,6 +2439,157 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
   if (h == p.heads - 1u) {
     for (var c = p.heads * D; c < p.row; c++) { o[tok * p.row + c] = 0.0; }
   }
+}`);
+}
+
+/**
+ * 1-D transposed convolution (ConvTranspose1d, any kernel K ≥ stride s, padding pad) of x [Tin, C]
+ * → y [Tout, O]: y[t, o] = bias[o] + Σ over taps k with (t + pad − k) divisible by s of
+ * x[(t + pad − k) / s] · w[k, o, :] (weight stored [K, O, C], C a multiple of 4), with an optional
+ * LeakyReLU on the input as it is read (HiFi-GAN's upsamplers).
+ */
+export function convTranspose1dSpec(leakyIn?: number): KernelSpec {
+  return spec(`conv_transpose1d${leakyIn !== undefined ? `/leaky-in${leakyIn}` : ""}`, ["uniform", "read", "read", "read", "rw"], cpu.cpuConvTranspose1d(leakyIn), () => /* wgsl */ `
+struct P { Tin: u32, Tout: u32, C: u32, O: u32, K: u32, s: u32, pad: u32, _a: u32 }
+@group(0) @binding(0) var<uniform> p: P;
+@group(0) @binding(1) var<storage, read> x: array<vec4<f32>>;
+@group(0) @binding(2) var<storage, read> w: array<vec4<f32>>;
+@group(0) @binding(3) var<storage, read> bias: array<f32>;
+@group(0) @binding(4) var<storage, read_write> y: array<f32>;
+
+@compute @workgroup_size(${EW})
+fn main(${EW_ARGS}) {
+  ${FLAT}
+  if (idx >= p.Tout * p.O) { return; }
+  let o = idx % p.O;
+  let t = idx / p.O;
+  let C4 = p.C / 4u;
+  var acc = bias[o];
+  for (var k = (t + p.pad) % p.s; k < p.K; k += p.s) {
+    let num = i32(t + p.pad) - i32(k);
+    if (num < 0) { break; }
+    let ti = u32(num) / p.s;
+    if (ti >= p.Tin) { continue; }
+    let xo = ti * C4;
+    let wo = (k * p.O + o) * C4;
+    for (var c = 0u; c < C4; c++) {
+      let xr = x[xo + c];
+      ${leakyIn !== undefined ? `let xv = select(xr * ${f32Lit(leakyIn)}, xr, xr > vec4<f32>(0.0));` : "let xv = xr;"}
+      acc += dot(xv, w[wo + c]);
+    }
+  }
+  y[idx] = acc;
+}`);
+}
+
+/**
+ * Self-attention with windowed relative positions (VITS / Glow-TTS): q, k, v [L, H·D] → [L, H·D],
+ * scores scale · (q_i · k_j + q_i · eK[j − i + W]) and the output Σ p_ij (v_j + eV[j − i + W]),
+ * where the relative tables eK, eV [2W + 1, D] (shared by the heads) count only for |j − i| ≤ W.
+ * One workgroup per (head, row); the row's scores are kept in workgroup memory (L ≤ 2048).
+ */
+export function relAttentionSpec(): KernelSpec {
+  return spec("rel_attention", ["uniform", "read", "read", "read", "read", "read", "rw"], cpu.cpuRelAttention, () => /* wgsl */ `
+struct P { L: u32, D: u32, row: u32, W: u32, scale: f32, _a: u32, _b: u32, _c: u32 }
+@group(0) @binding(0) var<uniform> p: P;
+@group(0) @binding(1) var<storage, read> q: array<f32>;
+@group(0) @binding(2) var<storage, read> k: array<f32>;
+@group(0) @binding(3) var<storage, read> v: array<f32>;
+@group(0) @binding(4) var<storage, read> ek: array<f32>;
+@group(0) @binding(5) var<storage, read> ev: array<f32>;
+@group(0) @binding(6) var<storage, read_write> o: array<f32>;
+var<workgroup> sc: array<f32, 2048>;
+var<workgroup> red: array<f32, 64>;
+
+@compute @workgroup_size(64)
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) li: u32) {
+  let h = wid.x;
+  let i = wid.y;
+  let qo = i * p.row + h * p.D;
+  var m = -3.4e38;
+  for (var j = li; j < p.L; j += 64u) {
+    var s = 0.0;
+    for (var d = 0u; d < p.D; d++) { s += q[qo + d] * k[j * p.row + h * p.D + d]; }
+    let rel = i32(j) - i32(i);
+    if (abs(rel) <= i32(p.W)) {
+      let e = u32(rel + i32(p.W)) * p.D;
+      var r = 0.0;
+      for (var d = 0u; d < p.D; d++) { r += q[qo + d] * ek[e + d]; }
+      s += r;
+    }
+    s *= p.scale;
+    sc[j] = s;
+    m = max(m, s);
+  }
+  red[li] = m;
+  workgroupBarrier();
+  for (var st = 32u; st > 0u; st >>= 1u) {
+    if (li < st) { red[li] = max(red[li], red[li + st]); }
+    workgroupBarrier();
+  }
+  let mx = red[0];
+  workgroupBarrier();
+  var z = 0.0;
+  for (var j = li; j < p.L; j += 64u) { let e = exp(sc[j] - mx); sc[j] = e; z += e; }
+  red[li] = z;
+  workgroupBarrier();
+  for (var st = 32u; st > 0u; st >>= 1u) {
+    if (li < st) { red[li] += red[li + st]; }
+    workgroupBarrier();
+  }
+  let inv = 1.0 / red[0];
+  let lo = u32(max(i32(i) - i32(p.W), 0));
+  let hi = min(i + p.W, p.L - 1u);
+  for (var d = li; d < p.D; d += 64u) {
+    var acc = 0.0;
+    for (var j = 0u; j < p.L; j++) { acc += sc[j] * v[j * p.row + h * p.D + d]; }
+    for (var j = lo; j <= hi; j++) { acc += sc[j] * ev[(j + p.W - i) * p.D + d]; }
+    o[qo + d] = acc * inv;
+  }
+}`);
+}
+
+/** WaveNet's gate: x [T, 2H] → y [T, H], y = tanh(x[:, c]) · sigmoid(x[:, H + c]) (inputs clamped so neither overflows). */
+export function gatedTanhSpec(): KernelSpec {
+  return spec("gated_tanh", ["uniform", "read", "rw"], cpu.cpuGatedTanh, () => /* wgsl */ `
+struct P { T: u32, H: u32, _a: u32, _b: u32 }
+@group(0) @binding(0) var<uniform> p: P;
+@group(0) @binding(1) var<storage, read> x: array<f32>;
+@group(0) @binding(2) var<storage, read_write> y: array<f32>;
+
+@compute @workgroup_size(${EW})
+fn main(${EW_ARGS}) {
+  ${FLAT}
+  if (idx >= p.T * p.H) { return; }
+  let t = idx / p.H;
+  let c = idx % p.H;
+  let a = clamp(x[t * 2u * p.H + c], -20.0, 20.0);
+  let b = clamp(x[t * 2u * p.H + p.H + c], -80.0, 80.0);
+  y[idx] = tanh(a) * (1.0 / (1.0 + exp(-b)));
+}`);
+}
+
+/**
+ * Column ranges between row-major matrices: dst[t, dstStart + j] = (or +=) src[t, srcStart + j'],
+ * j' = j or n − 1 − j when reversed (a channel flip), for t < T, j < n.
+ */
+export function colsSpec(): KernelSpec {
+  return spec("cols", ["uniform", "read", "rw"], cpu.cpuCols, () => /* wgsl */ `
+struct P { T: u32, n: u32, srcStride: u32, srcStart: u32, dstStride: u32, dstStart: u32, reverse: u32, accumulate: u32 }
+@group(0) @binding(0) var<uniform> p: P;
+@group(0) @binding(1) var<storage, read> src: array<f32>;
+@group(0) @binding(2) var<storage, read_write> dst: array<f32>;
+
+@compute @workgroup_size(${EW})
+fn main(${EW_ARGS}) {
+  ${FLAT}
+  if (idx >= p.T * p.n) { return; }
+  let t = idx / p.n;
+  let j = idx % p.n;
+  let sj = select(j, p.n - 1u - j, p.reverse == 1u);
+  let v = src[t * p.srcStride + p.srcStart + sj];
+  let at = t * p.dstStride + p.dstStart + j;
+  if (p.accumulate == 1u) { dst[at] += v; } else { dst[at] = v; }
 }`);
 }
 

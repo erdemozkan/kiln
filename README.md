@@ -527,6 +527,7 @@ K/V; each decoder step reads them through a step block whose span covers every p
 | Image preprocessing (all six PIL filters; DeiT and CLIP pipelines) | PIL 8 + numpy | resized bytes identical; pixel values identical (float32) |
 | CLIP tokenizer (`openai/clip-vit-base-patch32`) | transformers.js | the same ids for 8 texts (punctuation, accents, CJK, emoji, long words) |
 | ResNet-50 (`microsoft/resnet-50`), ConvNeXt (`facebook/convnext-tiny-224`) | transformers.js (`Xenova/*`, fp32) on the same pixel values | every uniquely labelled class within 1.7e-8 (ResNet) and 4.7e-7 (ConvNeXt); 337 / 374 ms end to end against 370 / 434 ms |
+| VITS text-to-speech (`facebook/mms-tts-eng`) | transformers.js (`Xenova/mms-tts-eng`, fp32), its two noise nodes set to zero, Kiln at zero noise | the same 33,024 samples, within 1.4e-4 (peak 0.87); 617 ms end to end against 1.33 s (WebGPU) |
 | ViT + GPT-2 captioning (`nlpconnect/vit-gpt2-image-captioning`) | transformers.js (`Xenova/vit-gpt2-image-captioning`, fp32) on the same pixel values | the same caption on all three photos tried |
 | DINOv2 (`facebook/dinov2-small-imagenet1k-1-layer`) | transformers.js (`Xenova/dinov2-small-imagenet1k-1-layer`, fp32) on the same pixel values | within 6e-3: its export resizes position embeddings bilinearly, Python bicubically (Kiln); with its resize, within 3.2e-7. 383 ms end to end against 683 ms |
 | Swin2SR (`caidas/swin2SR-classical-sr-x2-64`) | transformers.js (`Xenova/swin2SR-classical-sr-x2-64`, fp32) on the same pixel values | 4 of 147,456 output bytes one level apart (128 × 96 → 256 × 192); 3.4 s end to end against 10.4 s |
@@ -755,6 +756,28 @@ Generation follows transformers.js: greedy from the decoder start token to end-o
 `max_length` of 20, special tokens dropped. On three photos (cats, tiger, a football match), fed the
 same pixel values as transformers.js (`Xenova/vit-gpt2-image-captioning`, fp32), the captions were
 identical, including the model's own mistake of calling the tiger a zebra.
+
+Text-to-speech (`text-to-speech`, `text-to-audio`) runs VITS, the MMS-TTS voices
+(`facebook/mms-tts-eng` by default, and the other languages' `facebook/mms-tts-*`).
+transformers.js's own default (Supertonic) exists only as ONNX. The pieces:
+- Text encoder, on the GPU: windowed relative-position attention gets a kernel of its own; its
+  kernel-3 feed-forward runs on the conv kernel, now taking 1-D shapes.
+- Stochastic duration predictor, on the CPU: its rational-quadratic spline flows run per character.
+- Flow, on the GPU: the WaveNet coupling layers have their weight norm folded in at load, and the
+  channel splits and flips are column copies.
+- HiFi-GAN vocoder, on the GPU: a transposed-convolution kernel, and LeakyReLU folded into the
+  convolutions' input reads.
+
+VITS samples noise twice, so its output differs on every run, in transformers.js as in Python.
+`seed` makes Kiln's repeatable, and `noise_scale: 0, noise_scale_duration: 0` takes the mean
+path. For the check, the two random nodes of transformers.js's export
+(`Xenova/mms-tts-eng`, fp32) were rewritten to output zeros. On "Hello, my dog is cute." both gave
+33,024 samples (the same durations), within 1.4e-4 of each other, peak 0.87. With noise, Whisper
+tiny.en heard Kiln's speech as "Hello my dog is cute.", "Hello my dot is cute." and "Hello my Doug is
+cute." for three seeds, and the zero-noise speech as "Hello, my dog is cute." exactly; a noisy
+transformers.js sample came out as "Tellomide.is Qt.". Both pipelines end to end (median of five
+warm calls, backgrounded pane): 617 ms in Kiln on WebGPU against 1.33 s for transformers.js on
+WebGPU and 4.4 s on WASM.
 
 T5's learned relative position bias is added to each score by the per-row attention kernels (GPU
 and CPU, buckets computed in the kernel; bucket function equal to transformers' over ±300

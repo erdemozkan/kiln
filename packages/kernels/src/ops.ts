@@ -27,6 +27,10 @@ import {
   attnProbsSpec,
   blockAttentionSpec,
   conv2dSpec,
+  convTranspose1dSpec,
+  relAttentionSpec,
+  gatedTanhSpec,
+  colsSpec,
   pixelShuffleSpec,
   swinAttentionSpec,
   dwConvSpec,
@@ -494,27 +498,36 @@ export const convOut = (n: number, k: number, stride: number, pad: number, dil =
  * [Ho·Wo, O] = bias + conv (+ residual), then ReLU with `relu`; `reluIn` applies ReLU to the input
  * as it is read; `n` images stacked in x convolve as one batch (see conv2dSpec).
  */
-export function conv2d(ctx: Ctx, x: Tensor, w: Tensor, bias: Tensor, o: { H: number; W: number; k: number; stride: number; pad: number; relu?: boolean; reluIn?: boolean; leaky?: boolean; residual?: Tensor; n?: number; dilation?: number }): { y: Tensor; H: number; W: number } {
+export function conv2d(
+  ctx: Ctx,
+  x: Tensor,
+  w: Tensor,
+  bias: Tensor,
+  o: { H: number; W: number; k: number; kh?: number; stride: number; pad: number; padH?: number; relu?: boolean; reluIn?: boolean; leaky?: number; leakyIn?: number; residual?: Tensor; n?: number; dilation?: number },
+): { y: Tensor; H: number; W: number } {
   const C = lastDim(x);
   const [O, K] = w.shape as [number, number];
   const n = o.n ?? 1;
+  // k (and pad) across, kh (and padH) down: a 1-D convolution is H = 1, kh = 1.
+  const kh = o.kh ?? o.k;
+  const padH = o.padH ?? o.pad;
   if (C % 4 !== 0 || numel(x.shape) !== n * o.H * o.W * C) throw new Error(`conv2d: [${x.shape}] is not ${n} ${o.H}×${o.W} image(s) with a multiple of 4 channels`);
-  if (K !== Math.ceil((o.k * o.k * C) / 32) * 32) throw new Error(`conv2d: weight [${w.shape}] does not fit ${o.k}×${o.k} taps of ${C} channels`);
+  if (K !== Math.ceil((kh * o.k * C) / 32) * 32) throw new Error(`conv2d: weight [${w.shape}] does not fit ${kh}×${o.k} taps of ${C} channels`);
   const dil = o.dilation ?? 1;
-  const Ho = convOut(o.H, o.k, o.stride, o.pad, dil);
+  const Ho = convOut(o.H, kh, o.stride, padH, dil);
   const Wo = convOut(o.W, o.k, o.stride, o.pad, dil);
   const M = n * Ho * Wo;
   const y = ctx.alloc([M, O]);
   const groups = Math.ceil(O / 64);
-  const params = ctx.uniform([o.H, o.W, C, O, Ho, Wo, o.k, o.k, o.stride, o.pad, K, M, n, dil, 0, 0].map(u32));
+  const params = ctx.uniform([o.H, o.W, C, O, Ho, Wo, kh, o.k, o.stride, o.pad, K, M, n, dil, padH, 0].map(u32));
   const bufs = [params, x.buf, w.buf, bias.buf];
   if (o.residual) bufs.push(o.residual.buf);
   bufs.push(y.buf);
-  if (O <= 4 && !o.reluIn && !o.leaky) {
-    ctx.run(conv2dNarrowSpec({ relu: !!o.relu, residual: !!o.residual }), bufs, grid1d(M), `conv2d narrow ${o.k}x${o.k}/${o.stride} ${C}→${O}`);
+  if (O <= 4 && !o.reluIn && o.leaky === undefined) {
+    ctx.run(conv2dNarrowSpec({ relu: !!o.relu, residual: !!o.residual, leakyIn: o.leakyIn }), bufs, grid1d(M), `conv2d narrow ${kh}x${o.k}/${o.stride} ${C}→${O}`);
     return { y, H: Ho, W: Wo };
   }
-  ctx.run(conv2dSpec({ relu: !!o.relu, residual: !!o.residual, reluIn: !!o.reluIn, leaky: !!o.leaky }), bufs, [Math.min(groups, MM_SLICE), Math.ceil(M / 64), Math.ceil(groups / MM_SLICE)], `conv2d ${o.k}x${o.k}/${o.stride} ${C}→${O}`);
+  ctx.run(conv2dSpec({ relu: !!o.relu, residual: !!o.residual, reluIn: !!o.reluIn, leaky: o.leaky, leakyIn: o.leakyIn }), bufs, [Math.min(groups, MM_SLICE), Math.ceil(M / 64), Math.ceil(groups / MM_SLICE)], `conv2d ${kh}x${o.k}/${o.stride} ${C}→${O}`);
   return { y, H: Ho, W: Wo };
 }
 
@@ -551,6 +564,46 @@ export function swinAttention(ctx: Ctx, q: Tensor, k: Tensor, v: Tensor, bias: T
   const params = ctx.uniform([o.H, o.W, row, o.D, o.heads, o.shift, o.win, 0].map(u32));
   ctx.run(swinAttentionSpec(o.D, o.win), [params, q.buf, k.buf, v.buf, bias.buf, scale.buf, out.buf], [(o.H / o.win) * (o.W / o.win), o.heads, 1]);
   return out;
+}
+
+/** ConvTranspose1d of x [Tin, C] with w [K, O, C] (see convTranspose1dSpec): [Tout, O], Tout = (Tin − 1)·s − 2·pad + K. */
+export function convTranspose1d(ctx: Ctx, x: Tensor, w: Tensor, bias: Tensor, o: { s: number; pad: number; leakyIn?: number }): Tensor {
+  const C = lastDim(x);
+  const Tin = numel(x.shape) / C;
+  const [K, O, wc] = w.shape as [number, number, number];
+  if (wc !== C || C % 4) throw new Error(`convTranspose1d: weight [${w.shape}] does not take ${C} channels (a multiple of 4)`);
+  const Tout = (Tin - 1) * o.s - 2 * o.pad + K;
+  const y = ctx.alloc([Tout, O]);
+  ctx.run(convTranspose1dSpec(o.leakyIn), [ctx.uniform([Tin, Tout, C, O, K, o.s, o.pad, 0].map(u32)), x.buf, w.buf, bias.buf, y.buf], grid1d(Tout * O));
+  return y;
+}
+
+/** Self-attention with windowed relative position tables eK, eV [2W + 1, D] (see relAttentionSpec): q, k, v [L, H·D] → [L, H·D]. */
+export function relAttention(ctx: Ctx, q: Tensor, k: Tensor, v: Tensor, ek: Tensor, ev: Tensor, o: { heads: number; window: number; scale: number }): Tensor {
+  const row = lastDim(q);
+  const L = numel(q.shape) / row;
+  if (L > 2048) throw new Error(`relAttention: at most 2048 positions, got ${L}`);
+  const out = ctx.alloc([L, row]);
+  const params = ctx.uniform([u32(L), u32(row / o.heads), u32(row), u32(o.window), f32(o.scale), u32(0), u32(0), u32(0)]);
+  ctx.run(relAttentionSpec(), [params, q.buf, k.buf, v.buf, ek.buf, ev.buf, out.buf], [o.heads, L, 1]);
+  return out;
+}
+
+/** WaveNet's gate of x [T, 2H]: [T, H] (see gatedTanhSpec). */
+export function gatedTanh(ctx: Ctx, x: Tensor): Tensor {
+  const H = lastDim(x) / 2;
+  const T = numel(x.shape) / (2 * H);
+  const y = ctx.alloc([T, H]);
+  ctx.run(gatedTanhSpec(), [ctx.uniform([u32(T), u32(H), u32(0), u32(0)]), x.buf, y.buf], grid1d(T * H));
+  return y;
+}
+
+/** Copies (or adds) columns srcStart … srcStart + n − 1 of src into columns dstStart … of dst, reversed with `reverse` (see colsSpec). */
+export function cols(ctx: Ctx, dst: Tensor, src: Tensor, o: { n: number; srcStart?: number; dstStart?: number; reverse?: boolean; accumulate?: boolean }): void {
+  const ss = lastDim(src);
+  const ds = lastDim(dst);
+  const T = numel(src.shape) / ss;
+  ctx.run(colsSpec(), [ctx.uniform([T, o.n, ss, o.srcStart ?? 0, ds, o.dstStart ?? 0, o.reverse ? 1 : 0, o.accumulate ? 1 : 0].map(u32)), src.buf, dst.buf], grid1d(T * o.n));
 }
 
 /** GroupNorm of n images x [n·T, C] in G groups, ReLU after with `relu` (see groupNormSpec). */

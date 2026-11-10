@@ -31,11 +31,13 @@ export type PipelineTask =
   | "image-segmentation"
   | "background-removal"
   | "image-to-image"
-  | "image-to-text";
+  | "image-to-text"
+  | "text-to-audio"
+  | "text-to-speech";
 
 const SEQ2SEQ = new Set<string>(["summarization", "translation", "text2text-generation", "automatic-speech-recognition"]);
 
-const ALIASES: Partial<Record<PipelineTask, PipelineTask>> = { embeddings: "feature-extraction", "sentiment-analysis": "text-classification", ner: "token-classification" };
+const ALIASES: Partial<Record<PipelineTask, PipelineTask>> = { embeddings: "feature-extraction", "sentiment-analysis": "text-classification", ner: "token-classification", "text-to-speech": "text-to-audio" };
 
 /** Models used when `pipeline(task)` is given none (original Hub repos, not ONNX exports). */
 export const DEFAULT_MODELS: Record<string, string> = {
@@ -61,6 +63,8 @@ export const DEFAULT_MODELS: Record<string, string> = {
   "background-removal": "briaai/RMBG-1.4",
   "image-to-image": "caidas/swin2SR-classical-sr-x2-64",
   "image-to-text": "nlpconnect/vit-gpt2-image-captioning",
+  // transformers.js's default (Supertonic) exists only as ONNX.
+  "text-to-audio": "facebook/mms-tts-eng",
 };
 
 const VISION = new Set<string>(["image-classification", "image-feature-extraction", "zero-shot-image-classification", "object-detection", "depth-estimation", "image-segmentation", "background-removal", "image-to-image", "image-to-text"]);
@@ -565,6 +569,30 @@ export interface ImageToTextPipeline {
   (images: ImageInput[], options?: ImageToTextOptions): Promise<{ generated_text: string }[][]>;
 }
 
+export interface TextToAudioOptions {
+  /** Scale of the sampled latent noise (default the model's, 0.667); 0 is deterministic. */
+  noise_scale?: number;
+  /** Scale of the duration predictor's noise (default 0.8). */
+  noise_scale_duration?: number;
+  /** Faster above 1, slower below. */
+  speaking_rate?: number;
+  /** Seed for repeatable output. */
+  seed?: number;
+}
+/** Speech: mono samples in −1…1 at `sampling_rate` Hz (transformers.js's RawAudio fields). */
+export interface TextToAudioResult {
+  audio: Float32Array;
+  sampling_rate: number;
+}
+export interface TextToAudioPipeline {
+  readonly task: PipelineTask;
+  readonly model: KilnAudio;
+  readonly info: AudioInfo;
+  dispose(): Promise<void>;
+  (text: string, options?: TextToAudioOptions): Promise<TextToAudioResult>;
+  (texts: string[], options?: TextToAudioOptions): Promise<TextToAudioResult[]>;
+}
+
 /** An image in a form the worker can receive and decode: relative URLs resolved, DOM images drawn to bitmaps. */
 async function toWorkerImage(x: ImageInput): Promise<unknown> {
   if (typeof x === "string") return typeof location !== "undefined" ? new URL(x, location.href).href : x;
@@ -625,6 +653,7 @@ export async function pipeline(task: "image-segmentation", model?: string, optio
 export async function pipeline(task: "background-removal", model?: string, options?: PipelineOptions): Promise<BackgroundRemovalPipeline>;
 export async function pipeline(task: "image-to-image", model?: string, options?: PipelineOptions): Promise<ImageToImagePipeline>;
 export async function pipeline(task: "image-to-text", model?: string, options?: PipelineOptions): Promise<ImageToTextPipeline>;
+export async function pipeline(task: "text-to-audio" | "text-to-speech", model?: string, options?: PipelineOptions): Promise<TextToAudioPipeline>;
 export async function pipeline(task: PipelineTask, model?: string, options: PipelineOptions = {}): Promise<unknown> {
   const t = ALIASES[task] ?? task;
   const id = model ?? DEFAULT_MODELS[t];
@@ -663,6 +692,21 @@ export async function pipeline(task: PipelineTask, model?: string, options: Pipe
       if (!Array.isArray(images)) return one(images, a, b);
       const out: unknown[] = [];
       for (const x of images) out.push(await one(x, a, b));
+      return out;
+    };
+    return Object.assign(call, { task, model: m, info: m.info, tokenizer: {}, dispose: () => m.unload() });
+  }
+  if (t === "text-to-audio") {
+    const m = await KilnAudio.load(id, { quant: q, device: dev, cpuThreads, revision, endpoint, worker, onProgress: progress });
+    progress_callback?.({ status: "ready", task, model: id });
+    if (m.info.head !== "tts") {
+      await m.unload();
+      throw new Error(`Kiln: ${id} is not a text-to-speech model`);
+    }
+    const call = async (text: string | string[], opts?: TextToAudioOptions) => {
+      if (!Array.isArray(text)) return m.speak(text, { ...opts });
+      const out: TextToAudioResult[] = [];
+      for (const s of text) out.push(await m.speak(s, { ...opts }));
       return out;
     };
     return Object.assign(call, { task, model: m, info: m.info, tokenizer: {}, dispose: () => m.unload() });

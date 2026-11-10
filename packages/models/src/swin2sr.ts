@@ -120,7 +120,7 @@ export class Swin2srModel {
     be.write(step, 0, packStep({ pos0: 0, lastRow: 0, seed: 0, temperature: 0 }));
     const ctx = new Ctx(be, step, `swin2sr/${H}x${W}`, this.pool);
     const input = ctx.buffer(H * W * 4 * 4, "swin2sr/pixels");
-    const conv = (x: Tensor, p: string, k: number, o: { h?: number; w?: number; residual?: Tensor; leaky?: boolean } = {}) =>
+    const conv = (x: Tensor, p: string, k: number, o: { h?: number; w?: number; residual?: Tensor; leaky?: number } = {}) =>
       ops.conv2d(ctx, x, this.w(`${p}.weight`), this.w(`${p}.bias`), { H: o.h ?? H, W: o.w ?? W, k, stride: 1, pad: (k - 1) / 2, residual: o.residual, leaky: o.leaky }).y;
     const ln = (x: Tensor, p: string) => ops.layernorm(ctx, x, this.w(`${p}.weight`), this.w(`${p}.bias`), c.eps, c.dim);
 
@@ -150,7 +150,7 @@ export class Swin2srModel {
       ops.scaleAdd(ctx, x, g, 1, false);
     });
     const body = conv(ln(x, "lnF"), "afterBody", 3, { residual: shallow });
-    let u = conv(body, "beforeUp", 3, { leaky: true });
+    let u = conv(body, "beforeUp", 3, { leaky: 0.01 });
     let [h, w] = [H, W];
     for (let i = 0; 2 ** i < c.upscale; i++) {
       u = ops.pixelShuffle(ctx, conv(u, `up${i}`, 3, { h, w }), { H: h, W: w, r: 2 });

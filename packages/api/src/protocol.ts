@@ -91,14 +91,14 @@ export interface Seq2SeqInfo {
 }
 
 /** Tasks of speech encoders on raw audio (wav2vec2, HuBERT). */
-export type AudioTask = "automatic-speech-recognition" | "audio-classification";
+export type AudioTask = "automatic-speech-recognition" | "audio-classification" | "text-to-audio";
 
 export interface AudioInfo {
   model: string;
   /** "wav2vec2" or "hubert". */
   family: string;
-  /** "ctc" (speech recognition) or "classification". */
-  head: "ctc" | "classification";
+  /** "ctc" (speech recognition), "classification", or "tts" (text-to-speech). */
+  head: "ctc" | "classification" | "tts";
   layers: number;
   hiddenSize: number;
   backend: string;

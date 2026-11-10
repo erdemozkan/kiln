@@ -311,8 +311,17 @@ export class KilnAudio extends WorkerChannel {
 
   /** CTC speech recognition ({ text }) or audio classification ([{ label, score }]) on 16 kHz mono samples. */
   run<T>(task: AudioTask, samples: Float32Array, options: Record<string, unknown> = {}): Promise<T> {
+    return this.request<T>(task, [samples, options]);
+  }
+
+  /** Text-to-speech (a VITS model): { audio, sampling_rate }. */
+  speak(text: string, options: Record<string, unknown> = {}): Promise<{ audio: Float32Array; sampling_rate: number }> {
+    return this.request("text-to-audio", [text, options]);
+  }
+
+  private request<T>(task: AudioTask, args: unknown[]): Promise<T> {
     return new Promise((resolve, reject) =>
-      this.send({ type: "audioTask", task, args: [samples, options] }, (msg) => {
+      this.send({ type: "audioTask", task, args }, (msg) => {
         if (msg.type === "result") resolve(msg.result as T);
         else if (msg.type === "error") reject(new Error(msg.message));
         return msg.type === "result" || msg.type === "error";

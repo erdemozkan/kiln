@@ -1,5 +1,5 @@
 import { readImage, type ImageInput } from "@kiln/loader";
-import { createAudio, createVision, type VisionEngine, createEncoder, createEngine, createSeq2Seq, type AudioEngine, loadPromptCache, promptCacheName, savePromptCache, type EncoderEngine, type Engine, type Seq2SeqEngine, type Seq2SeqGenerateOptions, type TextDelta } from "@kiln/runtime";
+import { createAudio, createVision, TtsEngine, type VisionEngine, createEncoder, createEngine, createSeq2Seq, type AudioEngine, loadPromptCache, promptCacheName, savePromptCache, type EncoderEngine, type Engine, type Seq2SeqEngine, type Seq2SeqGenerateOptions, type TextDelta } from "@kiln/runtime";
 import type { AudioTask, VisionTask, EncoderTask, Request, Response, Seq2SeqTask } from "./protocol";
 
 /** The slice of DedicatedWorkerGlobalScope we use (lib.webworker conflicts with lib.dom in one program). */
@@ -10,7 +10,7 @@ const scope = self as unknown as {
 let engine: Engine | undefined;
 let encoder: EncoderEngine | undefined;
 let seq2seq: Seq2SeqEngine | undefined;
-let audio: AudioEngine | undefined;
+let audio: AudioEngine | TtsEngine | undefined;
 let vision: VisionEngine | undefined;
 
 const OUTPUT_KEY: Record<Seq2SeqTask, string> = { summarization: "summary_text", translation: "translation_text", "text2text-generation": "generated_text", "automatic-speech-recognition": "text" };
@@ -211,16 +211,19 @@ scope.onmessage = async (e: MessageEvent<Request>) => {
         post({
           id: msg.id,
           type: "audioLoaded",
-          info: {
-            model: msg.model,
-            family: a.cfg.modelType,
-            head: a.classifier ? "classification" : "ctc",
-            layers: a.cfg.layers,
-            hiddenSize: a.cfg.hidden,
-            backend: a.backend.name,
-            cpuThreads: a.backend.name === "cpu" ? (a.backend as { threads?: number }).threads : undefined,
-            labels: a.cfg.id2label,
-          },
+          info:
+            a instanceof TtsEngine
+              ? { model: msg.model, family: "vits", head: "tts", layers: a.cfg.layers, hiddenSize: a.cfg.hidden, backend: a.backend.name, cpuThreads: a.backend.name === "cpu" ? (a.backend as { threads?: number }).threads : undefined }
+              : {
+                  model: msg.model,
+                  family: a.cfg.modelType,
+                  head: a.classifier ? "classification" : "ctc",
+                  layers: a.cfg.layers,
+                  hiddenSize: a.cfg.hidden,
+                  backend: a.backend.name,
+                  cpuThreads: a.backend.name === "cpu" ? (a.backend as { threads?: number }).threads : undefined,
+                  labels: a.cfg.id2label,
+                },
         });
         break;
       }
@@ -279,8 +282,15 @@ scope.onmessage = async (e: MessageEvent<Request>) => {
         if (!a) throw new Error("no speech model loaded");
         queue = queue.then(async () => {
           try {
-            const [samples, opts] = msg.args as [Float32Array, Record<string, unknown> | undefined];
-            const result = (msg.task as AudioTask) === "audio-classification" ? await a.classify(samples, opts) : await a.transcribe(samples);
+            let result: unknown;
+            if (a instanceof TtsEngine) {
+              if ((msg.task as AudioTask) !== "text-to-audio") throw new Error("this is a text-to-speech model");
+              result = await a.synthesize(msg.args[0] as string, msg.args[1] as Record<string, unknown> | undefined);
+            } else {
+              if ((msg.task as AudioTask) === "text-to-audio") throw new Error("this model does not speak; load a text-to-speech model");
+              const [samples, opts] = msg.args as [Float32Array, Record<string, unknown> | undefined];
+              result = (msg.task as AudioTask) === "audio-classification" ? await a.classify(samples, opts) : await a.transcribe(samples);
+            }
             post({ id: msg.id, type: "result", result });
           } catch (err) {
             post({ id: msg.id, type: "error", message: err instanceof Error ? err.message : String(err) });

@@ -14,3 +14,4 @@ export * from "./isnet";
 export * from "./segformer";
 export * from "./swin2sr";
 export * from "./convnets";
+export * from "./vits";
