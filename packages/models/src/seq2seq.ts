@@ -2,8 +2,12 @@ import { ActivationPool, Ctx, STEP_BYTES, packStep, physical, type Backend, type
 import { ops, type Activation } from "@kiln/kernels";
 import { UnsupportedModelError } from "./config";
 
-/** BART-style encoder-decoder models: BART / DistilBART, Marian (OPUS-MT), M2M100 / NLLB. */
-export type Seq2SeqFamily = "bart" | "marian" | "m2m100" | "t5" | "whisper";
+/**
+ * BART-style encoder-decoder models: BART / DistilBART, Marian (OPUS-MT), M2M100 / NLLB, Whisper; and
+ * "gpt2", the GPT-2 decoder with cross-attention of a VisionEncoderDecoder, whose "encoder" output
+ * is given (an image model's hidden states).
+ */
+export type Seq2SeqFamily = "bart" | "marian" | "m2m100" | "t5" | "whisper" | "gpt2";
 
 export interface Seq2SeqConfig {
   family: Seq2SeqFamily;
@@ -115,6 +119,41 @@ export function seq2seqConfigFromHF(c: Record<string, unknown>): Seq2SeqConfig {
     eos: Number(c.eos_token_id ?? 2),
     decoderStart: Number(c.decoder_start_token_id ?? (family === "marian" ? pad : 2)),
     raw: c,
+  };
+}
+
+/**
+ * The decoder of a VisionEncoderDecoder (`decoder` in its config.json): GPT-2 with cross-attention,
+ * pre-LayerNorm, learned positions from row 0, tanh-GELU, logits from the tied token embedding.
+ */
+export function visionDecoderConfigFromHF(top: Record<string, unknown>): Seq2SeqConfig {
+  const c = (top.decoder as Record<string, unknown> | undefined) ?? {};
+  if (c.model_type !== "gpt2") throw new UnsupportedModelError(`VisionEncoderDecoder decoder "${String(c.model_type)}" is not supported (gpt2)`);
+  if (c.add_cross_attention !== true) throw new UnsupportedModelError("the GPT-2 decoder has no cross-attention");
+  const d = num(c, "n_embd");
+  const eos = Number(top.eos_token_id ?? c.eos_token_id ?? 50256);
+  return {
+    family: "gpt2",
+    modelType: "gpt2",
+    dModel: d,
+    encLayers: 0,
+    decLayers: num(c, "n_layer"),
+    encHeads: num(c, "n_head"),
+    decHeads: num(c, "n_head"),
+    encFfn: 0,
+    decFfn: Number(c.n_inner ?? 4 * d),
+    vocab: num(c, "vocab_size"),
+    maxPositions: num(c, "n_positions"),
+    preNorm: true,
+    layernormEmbedding: false,
+    positions: "learned",
+    posOffset: 0,
+    embedScale: 1,
+    act: activation(c.activation_function ?? "gelu_new"),
+    pad: Number(top.pad_token_id ?? eos),
+    eos,
+    decoderStart: Number(top.decoder_start_token_id ?? c.bos_token_id ?? eos),
+    raw: top,
   };
 }
 
@@ -249,6 +288,8 @@ interface Pair {
   enc: { ctx: Ctx; dispatches: readonly Dispatch[]; step: Buf; ids: Buf; pos: Buf; kc: Buf; vc: Buf };
   /** Whisper: the log-mel input [frames, mels]. */
   feats?: Buf;
+  /** GPT-2 decoder: the given encoder hidden states [S, d_model]. */
+  hidden?: Buf;
   dec: { ctx: Ctx; dispatches: readonly Dispatch[]; logits: Tensor };
   /** The decoder plan with the alignment heads' cross-attention recorded (see enableAlignment). */
   decAlign?: readonly Dispatch[];
@@ -360,8 +401,12 @@ export class Seq2SeqModel {
     const kc = be.alloc(S * d * 4, "storage", "seq2seq/enc-k");
     const vc = be.alloc(S * d * 4, "storage", "seq2seq/enc-v");
     let feats: Buf | undefined;
+    let hidden: Buf | undefined;
     let x: Tensor;
-    if (c.audio) {
+    if (c.family === "gpt2") {
+      hidden = ectx.buffer(S * d * 4, "seq2seq/hidden");
+      x = { shape: [S, d], dtype: "f32", buf: hidden };
+    } else if (c.audio) {
       // Whisper: log-mel frames → conv1 (k 3) → GELU → conv2 (k 3, stride 2) → GELU → + positions.
       const { mels, frames } = c.audio;
       feats = ectx.buffer(frames * mels * 4, "seq2seq/mel");
@@ -384,7 +429,7 @@ export class Seq2SeqModel {
       }, `${p}.o`);
       x = this.ffn(ectx, x, p);
     }
-    if (c.preNorm) x = this.ln(ectx, x, "enc.lnF");
+    if (c.preNorm && c.encLayers) x = this.ln(ectx, x, "enc.lnF");
     const crossK: Buf[] = [];
     const crossV: Buf[] = [];
     for (let l = 0; l < c.decLayers; l++) {
@@ -433,6 +478,7 @@ export class Seq2SeqModel {
     return {
       S,
       feats,
+      hidden,
       enc: { ctx: ectx, dispatches: ectx.dispatches, step, ids, pos, kc, vc },
       dec: { ctx: dctx, dispatches: plain, logits },
       decAlign: plain.length < all.length ? all : undefined,
@@ -477,6 +523,20 @@ export class Seq2SeqModel {
       this.pairs.set(S, pair);
     }
     this.backend.write(pair.feats!, 0, features);
+    this.backend.submit(pair.enc.dispatches);
+    this.current = pair;
+  }
+
+  /** GPT-2 decoder: takes an image model's hidden states [S, d_model] as the encoder output and readies the decoder. */
+  async encodeHidden(hidden: Float32Array, S: number): Promise<void> {
+    if (this.cfg.family !== "gpt2") throw new Error("seq2seq: this model encodes its own source");
+    if (hidden.length !== S * this.cfg.dModel) throw new Error(`seq2seq: expected ${S} × ${this.cfg.dModel} hidden states, got ${hidden.length}`);
+    let pair = this.pairs.get(S);
+    if (!pair) {
+      pair = this.build(S);
+      this.pairs.set(S, pair);
+    }
+    this.backend.write(pair.hidden!, 0, hidden);
     this.backend.submit(pair.enc.dispatches);
     this.current = pair;
   }

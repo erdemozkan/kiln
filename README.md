@@ -527,6 +527,7 @@ K/V; each decoder step reads them through a step block whose span covers every p
 | Image preprocessing (all six PIL filters; DeiT and CLIP pipelines) | PIL 8 + numpy | resized bytes identical; pixel values identical (float32) |
 | CLIP tokenizer (`openai/clip-vit-base-patch32`) | transformers.js | the same ids for 8 texts (punctuation, accents, CJK, emoji, long words) |
 | ResNet-50 (`microsoft/resnet-50`), ConvNeXt (`facebook/convnext-tiny-224`) | transformers.js (`Xenova/*`, fp32) on the same pixel values | every uniquely labelled class within 1.7e-8 (ResNet) and 4.7e-7 (ConvNeXt); 337 / 374 ms end to end against 370 / 434 ms |
+| ViT + GPT-2 captioning (`nlpconnect/vit-gpt2-image-captioning`) | transformers.js (`Xenova/vit-gpt2-image-captioning`, fp32) on the same pixel values | the same caption on all three photos tried |
 | DINOv2 (`facebook/dinov2-small-imagenet1k-1-layer`) | transformers.js (`Xenova/dinov2-small-imagenet1k-1-layer`, fp32) on the same pixel values | within 6e-3: its export resizes position embeddings bilinearly, Python bicubically (Kiln); with its resize, within 3.2e-7. 383 ms end to end against 683 ms |
 | Swin2SR (`caidas/swin2SR-classical-sr-x2-64`) | transformers.js (`Xenova/swin2SR-classical-sr-x2-64`, fp32) on the same pixel values | 4 of 147,456 output bytes one level apart (128 × 96 → 256 × 192); 3.4 s end to end against 10.4 s |
 | SegFormer (`nvidia/segformer-b0-finetuned-ade-512-512`) | transformers.js (`Xenova/segformer-b0-finetuned-ade-512-512`, fp32) on the same pixel values | the same 14 classes on the cats photo, all 307,200 pixels the same class; 0.75 s end to end against 3.9 s |
@@ -743,6 +744,17 @@ alone. Both pipelines end to end (median of five warm calls, WebGPU, backgrounde
 them found a preprocessing bug, now fixed: an integer `size` on a ConvNeXt-style processor
 (`microsoft/resnet-50`'s config) skipped the `crop_pct` resize and crop, and at 384 and above
 ConvNeXt now resizes straight to a square as Python does.
+
+Image captioning (`image-to-text`) runs VisionEncoderDecoder models with a ViT encoder and a GPT-2
+decoder (`nlpconnect/vit-gpt2-image-captioning`, the default, as in transformers.js). The encoder is
+the ViT code. The decoder is the seq2seq code, with the image's last hidden state standing in for an
+encoder output: each layer's cross-attention keys and values are computed from it once, then
+decoding runs one token per step with the greedy choice made on the GPU. GPT-2's Conv1D matrices
+(stored input-major) are transposed when loading and its fused attention projections split.
+Generation follows transformers.js: greedy from the decoder start token to end-of-sequence or a
+`max_length` of 20, special tokens dropped. On three photos (cats, tiger, a football match), fed the
+same pixel values as transformers.js (`Xenova/vit-gpt2-image-captioning`, fp32), the captions were
+identical, including the model's own mistake of calling the tiger a zebra.
 
 T5's learned relative position bias is added to each score by the per-row attention kernels (GPU
 and CPU, buckets computed in the kernel; bucket function equal to transformers' over ±300

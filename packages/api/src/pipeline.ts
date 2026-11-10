@@ -30,7 +30,8 @@ export type PipelineTask =
   | "depth-estimation"
   | "image-segmentation"
   | "background-removal"
-  | "image-to-image";
+  | "image-to-image"
+  | "image-to-text";
 
 const SEQ2SEQ = new Set<string>(["summarization", "translation", "text2text-generation", "automatic-speech-recognition"]);
 
@@ -59,9 +60,10 @@ export const DEFAULT_MODELS: Record<string, string> = {
   // transformers.js's default (MODNet) exists only as ONNX. RMBG-1.4's license is non-commercial.
   "background-removal": "briaai/RMBG-1.4",
   "image-to-image": "caidas/swin2SR-classical-sr-x2-64",
+  "image-to-text": "nlpconnect/vit-gpt2-image-captioning",
 };
 
-const VISION = new Set<string>(["image-classification", "image-feature-extraction", "zero-shot-image-classification", "object-detection", "depth-estimation", "image-segmentation", "background-removal", "image-to-image"]);
+const VISION = new Set<string>(["image-classification", "image-feature-extraction", "zero-shot-image-classification", "object-detection", "depth-estimation", "image-segmentation", "background-removal", "image-to-image", "image-to-text"]);
 
 /** Speech encoders run on raw samples (CTC or a classifier) rather than as encoder-decoders. */
 const AUDIO_ENCODERS = new Set(["wav2vec2", "hubert"]);
@@ -548,6 +550,21 @@ export interface ImageToImagePipeline {
   (images: ImageInput[]): Promise<ImageToImageResult[]>;
 }
 
+export interface ImageToTextOptions {
+  /** Most tokens to generate (default: up to max_length, 20, counting the start token). */
+  max_new_tokens?: number;
+  /** Longest output counting the decoder start token (default 20). */
+  max_length?: number;
+}
+export interface ImageToTextPipeline {
+  readonly task: PipelineTask;
+  readonly model: KilnVision;
+  readonly info: VisionInfo;
+  dispose(): Promise<void>;
+  (image: ImageInput, options?: ImageToTextOptions): Promise<{ generated_text: string }[]>;
+  (images: ImageInput[], options?: ImageToTextOptions): Promise<{ generated_text: string }[][]>;
+}
+
 /** An image in a form the worker can receive and decode: relative URLs resolved, DOM images drawn to bitmaps. */
 async function toWorkerImage(x: ImageInput): Promise<unknown> {
   if (typeof x === "string") return typeof location !== "undefined" ? new URL(x, location.href).href : x;
@@ -607,6 +624,7 @@ export async function pipeline(task: "depth-estimation", model?: string, options
 export async function pipeline(task: "image-segmentation", model?: string, options?: PipelineOptions): Promise<ImageSegmentationPipeline>;
 export async function pipeline(task: "background-removal", model?: string, options?: PipelineOptions): Promise<BackgroundRemovalPipeline>;
 export async function pipeline(task: "image-to-image", model?: string, options?: PipelineOptions): Promise<ImageToImagePipeline>;
+export async function pipeline(task: "image-to-text", model?: string, options?: PipelineOptions): Promise<ImageToTextPipeline>;
 export async function pipeline(task: PipelineTask, model?: string, options: PipelineOptions = {}): Promise<unknown> {
   const t = ALIASES[task] ?? task;
   const id = model ?? DEFAULT_MODELS[t];
@@ -630,7 +648,7 @@ export async function pipeline(task: PipelineTask, model?: string, options: Pipe
     const one = async (x: ImageInput, a?: unknown, b?: object) => {
       const img = await toWorkerImage(x);
       if (zeroShot) return m.run<unknown>("zero-shot-image-classification", img, a, { ...b });
-      const r = await m.run<unknown>(t as "image-classification" | "image-feature-extraction" | "object-detection" | "depth-estimation" | "image-segmentation" | "background-removal" | "image-to-image", img, { ...(a as object) });
+      const r = await m.run<unknown>(t as "image-classification" | "image-feature-extraction" | "object-detection" | "depth-estimation" | "image-segmentation" | "background-removal" | "image-to-image" | "image-to-text", img, { ...(a as object) });
       if (t === "image-feature-extraction") {
         const f = r as { data: Float32Array; dims: number[] };
         return new Tensor("float32", f.data, f.dims);

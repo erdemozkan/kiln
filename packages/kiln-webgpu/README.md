@@ -172,6 +172,10 @@ await semantic("cats.jpg"); // [{ score: null, label: "wall", mask }, { score: n
 const resnet = await pipeline("image-classification", "microsoft/resnet-50");
 await resnet("tiger.jpg"); // [{ label: "tiger, Panthera tigris", score: 0.940 }, ...]
 
+// ViT + GPT-2: a caption.
+const captioner = await pipeline("image-to-text"); // nlpconnect/vit-gpt2-image-captioning
+await captioner("cats.jpg"); // [{ generated_text: "a cat laying on a blanket next to a cat laying on a bed" }]
+
 // Swin2SR: 2× super-resolution.
 const upscaler = await pipeline("image-to-image"); // caidas/swin2SR-classical-sr-x2-64
 const big = await upscaler("small.png"); // { width: 2 × w, height: 2 × h, channels: 3, data }

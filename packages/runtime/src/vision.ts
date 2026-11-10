@@ -1,12 +1,12 @@
 // Image models from transformers checkpoints (ViT, DeiT, DINOv2, CLIP, ResNet, ConvNeXt, YOLOS, DETR, Depth
 // Anything, RMBG, SegFormer, Swin2SR):
 // image classification, image features, zero-shot classification, object detection, panoptic
-// segmentation, depth estimation, background removal and super-resolution, with transformers' image preprocessing
+// segmentation, depth estimation, background removal, super-resolution and captioning, with transformers' image preprocessing
 // (PIL-exact resizing).
 import type { Backend, Tensor } from "@kiln/core";
 import { fetchJSON, fileUrl, listRepoFiles, parseModelId, preprocessImage, resizeImage, readPytorchHeader, readSafetensorsHeader, toF32, weightFiles, type ByteSource, type ImageProcessorConfig, type RgbImage, type TensorEntry } from "@kiln/loader";
-import { ClipTextModel, ConvNetModel, convNetConfigFromHF, convNetConvs, convNextName, type ConvNetConfig, SWIN2SR_MEAN, Swin2srModel, swin2srBias, swin2srConfigFromHF, DETR_IN_CHANNELS, DepthAnythingModel, ISNET_IN_CHANNELS, IsNetModel, SEGFORMER_IN_CHANNELS, SegformerModel, isnetConvs, segformerConfigFromHF, segformerName, type SegformerConfig, DetrModel, VitModel, bicubicResize, convMatrix, convTransposeMatrix, depthConfigFromHF, depthName, detrConfigFromHF, detrName, dinov2Positions, foldConvBn, clipPoolIndex, clipTextConfigFromHF, clipTextName, vitConfigFromHF, vitGrid, vitName, vitPatchK, type DepthAnythingConfig, type DetrConfig, type VitConfig, type VitEmbeddings } from "@kiln/models";
-import { ClipTokenizer, type ClipTokenizerJSON } from "@kiln/tokenizers";
+import { ClipTextModel, Seq2SeqModel, visionDecoderConfigFromHF, ConvNetModel, convNetConfigFromHF, convNetConvs, convNextName, type ConvNetConfig, SWIN2SR_MEAN, Swin2srModel, swin2srBias, swin2srConfigFromHF, DETR_IN_CHANNELS, DepthAnythingModel, ISNET_IN_CHANNELS, IsNetModel, SEGFORMER_IN_CHANNELS, SegformerModel, isnetConvs, segformerConfigFromHF, segformerName, type SegformerConfig, DetrModel, VitModel, bicubicResize, convMatrix, convTransposeMatrix, depthConfigFromHF, depthName, detrConfigFromHF, detrName, dinov2Positions, foldConvBn, clipPoolIndex, clipTextConfigFromHF, clipTextName, vitConfigFromHF, vitGrid, vitName, vitPatchK, type DepthAnythingConfig, type DetrConfig, type VitConfig, type VitEmbeddings } from "@kiln/models";
+import { ClipTokenizer, encoderTokenizerFromJSON, type ClipTokenizerJSON, type EncoderTokenizer, type EncoderTokenizerJSON } from "@kiln/tokenizers";
 import { openBackend, openParsed } from "./load";
 import { loadWeights, type LoadProgress, type WeightFile } from "./weights";
 
@@ -61,6 +61,13 @@ export interface ImageSegment {
   score: number | null;
   label: string | null;
   mask: { width: number; height: number; channels: 1; data: Uint8Array };
+}
+
+export interface ImageToTextOptions {
+  /** Most tokens to generate (default: up to the model's max_length, 20, counting the start token). */
+  max_new_tokens?: number;
+  /** Longest output counting the decoder start token (transformers' max_length; default 20). */
+  max_length?: number;
 }
 
 export interface ZeroShotImageOptions {
@@ -146,6 +153,7 @@ export class VisionEngine {
     private readonly semantic?: { cfg: SegformerConfig; model: SegformerModel },
     private readonly sr?: Swin2srModel,
     private readonly convnet?: { cfg: ConvNetConfig; model: ConvNetModel; head: Head; norm?: { w: Float32Array; b: Float32Array; eps: number }; labels: string[] },
+    private readonly captioner?: { decoder: Seq2SeqModel; tokenizer: EncoderTokenizer; maxLength: number },
   ) {}
 
   get cfg(): VitConfig {
@@ -482,6 +490,29 @@ export class VisionEngine {
   }
 
   /**
+   * Image captioning (VisionEncoderDecoder: ViT + GPT-2), as transformers.js's image-to-text pipeline
+   * does it: the image's last hidden state as the encoder output, greedy decoding from the decoder
+   * start token until end-of-sequence or max_length (20 by default, the start token included),
+   * special tokens dropped and the text trimmed.
+   */
+  async caption(img: RgbImage, options: ImageToTextOptions = {}): Promise<{ generated_text: string }[]> {
+    const cap = this.captioner;
+    if (!cap) throw new Error("this model does not caption images");
+    const h = await this.model.forward(this.pixels(img));
+    const dec = cap.decoder;
+    await dec.encodeHidden(h, h.length / dec.cfg.dModel);
+    const limit = Math.min(options.max_new_tokens ?? (options.max_length ?? cap.maxLength) - 1, dec.maxTarget - 1);
+    const ids: number[] = [];
+    let tok = dec.cfg.decoderStart;
+    for (let t = 0; t < limit; t++) {
+      tok = await dec.next(tok, t);
+      if (tok === dec.cfg.eos) break;
+      ids.push(tok);
+    }
+    return [{ generated_text: cap.tokenizer.decode(ids, true).trim() }];
+  }
+
+  /**
    * Class logits of an image (DeiT with a teacher: the mean of the CLS and distillation heads; DINOv2:
    * the head over [CLS, mean of the patch tokens]; ResNet: over the mean of the last feature map;
    * ConvNeXt: over its LayerNorm).
@@ -547,6 +578,7 @@ export class VisionEngine {
     this.semantic?.model.destroy();
     this.sr?.destroy();
     this.convnet?.model.destroy();
+    this.captioner?.decoder.destroy();
     this.clip?.text.destroy();
   }
 }
@@ -573,6 +605,7 @@ export async function createVision(modelId: string, opts: VisionLoadOptions = {}
   if (config!.model_type === "segformer") return createSegformer(modelId, ref, config!, prep, names, opts);
   if (config!.model_type === "swin2sr") return createSwin2sr(modelId, ref, config!, prep, names, opts);
   if (config!.model_type === "resnet" || config!.model_type === "convnext") return createConvNet(modelId, ref, config!, prep, names, opts);
+  if (config!.model_type === "vision-encoder-decoder") return createCaptioner(modelId, ref, config!, prep, names, opts, listing);
   const cfg = vitConfigFromHF(config!);
   const clip = cfg.modelType === "clip";
   if (clip && config!.model_type !== "clip") throw new Error(`${modelId}: a CLIP vision tower alone; zero-shot classification needs the full CLIP model`);
@@ -1313,6 +1346,119 @@ async function createConvNet(
     for (const [k, v] of Object.entries((config.id2label as Record<string, string> | undefined) ?? {})) labels[Number(k)] = v;
     const model = new ConvNetModel(backend, cfg, weights);
     return new VisionEngine(backend, undefined, prep, {}, undefined, undefined, undefined, undefined, undefined, undefined, { cfg, model, head: { w: hw.data, b: hb.data, out: hw.shape[0]! }, norm, labels });
+  } finally {
+    for (const s of sources) s.close?.();
+  }
+}
+
+/**
+ * A VisionEncoderDecoder captioner (ViT encoder, GPT-2 decoder with cross-attention): the encoder on
+ * the ViT code (its names under "encoder."), the decoder on the seq2seq code, GPT-2's Conv1D
+ * matrices (stored [in, out]) transposed and the fused attention projections split into q, k, v.
+ */
+async function createCaptioner(
+  modelId: string,
+  ref: ReturnType<typeof parseModelId>,
+  config: Record<string, unknown>,
+  prep: ImageProcessorConfig | undefined,
+  names: Awaited<ReturnType<typeof weightFiles>>,
+  opts: VisionLoadOptions,
+  listing: Promise<Set<string> | undefined>,
+): Promise<VisionEngine> {
+  const enc = (config.encoder as Record<string, unknown> | undefined) ?? {};
+  if (enc.model_type !== "vit") throw new Error(`${modelId}: VisionEncoderDecoder encoder "${String(enc.model_type)}" is not supported (vit)`);
+  const cfg = vitConfigFromHF(enc);
+  const dcfg = visionDecoderConfigFromHF(config);
+  if (dcfg.dModel !== cfg.hidden) throw new Error(`${modelId}: encoder width ${cfg.hidden} and decoder width ${dcfg.dModel} differ (a projection is not supported)`);
+  const ep = opts.endpoint;
+  const files0 = await listing;
+  if (files0 && !files0.has("tokenizer.json")) throw new Error(`${modelId} has no tokenizer.json`);
+  const tokenizer = encoderTokenizerFromJSON((await fetchJSON<EncoderTokenizerJSON>(fileUrl(ref, "tokenizer.json", ep)))!);
+  const backend = opts.backend ?? (await openBackend(opts.device ?? "auto", opts.cpuThreads));
+  const sources: ByteSource[] = [];
+  const located = new Map<string, { source: ByteSource; entry: TensorEntry }>();
+  try {
+    const vitFiles: WeightFile[] = [];
+    const decFiles: WeightFile[] = [];
+    const vitRename = (n: string) => (n.startsWith("encoder.") ? vitName(n.slice(8)) : undefined);
+    const dt = "decoder.transformer.";
+    const decRename = (n: string): string | undefined => {
+      if (n === dt + "wte.weight") return "shared.weight";
+      if (n === dt + "wpe.weight") return "dec.pos";
+      if (n === dt + "ln_f.weight" || n === dt + "ln_f.bias") return `dec.lnF.${n.split(".").pop()}`;
+      const m = /^decoder\.transformer\.h\.(\d+)\.(ln_1|ln_2|ln_cross_attn)\.(weight|bias)$/.exec(n);
+      return m ? `dec.l${m[1]}.${({ ln_1: "ln1", ln_2: "ln2", ln_cross_attn: "lnc" } as Record<string, string>)[m[2]!]}.${m[3]}` : undefined;
+    };
+    for (const name of names.names) {
+      const { source, header } = await openParsed(ref, name, ep, names.format === "safetensors" ? readSafetensorsHeader : readPytorchHeader);
+      sources.push(source);
+      for (const t of header.tensors) located.set(t.name, { source, entry: t });
+      vitFiles.push({ name, source, tensors: header.tensors.filter((t) => vitRename(t.name) !== undefined), rename: vitRename });
+      decFiles.push({ name, source, tensors: header.tensors.filter((t) => decRename(t.name) !== undefined), rename: decRename });
+    }
+    const need = async (name: string) => {
+      const t = located.get(name);
+      if (!t) throw new Error(`${modelId}: "${name}" is missing`);
+      const count = t.entry.shape.reduce((a, b) => a * b, 1);
+      return { shape: t.entry.shape, data: toF32(t.entry.type as Parameters<typeof toF32>[0], await t.source.read(t.entry.offset, t.entry.byteLength), count) };
+    };
+    const quant = opts.quant ?? "f32";
+    const vitWeights = await loadWeights(backend, vitFiles, quant, opts.onProgress);
+    const decWeights = await loadWeights(backend, decFiles, quant, opts.onProgress);
+    const upload = (into: Map<string, Tensor>, name: string, shape: number[], data: Float32Array) => {
+      const buf = backend.alloc(data.byteLength, "storage", `caption/${name}`);
+      backend.write(buf, 0, data);
+      into.set(name, { shape, dtype: "f32", buf } as Tensor);
+    };
+
+    // ViT: the patch matrix and the constant addend (CLS + position embeddings + patch bias), as createVision does.
+    const H = cfg.hidden;
+    const v = "encoder.embeddings.";
+    const pw = await need(v + "patch_embeddings.projection.weight");
+    const K = vitPatchK(cfg);
+    const row = 3 * cfg.patchSize * cfg.patchSize;
+    const patch = new Float32Array(H * K);
+    for (let o = 0; o < H; o++) patch.set(pw.data.subarray(o * row, (o + 1) * row), o * K);
+    upload(vitWeights, "patch.weight", [H, K], patch);
+    const pos = await need(v + "position_embeddings");
+    const T = cfg.prefix + (cfg.imageSize / cfg.patchSize) ** 2;
+    if (pos.data.length !== T * H) throw new Error(`${modelId}: position embeddings hold ${pos.data.length / H} tokens, the model has ${T}`);
+    const add = Float32Array.from(pos.data);
+    const cls = (await need(v + "cls_token")).data;
+    for (let i = 0; i < H; i++) add[i] += cls[i]!;
+    const pb = (await need(v + "patch_embeddings.projection.bias")).data;
+    for (let r = cfg.prefix; r < T; r++) for (let i = 0; i < H; i++) add[r * H + i] += pb[i]!;
+    upload(vitWeights, "embed.add", [T, H], add);
+
+    // GPT-2's Conv1D layers: stored [in, out], transposed to [out, in]; fused projections split.
+    const conv1d = async (from: string, to: string[]) => {
+      const w = await need(`${from}.weight`);
+      const b = await need(`${from}.bias`);
+      const [In, Out] = w.shape as [number, number];
+      const part = Out / to.length;
+      to.forEach((name, j) => {
+        const m = new Float32Array(part * In);
+        for (let o = 0; o < part; o++) for (let i = 0; i < In; i++) m[o * In + i] = w.data[i * Out + j * part + o]!;
+        upload(decWeights, `${name}.weight`, [part, In], m);
+        upload(decWeights, `${name}.bias`, [part], b.data.slice(j * part, (j + 1) * part));
+      });
+    };
+    for (let l = 0; l < dcfg.decLayers; l++) {
+      const h = `${dt}h.${l}.`;
+      const p = `dec.l${l}`;
+      await conv1d(h + "attn.c_attn", [`${p}.q`, `${p}.k`, `${p}.v`]);
+      await conv1d(h + "attn.c_proj", [`${p}.o`]);
+      await conv1d(h + "crossattention.q_attn", [`${p}.cq`]);
+      await conv1d(h + "crossattention.c_attn", [`${p}.ck`, `${p}.cv`]);
+      await conv1d(h + "crossattention.c_proj", [`${p}.co`]);
+      await conv1d(h + "mlp.c_fc", [`${p}.fc1`]);
+      await conv1d(h + "mlp.c_proj", [`${p}.fc2`]);
+    }
+    const vit = new VitModel(backend, cfg, vitWeights);
+    const decoder = new Seq2SeqModel(backend, dcfg, decWeights, { maxTarget: 256 });
+    // transformers' generation default when the config sets no max_length.
+    const maxLength = Number(config.max_length ?? 20);
+    return new VisionEngine(backend, { cfg, model: vit }, prep ?? { size: cfg.imageSize }, {}, undefined, undefined, undefined, undefined, undefined, undefined, undefined, { decoder, tokenizer, maxLength });
   } finally {
     for (const s of sources) s.close?.();
   }

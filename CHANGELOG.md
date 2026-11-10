@@ -78,7 +78,9 @@ shifted-window cosine attention kernel, pixel shuffle and a leaky-ReLU conv epil
 takes many short rows 8 per workgroup. Classifiers: ResNet (`microsoft/resnet-*`), ConvNeXt
 (`facebook/convnext-*`, 7×7 depthwise convolution) and DINOv2 (`facebook/dinov2-*-imagenet1k-*`,
 on the ViT code). Fixed: an integer `size` with `crop_pct` (ConvNeXt-style processors) now resizes
-and crops as transformers does; ConvNeXt at 384 and above resizes to a square.
+and crops as transformers does; ConvNeXt at 384 and above resizes to a square. Image captioning
+(`image-to-text`): VisionEncoderDecoder with a ViT encoder and a GPT-2 decoder (cross-attention
+from the image's hidden states, greedy decoding on the GPU).
 
 **Loading.** Reads ahead of a download in progress are fetched on their own instead of waiting
 (a `pytorch_model.bin` keeps its zip directory at the end, so large checkpoints showed no progress

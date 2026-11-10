@@ -49,6 +49,8 @@ export {
   type BackgroundRemovalResult,
   type ImageToImagePipeline,
   type ImageToImageResult,
+  type ImageToTextPipeline,
+  type ImageToTextOptions,
   type ZeroShotImageClassificationOptions,
   type PipelineOptions,
   type PipelineTask,
