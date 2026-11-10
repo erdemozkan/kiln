@@ -109,7 +109,13 @@ best label, OWLv2's boxes on the padded square), `threshold`, `top_k` and `perce
 in the image tower's plan (a patch-times-class-token kernel), labels meet the patches on the CPU and
 the last four images are kept, so new labels on an image skip the tower; OWLv2's processor (grey
 padding, scipy's Gaussian blur and linear zoom, identical float32 pixels); tokenizers built from
-vocab.json and merges.txt when a repo has no tokenizer.json.
+vocab.json and merges.txt when a repo has no tokenizer.json. Donut
+(`naver-clova-ix/donut-base-finetuned-docvqa`): `document-question-answering` with transformers'
+prompt and answer extraction (`max_new_tokens`), the Swin encoder on new shifted-window attention
+(relative-position bias, wrap-around mask) and patch-merging kernels, submitted a block at a time,
+the mBART decoder on the seq2seq code, DonutImageProcessor's resize, thumbnail and centered padding;
+the last two pages' encodings are kept. `resizeImage` takes PIL's `box`, and `reduceImage` /
+`resizeImageReducing` are PIL's Image.reduce and `reducing_gap`, byte for byte.
 
 **Loading.** Reads ahead of a download in progress are fetched on their own instead of waiting
 (a `pytorch_model.bin` keeps its zip directory at the end, so large checkpoints showed no progress

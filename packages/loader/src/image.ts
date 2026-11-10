@@ -51,16 +51,19 @@ const FILTERS: Record<number, Filter> = {
 
 const PRECISION_BITS = 32 - 8 - 2;
 
-/** PIL's precompute_coeffs + normalize_coeffs_8bpc: per output pixel, [first input, count] and fixed-point weights. */
-function coeffs(inSize: number, outSize: number, filter: Filter): { bounds: Int32Array; k: Int32Array; ksize: number } {
-  const scale = inSize / outSize;
+/**
+ * PIL's precompute_coeffs + normalize_coeffs_8bpc: per output pixel, [first input, count] and
+ * fixed-point weights, for the source span in0 … in1 (a resize box; default the whole side).
+ */
+function coeffs(inSize: number, outSize: number, filter: Filter, in0 = 0, in1 = inSize): { bounds: Int32Array; k: Int32Array; ksize: number } {
+  const scale = (in1 - in0) / outSize;
   const filterscale = Math.max(scale, 1);
   const support = filter.support * filterscale;
   const ksize = Math.ceil(support) * 2 + 1;
   const kk = new Float64Array(outSize * ksize);
   const bounds = new Int32Array(outSize * 2);
   for (let xx = 0; xx < outSize; xx++) {
-    const center = (xx + 0.5) * scale;
+    const center = in0 + (xx + 0.5) * scale;
     const ss = 1 / filterscale;
     let xmin = Math.trunc(center - support + 0.5);
     if (xmin < 0) xmin = 0;
@@ -90,14 +93,20 @@ const clip8 = (v: number) => {
 /**
  * PIL's Image.resize for 8-bit images (ImagingResample): a horizontal then a vertical pass, each
  * rounding to bytes, with PIL's fixed-point weights. `resample` uses PIL's numbering (0 nearest,
- * 1 lanczos, 2 bilinear, 3 bicubic, 4 box, 5 hamming), as transformers' configs do.
+ * 1 lanczos, 2 bilinear, 3 bicubic, 4 box, 5 hamming), as transformers' configs do. `box`
+ * [x0, y0, x1, y1] resamples that region of the source (fractions allowed), as PIL's `box` does.
  */
-export function resizeImage(img: RgbImage, width: number, height: number, resample = 2): RgbImage {
+export function resizeImage(img: RgbImage, width: number, height: number, resample = 2, box?: readonly [number, number, number, number]): RgbImage {
   const C = img.data.length / (img.width * img.height);
   // One channel too: greyscale (PIL's "L") resamples the same way, e.g. a mask.
   if (C !== 1 && C !== 3 && C !== 4) throw new Error("image data must be grey, RGB or RGBA bytes");
-  if (width === img.width && height === img.height) return { width, height, data: Uint8Array.from(img.data) };
+  const [x0, y0, x1, y1] = box ?? [0, 0, img.width, img.height];
+  // PIL resamples an axis when its size changes or the box does not cover it exactly.
+  const needX = width !== img.width || x0 !== 0 || x1 !== img.width;
+  const needY = height !== img.height || y0 !== 0 || y1 !== img.height;
+  if (!needX && !needY) return { width, height, data: Uint8Array.from(img.data) };
   if (resample === 0) {
+    if (box) throw new Error("resizeImage: a box with nearest resampling is not supported");
     // PIL's nearest: source pixel floor((x + 0.5) · scale).
     const out = new Uint8Array(width * height * C);
     for (let y = 0; y < height; y++) {
@@ -116,8 +125,8 @@ export function resizeImage(img: RgbImage, width: number, height: number, resamp
   // passes accumulate all channels of a pixel (horizontal) or whole rows (vertical) at once, reading
   // memory in order; the bytes are PIL's.
   const half = 1 << (PRECISION_BITS - 1);
-  if (width !== img.width) {
-    const { bounds, k, ksize } = coeffs(img.width, width, filter);
+  if (needX) {
+    const { bounds, k, ksize } = coeffs(img.width, width, filter, x0, x1);
     const d = img.data;
     const out = new Uint8Array(width * img.height * C);
     const acc = new Float64Array(C);
@@ -153,8 +162,8 @@ export function resizeImage(img: RgbImage, width: number, height: number, resamp
     }
     src = { width, height: img.height, data: out };
   }
-  if (height !== src.height) {
-    const { bounds, k, ksize } = coeffs(src.height, height, filter);
+  if (needY) {
+    const { bounds, k, ksize } = coeffs(src.height, height, filter, y0, y1);
     const d = src.data;
     const n = width * C;
     const out = new Uint8Array(height * n);
@@ -174,6 +183,49 @@ export function resizeImage(img: RgbImage, width: number, height: number, resamp
     src = { width, height, data: out };
   }
   return src;
+}
+
+/**
+ * PIL's Image.reduce: each fx × fy block averaged (blocks cut short at the right and bottom edges
+ * average what they hold), rounded as PIL's Reduce.c does with its fixed-point reciprocal.
+ */
+export function reduceImage(img: RgbImage, fx: number, fy: number): RgbImage {
+  const C = img.data.length / (img.width * img.height);
+  const W = Math.ceil(img.width / fx);
+  const H = Math.ceil(img.height / fy);
+  const out = new Uint8Array(W * H * C);
+  // division_UINT32(n, 8): a float32 2^32 / (256 · n), truncated.
+  const mult = (n: number) => Math.trunc(Math.fround(4294967296 / Math.fround(256 * n)));
+  const d = img.data;
+  for (let oy = 0; oy < H; oy++) {
+    const ys = oy * fy;
+    const ny = Math.min(fy, img.height - ys);
+    for (let ox = 0; ox < W; ox++) {
+      const xs = ox * fx;
+      const nx = Math.min(fx, img.width - xs);
+      const n = nx * ny;
+      const m = mult(n);
+      for (let c = 0; c < C; c++) {
+        let s = Math.trunc(n / 2);
+        for (let y = ys; y < ys + ny; y++) for (let x = xs; x < xs + nx; x++) s += d[(y * img.width + x) * C + c]!;
+        // (s · m) >> 24 in 32-bit unsigned arithmetic (the product is exact in a double).
+        out[(oy * W + ox) * C + c] = Math.floor(((s * m) % 4294967296) / 16777216);
+      }
+    }
+  }
+  return { width: W, height: H, data: out };
+}
+
+/**
+ * PIL's Image.resize with `reducing_gap` (transformers' thumbnails pass 2.0): when shrinking by at
+ * least twice the gap, first Image.reduce by the whole factor, then resample the matching box.
+ */
+export function resizeImageReducing(img: RgbImage, width: number, height: number, resample: number, reducingGap: number): RgbImage {
+  const fx = Math.trunc(img.width / width / reducingGap) || 1;
+  const fy = Math.trunc(img.height / height / reducingGap) || 1;
+  if (resample === 0 || (fx <= 1 && fy <= 1)) return resizeImage(img, width, height, resample);
+  // _get_safe_box over the whole image is the whole image, so the reduced box starts at 0.
+  return resizeImage(reduceImage(img, fx, fy), width, height, resample, [0, 0, img.width / fx, img.height / fy]);
 }
 
 /** The middle width × height of an image (numpy-style: offsets floor((in - out) / 2)), zero-padded if smaller. */

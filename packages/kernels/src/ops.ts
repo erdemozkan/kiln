@@ -34,6 +34,8 @@ import {
   colsSpec,
   pixelShuffleSpec,
   swinAttentionSpec,
+  swinV1AttentionSpec,
+  patchMergeSpec,
   windowAttentionSpec,
   channelGramSpec,
   channelApplySpec,
@@ -566,6 +568,30 @@ export function pixelShuffle(ctx: Ctx, x: Tensor, o: { H: number; W: number; r: 
   const C = lastDim(x) / (o.r * o.r);
   const y = ctx.alloc([o.H * o.r * o.W * o.r, C]);
   ctx.run(pixelShuffleSpec(), [ctx.uniform([u32(o.H), u32(o.W), u32(C), u32(o.r)]), x.buf, y.buf], grid1d(o.H * o.r * o.W * o.r * C));
+  return y;
+}
+
+/**
+ * Swin (v1) shifted-window attention over an H × W token image (see swinV1AttentionSpec): q, k, v
+ * [H·W, C], position bias [heads, win², win²] → [H·W, C].
+ */
+export function swinV1Attention(ctx: Ctx, q: Tensor, k: Tensor, v: Tensor, bias: Tensor, o: { H: number; W: number; heads: number; win: number; shift: number }): Tensor {
+  if (o.H % o.win || o.W % o.win) throw new Error(`swinV1Attention: ${o.H} × ${o.W} is not a whole number of ${o.win}-pixel windows`);
+  const C = lastDim(q);
+  const D = C / o.heads;
+  const out = ctx.alloc(q.shape);
+  const params = ctx.uniform([u32(o.H), u32(o.W), u32(C), u32(o.heads), f32(D ** -0.5), u32(o.win), u32(o.shift), u32(0)]);
+  ctx.run(swinV1AttentionSpec(D, o.win), [params, q.buf, k.buf, v.buf, bias.buf, out.buf], [(o.H / o.win) * (o.W / o.win), o.heads, 1]);
+  return out;
+}
+
+/** Swin's patch merging gather (see patchMergeSpec): x [H·W, C] → [(H/2)·(W/2), 4C]. */
+export function patchMerge(ctx: Ctx, x: Tensor, o: { H: number; W: number }): Tensor {
+  if (o.H % 2 || o.W % 2) throw new Error(`patchMerge: ${o.H} × ${o.W} has an odd side`);
+  const C = lastDim(x);
+  const n = (o.H / 2) * (o.W / 2);
+  const y = ctx.alloc([n, 4 * C]);
+  ctx.run(patchMergeSpec(), [ctx.uniform([u32(o.H), u32(o.W), u32(C), u32(0)]), x.buf, y.buf], grid1d(n * 4 * C));
   return y;
 }
 

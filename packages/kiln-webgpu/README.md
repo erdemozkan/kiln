@@ -184,6 +184,10 @@ await captioner("cats.jpg"); // [{ generated_text: "a cat laying on a blanket ne
 const florence = await pipeline("image-to-text", "microsoft/Florence-2-base-ft");
 await florence("car.jpg", { task: "<OD>" }); // [{ generated_text, "<OD>": { labels: ["car", "wheel", "wheel"], bboxes: [...] } }]
 
+// Donut: questions about a document image, no OCR.
+const qa = await pipeline("document-question-answering"); // naver-clova-ix/donut-base-finetuned-docvqa
+await qa("invoice.png", "What is the invoice number?"); // [{ answer: "us-001" }]
+
 // MMS-TTS (VITS): speech from text, 16 kHz mono.
 const tts = await pipeline("text-to-speech"); // facebook/mms-tts-eng
 const { audio, sampling_rate } = await tts("Hello, my dog is cute.", { seed: 1 });

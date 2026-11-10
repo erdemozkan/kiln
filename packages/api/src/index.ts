@@ -42,6 +42,8 @@ export {
   type ObjectDetectionResult,
   type ZeroShotObjectDetectionPipeline,
   type ZeroShotObjectDetectionOptions,
+  type DocumentQuestionAnsweringPipeline,
+  type DocumentQuestionAnsweringOptions,
   type DepthEstimationPipeline,
   type DepthEstimationResult,
   type ImageSegmentationPipeline,

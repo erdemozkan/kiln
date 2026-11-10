@@ -4,10 +4,13 @@ import { UnsupportedModelError } from "./config";
 
 /**
  * BART-style encoder-decoder models: BART / DistilBART, Marian (OPUS-MT), M2M100 / NLLB, Whisper; and
- * "gpt2", the GPT-2 decoder with cross-attention of a VisionEncoderDecoder, whose "encoder" output
- * is given (an image model's hidden states).
+ * the decoders of VisionEncoderDecoders, "gpt2" (GPT-2 with cross-attention) and "mbart" (Donut's),
+ * whose "encoder" output is given (an image model's hidden states).
  */
-export type Seq2SeqFamily = "bart" | "marian" | "m2m100" | "t5" | "whisper" | "gpt2" | "speecht5";
+export type Seq2SeqFamily = "bart" | "marian" | "m2m100" | "t5" | "whisper" | "gpt2" | "mbart" | "speecht5";
+
+/** Families whose source is given as hidden states instead of encoded here. */
+const givenSource = (f: Seq2SeqFamily) => f === "gpt2" || f === "mbart";
 
 export interface Seq2SeqConfig {
   family: Seq2SeqFamily;
@@ -126,11 +129,40 @@ export function seq2seqConfigFromHF(c: Record<string, unknown>): Seq2SeqConfig {
 
 /**
  * The decoder of a VisionEncoderDecoder (`decoder` in its config.json): GPT-2 with cross-attention,
- * pre-LayerNorm, learned positions from row 0, tanh-GELU, logits from the tied token embedding.
+ * pre-LayerNorm, learned positions from row 0, tanh-GELU, logits from the tied token embedding; or
+ * Donut's mBART decoder: scaled embeddings, learned positions from row 2, a LayerNorm after the
+ * embeddings, pre-LayerNorm layers and a final LayerNorm, logits from the tied token embedding.
  */
 export function visionDecoderConfigFromHF(top: Record<string, unknown>): Seq2SeqConfig {
   const c = (top.decoder as Record<string, unknown> | undefined) ?? {};
-  if (c.model_type !== "gpt2") throw new UnsupportedModelError(`VisionEncoderDecoder decoder "${String(c.model_type)}" is not supported (gpt2)`);
+  if (c.model_type === "mbart") {
+    const d = num(c, "d_model");
+    if (c.add_final_layer_norm === false) throw new UnsupportedModelError("an mBART decoder without its final LayerNorm is not supported");
+    return {
+      family: "mbart",
+      modelType: "mbart",
+      dModel: d,
+      encLayers: 0,
+      decLayers: num(c, "decoder_layers"),
+      encHeads: num(c, "decoder_attention_heads"),
+      decHeads: num(c, "decoder_attention_heads"),
+      encFfn: 0,
+      decFfn: num(c, "decoder_ffn_dim"),
+      vocab: num(c, "vocab_size"),
+      maxPositions: num(c, "max_position_embeddings"),
+      preNorm: true,
+      layernormEmbedding: true,
+      positions: "learned",
+      posOffset: 2,
+      embedScale: c.scale_embedding ? Math.sqrt(d) : 1,
+      act: activation(c.activation_function ?? "gelu"),
+      pad: Number(c.pad_token_id ?? 1),
+      eos: Number(c.eos_token_id ?? 2),
+      decoderStart: Number(top.decoder_start_token_id ?? c.bos_token_id ?? 0),
+      raw: top,
+    };
+  }
+  if (c.model_type !== "gpt2") throw new UnsupportedModelError(`VisionEncoderDecoder decoder "${String(c.model_type)}" is not supported (gpt2, mbart)`);
   if (c.add_cross_attention !== true) throw new UnsupportedModelError("the GPT-2 decoder has no cross-attention");
   const d = num(c, "n_embd");
   const eos = Number(top.eos_token_id ?? c.eos_token_id ?? 50256);
@@ -413,7 +445,7 @@ export class Seq2SeqModel {
     let feats: Buf | undefined;
     let hidden: Buf | undefined;
     let x: Tensor;
-    if (c.family === "gpt2") {
+    if (givenSource(c.family)) {
       hidden = ectx.buffer(S * d * 4, "seq2seq/hidden");
       x = { shape: [S, d], dtype: "f32", buf: hidden };
     } else if (c.audio) {
@@ -554,7 +586,7 @@ export class Seq2SeqModel {
 
   /** GPT-2 decoder: takes an image model's hidden states [S, d_model] as the encoder output and readies the decoder. */
   async encodeHidden(hidden: Float32Array, S: number): Promise<void> {
-    if (this.cfg.family !== "gpt2") throw new Error("seq2seq: this model encodes its own source");
+    if (!givenSource(this.cfg.family)) throw new Error("seq2seq: this model encodes its own source");
     if (hidden.length !== S * this.cfg.dModel) throw new Error(`seq2seq: expected ${S} × ${this.cfg.dModel} hidden states, got ${hidden.length}`);
     let pair = this.pairs.get(S);
     if (!pair) {

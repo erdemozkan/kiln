@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { centerCrop, detrResizeSize, dptResizeSize, preprocessImage, resizeImage } from "../src/image";
+import { centerCrop, detrResizeSize, dptResizeSize, preprocessImage, reduceImage, resizeImage, resizeImageReducing } from "../src/image";
 
 // A 5 × 4 RGB image and PIL 8's Image.resize of it (checked byte for byte; the 97 × 61 case and
 // whole DeiT / CLIP pipelines were also checked against PIL + numpy, all exact).
@@ -68,5 +68,21 @@ describe("ConvNeXt-style preprocessing (crop_pct)", () => {
   it("goes straight to a square at 384 and above, with no crop", () => {
     const p = preprocessImage(img, { image_processor_type: "ConvNextImageProcessor", size: { shortest_edge: 384 }, crop_pct: 0.875 });
     expect([p.width, p.height]).toEqual([384, 384]);
+  });
+});
+
+describe("PIL's reduce and reducing_gap", () => {
+  const ramp = (w: number, h: number) => ({ width: w, height: h, data: Uint8Array.from({ length: w * h * 3 }, (_, i) => (i * 37) % 256) });
+  it("averages blocks as Image.reduce does, short blocks at the edges included", () => {
+    // PIL 8: Image.fromarray(a).reduce((3, 2)) of an 11 × 7 ramp.
+    const want = [124, 118, 113, 116, 110, 104, 107, 144, 139, 129, 102, 139, 134, 128, 123, 126, 163, 157, 117, 112, 106, 139, 112, 149, 144, 138, 90, 93, 130, 124, 127, 122, 159, 149, 122, 95, 98, 135, 172, 175, 127, 78, 81, 118, 155, 189, 98, 135];
+    const r = reduceImage(ramp(11, 7), 3, 2);
+    expect([r.width, r.height]).toEqual([4, 4]);
+    expect(Array.from(r.data)).toEqual(want);
+  });
+  it("reduces first, then resamples the box, as Image.resize(reducing_gap=2) does", () => {
+    // PIL 8: resize((7, 2), BICUBIC, reducing_gap=2.0) of a 60 × 8 ramp (reduced by 4 first).
+    const want = [117, 117, 116, 132, 138, 136, 134, 129, 127, 115, 121, 125, 138, 128, 134, 129, 129, 127, 134, 133, 124, 130, 128, 125, 131, 131, 131, 117, 124, 116, 131, 134, 136, 136, 131, 130, 117, 119, 122, 135, 134, 135];
+    expect(Array.from(resizeImageReducing(ramp(60, 8), 7, 2, 3, 2).data)).toEqual(want);
   });
 });

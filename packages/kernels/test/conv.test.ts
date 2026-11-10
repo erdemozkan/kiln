@@ -76,6 +76,52 @@ describe("speech front-end kernels (CPU)", () => {
     for (let i = 0; i < 10; i++) expect(y[i]).toBeCloseTo(0.25 * a[i]! + 0.75 * b[i]!, 6);
   });
 
+  it("swinV1Attention matches transformers' roll, window partition, bias and mask", async () => {
+    // A 4 × 6 token image, windows of 2, shift 1, 2 heads of 3.
+    const [H, W, win, shift, heads, D] = [4, 6, 2, 1, 2, 3];
+    const C = heads * D;
+    const N = win * win;
+    const [q, k, v] = [randn(H * W * C), randn(H * W * C), randn(H * W * C)];
+    const bias = randn(heads * N * N);
+    const y = await run((ctx) => ops.swinV1Attention(ctx, upload(q, [H * W, C]), upload(k, [H * W, C]), upload(v, [H * W, C]), upload(bias, [heads, N, N]), { H, W, heads, win, shift }), H * W * C);
+    // transformers: roll by -shift, label regions on the padded grid (slices 0:-win, -win:-shift, -shift:), partition.
+    const rolled = (t: number) => (((Math.floor(t / W) + shift) % H) * W + ((t % W) + shift) % W);
+    const label = (yy: number, xx: number) => (yy < H - win ? 0 : yy < H - shift ? 1 : 2) * 3 + (xx < W - win ? 0 : xx < W - shift ? 1 : 2);
+    const want = new Float32Array(H * W * C);
+    for (let wy = 0; wy < H / win; wy++)
+      for (let wx = 0; wx < W / win; wx++) {
+        const pos = Array.from({ length: N }, (_, j) => [wy * win + Math.floor(j / win), wx * win + (j % win)] as const);
+        for (let h = 0; h < heads; h++)
+          pos.forEach(([yi, xi], i) => {
+            const ti = rolled(yi * W + xi);
+            const sc = pos.map(([yj, xj], j) => {
+              const tj = rolled(yj * W + xj);
+              let d = 0;
+              for (let e = 0; e < D; e++) d += q[ti * C + h * D + e]! * k[tj * C + h * D + e]!;
+              return d / Math.sqrt(D) + bias[(h * N + i) * N + j]! + (label(yi, xi) === label(yj, xj) ? 0 : -100);
+            });
+            const m = Math.max(...sc);
+            const e = sc.map((x) => Math.exp(x - m));
+            const z = e.reduce((a, b) => a + b, 0);
+            for (let dd = 0; dd < D; dd++) want[ti * C + h * D + dd] = pos.reduce((a, [yj, xj], j) => a + (e[j]! / z) * v[rolled(yj * W + xj) * C + h * D + dd]!, 0);
+          });
+      }
+    for (let i = 0; i < want.length; i++) expect(y[i]).toBeCloseTo(want[i]!, 5);
+  });
+
+  it("patchMerge gathers 2 × 2 blocks in transformers' order", async () => {
+    const [H, W, C] = [4, 6, 2];
+    const x = randn(H * W * C);
+    const y = await run((ctx) => ops.patchMerge(ctx, upload(x, [H * W, C]), { H, W }), H * W * C);
+    // cat([x[0::2, 0::2], x[1::2, 0::2], x[0::2, 1::2], x[1::2, 1::2]], -1)
+    const offs = [[0, 0], [1, 0], [0, 1], [1, 1]];
+    for (let oy = 0; oy < H / 2; oy++)
+      for (let ox = 0; ox < W / 2; ox++)
+        offs.forEach(([dy, dx], j) => {
+          for (let c = 0; c < C; c++) expect(y[((oy * (W / 2) + ox) * 4 + j) * C + c]).toBe(x[((2 * oy + dy!) * W + 2 * ox + dx!) * C + c]);
+        });
+  });
+
   it("mulFirstRow multiplies every row after the first by the first", async () => {
     const [T, D] = [4, 3];
     const x = randn(T * D);

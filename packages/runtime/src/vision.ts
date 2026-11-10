@@ -11,6 +11,7 @@ import { openBackend, openParsed } from "./load";
 import { loadWeights, type LoadProgress, type WeightFile } from "./weights";
 import { createFlorence, type Florence2, type FlorenceOptions } from "./florence";
 import { createOwl, type OwlDetector, type ZeroShotDetectionOptions } from "./owl";
+import { createDonut, type DocumentQuestionAnsweringOptions, type DonutDocQA } from "./donut";
 
 export interface VisionLoadOptions {
   /** Matrix storage: "f32" (default), "q8" or "q4". */
@@ -158,6 +159,7 @@ export class VisionEngine {
     private readonly captioner?: { decoder: Seq2SeqModel; tokenizer: EncoderTokenizer; maxLength: number },
     private readonly florence?: Florence2,
     private readonly owl?: OwlDetector,
+    private readonly donut?: DonutDocQA,
   ) {}
 
   get cfg(): VitConfig {
@@ -174,6 +176,10 @@ export class VisionEngine {
   summary(): { family: string; layers: number; hiddenSize: number; imageSize: number; labels: Record<number, string> } {
     const labels = (l: string[]) => Object.fromEntries(l.map((v, i) => [i, v]));
     if (this.matte) return { family: "rmbg", layers: 0, hiddenSize: 0, imageSize: 1024, labels: {} };
+    if (this.donut) {
+      const c = this.donut.cfg;
+      return { family: "donut", layers: c.depths.reduce((a, b) => a + b, 0), hiddenSize: c.embedDim * 2 ** (c.depths.length - 1), imageSize: Math.max(...c.imageHW), labels: {} };
+    }
     if (this.owl) {
       const c = this.owl.cfg;
       return { family: c.kind, layers: c.vision.layers + c.text.layers, hiddenSize: c.vision.hidden, imageSize: c.vision.imageSize, labels: {} };
@@ -303,6 +309,21 @@ export class VisionEngine {
   async detectZeroShot(img: RgbImage, labels: readonly string[], options: ZeroShotDetectionOptions = {}): Promise<DetectedObject[]> {
     if (!this.owl) throw new Error("zero-shot object detection needs an OWL-ViT or OWLv2 model");
     return this.owl.detect(img, labels, options);
+  }
+
+  /**
+   * Document question answering (Donut): the answer to a question about a page image, as
+   * transformers' pipeline gives it ([{ answer }], null when the model gives none). The page's
+   * encoding is kept, so more questions on it only run the decoder.
+   */
+  async answerDocument(img: RgbImage, question: string, options: DocumentQuestionAnsweringOptions = {}): Promise<{ answer: string | null }[]> {
+    if (!this.donut) throw new Error("document question answering needs a Donut model (naver-clova-ix/donut-base-finetuned-docvqa)");
+    return this.donut.answer(img, question, options);
+  }
+
+  /** The Donut model, for its parts. */
+  get docQA(): DonutDocQA | undefined {
+    return this.donut;
   }
 
   /** The OWL detector, for raw predictions. */
@@ -599,6 +620,7 @@ export class VisionEngine {
   }
 
   destroy(): void {
+    this.donut?.destroy();
     this.owl?.destroy();
     this.florence?.destroy();
     this.vit?.model.destroy();
@@ -635,6 +657,9 @@ export async function createVision(modelId: string, opts: VisionLoadOptions = {}
   if (config!.model_type === "segformer") return createSegformer(modelId, ref, config!, prep, names, opts);
   if (config!.model_type === "swin2sr") return createSwin2sr(modelId, ref, config!, prep, names, opts);
   if (config!.model_type === "resnet" || config!.model_type === "convnext") return createConvNet(modelId, ref, config!, prep, names, opts);
+  if (config!.model_type === "vision-encoder-decoder" && (config!.encoder as { model_type?: string } | undefined)?.model_type === "donut-swin") {
+    return createDonut(modelId, ref, config!, prep, names, opts, listing, (d, backend) => new VisionEngine(backend, undefined, d.processor, {}, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, d));
+  }
   if (config!.model_type === "vision-encoder-decoder") return createCaptioner(modelId, ref, config!, prep, names, opts, listing);
   if (config!.model_type === "owlv2" || config!.model_type === "owlvit") {
     return createOwl(modelId, ref, config!, prep, names, opts, listing, (o, backend) => new VisionEngine(backend, undefined, o.processor, {}, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, o));

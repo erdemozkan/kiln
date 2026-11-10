@@ -270,6 +270,8 @@ scope.onmessage = async (e: MessageEvent<Request>) => {
                         ? await v.segment(img, msg.args[1] as Record<string, unknown> | undefined)
                         : task === "background-removal"
                           ? await v.removeBackground(img)
+                          : task === "document-question-answering"
+                            ? await v.answerDocument(img, msg.args[1] as string, msg.args[2] as Record<string, unknown> | undefined)
                           : task === "image-to-image"
                             ? await v.upscale(img)
                             : task === "image-to-text"

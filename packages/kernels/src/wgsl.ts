@@ -2459,6 +2459,123 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
 }
 
 /**
+ * Swin (v1) shifted-window attention over an H × W token image, q, k, v [H·W, C] with heads of D
+ * columns: the image cyclically shifted by -shift, cut into win × win windows, and in each window
+ * softmax(q·kᵀ · scale + the head's position bias + mask) · v, with bias [heads, win², win²] (the
+ * relative-position table already expanded) and, when shifted, -100 between tokens from different
+ * regions of the wrap-around; written back at each token's unshifted position. One workgroup per
+ * (window, head), one thread per query; keys, then values, staged in workgroup memory a tile at a time.
+ */
+export function swinV1AttentionSpec(D: number, win: number): KernelSpec {
+  const N = win * win;
+  const tile = Math.min(N, Math.floor(4096 / D));
+  if (N > 256) throw new Error(`swin attention: a ${win} × ${win} window is more than 256 queries`);
+  return spec(`swin_v1_attention/D${D}/w${win}`, ["uniform", "read", "read", "read", "read", "rw"], cpu.cpuSwinV1Attention, () => /* wgsl */ `
+struct P { H: u32, W: u32, C: u32, heads: u32, scale: f32, win: u32, shift: u32, _a: u32 }
+@group(0) @binding(0) var<uniform> p: P;
+@group(0) @binding(1) var<storage, read> q: array<f32>;
+@group(0) @binding(2) var<storage, read> k: array<f32>;
+@group(0) @binding(3) var<storage, read> v: array<f32>;
+@group(0) @binding(4) var<storage, read> bias: array<f32>;
+@group(0) @binding(5) var<storage, read_write> o: array<f32>;
+const D = ${D}u;
+const N = ${N}u;
+const WIN = ${win}u;
+const TILE = ${tile}u;
+var<workgroup> tile: array<f32, ${tile * D}>;
+var<workgroup> region: array<u32, ${N}>;
+
+fn band(s: u32, n: u32) -> u32 {
+  if (p.shift == 0u) { return 0u; }
+  return select(0u, 1u, s >= n - WIN) + select(0u, 1u, s >= n - p.shift);
+}
+
+// Token index of window position j (shifted grid) in the unshifted image.
+fn token(wx: u32, j: u32) -> u32 {
+  let wpr = p.W / WIN;
+  let sy = (wx / wpr) * WIN + j / WIN;
+  let sx = (wx % wpr) * WIN + j % WIN;
+  return ((sy + p.shift) % p.H) * p.W + (sx + p.shift) % p.W;
+}
+
+@compute @workgroup_size(${N})
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) li: u32) {
+  let h = wid.y;
+  let wpr = p.W / WIN;
+  let tok = token(wid.x, li);
+  region[li] = band((wid.x / wpr) * WIN + li / WIN, p.H) * 3u + band((wid.x % wpr) * WIN + li % WIN, p.W);
+  var qv: array<f32, ${D}>;
+  for (var d = 0u; d < D; d++) { qv[d] = q[tok * p.C + h * D + d]; }
+  var s: array<f32, ${N}>;
+  var m = -3.4e38;
+  let bo = (h * N + li) * N;
+  for (var t0 = 0u; t0 < N; t0 += TILE) {
+    workgroupBarrier();
+    for (var i = li; i < TILE * D; i += N) {
+      let j = t0 + i / D;
+      if (j < N) { tile[i] = k[token(wid.x, j) * p.C + h * D + i % D]; }
+    }
+    workgroupBarrier();
+    let mine = region[li];
+    for (var jj = 0u; jj < TILE; jj++) {
+      let j = t0 + jj;
+      if (j >= N) { break; }
+      var dot = 0.0;
+      for (var d = 0u; d < D; d++) { dot += qv[d] * tile[jj * D + d]; }
+      var sc = dot * p.scale + bias[bo + j];
+      if (region[j] != mine) { sc -= 100.0; }
+      s[j] = sc;
+      m = max(m, sc);
+    }
+  }
+  var z = 0.0;
+  for (var j = 0u; j < N; j++) { s[j] = exp(s[j] - m); z += s[j]; }
+  var acc: array<f32, ${D}>;
+  for (var t0 = 0u; t0 < N; t0 += TILE) {
+    workgroupBarrier();
+    for (var i = li; i < TILE * D; i += N) {
+      let j = t0 + i / D;
+      if (j < N) { tile[i] = v[token(wid.x, j) * p.C + h * D + i % D]; }
+    }
+    workgroupBarrier();
+    for (var jj = 0u; jj < TILE; jj++) {
+      let j = t0 + jj;
+      if (j >= N) { break; }
+      for (var d = 0u; d < D; d++) { acc[d] += s[j] * tile[jj * D + d]; }
+    }
+  }
+  let inv = 1.0 / z;
+  for (var d = 0u; d < D; d++) { o[tok * p.C + h * D + d] = acc[d] * inv; }
+}`);
+}
+
+/**
+ * Swin's patch merging gather: x [H·W, C] (H, W even) → y [(H/2)·(W/2), 4C], each output row the
+ * 2 × 2 block's tokens in transformers' order: (0, 0), (1, 0), (0, 1), (1, 1) as (row, column).
+ */
+export function patchMergeSpec(): KernelSpec {
+  return spec("patch_merge", ["uniform", "read", "rw"], cpu.cpuPatchMerge, () => /* wgsl */ `
+struct P { H: u32, W: u32, C: u32, _a: u32 }
+@group(0) @binding(0) var<uniform> p: P;
+@group(0) @binding(1) var<storage, read> x: array<f32>;
+@group(0) @binding(2) var<storage, read_write> y: array<f32>;
+
+@compute @workgroup_size(${EW})
+fn main(${EW_ARGS}) {
+  ${FLAT}
+  let wo = p.W / 2u;
+  let n = (p.H / 2u) * wo * 4u * p.C;
+  if (idx >= n) { return; }
+  let c = idx % p.C;
+  let j = (idx / p.C) % 4u;
+  let o = idx / (4u * p.C);
+  let yy = (o / wo) * 2u + j % 2u;
+  let xx = (o % wo) * 2u + j / 2u;
+  y[idx] = x[(yy * p.W + xx) * p.C + c];
+}`);
+}
+
+/**
  * Plain windowed multi-head attention (DaViT's spatial blocks; no shift, no bias) over an H × W token
  * image whose fused projection qkv [H·W, 3C] holds q, k, v side by side (head h at h·D of each):
  * softmax(q·scale · kᵀ) · v within each win × win window → o [H·W, C]. One workgroup per (window,

@@ -33,6 +33,7 @@ export type PipelineTask =
   | "background-removal"
   | "image-to-image"
   | "image-to-text"
+  | "document-question-answering"
   | "text-to-audio"
   | "text-to-speech";
 
@@ -65,11 +66,12 @@ export const DEFAULT_MODELS: Record<string, string> = {
   "background-removal": "briaai/RMBG-1.4",
   "image-to-image": "caidas/swin2SR-classical-sr-x2-64",
   "image-to-text": "nlpconnect/vit-gpt2-image-captioning",
+  "document-question-answering": "naver-clova-ix/donut-base-finetuned-docvqa",
   // transformers.js's default (Supertonic) exists only as ONNX.
   "text-to-audio": "facebook/mms-tts-eng",
 };
 
-const VISION = new Set<string>(["image-classification", "image-feature-extraction", "zero-shot-image-classification", "object-detection", "zero-shot-object-detection", "depth-estimation", "image-segmentation", "background-removal", "image-to-image", "image-to-text"]);
+const VISION = new Set<string>(["image-classification", "image-feature-extraction", "zero-shot-image-classification", "object-detection", "zero-shot-object-detection", "depth-estimation", "image-segmentation", "background-removal", "image-to-image", "image-to-text", "document-question-answering"]);
 
 /** Speech encoders run on raw samples (CTC or a classifier) rather than as encoder-decoders. */
 const AUDIO_ENCODERS = new Set(["wav2vec2", "hubert"]);
@@ -506,6 +508,18 @@ export interface ZeroShotObjectDetectionPipeline {
   (images: ImageInput[], candidate_labels: string[], options?: ZeroShotObjectDetectionOptions): Promise<ObjectDetectionResult[][]>;
 }
 
+export interface DocumentQuestionAnsweringOptions {
+  /** Most tokens to generate (default 256; the decoder's positions cap it). */
+  max_new_tokens?: number;
+}
+export interface DocumentQuestionAnsweringPipeline {
+  readonly task: PipelineTask;
+  readonly model: KilnVision;
+  readonly info: VisionInfo;
+  dispose(): Promise<void>;
+  (image: ImageInput | [ImageInput], question: string, options?: DocumentQuestionAnsweringOptions): Promise<{ answer: string | null }[]>;
+}
+
 /** A depth map: `predicted_depth` [height, width] at the original image size, and `depth`, the map as 0…255 grey bytes. */
 export interface DepthEstimationResult {
   predicted_depth: Tensor;
@@ -690,6 +704,7 @@ export async function pipeline(task: "image-segmentation", model?: string, optio
 export async function pipeline(task: "background-removal", model?: string, options?: PipelineOptions): Promise<BackgroundRemovalPipeline>;
 export async function pipeline(task: "image-to-image", model?: string, options?: PipelineOptions): Promise<ImageToImagePipeline>;
 export async function pipeline(task: "image-to-text", model?: string, options?: PipelineOptions): Promise<ImageToTextPipeline>;
+export async function pipeline(task: "document-question-answering", model?: string, options?: PipelineOptions): Promise<DocumentQuestionAnsweringPipeline>;
 export async function pipeline(task: "text-to-audio" | "text-to-speech", model?: string, options?: PipelineOptions): Promise<TextToAudioPipeline>;
 export async function pipeline(task: PipelineTask, model?: string, options: PipelineOptions = {}): Promise<unknown> {
   const t = ALIASES[task] ?? task;
@@ -726,6 +741,12 @@ export async function pipeline(task: PipelineTask, model?: string, options: Pipe
       return r;
     };
     const call = async (images: ImageInput | ImageInput[], a?: unknown, b?: object) => {
+      if (t === "document-question-answering") {
+        // One page, as in transformers.js (a batch of one is accepted).
+        if (Array.isArray(images) && images.length !== 1) throw new Error("document-question-answering takes one image at a time");
+        const img = await toWorkerImage(Array.isArray(images) ? images[0]! : images);
+        return m.run<unknown>("document-question-answering", img, a, { ...b });
+      }
       if (!Array.isArray(images)) return one(images, a, b);
       const out: unknown[] = [];
       for (const x of images) out.push(await one(x, a, b));

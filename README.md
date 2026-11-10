@@ -532,6 +532,8 @@ K/V; each decoder step reads them through a step block whose span covers every p
 | SpeechT5 text-to-speech (`microsoft/speecht5_tts` + `microsoft/speecht5_hifigan`) | transformers.js (`Xenova/speecht5_tts`, fp32), its prenet dropout rewritten to keep every unit, Kiln with `prenet_dropout: "keep"` | the same ids; the same 122,880 samples, within 1e-5 over the first 80 frames, then drifting as frames feed back (mean difference 3.3e-4). With dropout: 1.9 s against 6.4 s (WebGPU) for "Hello, my dog is cute.", 3.6 s against 12.7 s for a 44-character sentence |
 | ViT + GPT-2 captioning (`nlpconnect/vit-gpt2-image-captioning`) | transformers.js (`Xenova/vit-gpt2-image-captioning`, fp32) on the same pixel values | the same caption on all three photos tried |
 | Florence-2 (`microsoft/Florence-2-base-ft`) | transformers.js (`onnx-community/Florence-2-base-ft`, fp32) on the same 768 × 768 pixels | 3 of 20 outputs identical (4 photos × caption, detailed caption, detection, grounding, OCR): its export fixed the channel-attention scale at a 224 × 224 trace, 3.4× too large at 768 (see below). With that scale given to Kiln too, the image tokens agree within 2.6e-4 and all 20 outputs are identical, every location token included. 2.9 s against 5.8 s for a caption, 3.0 s against 6.1 s for detection (WebGPU) |
+| Donut DocVQA (`naver-clova-ix/donut-base-finetuned-docvqa`) | transformers.js 4.3.2 (`Xenova/donut-base-finetuned-docvqa`, fp32) on the same pixel values, and its own pipeline | the same answers in all 8 questions on 5 pages (invoice number, total, due date, receipt total and store, balance due, schedule time, book title), from both; the same prompt ids; encoder output within 8e-5 for 99% of values (median 7e-7; at most 0.11, in an outlier channel near −91). 16.9–18.3 s against 33.1–34.3 s for a new page; 1.3 s against 31–34 s for another question on the same page |
+| Donut image processing | PIL 8 + numpy (transformers v4's steps) | pixel values identical (float32), including thumbnails that PIL reduces before resampling |
 | SmolVLM (`HuggingFaceTB/SmolVLM-256M-Instruct`) | transformers.js (the repo's ONNX export, fp32) on the same tiles and prompt | image features within 2.1e-4 (values up to 96); the same greedy replies in all 17 runs, 9 photo-question pairs with image splitting (13 to 17 tiles) and 8 without. 17.4 s against 25.0 s for a short answer with splitting, 2.3 s against 4.3 s without (WebGPU) |
 | DINOv2 (`facebook/dinov2-small-imagenet1k-1-layer`) | transformers.js (`Xenova/dinov2-small-imagenet1k-1-layer`, fp32) on the same pixel values | within 6e-3: its export resizes position embeddings bilinearly, Python bicubically (Kiln); with its resize, within 3.2e-7. 383 ms end to end against 683 ms |
 | Swin2SR (`caidas/swin2SR-classical-sr-x2-64`) | transformers.js (`Xenova/swin2SR-classical-sr-x2-64`, fp32) on the same pixel values | 4 of 147,456 output bytes one level apart (128 × 96 → 256 × 192); 3.4 s end to end against 10.4 s |
@@ -822,6 +824,34 @@ each) ahead of the prompt's in the BART encoder, and greedy generation with the 
 (forced BOS and EOS, no repeated 3-grams; `num_beams` is ignored, as transformers.js does).
 Microsoft's tokenizer.json lacks the 1,024 task and location tokens the processor adds at load;
 Kiln adds them at the same ids.
+
+Document question answering (`document-question-answering`) runs Donut
+(`naver-clova-ix/donut-base-finetuned-docvqa`, the default; transformers.js's default is its ONNX
+export): a question about a page image, answered without OCR.
+
+```js
+const qa = await pipeline("document-question-answering");
+await qa("invoice.png", "What is the invoice number?"); // [{ answer: "us-001" }]
+```
+
+Donut is a VisionEncoderDecoder: a Swin encoder over the page at 2560 × 1920, and a 4-layer mBART
+decoder. The encoder runs on new kernels for Swin's shifted-window attention (10 × 10 windows,
+relative-position bias, the -100 mask between wrapped regions) and patch merging; its 307,200
+first-stage tokens make it the heaviest image model Kiln runs (about 2.4 TFLOP, submitted a block
+at a time so no command buffer holds seconds of work). The decoder is the seq2seq code given the
+encoder's 4,800 tokens. The page goes through DonutImageProcessor's steps with PIL's resampling:
+the shortest edge to 1920 (bilinear), a thumbnail that fits 2560 × 1920 (bicubic with PIL's
+`reducing_gap`, which first box-reduces images shrunk 4× or more; Kiln has PIL's reduce too), and
+black padding around the center. The prompt is transformers' (`<s_docvqa><s_question>…</s_question><s_answer>`),
+decoding is greedy, and the answer is the text before `</s_answer>` (`null` when the model never
+closes it). Kiln keeps the last two pages' encodings, so another question on a page costs only the
+decoder: 1.3 s instead of 17 s.
+
+On 8 questions over 5 pages from transformers.js's examples, Kiln, transformers.js on the same pixel
+values and transformers.js's own pipeline gave the same 8 answers. A new page takes 16.9–18.3 s
+against 33.1–34.3 s for transformers.js, and another question on it 1.3 s against 31–34 s (WebGPU,
+backgrounded pane). The weights come as a 2022 `pytorch_model.bin` only; Kiln reads it with its own
+zip and pickle reader.
 
 SmolVLM (`HuggingFaceTB/SmolVLM-256M-Instruct`, `-500M-Instruct`, and other Idefics3 checkpoints)
 answers questions about images in chat. `load(id)`, then messages with image parts, as for Gemma 3; no

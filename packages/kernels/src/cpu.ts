@@ -1260,6 +1260,62 @@ export const cpuAdvance: CpuKernel = (b) => {
   st[1] = 0;
 };
 
+export const cpuSwinV1Attention: CpuKernel = (b) => {
+  const [H, W, C, heads] = Array.from(b[0]!.u32.subarray(0, 4)) as [number, number, number, number];
+  const scale = b[0]!.f32[4]!;
+  const [win, shift] = [b[0]!.u32[5]!, b[0]!.u32[6]!];
+  const [q, k, v, bias, o] = [b[1]!.f32, b[2]!.f32, b[3]!.f32, b[4]!.f32, b[5]!.f32];
+  const D = C / heads;
+  const N = win * win;
+  const f = Math.fround;
+  const band = (s: number, n: number) => (shift ? (s >= n - win ? 1 : 0) + (s >= n - shift ? 1 : 0) : 0);
+  const s = new Float64Array(N);
+  for (let wy = 0; wy < H / win; wy++)
+    for (let wx = 0; wx < W / win; wx++) {
+      const toks: number[] = [];
+      const reg: number[] = [];
+      for (let j = 0; j < N; j++) {
+        const sy = wy * win + Math.floor(j / win);
+        const sx = wx * win + (j % win);
+        toks.push(((sy + shift) % H) * W + ((sx + shift) % W));
+        reg.push(band(sy, H) * 3 + band(sx, W));
+      }
+      for (let h = 0; h < heads; h++)
+        for (let i = 0; i < N; i++) {
+          const t = toks[i]!;
+          let m = -Infinity;
+          for (let j = 0; j < N; j++) {
+            let dot = 0;
+            for (let d = 0; d < D; d++) dot += q[t * C + h * D + d]! * k[toks[j]! * C + h * D + d]!;
+            s[j] = f(dot) * scale + bias[(h * N + i) * N + j]! - (reg[j] !== reg[i] ? 100 : 0);
+            m = Math.max(m, s[j]!);
+          }
+          let z = 0;
+          for (let j = 0; j < N; j++) z += s[j] = Math.exp(s[j]! - m);
+          for (let d = 0; d < D; d++) {
+            let a = 0;
+            for (let j = 0; j < N; j++) a += s[j]! * v[toks[j]! * C + h * D + d]!;
+            o[t * C + h * D + d] = a / z;
+          }
+        }
+    }
+};
+
+export const cpuPatchMerge: CpuKernel = (b) => {
+  const [H, W, C] = [b[0]!.u32[0]!, b[0]!.u32[1]!, b[0]!.u32[2]!];
+  const [x, y] = [b[1]!.f32, b[2]!.f32];
+  const wo = W / 2;
+  const n = (H / 2) * wo * 4 * C;
+  for (let idx = 0; idx < n; idx++) {
+    const c = idx % C;
+    const j = Math.floor(idx / C) % 4;
+    const o = Math.floor(idx / (4 * C));
+    const yy = Math.floor(o / wo) * 2 + (j % 2);
+    const xx = (o % wo) * 2 + Math.floor(j / 2);
+    y[idx] = x[(yy * W + xx) * C + c]!;
+  }
+};
+
 export const cpuWindowAttention: CpuKernel = (b) => {
   const [H, W, C, heads] = Array.from(b[0]!.u32.subarray(0, 4)) as [number, number, number, number];
   const scale = b[0]!.f32[4]!;

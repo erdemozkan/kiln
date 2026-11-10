@@ -19,3 +19,4 @@ export * from "./hifigan";
 export * from "./speecht5";
 export * from "./florence2";
 export * from "./owl";
+export * from "./donut";
