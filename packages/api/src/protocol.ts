@@ -20,8 +20,13 @@ export interface WireLoadOptions {
    * or a full id. Messages may then hold `{ type: "image", image }` parts (Blob, ImageBitmap, ImageData).
    */
   mmproj?: string;
-  /** Images whose features stay on the GPU at once, with `mmproj` (default 4). */
+  /** Images whose features stay on the GPU at once, with `mmproj` or for SmolVLM (default 4). */
   imageSlots?: number;
+  /**
+   * SmolVLM: split each image into 512 × 512 tiles plus a global view, as its processor does by
+   * default, or false for one view (64 tokens; much faster, less detail).
+   */
+  imageSplitting?: boolean;
   /** "auto" (default): WebGPU, or the CPU when the browser has none; "gpu" or "cpu" to choose. */
   device?: "auto" | "gpu" | "cpu";
   /** Threads for CPU matmuls (default hardwareConcurrency, at most 4; more than one needs a cross-origin isolated page). */
@@ -45,7 +50,7 @@ export interface ModelInfo {
   backend: string;
   /** On the CPU backend, the threads large matmuls are split across (1 without cross-origin isolation). */
   cpuThreads?: number;
-  /** True when chat messages may hold images (Gemma 3 loaded with `mmproj`). */
+  /** True when chat messages may hold images (Gemma 3 loaded with `mmproj`, or SmolVLM). */
   vision: boolean;
   /** Context length this load allocated, in tokens. */
   maxSeq: number;

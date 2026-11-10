@@ -1,6 +1,7 @@
 import type { Backend, Buf, Dispatch, Profile } from "@kiln/core";
 import { GrammarMatcher, TokenTrie, compileFormat, type ResponseFormat } from "@kiln/grammar";
-import { LlamaModel, MAX_VERIFY_ROWS, type ForwardPlan, type ImagePixels, type VisionTower } from "@kiln/models";
+import { LlamaModel, MAX_VERIFY_ROWS, type ForwardPlan, type Idefics3Processing, type ImagePixels, type VisionTower } from "@kiln/models";
+import { idefics3PromptString, idefics3Tiles } from "./idefics3";
 import { detectChatFormat, type ChatDocument, type ChatFormat, type ChatMessage, type Tokenizer, type ToolSpec } from "@kiln/tokenizers";
 import { SubmitPacer } from "./pace";
 import { PrefixStore } from "./prefix-store";
@@ -192,7 +193,7 @@ export class Engine {
     readonly backend: Backend,
     readonly model: LlamaModel,
     readonly tokenizer: Tokenizer,
-    /** Gemma 3's vision tower, when loaded with its mmproj file: chat messages may then hold images. */
+    /** A vision tower (Gemma 3 with its mmproj file, or SmolVLM): chat messages may then hold images. */
     readonly vision?: VisionTower,
   ) {
     try {
@@ -212,9 +213,17 @@ export class Engine {
     // Only reasoning models know <think>; injecting it elsewhere derails them.
     const thinks = this.tokenizer.tokenId("<think>") !== undefined;
     const images = messages.flatMap((m) => (typeof m.content === "string" ? [] : m.content.flatMap((p) => (p.type === "image" ? [p.image as ImagePixels] : []))));
-    if (images.length && !this.vision) throw new Error("this model takes no images (load Gemma 3 with its mmproj file to give it images)");
-    // Templates see image parts without their pixels; Gemma's writes <start_of_image> for each.
-    const shown = messages.map((m) => (typeof m.content === "string" ? m : { ...m, content: m.content.map((p) => (p.type === "image" ? { type: "image" as const, image: null } : p)) }));
+    if (images.length && !this.vision) throw new Error("this model takes no images (load Gemma 3 with its mmproj file, or a SmolVLM model, to give it images)");
+    const idefics3 = this.vision?.processing;
+    // Templates see image parts without their pixels; Gemma's writes <start_of_image> for each,
+    // SmolVLM's <image>. SmolVLM's template reads every message's content as a list of parts.
+    const shown = messages.map((m) =>
+      typeof m.content === "string"
+        ? idefics3
+          ? { ...m, content: [{ type: "text" as const, text: m.content }] }
+          : m
+        : { ...m, content: m.content.map((p) => (p.type === "image" ? { type: "image" as const, image: null } : p)) },
+    );
     const prompt = this.chatFormat.render(shown, {
       enableThinking: thinks ? opts.enableThinking : undefined,
       tools: opts.tools,
@@ -224,9 +233,50 @@ export class Engine {
       yield* this.complete(prompt, this.forceToolCall(opts));
       return;
     }
+    if (idefics3) {
+      yield* this.decodeIds(await this.withTiles(prompt, images, idefics3), this.forceToolCall(opts));
+      return;
+    }
     const slots: number[] = [];
     for (const img of images) slots.push(await this.imageSlot(img));
     yield* this.decodeIds(this.withImages(prompt, slots), this.forceToolCall(opts));
+  }
+
+  /**
+   * Prompt ids as Idefics3's processor expands them (SmolVLM): each <image> the template wrote becomes
+   * the image's tiles and global view, each as its row/column tag and `tokens` image tokens (see
+   * `idefics3PromptString`). Each tile has its own feature slot, and its run of image tokens gets
+   * ids vocabSize + slot · tokens + i.
+   */
+  private async withTiles(prompt: string, images: readonly ImagePixels[], p: Idefics3Processing): Promise<number[]> {
+    const vision = this.vision!;
+    const parts = prompt.split("<image>");
+    if (parts.length - 1 !== images.length) throw new Error(`the chat template wrote ${parts.length - 1} image markers for ${images.length} images`);
+    let text = parts[0]!;
+    const tiles: ImagePixels[] = [];
+    for (let i = 0; i < images.length; i++) {
+      const t = idefics3Tiles(images[i]!, p);
+      tiles.push(...t.tiles);
+      text += idefics3PromptString(t.rows, t.cols, vision.tokens) + parts[i + 1]!;
+    }
+    const cap = (this.model.imageFeatures!.size / 4 / this.model.cfg.hiddenSize / vision.tokens) | 0;
+    if (tiles.length > cap) throw new Error(`these images make ${tiles.length} tiles, but ${cap} fit; load with a larger imageSlots, or imageSplitting: false`);
+    const slots: number[] = [];
+    for (const tile of tiles) slots.push(await this.imageSlot(tile));
+    const ids = this.tokenizer.encode(text);
+    const per = vision.tokens;
+    let k = 0;
+    for (let i = 0; i < ids.length; i++) {
+      if (ids[i] !== p.imageTokenId) continue;
+      const base = this.model.cfg.vocabSize + slots[k++]! * per;
+      for (let j = 0; j < per; j++, i++) {
+        if (ids[i] !== p.imageTokenId) throw new Error("Idefics3: a run of image tokens is shorter than the image's tokens");
+        ids[i] = base + j;
+      }
+      i--;
+    }
+    if (k !== tiles.length) throw new Error(`Idefics3: the prompt holds ${k} tiles' image tokens for ${tiles.length} tiles`);
+    return ids;
   }
 
   /**
@@ -357,8 +407,9 @@ export class Engine {
       this.written = saved.entry.written;
       start = saved.length;
     }
-    // An image's tokens attend to each other both ways, so each image is prefilled whole, in one chunk.
-    const spans = imageSpans(promptIds, this.model.cfg.vocabSize);
+    // An image's tokens attend to each other both ways (Gemma 3), so each image is prefilled whole, in
+    // one chunk. SmolVLM's are causal, like text.
+    const spans = this.vision?.bidirectional ? imageSpans(promptIds, this.model.cfg.vocabSize) : [];
     for (const [lo, hi] of spans) if (start > lo && start < hi) start = lo;
     this.cached = [];
     const stats: GenerateStats = { promptTokens: promptIds.length, cachedTokens: start, generatedTokens: 0, prefillMs: 0, decodeMs: 0, ttftMs: 0 };
@@ -745,7 +796,9 @@ export class Engine {
     if (this.busy || s.kvDtype !== m.kvDtype || s.layers !== m.cfg.numLayers || s.rowBytes !== m.kvRowBytes || s.tokens.length >= m.maxSeq) return false;
     if (s.data.length !== m.kvSnapshotBytes(s.tokens.length)) return false;
     m.writeKv(s.tokens.length, s.data);
-    this.cached = [...s.tokens];
+    // Image feature slots start empty after a load, so ids of an earlier image would match a new one's.
+    const image = s.tokens.findIndex((id) => id >= m.cfg.vocabSize);
+    this.cached = image < 0 ? [...s.tokens] : s.tokens.slice(0, image);
     this.written = s.tokens.length;
     return true;
   }

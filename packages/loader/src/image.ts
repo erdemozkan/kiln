@@ -112,33 +112,64 @@ export function resizeImage(img: RgbImage, width: number, height: number, resamp
   const filter = FILTERS[resample];
   if (!filter) throw new Error(`unknown resample filter ${resample}`);
   let src: RgbImage = img;
+  // Sums of byte · fixed-point weight are exact integers in a double whatever their order, so the
+  // passes accumulate all channels of a pixel (horizontal) or whole rows (vertical) at once, reading
+  // memory in order; the bytes are PIL's.
+  const half = 1 << (PRECISION_BITS - 1);
   if (width !== img.width) {
     const { bounds, k, ksize } = coeffs(img.width, width, filter);
+    const d = img.data;
     const out = new Uint8Array(width * img.height * C);
-    for (let y = 0; y < img.height; y++)
+    const acc = new Float64Array(C);
+    for (let y = 0; y < img.height; y++) {
+      const row = y * img.width;
       for (let x = 0; x < width; x++) {
-        const xmin = bounds[x * 2]!;
         const xmax = bounds[x * 2 + 1]!;
-        for (let c = 0; c < C; c++) {
-          let ss = 1 << (PRECISION_BITS - 1);
-          for (let i = 0; i < xmax; i++) ss += img.data[(y * img.width + xmin + i) * C + c]! * k[x * ksize + i]!;
-          out[(y * width + x) * C + c] = clip8(ss);
+        const kb = x * ksize;
+        let o = (row + bounds[x * 2]!) * C;
+        const at = (y * width + x) * C;
+        if (C === 3) {
+          let s0 = half;
+          let s1 = half;
+          let s2 = half;
+          for (let i = 0; i < xmax; i++, o += 3) {
+            const w = k[kb + i]!;
+            s0 += d[o]! * w;
+            s1 += d[o + 1]! * w;
+            s2 += d[o + 2]! * w;
+          }
+          out[at] = clip8(s0);
+          out[at + 1] = clip8(s1);
+          out[at + 2] = clip8(s2);
+        } else {
+          acc.fill(half);
+          for (let i = 0; i < xmax; i++, o += C) {
+            const w = k[kb + i]!;
+            for (let c = 0; c < C; c++) acc[c]! += d[o + c]! * w;
+          }
+          for (let c = 0; c < C; c++) out[at + c] = clip8(acc[c]!);
         }
       }
+    }
     src = { width, height: img.height, data: out };
   }
   if (height !== src.height) {
     const { bounds, k, ksize } = coeffs(src.height, height, filter);
-    const out = new Uint8Array(width * height * C);
+    const d = src.data;
+    const n = width * C;
+    const out = new Uint8Array(height * n);
+    const acc = new Float64Array(n);
     for (let y = 0; y < height; y++) {
       const ymin = bounds[y * 2]!;
       const ymax = bounds[y * 2 + 1]!;
-      for (let x = 0; x < width; x++)
-        for (let c = 0; c < C; c++) {
-          let ss = 1 << (PRECISION_BITS - 1);
-          for (let i = 0; i < ymax; i++) ss += src.data[((ymin + i) * width + x) * C + c]! * k[y * ksize + i]!;
-          out[(y * width + x) * C + c] = clip8(ss);
-        }
+      acc.fill(half);
+      for (let i = 0; i < ymax; i++) {
+        const w = k[y * ksize + i]!;
+        const base = (ymin + i) * n;
+        for (let j = 0; j < n; j++) acc[j]! += d[base + j]! * w;
+      }
+      const at = y * n;
+      for (let j = 0; j < n; j++) out[at + j] = clip8(acc[j]!);
     }
     src = { width, height, data: out };
   }

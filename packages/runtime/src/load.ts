@@ -1,4 +1,4 @@
-import type { Backend } from "@kiln/core";
+import type { Backend, Tensor } from "@kiln/core";
 import { createWebGPUBackend } from "@kiln/backend-webgpu";
 import {
   CachedHttpSource,
@@ -19,7 +19,25 @@ import {
   type TensorEntry,
 } from "@kiln/loader";
 import { CpuBackend, ops, type KvDtype } from "@kiln/kernels";
-import { LlamaModel, VisionTower, configFromGGUF, configFromHF, ggufToHF, graniteName, multimodalTextName, patchK, visionConfigFromGGUF, weightScale, type LlamaConfig } from "@kiln/models";
+import {
+  LlamaModel,
+  UnsupportedModelError,
+  VisionTower,
+  configFromGGUF,
+  configFromHF,
+  ggufToHF,
+  graniteName,
+  idefics3Processing,
+  idefics3TextName,
+  idefics3VisionName,
+  multimodalTextName,
+  patchK,
+  patchOrder,
+  visionConfigFromGGUF,
+  visionConfigFromIdefics3,
+  weightScale,
+  type LlamaConfig,
+} from "@kiln/models";
 import { Tokenizer, type ChatTemplate, type TokenizerJSON } from "@kiln/tokenizers";
 import { Engine } from "./engine";
 import { llamaMatmulShapes, tuneMatmuls } from "./tune";
@@ -76,8 +94,16 @@ export interface LoadOptions {
    * ("mmproj-F16.gguf") or a full id ("org/repo/mmproj.gguf"). Chat messages may then hold images.
    */
   mmproj?: string;
-  /** Images whose features stay on the GPU at once, with `mmproj` (default 4, 256 tokens each). */
+  /**
+   * Images whose features stay on the GPU at once (default 4): with `mmproj` (256 tokens each), or for
+   * SmolVLM (each image's tiles).
+   */
   imageSlots?: number;
+  /**
+   * SmolVLM: split each image into tiles plus a global view, as its processor does by default
+   * (`do_image_splitting`), or false for one 512 × 512 view (64 tokens; much faster, less detail).
+   */
+  imageSplitting?: boolean;
   onProgress?: (p: LoadProgress) => void;
 }
 
@@ -91,7 +117,7 @@ export async function createEngine(modelId: string, opts: LoadOptions = {}): Pro
   const quant = opts.quant ?? "auto";
   ops.setMatmulF16(!!opts.f16Math && backend.limits.features.has("shader-f16"));
   ops.setSubgroups(!!opts.subgroups);
-  const { cfg, tokenizer, files } = ref.gguf ? await openGGUF(ref, opts.endpoint) : await openSafetensors(ref, opts.endpoint);
+  const { cfg, tokenizer, files, idefics3 } = ref.gguf ? await openGGUF(ref, opts.endpoint) : await openSafetensors(ref, opts.endpoint);
   try {
     const tuning =
       opts.tune === false || backend.name === "cpu"
@@ -101,10 +127,14 @@ export async function createEngine(modelId: string, opts: LoadOptions = {}): Pro
             (err: unknown) => console.warn("[kiln] matmul tuning failed; using defaults:", err),
           );
     const weights = await loadWeights(backend, files, quant, opts.onProgress);
-    const vision = opts.mmproj ? await openVision(backend, opts.mmproj.split("/").length >= 3 ? parseModelId(opts.mmproj, opts.revision) : { ...ref, gguf: opts.mmproj }, opts) : undefined;
+    const vision = idefics3
+      ? await openIdefics3Vision(backend, files, idefics3, opts)
+      : opts.mmproj
+        ? await openVision(backend, opts.mmproj.split("/").length >= 3 ? parseModelId(opts.mmproj, opts.revision) : { ...ref, gguf: opts.mmproj }, opts)
+        : undefined;
     if (vision && vision.cfg.projectionDim !== cfg.hiddenSize) throw new Error(`mmproj projects to ${vision.cfg.projectionDim}, but the model is ${cfg.hiddenSize} wide`);
     await tuning;
-    const imageTokens = vision ? (opts.imageSlots ?? 4) * vision.tokens : 0;
+    const imageTokens = vision ? (opts.imageSlots ?? 4) * vision.tokensPerImage : 0;
     const model = new LlamaModel(backend, cfg, weights, { maxSeq: opts.maxSeq, kvDtype: opts.kvDtype, fuse: opts.fuse, imageTokens });
     const engine = new Engine(backend, model, tokenizer, vision);
     if (opts.maxSubmitMs !== undefined) engine.maxSubmitMs = opts.maxSubmitMs;
@@ -127,39 +157,8 @@ async function openVision(backend: Backend, ref: ModelRef, opts: LoadOptions): P
     const linear = /^v\.blk\.\d+\.(attn_[qkv]|attn_out|ffn_up|ffn_down)\.weight$/;
     const ffn = /^v\.blk\.\d+\.ffn_(up|down)\.(weight|bias)$/;
     const manual = new Set(["v.patch_embd.weight", "mm.input_projection.weight"]);
-    // The MLP width (4304) is padded with zeros to a multiple of 32 for the matmul kernels: zero rows
-    // of ffn_up and its bias give gelu(0) = 0 in the extra columns, which zero ffn_down columns ignore.
-    const I = cfg.intermediate;
-    const Ip = Math.ceil(I / 32) * 32;
-    const padded: TensorEntry[] = [];
-    const parts: Uint8Array[] = [];
-    let at = 0;
-    for (const t of header.tensors.filter((t) => ffn.test(t.name))) {
-      const raw = await source.read(t.offset, t.byteLength);
-      const size = t.type === "F32" ? 4 : t.type === "F16" ? 2 : 0;
-      if (!size) throw new Error(`mmproj: ${t.name} is ${t.type}; F16 or F32 expected`);
-      let bytes: Uint8Array;
-      let shape: number[];
-      if (t.name.endsWith(".bias") || t.name.includes("ffn_up")) {
-        // [I] or [I, hidden]: zero rows appended.
-        const row = t.shape.length === 2 ? t.shape[1]! * size : size;
-        bytes = new Uint8Array(Ip * row);
-        bytes.set(raw);
-        shape = t.shape.length === 2 ? [Ip, t.shape[1]!] : [Ip];
-      } else {
-        // ffn_down [hidden, I]: zero columns appended to every row.
-        const rows = t.shape[0]!;
-        bytes = new Uint8Array(rows * Ip * size);
-        for (let r = 0; r < rows; r++) bytes.set(raw.subarray(r * I * size, (r + 1) * I * size), r * Ip * size);
-        shape = [rows, Ip];
-      }
-      padded.push({ ...t, shape, offset: at, byteLength: bytes.length });
-      parts.push(bytes);
-      at += bytes.length;
-    }
-    const blob = new Uint8Array(at);
-    parts.reduce((o, p) => (blob.set(p, o), o + p.length), 0);
-    const padSource = new MemorySource(blob, "mmproj-ffn");
+    // The MLP width (4304) is padded with zeros to a multiple of 32 (see `padMlp`).
+    const { source: padSource, tensors: padded } = await padMlp(source, header.tensors.filter((t) => ffn.test(t.name)), cfg.intermediate, (n) => n.endsWith(".bias") || n.includes("ffn_up"));
     const keep = header.tensors.filter((t) => !manual.has(t.name) && !ffn.test(t.name));
     const weights = new Map([
       ...(await loadWeights(backend, [{ name: ref.gguf!, source, tensors: keep.filter((t) => linear.test(t.name)) }], "q8", opts.onProgress)),
@@ -192,6 +191,114 @@ async function openVision(backend: Backend, ref: ModelRef, opts: LoadOptions): P
   } finally {
     source.close?.();
   }
+}
+
+/**
+ * MLP tensors with their width I padded with zeros to a multiple of 32 for the matmul kernels, as one
+ * in-memory file under their own names: the up weight [I, h] and its bias [I] (`grows`) gain zero
+ * rows, which gelu keeps at 0, and the down weight [h, I] zero columns, which ignore them.
+ */
+async function padMlp(source: ByteSource, tensors: TensorEntry[], I: number, grows: (name: string) => boolean): Promise<{ source: MemorySource; tensors: TensorEntry[] }> {
+  const Ip = Math.ceil(I / 32) * 32;
+  const padded: TensorEntry[] = [];
+  const parts: Uint8Array[] = [];
+  let at = 0;
+  for (const t of tensors) {
+    const raw = await source.read(t.offset, t.byteLength);
+    const size = t.type === "F32" ? 4 : t.type === "F16" || t.type === "BF16" ? 2 : 0;
+    if (!size) throw new Error(`${t.name} is ${t.type}; F32, F16 or BF16 expected`);
+    let bytes: Uint8Array;
+    let shape: number[];
+    if (grows(t.name)) {
+      // [I] or [I, hidden]: zero rows appended.
+      const row = t.shape.length === 2 ? t.shape[1]! * size : size;
+      bytes = new Uint8Array(Ip * row);
+      bytes.set(raw);
+      shape = t.shape.length === 2 ? [Ip, t.shape[1]!] : [Ip];
+    } else if (t.shape.length === 2) {
+      // The down weight [hidden, I]: zero columns appended to every row.
+      const rows = t.shape[0]!;
+      bytes = new Uint8Array(rows * Ip * size);
+      for (let r = 0; r < rows; r++) bytes.set(raw.subarray(r * I * size, (r + 1) * I * size), r * Ip * size);
+      shape = [rows, Ip];
+    } else {
+      bytes = raw.slice();
+      shape = t.shape;
+    }
+    padded.push({ ...t, shape, offset: at, byteLength: bytes.length });
+    parts.push(bytes);
+    at += bytes.length;
+  }
+  const blob = new Uint8Array(at);
+  parts.reduce((o, p) => (blob.set(p, o), o + p.length), 0);
+  return { source: new MemorySource(blob, "padded-mlp"), tensors: padded };
+}
+
+interface Idefics3Files {
+  config: Record<string, unknown>;
+  preprocessor: Record<string, unknown> | undefined;
+}
+
+/**
+ * SmolVLM's (Idefics3's) vision tower and connector from the checkpoint's safetensors, under mmproj
+ * names: matmul weights as q8 (f32 with `quant: "f32"`), the rest f32; the patch convolution read as
+ * a [hidden, 3·p·p] matrix padded to `patchK` columns and the position embeddings put in `patchOrder`.
+ */
+async function openIdefics3Vision(backend: Backend, files: WeightFile[], info: Idefics3Files, opts: LoadOptions): Promise<VisionTower> {
+  const cfg = visionConfigFromIdefics3(info.config, info.preprocessor);
+  const processing = idefics3Processing(info.config, info.preprocessor, cfg);
+  if (opts.imageSplitting !== undefined) processing.split = opts.imageSplitting;
+  const quant = opts.quant === "f32" ? "f32" : "q8";
+  const linear = /^(v\.blk\.\d+\.(attn_[qkv]|attn_out|ffn_up|ffn_down)|mm\.input_projection)\.weight$/;
+  const mlp = /^v\.blk\.\d+\.ffn_(up\.(weight|bias)|down\.weight)$/;
+  const manual = new Set(["v.patch_embd.weight", "v.position_embd.weight"]);
+  const pad = cfg.intermediate % 32 !== 0;
+  const only = (keep: (n: string) => boolean) => (name: string) => {
+    const n = idefics3VisionName(name);
+    return n && !manual.has(n) && keep(n) ? n : undefined;
+  };
+  const weights = new Map<string, Tensor>();
+  const found = new Map<string, { file: WeightFile; entry: TensorEntry }>();
+  for (const file of files) {
+    for (const entry of file.tensors) {
+      const n = idefics3VisionName(entry.name);
+      if (n) found.set(n, { file, entry });
+    }
+    const add = (m: Map<string, Tensor>) => m.forEach((t, k) => weights.set(k, t));
+    const plain = { name: file.name, source: file.source, tensors: file.tensors };
+    add(await loadWeights(backend, [{ ...plain, rename: only((n) => linear.test(n) && !(pad && mlp.test(n))) }], quant, opts.onProgress));
+    add(await loadWeights(backend, [{ ...plain, rename: only((n) => !linear.test(n) && !(pad && mlp.test(n))) }], "f32"));
+    if (pad) {
+      const mine = file.tensors.filter((t) => mlp.test(idefics3VisionName(t.name) ?? ""));
+      const p = await padMlp(file.source, mine, cfg.intermediate, (n) => !idefics3VisionName(n)!.includes("ffn_down"));
+      const padded = { name: file.name, source: p.source, tensors: p.tensors };
+      add(await loadWeights(backend, [{ ...padded, rename: only((n) => n.endsWith(".weight")) }], quant));
+      add(await loadWeights(backend, [{ ...padded, rename: only((n) => n.endsWith(".bias")) }], "f32"));
+    }
+  }
+  const read = async (name: string) => {
+    const f = found.get(name);
+    if (!f) throw new Error(`Idefics3: the checkpoint has no ${name}`);
+    const { entry } = f;
+    const n = entry.shape.reduce((a, b) => a * b, 1);
+    return toF32(entry.type as Parameters<typeof toF32>[0], await f.file.source.read(entry.offset, entry.byteLength), n);
+  };
+  const upload = (values: Float32Array, shape: number[]) => {
+    const buf = backend.alloc(values.byteLength, "storage", "vision/w");
+    backend.write(buf, 0, values);
+    return { shape, dtype: "f32" as const, buf };
+  };
+  const K = 3 * cfg.patchSize * cfg.patchSize;
+  const patch = await read("v.patch_embd.weight");
+  const patchW = new Float32Array(cfg.hidden * patchK(cfg));
+  for (let r = 0; r < cfg.hidden; r++) patchW.set(patch.subarray(r * K, (r + 1) * K), r * patchK(cfg));
+  weights.set("v.patch_embd.weight", upload(patchW, [cfg.hidden, patchK(cfg)]));
+  const pos = await read("v.position_embd.weight");
+  const order = patchOrder(cfg);
+  const permuted = new Float32Array(pos.length);
+  for (let r = 0; r < order.length; r++) permuted.set(pos.subarray(order[r]! * cfg.hidden, (order[r]! + 1) * cfg.hidden), r * cfg.hidden);
+  weights.set("v.position_embd.weight", upload(permuted, [order.length, cfg.hidden]));
+  return new VisionTower(backend, cfg, weights, processing);
 }
 
 /** WebGPU, or the CPU backend when asked for or (for "auto") when WebGPU is missing or has no adapter. */
@@ -237,26 +344,31 @@ export async function openParsed<H>(ref: ModelRef, file: string, endpoint: strin
   }
 }
 
-async function openSafetensors(ref: ModelRef, endpoint?: string): Promise<{ cfg: LlamaConfig; tokenizer: Tokenizer; files: WeightFile[] }> {
+async function openSafetensors(ref: ModelRef, endpoint?: string): Promise<{ cfg: LlamaConfig; tokenizer: Tokenizer; files: WeightFile[]; idefics3?: Idefics3Files }> {
   // Required files start at once. Optional ones wait for the repo's file listing, so files that do
   // not exist are not requested (each would log a 404); without a listing they are probed.
   const listing = listRepoFiles(ref, endpoint);
   const exists = (file: string) => listing.then((files) => !files || files.has(file));
   const optionalJSON = async <T>(file: string) => ((await exists(file)) ? fetchJSON<T>(fileUrl(ref, file, endpoint), true) : undefined);
   const optionalText = async (file: string) => ((await exists(file)) ? fetchText(fileUrl(ref, file, endpoint), true) : undefined);
-  const [config, generation, tokJson, tokConfig, templateFile, names] = await Promise.all([
+  const [config, generation, tokJson, tokConfig, templateFile, names, templateJson] = await Promise.all([
     fetchJSON<Record<string, unknown>>(fileUrl(ref, "config.json", endpoint)),
     optionalJSON<Record<string, unknown>>("generation_config.json"),
     fetchJSON<TokenizerJSON>(fileUrl(ref, "tokenizer.json", endpoint)),
     optionalJSON<TokenizerConfig>("tokenizer_config.json"),
     optionalText("chat_template.jinja"),
     listing.then((files) => safetensorsFiles(ref, endpoint, files)),
+    optionalJSON<{ chat_template?: string }>("chat_template.json"),
   ]);
-  const cfg = configFromHF(config!, generation);
+  // SmolVLM (Idefics3): a Llama language model plus a vision tower read from the same files.
+  const idefics3 = config!.model_type === "idefics3";
+  const textConfig = idefics3 ? (config!.text_config as Record<string, unknown> | undefined) : undefined;
+  if (idefics3 && !textConfig) throw new UnsupportedModelError('model_type "idefics3" without a text_config');
+  const cfg = configFromHF(textConfig ?? config!, generation);
   // Gemma's RMSNorm scales by (1 + w); folding the 1 in at load keeps one norm kernel for every family.
   const transform = cfg.family === "gemma3" ? (name: string, v: Float32Array) => (name.endsWith("norm.weight") ? addOne(v) : undefined) : undefined;
   // Multimodal Gemma 3 (4B and up): load the language model's weights under their text names, skip the rest.
-  const rename = config!.model_type === "gemma3" ? multimodalTextName : config!.model_type === "granitemoehybrid" ? graniteName : undefined;
+  const rename = config!.model_type === "gemma3" ? multimodalTextName : config!.model_type === "granitemoehybrid" ? graniteName : idefics3 ? idefics3TextName : undefined;
   const scale = cfg.residualScale !== undefined || cfg.logitScale !== undefined ? (name: string) => weightScale(cfg, name) : undefined;
   const files: WeightFile[] = [];
   try {
@@ -270,8 +382,9 @@ async function openSafetensors(ref: ModelRef, endpoint?: string): Promise<{ cfg:
     throw err;
   }
   const tokenizer = Tokenizer.fromJSON(tokJson!);
-  tokenizer.chatTemplate = chatTemplate(tokConfig, templateFile);
-  return { cfg, tokenizer, files };
+  tokenizer.chatTemplate = chatTemplate(tokConfig, templateFile ?? templateJson?.chat_template);
+  const preprocessor = idefics3 ? await optionalJSON<Record<string, unknown>>("preprocessor_config.json") : undefined;
+  return { cfg, tokenizer, files, idefics3: idefics3 ? { config: config!, preprocessor } : undefined };
 }
 
 function addOne(v: Float32Array): void {
@@ -293,7 +406,7 @@ function chatTemplate(cfg: TokenizerConfig | undefined, file: string | undefined
   return { source, bosToken: token(cfg?.bos_token), eosToken: token(cfg?.eos_token) };
 }
 
-async function openGGUF(ref: ModelRef, endpoint?: string): Promise<{ cfg: LlamaConfig; tokenizer: Tokenizer; files: WeightFile[] }> {
+async function openGGUF(ref: ModelRef, endpoint?: string): Promise<{ cfg: LlamaConfig; tokenizer: Tokenizer; files: WeightFile[]; idefics3?: undefined }> {
   const file = ref.gguf!;
   const { source, header: gguf } = await openParsed(ref, file, endpoint, readGGUFHeader);
   const cfg = configFromGGUF(gguf.metadata, gguf.tensors.map((t) => t.name));

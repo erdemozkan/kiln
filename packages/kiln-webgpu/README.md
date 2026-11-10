@@ -256,10 +256,22 @@ An image may be a Blob, File, ImageBitmap or ImageData; it is resized to 896 × 
 vision tower takes a while on integrated GPUs (about 46 s on an Intel Iris Plus 650); later turns that
 keep the image reuse its features and their cached tokens.
 
+SmolVLM (`HuggingFaceTB/SmolVLM-256M-Instruct`, `-500M-Instruct` and other Idefics3 checkpoints)
+takes images the same way, with no extra file:
+
+```ts
+const vlm = await load("HuggingFaceTB/SmolVLM-256M-Instruct");
+const reply = vlm.chat([{ role: "user", content: [{ type: "image", image: blob }, { type: "text", text: "Can you describe this image?" }] }]);
+```
+
+As its processor does, the image is cut into 512 × 512 tiles plus a global view (13 tiles, 832
+image tokens, for a 640 × 480 photo); `load(id, { imageSplitting: false })` uses one 512 × 512 view
+instead (64 tokens, several times faster, less detail).
+
 ## Models
 
-Llama, Mistral, Qwen2, Qwen3, SmolLM, Granite 3 and 4 (350M to 2B) and Gemma 3 (270M to 4B and larger;
-images as above) decoders, from
+Llama, Mistral, Qwen2, Qwen3, SmolLM, Granite 3 and 4 (350M to 2B), Gemma 3 (270M to 4B and larger;
+images as above) and SmolVLM (images as above) decoders, from
 safetensors (F32/F16/BF16) or GGUF (F32/F16/BF16/Q4_0/Q4_1/Q5_0/Q5_1/Q8_0/Q4_K/Q5_K/Q6_K).
 Weights are held on the GPU as q4, q8 or f32. The default, `quant: "auto"`, stores float weights as q4
 and keeps a GGUF file's tensors at their own precision (exactly, except Q6_K, which becomes q8);

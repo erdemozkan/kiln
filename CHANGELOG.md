@@ -96,7 +96,14 @@ a tanh epilogue on the conv kernel, and the HiFi-GAN builder shared with VITS. F
 parsed answer (boxes, quad boxes, polygons in pixels). The DaViT tower runs on the GPU with new
 window-attention and channel-attention kernels, its image tokens go ahead of the prompt's in the
 BART encoder, generation applies the model's processors, and the processor's tokens are added to
-Microsoft's tokenizer.
+Microsoft's tokenizer. SmolVLM (Idefics3: `HuggingFaceTB/SmolVLM-256M-Instruct`, `-500M-Instruct`) takes
+images in chat like Gemma 3, with no extra file: Idefics3's processor (PIL Lanczos, 512 × 512 tiles
+plus a global view, row and column tags; `imageSplitting: false` for one view), the SigLIP tower
+with the pixel shuffle folded into the patch order, causal image tokens, and a feature slot per
+tile. The vision tower keeps one layer queued ahead (0.3 s less per SmolVLM tile), and the PIL
+resizer reads memory in order (the same bytes; SmolVLM's preprocessing of a 640 × 480 photo took
+370 ms instead of 575). Fixed: a prompt cache restored at load could match a new image's tokens to an old
+image's K/V; restored prefixes now stop at the first image token.
 
 **Loading.** Reads ahead of a download in progress are fetched on their own instead of waiting
 (a `pytorch_model.bin` keeps its zip directory at the end, so large checkpoints showed no progress

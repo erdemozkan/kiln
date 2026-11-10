@@ -36,7 +36,7 @@ const json = llm.chat(messages, { format: { type: "json", schema } }); // or { t
 |---|---|
 | `@kiln/api` | Main-thread client, worker RPC, streaming `TextStream`, transformers.js-style `pipeline` |
 | `@kiln/runtime` | `Engine`: chunked prefill, pipelined decode, weight streaming |
-| `@kiln/models` | Code-defined architectures (Llama / Mistral / Qwen2 / Qwen3 / SmolLM / Granite / Gemma 3), HF + GGUF config mapping |
+| `@kiln/models` | Code-defined architectures (Llama / Mistral / Qwen2 / Qwen3 / SmolLM / Granite / Gemma 3 / SmolVLM), HF + GGUF config mapping |
 | `@kiln/tokenizers` | Byte-level and SentencePiece-style BPE from `tokenizer.json` or GGUF metadata, streaming UTF-8 decode, a Jinja interpreter for chat templates |
 | `@kiln/grammar` | JSON / JSON Schema / choice grammars as a byte-level pushdown matcher, token masks over a vocabulary trie |
 | `@kiln/kernels` | WGSL kernels, op wrappers, CPU reference implementations |
@@ -484,6 +484,7 @@ Models run end to end (greedy answers to fixed questions checked by hand; tool c
 | `granitemoehybrid` | granite-4.0-350m (tool calls), with `quant: "q8"` | safetensors, GGUF Q8_0 | 26 tok/s; 38.7 tok/s (Q8_0) |
 | `granitemoehybrid` | granite-4.0-1b (tool calls) | safetensors (3.3 GB) | 11.5 tok/s (q4) |
 | `gemma3` | Gemma 3 4B-it (recalls a fact 1,100 and 3,000 tokens back; images with `mmproj`) | GGUF Q4_0 (2.4 GB) + mmproj-F16 | 177–180 ms GPU per step (about 5.5 tok/s); 24.6 tok/s on an M3 |
+| `idefics3` | SmolVLM-256M-Instruct, SmolVLM-500M-Instruct (images in chat) | safetensors | a 640 × 480 photo in about 17 s (13 tiles), 2–4 s without splitting |
 
 Encoder models (BERT, DistilBERT, RoBERTa, from safetensors) run the six text tasks transformers.js
 runs on them, with its task names and output shapes. Checked against Python transformers (4.1.1,
@@ -531,6 +532,7 @@ K/V; each decoder step reads them through a step block whose span covers every p
 | SpeechT5 text-to-speech (`microsoft/speecht5_tts` + `microsoft/speecht5_hifigan`) | transformers.js (`Xenova/speecht5_tts`, fp32), its prenet dropout rewritten to keep every unit, Kiln with `prenet_dropout: "keep"` | the same ids; the same 122,880 samples, within 1e-5 over the first 80 frames, then drifting as frames feed back (mean difference 3.3e-4). With dropout: 1.9 s against 6.4 s (WebGPU) for "Hello, my dog is cute.", 3.6 s against 12.7 s for a 44-character sentence |
 | ViT + GPT-2 captioning (`nlpconnect/vit-gpt2-image-captioning`) | transformers.js (`Xenova/vit-gpt2-image-captioning`, fp32) on the same pixel values | the same caption on all three photos tried |
 | Florence-2 (`microsoft/Florence-2-base-ft`) | transformers.js (`onnx-community/Florence-2-base-ft`, fp32) on the same 768 × 768 pixels | 3 of 20 outputs identical (4 photos × caption, detailed caption, detection, grounding, OCR): its export fixed the channel-attention scale at a 224 × 224 trace, 3.4× too large at 768 (see below). With that scale given to Kiln too, the image tokens agree within 2.6e-4 and all 20 outputs are identical, every location token included. 2.9 s against 5.8 s for a caption, 3.0 s against 6.1 s for detection (WebGPU) |
+| SmolVLM (`HuggingFaceTB/SmolVLM-256M-Instruct`) | transformers.js (the repo's ONNX export, fp32) on the same tiles and prompt | image features within 2.1e-4 (values up to 96); the same greedy replies in all 17 runs, 9 photo-question pairs with image splitting (13 to 17 tiles) and 8 without. 17.4 s against 25.0 s for a short answer with splitting, 2.3 s against 4.3 s without (WebGPU) |
 | DINOv2 (`facebook/dinov2-small-imagenet1k-1-layer`) | transformers.js (`Xenova/dinov2-small-imagenet1k-1-layer`, fp32) on the same pixel values | within 6e-3: its export resizes position embeddings bilinearly, Python bicubically (Kiln); with its resize, within 3.2e-7. 383 ms end to end against 683 ms |
 | Swin2SR (`caidas/swin2SR-classical-sr-x2-64`) | transformers.js (`Xenova/swin2SR-classical-sr-x2-64`, fp32) on the same pixel values | 4 of 147,456 output bytes one level apart (128 × 96 → 256 × 192); 3.4 s end to end against 10.4 s |
 | SegFormer (`nvidia/segformer-b0-finetuned-ade-512-512`) | transformers.js (`Xenova/segformer-b0-finetuned-ade-512-512`, fp32) on the same pixel values | the same 14 classes on the cats photo, all 307,200 pixels the same class; 0.75 s end to end against 3.9 s |
@@ -784,6 +786,32 @@ each) ahead of the prompt's in the BART encoder, and greedy generation with the 
 (forced BOS and EOS, no repeated 3-grams; `num_beams` is ignored, as transformers.js does).
 Microsoft's tokenizer.json lacks the 1,024 task and location tokens the processor adds at load;
 Kiln adds them at the same ids.
+
+SmolVLM (`HuggingFaceTB/SmolVLM-256M-Instruct`, `-500M-Instruct`, and other Idefics3 checkpoints)
+answers questions about images in chat. `load(id)`, then messages with image parts, as for Gemma 3; no
+extra file is needed. Images go through Idefics3's processor with PIL's Lanczos resampling (Kiln's
+resizer is PIL's, byte for byte). The longest edge is set to 2048, both sides are taken up to
+multiples of 512, and the image is cut into 512 × 512 tiles, plus the whole image squashed to one
+tile as a global view: 13 tiles, 832 image tokens, for a 640 × 480 photo. `imageSplitting: false`
+keeps only one 512 × 512 view (64 tokens). Each tile runs the SigLIP tower Kiln has for Gemma 3. The
+connector's pixel shuffle (each 4 × 4 group of patches into one token of 16 × 768 values) costs
+nothing: the tower treats its patches as a set, so they are fed grouped by output token, and the
+post-norm rows already lie in the shuffled order (the position embeddings are permuted to match at
+load). The tiles' tokens go into the prompt with their row and column tags, causal like the text.
+Each tile keeps its features in a slot (`imageSlots` images' worth, 4 by default), so asking again
+about the same image runs no vision and reuses the cached prompt: 1.8 s instead of 17.4.
+
+To check it against transformers.js (the repo's ONNX export, fp32), both were given the same tiles and
+prompt. Its own processor resizes bilinearly, in floats, and anchors the last tile to the image's
+edge, so its pixels differ from Python's. The image features agreed within 2.1e-4, for values up to
+96. The greedy replies were identical in all 17 runs: 9 photo-question pairs with splitting (13 to
+17 tiles; descriptions up to 64 tokens, counts, an invoice total, a receipt) and 8 without. End to
+end on the same GPU (hidden pane, warm), with splitting: 17.4 s against 25.0 s (invoice total),
+16.9 s against 23.9 s (football players), 18.7 s against 34.9 s (a 64-token description). Without
+splitting: 2.3 s against 4.3 s, 2.1 s against 3.4 s, and 4.0 s against 11.3 s. A tile is about
+1.0 s of GPU work on the Intel Mac (f32 GEMMs at about 230 GFLOP/s, then attention), q8 weights
+no faster. The tower now keeps one layer queued ahead instead of waiting on each layer, which
+saved 0.3 s per tile.
 
 transformers.js's export differs from the model. DaViT's channel attention scales queries by
 N^-½, N the number of tokens; the ONNX graph froze that number when it was traced at 224 × 224

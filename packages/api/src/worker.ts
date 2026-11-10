@@ -75,21 +75,22 @@ const post = (msg: Response) => scope.postMessage(msg);
 let queue: Promise<void> = Promise.resolve();
 
 /**
- * An image part as the vision tower takes it: RGBA bytes at its size. Pixel data of that size passes
- * through; anything else (Blob, File, ImageBitmap, ImageData of another size) is resized by the
- * browser (high-quality resampling) through an OffscreenCanvas.
+ * An image part as the vision tower takes it: RGBA bytes at its size, or at the image's own size
+ * (`size` undefined). Pixel data of that size passes through; anything else (Blob, File, ImageBitmap,
+ * ImageData of another size) is decoded, and resized by the browser (high-quality resampling),
+ * through an OffscreenCanvas.
  */
-async function toPixels(image: unknown, size: number): Promise<{ width: number; height: number; data: Uint8ClampedArray | Uint8Array }> {
+async function toPixels(image: unknown, size: number | undefined): Promise<{ width: number; height: number; data: Uint8ClampedArray | Uint8Array }> {
   const px = image as { width?: number; height?: number; data?: Uint8ClampedArray | Uint8Array };
-  if (px && px.width === size && px.height === size && (px.data instanceof Uint8ClampedArray || px.data instanceof Uint8Array)) {
-    return { width: size, height: size, data: px.data };
-  }
+  const bytes = px && (px.data instanceof Uint8ClampedArray || px.data instanceof Uint8Array);
+  if (bytes && (size === undefined || (px.width === size && px.height === size))) return { width: px.width!, height: px.height!, data: px.data! };
   const source = px && px.data && !(image instanceof ImageData) ? new ImageData(new Uint8ClampedArray(px.data), px.width!, px.height!) : (image as ImageBitmapSource);
-  const bitmap = await createImageBitmap(source, { resizeWidth: size, resizeHeight: size, resizeQuality: "high" });
-  const ctx = new OffscreenCanvas(size, size).getContext("2d")!;
+  const bitmap = await createImageBitmap(source, size === undefined ? {} : { resizeWidth: size, resizeHeight: size, resizeQuality: "high" });
+  const [w, h] = [bitmap.width, bitmap.height];
+  const ctx = new OffscreenCanvas(w, h).getContext("2d")!;
   ctx.drawImage(bitmap, 0, 0);
   bitmap.close();
-  return ctx.getImageData(0, 0, size, size);
+  return ctx.getImageData(0, 0, w, h);
 }
 
 async function generate(msg: Extract<Request, { type: "chat" | "complete" }>, ac: AbortController): Promise<void> {
@@ -97,8 +98,10 @@ async function generate(msg: Extract<Request, { type: "chat" | "complete" }>, ac
     if (!engine) throw new Error("no model loaded");
     const opts = { ...msg.opts, signal: ac.signal };
     let messages = msg.type === "chat" ? msg.messages : [];
-    const size = engine.vision?.cfg.imageSize;
-    if (size && messages.some((m) => typeof m.content !== "string")) {
+    // Gemma 3's tower takes the image squashed to its size; SmolVLM's processor tiles the full image.
+    const vision = engine.vision;
+    const size = vision?.processing ? undefined : vision?.cfg.imageSize;
+    if (vision && messages.some((m) => typeof m.content !== "string")) {
       messages = await Promise.all(
         messages.map(async (m) =>
           typeof m.content === "string" ? m : { ...m, content: await Promise.all(m.content.map(async (p) => (p.type === "image" ? { type: "image" as const, image: await toPixels(p.image, size) } : p))) },
