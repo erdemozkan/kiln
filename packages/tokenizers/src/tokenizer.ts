@@ -32,6 +32,10 @@ export interface AddedToken {
   id: number;
   content: string;
   special: boolean;
+  /** Takes the whitespace before it (tokenizers' lstrip). */
+  lstrip?: boolean;
+  /** Takes the whitespace after it (rstrip: Phi-3's `<|end|>` eats the newline the template writes). */
+  rstrip?: boolean;
 }
 
 export interface TokenizerJSON {
@@ -54,7 +58,7 @@ export interface TokenizerJSON {
  *   prepended, the whole text is one word of Unicode characters, and characters outside the vocabulary
  *   fall back to `<0xXX>` byte tokens.
  */
-type Scheme = { kind: "byte-level" } | { kind: "metaspace"; prepend: "always" | "first" | "never"; split: boolean };
+type Scheme = { kind: "byte-level" } | { kind: "metaspace"; prepend: "always" | "first" | "never"; split: boolean; /** Only when the text does not start with ▁ already (a Metaspace pre-tokenizer; a Prepend normalizer always adds it). */ ifMissing?: boolean };
 
 /** U+2581, SentencePiece's visible space. */
 const SPACE = "\u2581";
@@ -72,6 +76,8 @@ export class Tokenizer {
   private readonly cache = new Map<string, number[]>();
   private readonly addedRe: RegExp | undefined;
   private readonly added = new Map<string, AddedToken>();
+  /** Whether any added token strips the whitespace beside it. */
+  private readonly strips: boolean;
   readonly specialIds = new Set<number>();
   private readonly scheme: Scheme;
   /** The model's chat template, when the loader found one. */
@@ -93,6 +99,7 @@ export class Tokenizer {
     merges.forEach((m, i) => this.ranks.set(m, i));
     this.scheme = opts.scheme ?? { kind: "byte-level" };
     for (const [tok, id] of vocab) this.idToToken[id] = tok;
+    this.strips = addedTokens.some((t) => t.lstrip || t.rstrip);
     for (const t of addedTokens) {
       this.added.set(t.content, t);
       this.idToToken[t.id] = t.content;
@@ -192,7 +199,16 @@ export class Tokenizer {
     if (this.opts.nfc) text = text.normalize("NFC");
     const ids: number[] = [];
     const segments = opts.allowSpecial !== false && this.addedRe ? splitIsolated(text, this.addedRe) : [text];
+    if (this.strips) {
+      segments.forEach((seg, i) => {
+        const a = this.added.get(seg);
+        if (!a) return;
+        if (a.lstrip && i > 0 && !this.added.has(segments[i - 1]!)) segments[i - 1] = segments[i - 1]!.trimEnd();
+        if (a.rstrip && i + 1 < segments.length && !this.added.has(segments[i + 1]!)) segments[i + 1] = segments[i + 1]!.trimStart();
+      });
+    }
     for (const seg of segments) {
+      if (!seg) continue;
       const added = opts.allowSpecial !== false ? this.added.get(seg) : undefined;
       if (added) {
         ids.push(added.id);
@@ -202,7 +218,7 @@ export class Tokenizer {
         if (!seg) continue;
         const { prepend, split } = this.scheme;
         let s = seg.replaceAll(" ", SPACE);
-        if (prepend === "always" || (prepend === "first" && ids.length === 0 && text.startsWith(seg))) s = SPACE + s;
+        if ((prepend === "always" || (prepend === "first" && ids.length === 0 && text.startsWith(seg))) && !(this.scheme.ifMissing && s.startsWith(SPACE))) s = SPACE + s;
         for (const p of split ? s.split(new RegExp(`(?=${SPACE})`)) : [s]) ids.push(...this.bpe(p));
         continue;
       }
@@ -304,7 +320,7 @@ function metaspaceScheme(json: TokenizerJSON): Scheme | undefined {
   const ms = steps.find((p) => p.type === "Metaspace");
   if (!ms || (ms.replacement && ms.replacement !== SPACE)) return undefined;
   const prepend = ms.prepend_scheme === "first" || ms.prepend_scheme === "never" ? ms.prepend_scheme : ms.add_prefix_space === false ? "never" : "always";
-  return { kind: "metaspace", prepend, split: ms.split ?? true };
+  return { kind: "metaspace", prepend, split: ms.split ?? true, ifMissing: true };
 }
 
 /**

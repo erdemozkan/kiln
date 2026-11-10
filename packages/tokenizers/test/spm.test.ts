@@ -32,9 +32,9 @@ describe("SentencePiece Unigram", () => {
     expect(t.encode("hello world").ids).toEqual([4, 9, 1]);
   });
 
-  it("fuses runs of unknown characters, collapses and trims spaces", () => {
+  it("fuses runs of unknown characters and collapses spaces, keeping the ends as tokenizers' Replace does", () => {
     const t = unigram();
-    expect(t.encode("  hello   xyz world  ").ids).toEqual([4, 3, 2, 9, 1]);
+    expect(t.encode("  hello   xyz world  ").ids).toEqual([4, 3, 2, 9, 3, 1]);
     expect(t.decode(t.encode("hello world").ids)).toBe("hello world");
   });
 });

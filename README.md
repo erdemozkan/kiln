@@ -304,7 +304,7 @@ waited on the previous one's readback; now they are queued back to back and read
 fill-mask was 851 ms (the 30k-word output layer ran in TypeScript; now on the GPU). transformers.js
 loads faster from its cache (0.9 s against 1.8 s for SmolLM2: Kiln converts weights at load) and
 downloads less (its files are pre-quantized), and its runtime adds 6.7 MB (gzipped) of WASM to
-Kiln's 120 KB.
+Kiln's 251 KB (the whole package, its worker included).
 
 SmolLM2-135M-Instruct, q4, Intel Gen-9 integrated GPU (Intel Mac), Chrome/Dawn. GPU clocks on this
 machine drift 10–15% between runs, so comparisons below are always from one session.
@@ -1019,6 +1019,32 @@ normalization `torch.istft` does. Kiln follows PyTorch (the comparison scales tr
 audio by 1 / 1.5). End to end on WebGPU (median of 3, same pane): 1.5 s against 2.5 s for
 "Hello, my dog is cute.", 3.8 s against 6.3 s for an 82-character sentence.
 
+transformers.js's lower-level API is there too, so code written for it moves over by changing the
+import: `AutoTokenizer.from_pretrained(id)` (a callable `PreTrainedTokenizer` with `encode`, `decode`,
+`batch_decode`, `tokenize`, the special tokens and their ids, padding and truncation, and
+`apply_chat_template` with the model's own Jinja template), `RawImage` (`read`, `fromURL`,
+`fromBlob`, `rgb`, `grayscale`, `resize` with PIL's filters, `crop`, `toTensor`, `toBlob`; pipelines
+take one wherever they take an image), `read_audio` and `env` (`env.remoteHost` points Kiln at a
+mirror; the other settings are accepted and do nothing). Tokenizers run on the page's thread, and
+each pipeline's `tokenizer` is now the model's own. Against transformers.js 4.3.2's tokenizers in
+Node, on 31 repos (BERT, DistilBERT, RoBERTa, MiniLM, BGE, XLM-R, T5, Flan-T5, NLLB, M2M100, Marian,
+CLIP, Whisper, Qwen 2.5 and 3, SmolLM 2 and 3, SmolVLM, Llama 2 and 3.2, Gemma 3, Mistral v0.3,
+Phi-3.5, Phi-4, Granite 3.3 and 4, LFM2, GPT-2) and 12 strings each (accents, CJK, emoji, code,
+doubled and edge spaces, special-token text), the ids of `encode`, with and without special tokens,
+were identical, and so were `decode`, batched calls and the rendered and tokenized chat templates
+of the 11 repos whose template transformers.js loads. The differences left are transformers.js's: with no pad token in a
+repo's tokenizer_config.json it pads with `undefined` and then fails to build the tensor (Kiln pads
+with the tokenizer's own pad token, and errors as Python does when there is none); with a ByteLevel
+post-processor (Qwen, Granite, GPT-2) it drops the second text of a pair; it cannot load SmolVLM's
+template or repos without a tokenizer.json (Kiln builds BERT's from vocab.txt and RoBERTa / BART's
+from vocab.json and merges.txt, which then match the ids of the same tokenizers' ONNX copies); and
+`tokenize` shows the original text for a piece outside a Unigram vocabulary, where Kiln shows
+`<unk>`. The comparison found four bugs in Kiln's tokenizers, now fixed: added tokens ignored
+`lstrip` / `rstrip`, so Phi-3.5's `<|end|>` kept the newline after it and chat prompts differed
+from transformers' by a token per turn; T5 and XLM-R did not split on whitespace before their
+Metaspace step (doubled or trailing spaces made extra "▁" tokens); NLLB's lost a "▁" before an added
+token; and Mistral v0.3's Metaspace step added a "▁" to text already starting with one.
+
 T5's learned relative position bias is added to each score by the per-row attention kernels (GPU
 and CPU, buckets computed in the kernel; bucket function equal to transformers' over ±300
 positions, kernel checks within 6.1e-7). SentencePiece tokenizers: Unigram (Viterbi) and character
@@ -1195,8 +1221,7 @@ Known limits, roughly in roadmap order:
   `toolChoice` forces one call; under "auto" calls are not checked against the tool schemas.
 - Q6_K (scales every 16 values) is rounded to q8 on load rather than run as stored; the other GGUF
   block types are held exactly.
-- Unigram tokenizers (T5, XLM-R, some SentencePiece models) are not supported. `toolChoice` only
-  constrains the `<tool_call>` format.
+- `toolChoice` only constrains the `<tool_call>` format.
 - Single storage binding per tensor: very large f32 embeddings can exceed `maxStorageBufferBindingSize`
   (use q4 or q8).
 - Images: Gemma 3 (from its transformers checkpoint or llama.cpp's mmproj GGUF) and SmolVLM; for

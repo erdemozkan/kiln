@@ -218,6 +218,30 @@ With a CLIP model, `image-feature-extraction` returns the image embedding (the v
 output). All labels go through the text tower in one batch, alongside the image, and their
 embeddings are cached, so asking about the same labels again only runs the image tower.
 
+## transformers.js's tokenizer, RawImage, read_audio and env
+
+transformers.js's lower-level helpers, under the same names:
+
+```js
+import { AutoTokenizer, RawImage, read_audio, env } from "kiln-webgpu";
+
+const tokenizer = await AutoTokenizer.from_pretrained("Qwen/Qwen2.5-0.5B-Instruct");
+const { input_ids, attention_mask } = tokenizer(["Hello", "Hi there"], { padding: true }); // int64 Tensors
+tokenizer.decode(input_ids.tolist()[0], { skip_special_tokens: true });
+const prompt = tokenizer.apply_chat_template(messages, { tokenize: false, add_generation_prompt: true });
+
+const image = await RawImage.read("https://example.com/cat.jpg"); // or fromBlob, fromURL
+const small = await (await image.resize(224, null)).grayscale(); // PIL's resampling
+const audio = await read_audio(url, 16000); // Float32Array
+
+env.remoteHost = "https://my-mirror.example.com/"; // a Hub mirror for everything Kiln loads
+```
+
+The tokenizer reads tokenizer.json (or BERT's vocab.txt, RoBERTa / BART's vocab.json and
+merges.txt) and runs on the calling thread; its ids match transformers.js's on the 31 repos
+compared. Every pipeline's `tokenizer` is the model's own (an empty object for GGUF files), and
+pipelines take a `RawImage` wherever they take an image. Of `env`, only `remoteHost` does anything.
+
 ## Kiln's own API
 
 ```ts

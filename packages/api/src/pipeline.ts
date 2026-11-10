@@ -5,6 +5,8 @@ import type { LoadProgress } from "@kiln/runtime";
 import type { ChatMessage } from "@kiln/tokenizers";
 import { KilnVision, KilnAudio, KilnEncoder, KilnModel, KilnSeq2Seq, type GenerateOptions, type LoadOptions, type TextStream } from "./client";
 import { fetchJSON, fileUrl, parseModelId, readAudio, type AudioInput } from "@kiln/loader";
+import { Tensor } from "./tensor";
+import { PreTrainedTokenizer, RawImage, envEndpoint } from "./compat";
 import type { VisionInfo, AudioInfo, EncoderInfo, EncoderTask, ModelInfo, Seq2SeqInfo, Seq2SeqTask } from "./protocol";
 
 /** Task names, with transformers.js's aliases. */
@@ -160,8 +162,8 @@ export interface TextGenerationPipeline {
   readonly model: KilnModel;
   /** Model details (family, layers, backend, context); Kiln's `ModelInfo`. */
   readonly info: ModelInfo;
-  /** Placeholder for `new TextStreamer(generator.tokenizer, …)`: the tokenizer itself runs in Kiln's worker. */
-  readonly tokenizer: object;
+  /** The model's tokenizer on this thread (an empty object for GGUF files); generation tokenizes in Kiln's worker. */
+  readonly tokenizer: PreTrainedTokenizer;
   /** Unloads the model and stops its worker. */
   dispose(): Promise<void>;
 }
@@ -258,27 +260,16 @@ export async function runTextGeneration(
 }
 
 /** A float tensor, as transformers.js returns embeddings: row-major `data` of shape `dims`. */
-export class Tensor {
-  constructor(
-    readonly type: "float32",
-    readonly data: Float32Array,
-    readonly dims: number[],
-  ) {}
+export { Tensor };
 
-  get size(): number {
-    return this.data.length;
-  }
-
-  /** Nested arrays of numbers, outermost dimension first. */
-  tolist(): unknown[] {
-    const rec = (offset: number, d: number): unknown[] => {
-      const n = this.dims[d]!;
-      if (d === this.dims.length - 1) return Array.from(this.data.subarray(offset, offset + n));
-      const stride = this.dims.slice(d + 1).reduce((a, b) => a * b, 1);
-      return Array.from({ length: n }, (_, i) => rec(offset + i * stride, d + 1));
-    };
-    return rec(0, 0);
-  }
+/**
+ * The repo's tokenizer on this thread, as transformers.js's pipelines carry one; an empty object for
+ * GGUF files and repos without a tokenizer.json. Loaded after the model, so the browser's HTTP cache
+ * serves the worker's copy.
+ */
+async function sideTokenizer(id: string, options: PipelineOptions): Promise<PreTrainedTokenizer> {
+  if (/\.gguf$/i.test(id)) return {} as PreTrainedTokenizer;
+  return PreTrainedTokenizer.from_pretrained(id, { revision: options.revision, endpoint: options.endpoint }).catch(() => ({}) as PreTrainedTokenizer);
 }
 
 /** Cosine similarity of two vectors (transformers.js's `cos_sim`). */
@@ -297,8 +288,8 @@ interface EncoderPipelineBase {
   readonly task: PipelineTask;
   readonly model: KilnEncoder;
   readonly info: EncoderInfo;
-  /** Placeholder, as for text generation: the tokenizer runs in Kiln's worker. */
-  readonly tokenizer: object;
+  /** The model's tokenizer on this thread; the pipeline itself tokenizes in Kiln's worker. */
+  readonly tokenizer: PreTrainedTokenizer;
   dispose(): Promise<void>;
 }
 
@@ -371,7 +362,8 @@ interface Seq2SeqPipelineBase {
   readonly task: PipelineTask;
   readonly model: KilnSeq2Seq;
   readonly info: Seq2SeqInfo;
-  readonly tokenizer: object;
+  /** The model's tokenizer on this thread; the pipeline itself tokenizes in Kiln's worker. */
+  readonly tokenizer: PreTrainedTokenizer;
   dispose(): Promise<void>;
 }
 export interface SummarizationPipeline extends Seq2SeqPipelineBase {
@@ -660,6 +652,8 @@ export interface TextToAudioPipeline {
 
 /** An image in a form the worker can receive and decode: relative URLs resolved, DOM images drawn to bitmaps. */
 async function toWorkerImage(x: ImageInput): Promise<unknown> {
+  // A transformers.js RawImage in grayscale (or gray + alpha): RGB, as its pipelines convert it.
+  if (x instanceof RawImage && x.channels < 3) x = x.rgb();
   if (typeof x === "string") return typeof location !== "undefined" ? new URL(x, location.href).href : x;
   if (x instanceof URL) return x.href;
   if (x instanceof Blob || x instanceof ArrayBuffer || x instanceof Uint8Array) return x;
@@ -722,6 +716,7 @@ export async function pipeline(task: "image-to-text", model?: string, options?: 
 export async function pipeline(task: "document-question-answering", model?: string, options?: PipelineOptions): Promise<DocumentQuestionAnsweringPipeline>;
 export async function pipeline(task: "text-to-audio" | "text-to-speech", model?: string, options?: PipelineOptions): Promise<TextToAudioPipeline>;
 export async function pipeline(task: PipelineTask, model?: string, options: PipelineOptions = {}): Promise<unknown> {
+  if (options.endpoint === undefined && envEndpoint()) options = { ...options, endpoint: envEndpoint() };
   const t = ALIASES[task] ?? task;
   const id = model ?? DEFAULT_MODELS[t];
   if (!id) {
@@ -731,7 +726,7 @@ export async function pipeline(task: PipelineTask, model?: string, options: Pipe
     const m = await KilnModel.load(id, toLoadOptions(id, options));
     options.progress_callback?.({ status: "ready", task, model: id });
     const call = (input: Input | Input[], opts?: TextGenerationOptions) => runTextGeneration(m, input, opts);
-    return Object.assign(call, { task, model: m, info: m.info, tokenizer: {}, dispose: () => m.unload() });
+    return Object.assign(call, { task, model: m, info: m.info, tokenizer: await sideTokenizer(id, options), dispose: () => m.unload() });
   }
   const { progress_callback, dtype, quant, device, cpuThreads, revision, endpoint, worker } = options;
   const progress = progress_callback ? toLoadOptions(id, { progress_callback }).onProgress : undefined;
@@ -846,7 +841,8 @@ export async function pipeline(task: PipelineTask, model?: string, options: Pipe
             return one(audio);
           }
         : (texts: string | string[], opts?: Text2TextOptions) => m.run(t as Seq2SeqTask, texts, { ...opts });
-    return Object.assign(call, { task, model: m, info: m.info, tokenizer: {}, dispose: () => m.unload() });
+    const tokenizer = t === "automatic-speech-recognition" ? {} : await sideTokenizer(id, options);
+    return Object.assign(call, { task, model: m, info: m.info, tokenizer, dispose: () => m.unload() });
   }
   const m = await KilnEncoder.load(id, { quant: q, device: dev, cpuThreads, revision, endpoint, worker, onProgress: progress });
   progress_callback?.({ status: "ready", task, model: id });
@@ -858,5 +854,5 @@ export async function pipeline(task: PipelineTask, model?: string, options: Pipe
           return new Tensor("float32", r.data, r.dims);
         }
       : run;
-  return Object.assign(call, { task, model: m, info: m.info, tokenizer: {}, dispose: () => m.unload() });
+  return Object.assign(call, { task, model: m, info: m.info, tokenizer: await sideTokenizer(id, options), dispose: () => m.unload() });
 }

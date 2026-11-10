@@ -75,6 +75,12 @@ export interface SentencePieceOptions {
   collapseSpaces?: boolean;
   /** Prepend ▁ to the text (Metaspace add_prefix_space / prepend_scheme, SentencePiece add_dummy_prefix). */
   prefixSpace?: boolean;
+  /** Prepend it to every span between added tokens, not just the first (Metaspace prepend_scheme "always"). */
+  prefixAll?: boolean;
+  /** Keep the ends when collapsing spaces (tokenizers' Replace), where SentencePiece trims them. */
+  keepEdges?: boolean;
+  /** Split on whitespace before the Metaspace step, dropping it (a WhitespaceSplit pre-tokenizer: T5, XLM-R). */
+  whitespaceSplit?: boolean;
 }
 
 /**
@@ -85,6 +91,8 @@ export interface SentencePieceOptions {
 export class SentencePieceTokenizer extends TemplatedTokenizer {
   private readonly idTo: string[] = [];
   private readonly added = new Map<string, number>();
+  /** Added tokens that take the whitespace before (lstrip) or after (rstrip) them. */
+  private readonly strip = new Map<string, { l: boolean; r: boolean }>();
   private readonly addedRe: RegExp | undefined;
   readonly specialIds = new Set<number>();
   readonly maskToken: string | undefined = undefined;
@@ -92,7 +100,7 @@ export class SentencePieceTokenizer extends TemplatedTokenizer {
 
   constructor(
     private readonly model: Model,
-    added: { id: number; content: string; special: boolean }[],
+    added: { id: number; content: string; special: boolean; lstrip?: boolean; rstrip?: boolean }[],
     post: EncoderTokenizerJSON["post_processor"],
     private readonly opts: SentencePieceOptions,
   ) {
@@ -103,6 +111,7 @@ export class SentencePieceTokenizer extends TemplatedTokenizer {
       this.added.set(t.content, t.id);
       this.idTo[t.id] = t.content;
       if (t.special) this.specialIds.add(t.id);
+      if (t.lstrip || t.rstrip) this.strip.set(t.content, { l: !!t.lstrip, r: !!t.rstrip });
     }
     if (this.added.size) {
       const alts = [...this.added.keys()].sort((a, b) => b.length - a.length).map((s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
@@ -129,41 +138,55 @@ export class SentencePieceTokenizer extends TemplatedTokenizer {
   }
 
   protected tokenize(text: string): number[] {
-    const out: number[] = [];
+    // Spans of text between added tokens; lstrip / rstrip tokens take the whitespace beside them.
+    const parts: (string | number)[] = [];
     let last = 0;
-    let first = true;
-    const span = (s: string) => {
-      if (!s) return;
-      this.span(s, first, out);
-      first = false;
-    };
     if (this.addedRe) {
       for (const m of text.matchAll(this.addedRe)) {
-        span(text.slice(last, m.index));
-        out.push(this.added.get(m[0])!);
+        parts.push(text.slice(last, m.index), this.added.get(m[0])!);
+        const st = this.strip.get(m[0]);
+        if (st?.l && parts.length >= 2) parts[parts.length - 2] = (parts[parts.length - 2] as string).trimEnd();
         last = m.index! + m[0].length;
+        if (st?.r) while (last < text.length && /\s/.test(text[last]!)) last++;
       }
     }
-    span(text.slice(last));
+    parts.push(text.slice(last));
+    const out: number[] = [];
+    let first = true;
+    for (const p of parts) {
+      if (typeof p === "number") out.push(p);
+      else if (p) {
+        this.span(p, first, out);
+        first = false;
+      }
+    }
     return out;
   }
 
   private span(text: string, first: boolean, out: number[]): void {
-    let s = this.opts.charsmap ? this.opts.charsmap.normalize(text) : text;
-    // SentencePiece's remove_extra_whitespaces: runs collapsed, both ends trimmed.
-    if (this.opts.collapseSpaces) s = s.replace(/ {2,}/g, " ").trim();
-    s = s.replaceAll(" ", SPACE);
-    if (this.opts.prefixSpace && first && !s.startsWith(SPACE)) s = SPACE + s;
-    // Words start at each ▁ (the ▁ stays with the word that follows it).
-    for (const w of s.split(new RegExp(`(?=${SPACE})`, "u"))) {
-      if (!w) continue;
-      let ids = this.cache.get(w);
-      if (!ids) {
-        ids = this.model.kind === "unigram" ? this.viterbi(w) : this.bpe(w);
-        if (this.cache.size < 50000) this.cache.set(w, ids);
-      }
-      out.push(...ids);
+    const o = this.opts;
+    let s = o.charsmap ? o.charsmap.normalize(text) : text;
+    // SentencePiece's remove_extra_whitespaces: runs collapsed, both ends trimmed (tokenizers'
+    // Replace collapses only).
+    if (o.collapseSpaces) {
+      s = s.replace(/ {2,}/g, " ");
+      if (!o.keepEdges) s = s.trim();
     }
+    const words = o.whitespaceSplit ? s.split(/\s+/u).filter(Boolean) : [s];
+    words.forEach((word, k) => {
+      let w0 = word.replaceAll(" ", SPACE);
+      if (o.prefixSpace && (o.prefixAll || (first && k === 0) || (o.whitespaceSplit && first)) && !w0.startsWith(SPACE)) w0 = SPACE + w0;
+      // Words start at each ▁ (the ▁ stays with the word that follows it).
+      for (const w of w0.split(new RegExp(`(?=${SPACE})`, "u"))) {
+        if (!w) continue;
+        let ids = this.cache.get(w);
+        if (!ids) {
+          ids = this.model.kind === "unigram" ? this.viterbi(w) : this.bpe(w);
+          if (this.cache.size < 50000) this.cache.set(w, ids);
+        }
+        out.push(...ids);
+      }
+    });
   }
 
   /** Best-scoring segmentation; characters no piece covers become one unk each, then runs of unk fuse. */
@@ -258,13 +281,17 @@ export function sentencePieceFromJSON(json: EncoderTokenizerJSON): SentencePiece
   const norms = json.normalizer?.type === "Sequence" ? ((json.normalizer as { normalizers?: Record<string, unknown>[] }).normalizers ?? []) : json.normalizer ? [json.normalizer as Record<string, unknown>] : [];
   const pre = json.pre_tokenizer as { type?: string; add_prefix_space?: boolean; prepend_scheme?: string; pretokenizers?: { type: string; add_prefix_space?: boolean; prepend_scheme?: string }[] } | null | undefined;
   const meta = pre?.type === "Metaspace" ? pre : pre?.pretokenizers?.find((p) => p.type === "Metaspace");
+  const scheme = meta ? meta.prepend_scheme ?? (meta.add_prefix_space === false ? "never" : "always") : "never";
   const opts: SentencePieceOptions = {
     charsmap: (() => {
       const p = norms.find((n) => n.type === "Precompiled") as { precompiled_charsmap?: string } | undefined;
       return p?.precompiled_charsmap ? PrecompiledCharsMap.fromBase64(p.precompiled_charsmap) : undefined;
     })(),
     collapseSpaces: norms.some((n) => n.type === "Replace" && JSON.stringify(n.pattern).includes(" {2,}")),
-    prefixSpace: meta ? meta.add_prefix_space ?? meta.prepend_scheme !== "never" : false,
+    prefixSpace: scheme !== "never",
+    prefixAll: scheme === "always",
+    keepEdges: true,
+    whitespaceSplit: pre?.type === "WhitespaceSplit" || !!pre?.pretokenizers?.some((p) => p.type === "WhitespaceSplit"),
   };
   const added = json.added_tokens ?? [];
   const m = json.model as unknown as { type?: string; vocab: [string, number][] | Record<string, number>; unk_id?: number; unk_token?: string; merges?: (string | [string, string])[] };

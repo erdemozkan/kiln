@@ -223,10 +223,10 @@ export function encoderTokenizerFromJSON(json: EncoderTokenizerJSON): EncoderTok
 }
 
 /**
- * BERT's tokenizer from vocab.txt (one token per line, for repos without a tokenizer.json), as
- * transformers' BertTokenizer builds it: `[CLS] A [SEP] B [SEP]`, lowercased when `lowercase`.
+ * BERT's tokenizer.json, as transformers' BertTokenizer builds it from vocab.txt (one token per line,
+ * for repos without a tokenizer.json): `[CLS] A [SEP] B [SEP]`, lowercased when `lowercase`.
  */
-export function wordPieceFromVocab(vocabTxt: string, opts: { lowercase?: boolean; stripAccents?: boolean | null } = {}): EncoderTokenizer {
+export function wordPieceJSONFromVocab(vocabTxt: string, opts: { lowercase?: boolean; stripAccents?: boolean | null } = {}): EncoderTokenizerJSON {
   const lines = vocabTxt.split(/\r?\n/);
   if (lines.at(-1) === "") lines.pop();
   const vocab: Record<string, number> = {};
@@ -236,27 +236,36 @@ export function wordPieceFromVocab(vocabTxt: string, opts: { lowercase?: boolean
     if (vocab[t] === undefined) throw new Error(`vocab.txt has no ${t}`);
     return vocab[t]!;
   };
-  return new WordPieceTokenizer({
+  return {
     model: { type: "WordPiece", vocab, unk_token: "[UNK]", continuing_subword_prefix: "##", max_input_chars_per_word: 100 },
     normalizer: { type: "BertNormalizer", lowercase: opts.lowercase ?? true, strip_accents: opts.stripAccents ?? null, clean_text: true, handle_chinese_chars: true },
     post_processor: { type: "BertProcessing", cls: ["[CLS]", id("[CLS]")], sep: ["[SEP]", id("[SEP]")] },
     added_tokens: specials.map((t) => ({ id: vocab[t]!, content: t, special: true })),
-  });
+  };
+}
+
+/** BERT's tokenizer from vocab.txt (see `wordPieceJSONFromVocab`). */
+export function wordPieceFromVocab(vocabTxt: string, opts: { lowercase?: boolean; stripAccents?: boolean | null } = {}): EncoderTokenizer {
+  return new WordPieceTokenizer(wordPieceJSONFromVocab(vocabTxt, opts));
 }
 
 /**
  * RoBERTa / BART's byte-level BPE from vocab.json and merges.txt (repos without a tokenizer.json),
  * with `<s> A </s>` and `<s> A </s></s> B </s>` as transformers' RobertaTokenizer builds them.
  */
-export function byteLevelFromVocabMerges(vocab: Record<string, number>, mergesTxt: string): EncoderTokenizer {
+export function byteLevelJSONFromVocabMerges(vocab: Record<string, number>, mergesTxt: string): EncoderTokenizerJSON {
   const merges = mergesTxt.split(/\r?\n/).filter((l) => l && !l.startsWith("#version"));
   const specials = ["<s>", "<pad>", "</s>", "<unk>", "<mask>"].filter((t) => vocab[t] !== undefined);
   const added = specials.map((t) => ({ id: vocab[t]!, content: t, special: true, lstrip: t === "<mask>" }));
-  const json: EncoderTokenizerJSON = {
+  return {
     model: { type: "BPE", vocab, merges },
     pre_tokenizer: { type: "ByteLevel", add_prefix_space: false, trim_offsets: true } as never,
     post_processor: { type: "RobertaProcessing", cls: ["<s>", vocab["<s>"]!], sep: ["</s>", vocab["</s>"]!] },
     added_tokens: added,
   };
-  return encoderTokenizerFromJSON(json);
+}
+
+/** RoBERTa / BART's byte-level BPE from vocab.json and merges.txt (see `byteLevelJSONFromVocabMerges`). */
+export function byteLevelFromVocabMerges(vocab: Record<string, number>, mergesTxt: string): EncoderTokenizer {
+  return encoderTokenizerFromJSON(byteLevelJSONFromVocabMerges(vocab, mergesTxt));
 }

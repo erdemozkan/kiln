@@ -73,4 +73,6 @@ export {
 export { readAudio, type AudioInput } from "@kiln/loader";
 export { readImage, preprocessImage, resizeImage, centerCrop, type RgbImage, type ImageProcessorConfig } from "@kiln/loader";
 
+export { AutoTokenizer, PreTrainedTokenizer, RawImage, read_audio, env, type BatchEncoding, type ChatTemplateOptions, type PretrainedOptions, type TokenizerCallOptions, type TokenizerConfig } from "./compat";
+export type { TensorType } from "./tensor";
 export { kokoroNormalize, kokoroPhonemes, type Phonemizer } from "./kokoro-text";

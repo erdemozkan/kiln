@@ -126,6 +126,14 @@ iSTFTNet generator on the GPU in three plans, with new LSTM, Snake, depthwise tr
 convolution, LeakyReLU and reflection-pad kernels; the harmonic source and the (inverse) STFT on
 the CPU. PyTorch checkpoints holding a dict of state dicts load with prefixed names.
 
+**transformers.js's lower-level API.** `AutoTokenizer` / `PreTrainedTokenizer` (callable, int64
+tensors, padding and truncation, `encode`, `decode`, `batch_decode`, `tokenize`, special tokens,
+`apply_chat_template`), `RawImage`, `read_audio` and `env` (`remoteHost`); pipelines carry the
+model's tokenizer and take a `RawImage`. Ids equal to transformers.js 4.3.2's on 31 repos. Tokenizer
+fixes found on the way: added tokens' `lstrip` / `rstrip` (Phi-3.5's chat prompts), whitespace
+splitting before Metaspace (T5, XLM-R), the "▁" before an added token (NLLB), and Mistral v0.3's
+prefix space.
+
 **Loading.** Reads ahead of a download in progress are fetched on their own instead of waiting
 (a `pytorch_model.bin` keeps its zip directory at the end, so large checkpoints showed no progress
 until fully downloaded). 2-D tensors saved as transposed views load where the weights are read on
