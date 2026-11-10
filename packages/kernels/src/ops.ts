@@ -33,6 +33,9 @@ import {
   colsSpec,
   pixelShuffleSpec,
   swinAttentionSpec,
+  windowAttentionSpec,
+  channelGramSpec,
+  channelApplySpec,
   dwConvSpec,
   resizeArgmaxSpec,
   conv2dNarrowSpec,
@@ -563,6 +566,29 @@ export function swinAttention(ctx: Ctx, q: Tensor, k: Tensor, v: Tensor, bias: T
   const out = ctx.alloc(q.shape);
   const params = ctx.uniform([o.H, o.W, row, o.D, o.heads, o.shift, o.win, 0].map(u32));
   ctx.run(swinAttentionSpec(o.D, o.win), [params, q.buf, k.buf, v.buf, bias.buf, scale.buf, out.buf], [(o.H / o.win) * (o.W / o.win), o.heads, 1]);
+  return out;
+}
+
+/** DaViT window attention (see windowAttentionSpec): the fused projection qkv [H·W, 3C] → [H·W, C]. */
+export function windowAttention(ctx: Ctx, qkv: Tensor, o: { H: number; W: number; heads: number; win: number }): Tensor {
+  if (o.H % o.win || o.W % o.win) throw new Error(`windowAttention: ${o.H} × ${o.W} is not a whole number of ${o.win}-pixel windows`);
+  const C = lastDim(qkv) / 3;
+  const D = C / o.heads;
+  const out = ctx.alloc([o.H * o.W, C]);
+  const params = ctx.uniform([u32(o.H), u32(o.W), u32(C), u32(o.heads), f32(D ** -0.5), u32(o.win), u32(0), u32(0)]);
+  ctx.run(windowAttentionSpec(D, o.win), [params, qkv.buf, out.buf], [(o.H / o.win) * (o.W / o.win), o.heads, 1]);
+  return out;
+}
+
+/** DaViT channel attention (see channelGramSpec, channelApplySpec): the fused projection qkv [N, 3C] in `groups` groups → [N, C]. */
+export function channelAttention(ctx: Ctx, qkv: Tensor, o: { groups: number }): Tensor {
+  const C = lastDim(qkv) / 3;
+  const N = numel(qkv.shape) / (3 * C);
+  const Ch = C / o.groups;
+  const attn = ctx.alloc([C, Ch]);
+  ctx.run(channelGramSpec(Ch), [ctx.uniform([u32(N), u32(C), f32(N ** -0.5), u32(Ch)]), qkv.buf, attn.buf], [C, 1, 1]);
+  const out = ctx.alloc([N, C]);
+  ctx.run(channelApplySpec(Ch), [ctx.uniform([u32(N), u32(C), u32(Ch), u32(0)]), qkv.buf, attn.buf, out.buf], grid1d(N * C));
   return out;
 }
 

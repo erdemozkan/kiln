@@ -9,6 +9,7 @@ import { ClipTextModel, Seq2SeqModel, visionDecoderConfigFromHF, ConvNetModel, c
 import { ClipTokenizer, encoderTokenizerFromJSON, type ClipTokenizerJSON, type EncoderTokenizer, type EncoderTokenizerJSON } from "@kiln/tokenizers";
 import { openBackend, openParsed } from "./load";
 import { loadWeights, type LoadProgress, type WeightFile } from "./weights";
+import { createFlorence, type Florence2, type FlorenceOptions } from "./florence";
 
 export interface VisionLoadOptions {
   /** Matrix storage: "f32" (default), "q8" or "q4". */
@@ -63,8 +64,8 @@ export interface ImageSegment {
   mask: { width: number; height: number; channels: 1; data: Uint8Array };
 }
 
-export interface ImageToTextOptions {
-  /** Most tokens to generate (default: up to the model's max_length, 20, counting the start token). */
+export interface ImageToTextOptions extends Omit<FlorenceOptions, "max_new_tokens"> {
+  /** Most tokens to generate (default: up to the model's max_length, 20, counting the start token; Florence-2: 1024). */
   max_new_tokens?: number;
   /** Longest output counting the decoder start token (transformers' max_length; default 20). */
   max_length?: number;
@@ -154,6 +155,7 @@ export class VisionEngine {
     private readonly sr?: Swin2srModel,
     private readonly convnet?: { cfg: ConvNetConfig; model: ConvNetModel; head: Head; norm?: { w: Float32Array; b: Float32Array; eps: number }; labels: string[] },
     private readonly captioner?: { decoder: Seq2SeqModel; tokenizer: EncoderTokenizer; maxLength: number },
+    private readonly florence?: Florence2,
   ) {}
 
   get cfg(): VitConfig {
@@ -170,6 +172,10 @@ export class VisionEngine {
   summary(): { family: string; layers: number; hiddenSize: number; imageSize: number; labels: Record<number, string> } {
     const labels = (l: string[]) => Object.fromEntries(l.map((v, i) => [i, v]));
     if (this.matte) return { family: "rmbg", layers: 0, hiddenSize: 0, imageSize: 1024, labels: {} };
+    if (this.florence) {
+      const c = this.florence.cfg;
+      return { family: "florence2", layers: c.vision.depths.reduce((a, b) => a + b, 0) * 2 + c.text.encLayers + c.text.decLayers, hiddenSize: c.text.dModel, imageSize: c.imageSize, labels: {} };
+    }
     if (this.convnet) {
       const c = this.convnet.cfg;
       return { family: c.kind, layers: c.depths.reduce((a, b) => a + b, 0), hiddenSize: c.hidden[c.hidden.length - 1]!, imageSize: 224, labels: Object.fromEntries(this.convnet.labels.map((v, i) => [i, v])) };
@@ -496,6 +502,7 @@ export class VisionEngine {
    * special tokens dropped and the text trimmed.
    */
   async caption(img: RgbImage, options: ImageToTextOptions = {}): Promise<{ generated_text: string }[]> {
+    if (this.florence) return this.florence.run(img, options);
     const cap = this.captioner;
     if (!cap) throw new Error("this model does not caption images");
     const h = await this.model.forward(this.pixels(img));
@@ -571,6 +578,7 @@ export class VisionEngine {
   }
 
   destroy(): void {
+    this.florence?.destroy();
     this.vit?.model.destroy();
     this.detr?.model.destroy();
     this.depthModel?.model.destroy();
@@ -606,6 +614,9 @@ export async function createVision(modelId: string, opts: VisionLoadOptions = {}
   if (config!.model_type === "swin2sr") return createSwin2sr(modelId, ref, config!, prep, names, opts);
   if (config!.model_type === "resnet" || config!.model_type === "convnext") return createConvNet(modelId, ref, config!, prep, names, opts);
   if (config!.model_type === "vision-encoder-decoder") return createCaptioner(modelId, ref, config!, prep, names, opts, listing);
+  if (config!.model_type === "florence2") {
+    return createFlorence(modelId, ref, config!, prep, names, opts, (f, backend) => new VisionEngine(backend, undefined, f.processor, {}, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, f));
+  }
   const cfg = vitConfigFromHF(config!);
   const clip = cfg.modelType === "clip";
   if (clip && config!.model_type !== "clip") throw new Error(`${modelId}: a CLIP vision tower alone; zero-shot classification needs the full CLIP model`);

@@ -85,7 +85,7 @@ export class Seq2SeqEngine {
   }
 
   /** Greedy generation from one source; the generated ids (start and forced tokens included). */
-  async generate(source: readonly number[], options: Seq2SeqGenerateOptions = {}): Promise<number[]> {
+  async generate(source: readonly number[], options: Seq2SeqGenerateOptions = {}, encode?: () => Promise<void>): Promise<number[]> {
     const g: Record<string, unknown> = { ...this.generation };
     for (const k of GEN_KEYS) if (options[k] !== undefined) g[k] = options[k];
     if (options.max_new_tokens !== undefined) delete g.max_length;
@@ -104,7 +104,7 @@ export class Seq2SeqEngine {
     const forcedEos = g.forced_eos_token_id === undefined || g.forced_eos_token_id === null ? undefined : [g.forced_eos_token_id].flat()[0] as number;
     const bad = ((g.bad_words_ids as number[][] | undefined) ?? []).filter((b) => b.length === 1).map((b) => b[0]!);
 
-    await this.model.encode(source);
+    await (encode ? encode() : this.model.encode(source));
     const ids = [start];
     while (ids.length < maxLen) {
       // transformers' logits processors as banned tokens for the backend's greedy choice.

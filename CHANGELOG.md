@@ -89,7 +89,14 @@ the `microsoft/speecht5_hifigan` vocoder, or `vocoder`): `speaker_embeddings` (a
 URL), the character SentencePiece tokenizer, the encoder on the seq2seq code with a clamped
 relative-position bias, the speech prenet on the CPU with its always-on dropout (`seed`, or
 `prenet_dropout: "keep"`), Python's stop rule (`threshold`), the postnet with folded batch norm and
-a tanh epilogue on the conv kernel, and the HiFi-GAN builder shared with VITS.
+a tanh epilogue on the conv kernel, and the HiFi-GAN builder shared with VITS. Florence-2 (`microsoft/Florence-2-base`,
+`-large` and their `-ft` versions) in `image-to-text`: `task` takes its task tokens (`<CAPTION>`,
+`<DETAILED_CAPTION>`, `<OD>`, `<OCR>`, `<OCR_WITH_REGION>`, `<CAPTION_TO_PHRASE_GROUNDING>`,
+`<REFERRING_EXPRESSION_SEGMENTATION>`, …) and `text_input` their text; results carry the processor's
+parsed answer (boxes, quad boxes, polygons in pixels). The DaViT tower runs on the GPU with new
+window-attention and channel-attention kernels, its image tokens go ahead of the prompt's in the
+BART encoder, generation applies the model's processors, and the processor's tokens are added to
+Microsoft's tokenizer.
 
 **Loading.** Reads ahead of a download in progress are fetched on their own instead of waiting
 (a `pytorch_model.bin` keeps its zip directory at the end, so large checkpoints showed no progress

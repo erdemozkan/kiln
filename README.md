@@ -530,6 +530,7 @@ K/V; each decoder step reads them through a step block whose span covers every p
 | VITS text-to-speech (`facebook/mms-tts-eng`) | transformers.js (`Xenova/mms-tts-eng`, fp32), its two noise nodes set to zero, Kiln at zero noise | the same 33,024 samples, within 1.4e-4 (peak 0.87); 617 ms end to end against 1.33 s (WebGPU) |
 | SpeechT5 text-to-speech (`microsoft/speecht5_tts` + `microsoft/speecht5_hifigan`) | transformers.js (`Xenova/speecht5_tts`, fp32), its prenet dropout rewritten to keep every unit, Kiln with `prenet_dropout: "keep"` | the same ids; the same 122,880 samples, within 1e-5 over the first 80 frames, then drifting as frames feed back (mean difference 3.3e-4). With dropout: 1.9 s against 6.4 s (WebGPU) for "Hello, my dog is cute.", 3.6 s against 12.7 s for a 44-character sentence |
 | ViT + GPT-2 captioning (`nlpconnect/vit-gpt2-image-captioning`) | transformers.js (`Xenova/vit-gpt2-image-captioning`, fp32) on the same pixel values | the same caption on all three photos tried |
+| Florence-2 (`microsoft/Florence-2-base-ft`) | transformers.js (`onnx-community/Florence-2-base-ft`, fp32) on the same 768 × 768 pixels | 3 of 20 outputs identical (4 photos × caption, detailed caption, detection, grounding, OCR): its export fixed the channel-attention scale at a 224 × 224 trace, 3.4× too large at 768 (see below). With that scale given to Kiln too, the image tokens agree within 2.6e-4 and all 20 outputs are identical, every location token included. 2.9 s against 5.8 s for a caption, 3.0 s against 6.1 s for detection (WebGPU) |
 | DINOv2 (`facebook/dinov2-small-imagenet1k-1-layer`) | transformers.js (`Xenova/dinov2-small-imagenet1k-1-layer`, fp32) on the same pixel values | within 6e-3: its export resizes position embeddings bilinearly, Python bicubically (Kiln); with its resize, within 3.2e-7. 383 ms end to end against 683 ms |
 | Swin2SR (`caidas/swin2SR-classical-sr-x2-64`) | transformers.js (`Xenova/swin2SR-classical-sr-x2-64`, fp32) on the same pixel values | 4 of 147,456 output bytes one level apart (128 × 96 → 256 × 192); 3.4 s end to end against 10.4 s |
 | SegFormer (`nvidia/segformer-b0-finetuned-ade-512-512`) | transformers.js (`Xenova/segformer-b0-finetuned-ade-512-512`, fp32) on the same pixel values | the same 14 classes on the cats photo, all 307,200 pixels the same class; 0.75 s end to end against 3.9 s |
@@ -757,6 +758,46 @@ Generation follows transformers.js: greedy from the decoder start token to end-o
 `max_length` of 20, special tokens dropped. On three photos (cats, tiger, a football match), fed the
 same pixel values as transformers.js (`Xenova/vit-gpt2-image-captioning`, fp32), the captions were
 identical, including the model's own mistake of calling the tiger a zebra.
+
+Florence-2 (`microsoft/Florence-2-base`, `-large` and their `-ft` versions) runs in `image-to-text`
+with its task tokens: `task` picks one (default `<CAPTION>`) and `text_input` adds the text of the
+tasks that take one. The answer comes back parsed as Florence2Processor's post_process_generation
+returns it, under the task token, next to the raw text:
+
+```js
+const florence = await pipeline("image-to-text", "microsoft/Florence-2-base-ft");
+await florence("car.jpg", { task: "<OD>" });
+// [{ generated_text: "</s><s>car<loc_54><loc_334><loc_933><loc_774>wheel…</s>",
+//    "<OD>": { labels: ["car", "wheel", "wheel"], bboxes: [[34.9, 160.6, 597.4, 371.8], …] } }]
+await florence("car.jpg", { task: "<CAPTION_TO_PHRASE_GROUNDING>", text_input: "A green car" });
+```
+
+Tasks: `<CAPTION>`, `<DETAILED_CAPTION>`, `<MORE_DETAILED_CAPTION>`, `<OD>`,
+`<DENSE_REGION_CAPTION>`, `<REGION_PROPOSAL>`, `<OCR>`, `<OCR_WITH_REGION>` (quad boxes),
+`<CAPTION_TO_PHRASE_GROUNDING>`, `<REFERRING_EXPRESSION_SEGMENTATION>` and
+`<REGION_TO_SEGMENTATION>` (polygons, which transformers.js does not parse),
+`<OPEN_VOCABULARY_DETECTION>`, and the `<REGION_TO_…>` tasks, whose input is a box as location
+tokens. Boxes are in the image's pixels. The pieces: the DaViT tower on the GPU, its spatial blocks
+on a window-attention kernel and its channel blocks on a channel-attention kernel (a per-group
+channel Gram matrix, softmaxed, applied to the values), the 577 image tokens (their mean, then
+each) ahead of the prompt's in the BART encoder, and greedy generation with the model's processors
+(forced BOS and EOS, no repeated 3-grams; `num_beams` is ignored, as transformers.js does).
+Microsoft's tokenizer.json lacks the 1,024 task and location tokens the processor adds at load;
+Kiln adds them at the same ids.
+
+transformers.js's export differs from the model. DaViT's channel attention scales queries by
+N^-½, N the number of tokens; the ONNX graph froze that number when it was traced at 224 × 224
+(1/56 at the first stage), while the processor feeds 768 × 768 images (1/192). Each of the 12
+channel blocks runs 3.4× too sharp, and the image tokens move by up to 8.4. The captions and boxes
+mostly survive it: 3 of the 20 outputs tried came out identical, the boxes of the others within a
+few bins, and the captions worded differently ("Two cats laying on a pink blanket with remotes."
+against Kiln's "Two cats are sleeping on a pink blanket."). Kiln computes the scale from the image,
+as the PyTorch code does. To check everything else, the vision encoder's intermediate tensors were
+exposed in a copy of the ONNX graph: the stem and the first spatial block agree within 2.6e-6,
+and the first difference is the channel attention. Kiln run with the export's frozen scales gave
+image tokens within 2.6e-4 of transformers.js's, and all 20 outputs identical, token for token. End
+to end on the same GPU (medians of three warm runs, hidden pane): a caption in 2.9 s against
+5.8 s, a detailed caption in 3.4 s against 7.4 s, detection in 3.0 s against 6.1 s.
 
 Text-to-speech (`text-to-speech`, `text-to-audio`) runs VITS, the MMS-TTS voices
 (`facebook/mms-tts-eng` by default, and the other languages' `facebook/mms-tts-*`).

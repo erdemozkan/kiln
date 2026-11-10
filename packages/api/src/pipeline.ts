@@ -557,18 +557,24 @@ export interface ImageToImagePipeline {
 }
 
 export interface ImageToTextOptions {
-  /** Most tokens to generate (default: up to max_length, 20, counting the start token). */
+  /** Most tokens to generate (default: up to max_length, 20, counting the start token; Florence-2: 1024). */
   max_new_tokens?: number;
   /** Longest output counting the decoder start token (default 20). */
   max_length?: number;
+  /** Florence-2: the task token ("<CAPTION>" by default, "<DETAILED_CAPTION>", "<OD>", "<OCR>", "<OCR_WITH_REGION>", …) or a prompt. */
+  task?: string;
+  /** Florence-2: the text input of tasks that take one ("<CAPTION_TO_PHRASE_GROUNDING>", "<OPEN_VOCABULARY_DETECTION>", …). */
+  text_input?: string;
 }
+/** Florence-2 adds the parsed answer under its task token: text, or { labels, bboxes } in the image's pixels, … */
+export type ImageToTextResult = { generated_text: string; [task: string]: unknown };
 export interface ImageToTextPipeline {
   readonly task: PipelineTask;
   readonly model: KilnVision;
   readonly info: VisionInfo;
   dispose(): Promise<void>;
-  (image: ImageInput, options?: ImageToTextOptions): Promise<{ generated_text: string }[]>;
-  (images: ImageInput[], options?: ImageToTextOptions): Promise<{ generated_text: string }[][]>;
+  (image: ImageInput, options?: ImageToTextOptions): Promise<ImageToTextResult[]>;
+  (images: ImageInput[], options?: ImageToTextOptions): Promise<ImageToTextResult[][]>;
 }
 
 export interface TextToAudioOptions {

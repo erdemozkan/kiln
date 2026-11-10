@@ -2443,6 +2443,146 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
 }
 
 /**
+ * Plain windowed multi-head attention (DaViT's spatial blocks; no shift, no bias) over an H × W token
+ * image whose fused projection qkv [H·W, 3C] holds q, k, v side by side (head h at h·D of each):
+ * softmax(q·scale · kᵀ) · v within each win × win window → o [H·W, C]. One workgroup per (window,
+ * head), one thread per query; keys, then values, are staged in workgroup memory a tile at a time.
+ */
+export function windowAttentionSpec(D: number, win: number): KernelSpec {
+  const N = win * win;
+  const tile = Math.min(N, Math.floor(4096 / D));
+  if (N > 256) throw new Error(`window attention: a ${win} × ${win} window is more than 256 queries`);
+  return spec(`window_attention/D${D}/w${win}`, ["uniform", "read", "rw"], cpu.cpuWindowAttention, () => /* wgsl */ `
+struct P { H: u32, W: u32, C: u32, heads: u32, scale: f32, _a: u32, _b: u32, _c: u32 }
+@group(0) @binding(0) var<uniform> p: P;
+@group(0) @binding(1) var<storage, read> qkv: array<f32>;
+@group(0) @binding(2) var<storage, read_write> o: array<f32>;
+const D = ${D}u;
+const N = ${N}u;
+const WIN = ${win}u;
+const TILE = ${tile}u;
+var<workgroup> tile: array<f32, ${tile * D}>;
+
+@compute @workgroup_size(${N})
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) li: u32) {
+  let h = wid.y;
+  let wpr = p.W / WIN;
+  let y0 = (wid.x / wpr) * WIN;
+  let x0 = (wid.x % wpr) * WIN;
+  let row = 3u * p.C;
+  let tok = (y0 + li / WIN) * p.W + x0 + li % WIN;
+  var qv: array<f32, ${D}>;
+  for (var d = 0u; d < D; d++) { qv[d] = qkv[tok * row + h * D + d] * p.scale; }
+  var s: array<f32, ${N}>;
+  var m = -3.4e38;
+  for (var t0 = 0u; t0 < N; t0 += TILE) {
+    workgroupBarrier();
+    for (var i = li; i < TILE * D; i += N) {
+      let j = t0 + i / D;
+      if (j < N) { tile[i] = qkv[((y0 + j / WIN) * p.W + x0 + j % WIN) * row + p.C + h * D + i % D]; }
+    }
+    workgroupBarrier();
+    for (var jj = 0u; jj < TILE; jj++) {
+      let j = t0 + jj;
+      if (j >= N) { break; }
+      var dot = 0.0;
+      for (var d = 0u; d < D; d++) { dot += qv[d] * tile[jj * D + d]; }
+      s[j] = dot;
+      m = max(m, dot);
+    }
+  }
+  var z = 0.0;
+  for (var j = 0u; j < N; j++) { s[j] = exp(s[j] - m); z += s[j]; }
+  var acc: array<f32, ${D}>;
+  for (var t0 = 0u; t0 < N; t0 += TILE) {
+    workgroupBarrier();
+    for (var i = li; i < TILE * D; i += N) {
+      let j = t0 + i / D;
+      if (j < N) { tile[i] = qkv[((y0 + j / WIN) * p.W + x0 + j % WIN) * row + 2u * p.C + h * D + i % D]; }
+    }
+    workgroupBarrier();
+    for (var jj = 0u; jj < TILE; jj++) {
+      let j = t0 + jj;
+      if (j >= N) { break; }
+      for (var d = 0u; d < D; d++) { acc[d] += s[j] * tile[jj * D + d]; }
+    }
+  }
+  let inv = 1.0 / z;
+  for (var d = 0u; d < D; d++) { o[tok * p.C + h * D + d] = acc[d] * inv; }
+}`);
+}
+
+/**
+ * DaViT channel attention, first half: per group g of Ch channels, from the fused projection
+ * qkv [N, 3C], attn[g] = softmax over j of Σₙ (q[n, i] · scale) · k[n, j] → attn [G, Ch, Ch]. One
+ * workgroup of 64 threads per (group, row i), each summing a stride of tokens.
+ */
+export function channelGramSpec(Ch: number): KernelSpec {
+  if (Ch > 64) throw new Error(`channel attention: ${Ch} channels per group is more than 64`);
+  return spec(`channel_gram/${Ch}`, ["uniform", "read", "rw"], cpu.cpuChannelGram, () => /* wgsl */ `
+struct P { N: u32, C: u32, scale: f32, _a: u32 }
+@group(0) @binding(0) var<uniform> p: P;
+@group(0) @binding(1) var<storage, read> qkv: array<f32>;
+@group(0) @binding(2) var<storage, read_write> attn: array<f32>;
+const CH = ${Ch}u;
+var<workgroup> red: array<f32, ${64 * Ch}>;
+var<workgroup> sc: array<f32, ${Ch}>;
+
+@compute @workgroup_size(64)
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) li: u32) {
+  let g = wid.x / CH;
+  let i = wid.x % CH;
+  let row = 3u * p.C;
+  var acc: array<f32, ${Ch}>;
+  for (var n = li; n < p.N; n += 64u) {
+    let q = qkv[n * row + g * CH + i] * p.scale;
+    let kb = n * row + p.C + g * CH;
+    for (var j = 0u; j < CH; j++) { acc[j] += q * qkv[kb + j]; }
+  }
+  for (var j = 0u; j < CH; j++) { red[li * CH + j] = acc[j]; }
+  workgroupBarrier();
+  if (li < CH) {
+    var t = 0.0;
+    for (var r = 0u; r < 64u; r++) { t += red[r * CH + li]; }
+    sc[li] = t;
+  }
+  workgroupBarrier();
+  if (li < CH) {
+    var m = -3.4e38;
+    for (var j = 0u; j < CH; j++) { m = max(m, sc[j]); }
+    var z = 0.0;
+    for (var j = 0u; j < CH; j++) { z += exp(sc[j] - m); }
+    attn[wid.x * CH + li] = exp(sc[li] - m) / z;
+  }
+}`);
+}
+
+/** DaViT channel attention, second half: o[n, g·Ch + i] = Σⱼ attn[g, i, j] · v[n, g·Ch + j], v from qkv [N, 3C]. */
+export function channelApplySpec(Ch: number): KernelSpec {
+  return spec(`channel_apply/${Ch}`, ["uniform", "read", "read", "rw"], cpu.cpuChannelApply, () => /* wgsl */ `
+struct P { N: u32, C: u32, _a: u32, _b: u32 }
+@group(0) @binding(0) var<uniform> p: P;
+@group(0) @binding(1) var<storage, read> qkv: array<f32>;
+@group(0) @binding(2) var<storage, read> attn: array<f32>;
+@group(0) @binding(3) var<storage, read_write> o: array<f32>;
+const CH = ${Ch}u;
+
+@compute @workgroup_size(${EW})
+fn main(${EW_ARGS}) {
+  ${FLAT}
+  if (idx >= p.N * p.C) { return; }
+  let n = idx / p.C;
+  let c = idx % p.C;
+  let g = c / CH;
+  let vb = n * 3u * p.C + 2u * p.C + g * CH;
+  let ab = c * CH;
+  var t = 0.0;
+  for (var j = 0u; j < CH; j++) { t += attn[ab + j] * qkv[vb + j]; }
+  o[idx] = t;
+}`);
+}
+
+/**
  * 1-D transposed convolution (ConvTranspose1d, any kernel K ≥ stride s, padding pad) of x [Tin, C]
  * → y [Tout, O]: y[t, o] = bias[o] + Σ over taps k with (t + pad − k) divisible by s of
  * x[(t + pad − k) / s] · w[k, o, :] (weight stored [K, O, C], C a multiple of 4), with an optional

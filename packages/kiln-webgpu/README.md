@@ -176,6 +176,10 @@ await resnet("tiger.jpg"); // [{ label: "tiger, Panthera tigris", score: 0.940 }
 const captioner = await pipeline("image-to-text"); // nlpconnect/vit-gpt2-image-captioning
 await captioner("cats.jpg"); // [{ generated_text: "a cat laying on a blanket next to a cat laying on a bed" }]
 
+// Florence-2: captions, detection, grounding, OCR and segmentation by task token.
+const florence = await pipeline("image-to-text", "microsoft/Florence-2-base-ft");
+await florence("car.jpg", { task: "<OD>" }); // [{ generated_text, "<OD>": { labels: ["car", "wheel", "wheel"], bboxes: [...] } }]
+
 // MMS-TTS (VITS): speech from text, 16 kHz mono.
 const tts = await pipeline("text-to-speech"); // facebook/mms-tts-eng
 const { audio, sampling_rate } = await tts("Hello, my dog is cute.", { seed: 1 });

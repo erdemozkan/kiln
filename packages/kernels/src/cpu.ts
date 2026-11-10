@@ -1252,3 +1252,72 @@ export const cpuAdvance: CpuKernel = (b) => {
   st[0] = st[0]! + st[1]! + 1;
   st[1] = 0;
 };
+
+export const cpuWindowAttention: CpuKernel = (b) => {
+  const [H, W, C, heads] = Array.from(b[0]!.u32.subarray(0, 4)) as [number, number, number, number];
+  const scale = b[0]!.f32[4]!;
+  const [qkv, o] = [b[1]!.f32, b[2]!.f32];
+  const D = C / heads;
+  const row = 3 * C;
+  // The window side rides in the uniform's sixth slot (the WGSL kernel has it compiled in).
+  const win = b[0]!.u32[5]!;
+  const N = win * win;
+  const f = Math.fround;
+  const s = new Float64Array(N);
+  for (let wy = 0; wy < H / win; wy++)
+    for (let wx = 0; wx < W / win; wx++) {
+      const toks = Array.from({ length: N }, (_, j) => (wy * win + Math.floor(j / win)) * W + wx * win + (j % win));
+      for (let h = 0; h < heads; h++)
+        for (const t of toks) {
+          let m = -Infinity;
+          for (let j = 0; j < N; j++) {
+            let dot = 0;
+            for (let d = 0; d < D; d++) dot += f(qkv[t * row + h * D + d]! * scale) * qkv[toks[j]! * row + C + h * D + d]!;
+            s[j] = dot;
+            m = Math.max(m, dot);
+          }
+          let z = 0;
+          for (let j = 0; j < N; j++) z += s[j] = Math.exp(s[j]! - m);
+          for (let d = 0; d < D; d++) {
+            let a = 0;
+            for (let j = 0; j < N; j++) a += s[j]! * qkv[toks[j]! * row + 2 * C + h * D + d]!;
+            o[t * C + h * D + d] = a / z;
+          }
+        }
+    }
+};
+
+export const cpuChannelGram: CpuKernel = (b) => {
+  const [N, C] = [b[0]!.u32[0]!, b[0]!.u32[1]!];
+  const scale = b[0]!.f32[2]!;
+  const Ch = b[0]!.u32[3]!;
+  const [qkv, attn] = [b[1]!.f32, b[2]!.f32];
+  const G = C / Ch;
+  const row = 3 * C;
+  const f = Math.fround;
+  const sc = new Float64Array(Ch);
+  for (let g = 0; g < G; g++)
+    for (let i = 0; i < Ch; i++) {
+      sc.fill(0);
+      for (let n = 0; n < N; n++) {
+        const q = f(qkv[n * row + g * Ch + i]! * scale);
+        for (let j = 0; j < Ch; j++) sc[j] += q * qkv[n * row + C + g * Ch + j]!;
+      }
+      const m = Math.max(...sc);
+      let z = 0;
+      for (let j = 0; j < Ch; j++) z += Math.exp(sc[j]! - m);
+      for (let j = 0; j < Ch; j++) attn[(g * Ch + i) * Ch + j] = Math.exp(sc[j]! - m) / z;
+    }
+};
+
+export const cpuChannelApply: CpuKernel = (b) => {
+  const [N, C, Ch] = [b[0]!.u32[0]!, b[0]!.u32[1]!, b[0]!.u32[2]!];
+  const [qkv, attn, o] = [b[1]!.f32, b[2]!.f32, b[3]!.f32];
+  for (let n = 0; n < N; n++)
+    for (let c = 0; c < C; c++) {
+      const g = Math.floor(c / Ch);
+      let t = 0;
+      for (let j = 0; j < Ch; j++) t += attn[c * Ch + j]! * qkv[n * 3 * C + 2 * C + g * Ch + j]!;
+      o[n * C + c] = t;
+    }
+};

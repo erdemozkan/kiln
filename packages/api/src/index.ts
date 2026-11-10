@@ -51,6 +51,7 @@ export {
   type ImageToImageResult,
   type ImageToTextPipeline,
   type ImageToTextOptions,
+  type ImageToTextResult,
   type TextToAudioPipeline,
   type TextToAudioOptions,
   type TextToAudioResult,

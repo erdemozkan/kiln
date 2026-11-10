@@ -324,6 +324,8 @@ export class Seq2SeqModel {
   private alignHeads: [number, number][] = [];
   private align: Buf | undefined;
   private alignS = 0;
+  /** Florence-2: every source starts with rows given as embeddings (encodePrefixed). */
+  private readonly prefixed: boolean;
   /** Whether next/nextDetail/step record the alignment heads (enableAlignment first). */
   recordAlignment = false;
 
@@ -331,8 +333,9 @@ export class Seq2SeqModel {
     readonly backend: Backend,
     readonly cfg: Seq2SeqConfig,
     private readonly weights: Map<string, Tensor>,
-    opts: { maxTarget?: number } = {},
+    opts: { maxTarget?: number; prefixed?: boolean } = {},
   ) {
+    this.prefixed = opts.prefixed === true;
     for (const [d, h] of [[cfg.dModel, cfg.encHeads], [cfg.dModel, cfg.decHeads]] as const) {
       if (d % h) throw new UnsupportedModelError(`d_model ${d} is not divisible by ${h} heads`);
     }
@@ -367,9 +370,10 @@ export class Seq2SeqModel {
     return ops.layernorm(ctx, x, this.w(`${p}.weight`), this.w(`${p}.bias`), 1e-5);
   }
 
-  /** Token + position embeddings (scaled, then LayerNorm for BART). */
-  private embed(ctx: Ctx, side: "enc" | "dec", ids: Buf, pos: Buf, T: number): Tensor {
+  /** Token + position embeddings (scaled, then LayerNorm for BART); `extra` [T, d] is added before the LayerNorm. */
+  private embed(ctx: Ctx, side: "enc" | "dec", ids: Buf, pos: Buf, T: number, extra?: Tensor): Tensor {
     let x = ops.embed(ctx, this.w("shared.weight"), ids, T, this.cfg.embedScale);
+    if (extra) ops.addInPlace(ctx, x, extra);
     ops.addInPlace(ctx, x, ops.embed(ctx, this.w(`${side}.pos`), pos, T));
     if (this.cfg.layernormEmbedding) x = this.ln(ctx, x, `${side}.lnE`);
     return x;
@@ -423,6 +427,10 @@ export class Seq2SeqModel {
       };
       x = conv(conv({ shape: [frames, mels], dtype: "f32", buf: feats }, "conv1", 1), "conv2", 2);
       ops.addInPlace(ectx, x, this.w("enc.pos"));
+    } else if (this.prefixed) {
+      // Florence-2: image tokens ahead of the prompt's, added onto the embeddings of padding ids.
+      hidden = ectx.buffer(S * d * 4, "seq2seq/prefix");
+      x = this.embed(ectx, "enc", ids, pos, S, { shape: [S, d], dtype: "f32", buf: hidden });
     } else x = this.embed(ectx, "enc", ids, pos, S);
     const De = d / c.encHeads;
     const eshape = { T: S, H: c.encHeads, Hkv: c.encHeads, D: De, maxSeq: S, kv: "f32" as const, scale: De ** -0.5, span: true };
@@ -555,6 +563,33 @@ export class Seq2SeqModel {
     }
     this.backend.write(pair.hidden!, 0, hidden);
     this.backend.submit(pair.enc.dispatches);
+    this.current = pair;
+  }
+
+  /**
+   * Florence-2: runs the encoder on `extra` [S, d] added to the embeddings of `ids` (S of them; the
+   * image rows' ids are padding, their embedding subtracted by the caller) and readies the decoder.
+   */
+  async encodePrefixed(ids: readonly number[], extra: Float32Array): Promise<void> {
+    if (!this.prefixed) throw new Error("seq2seq: this model was not built for prefixed sources");
+    const S = ids.length;
+    if (S > this.cfg.maxPositions) throw new Error(`seq2seq: ${S} source rows; the model takes at most ${this.cfg.maxPositions}`);
+    if (extra.length !== S * this.cfg.dModel) throw new Error(`seq2seq: expected ${S} × ${this.cfg.dModel} values, got ${extra.length}`);
+    let pair = this.pairs.get(S);
+    if (!pair) {
+      if (this.pairs.size >= 4) {
+        const [k, old] = this.pairs.entries().next().value!;
+        this.dropPair(old);
+        this.pairs.delete(k);
+      }
+      pair = this.build(S);
+      this.pairs.set(S, pair);
+    }
+    const be = this.backend;
+    be.write(pair.enc.ids, 0, Uint32Array.from(ids));
+    be.write(pair.enc.pos, 0, Uint32Array.from({ length: S }, (_, i) => i + this.cfg.posOffset));
+    be.write(pair.hidden!, 0, extra);
+    be.submit(pair.enc.dispatches);
     this.current = pair;
   }
 

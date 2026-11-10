@@ -668,4 +668,40 @@ describe("image convolution kernels (CPU)", () => {
         for (let d = 0; d < D; d++) expect(y[i * row + h * D + d]).toBeCloseTo(e.reduce((a, p, j) => a + p * v[j * row + h * D + d]!, 0) / z, 5);
       }
   });
+
+  it("windowAttention equals window partition → softmax(q·scale·kᵀ)·v → window reverse, from a fused qkv", async () => {
+    const [H, W, heads, D, win] = [4, 6, 2, 3, 2];
+    const C = heads * D;
+    const qkv = randn(H * W * 3 * C);
+    const y = await run((ctx) => ops.windowAttention(ctx, upload(qkv, [H * W, 3 * C]), { H, W, heads, win }), H * W * C);
+    const at = (t: number, part: number, h: number, d: number) => qkv[t * 3 * C + part * C + h * D + d]!;
+    for (let t = 0; t < H * W; t++) {
+      const [ty, tx] = [Math.floor(t / W), t % W];
+      const mates = Array.from({ length: H * W }, (_, j) => j).filter((j) => Math.floor(Math.floor(j / W) / win) === Math.floor(ty / win) && Math.floor((j % W) / win) === Math.floor(tx / win));
+      expect(mates.length).toBe(win * win);
+      for (let h = 0; h < heads; h++) {
+        const sc = mates.map((j) => Array.from({ length: D }, (_, d) => at(t, 0, h, d) * D ** -0.5 * at(j, 1, h, d)).reduce((a, b) => a + b, 0));
+        const m = Math.max(...sc);
+        const e = sc.map((x) => Math.exp(x - m));
+        const z = e.reduce((a, b) => a + b, 0);
+        for (let d = 0; d < D; d++) expect(y[t * C + h * D + d]).toBeCloseTo(mates.reduce((a, j, k) => a + e[k]! * at(j, 2, h, d), 0) / z, 5);
+      }
+    }
+  });
+
+  it("channelAttention equals DaViT's softmax((q·N^-½)ᵀ k) applied to vᵀ per channel group", async () => {
+    const [N, C, G] = [7, 8, 2];
+    const Ch = C / G;
+    const qkv = randn(N * 3 * C);
+    const y = await run((ctx) => ops.channelAttention(ctx, upload(qkv, [N, 3 * C]), { groups: G }), N * C);
+    const at = (n: number, part: number, c: number) => qkv[n * 3 * C + part * C + c]!;
+    for (let g = 0; g < G; g++)
+      for (let i = 0; i < Ch; i++) {
+        const sc = Array.from({ length: Ch }, (_, j) => Array.from({ length: N }, (_, n) => at(n, 0, g * Ch + i) * N ** -0.5 * at(n, 1, g * Ch + j)).reduce((a, b) => a + b, 0));
+        const m = Math.max(...sc);
+        const e = sc.map((x) => Math.exp(x - m));
+        const z = e.reduce((a, b) => a + b, 0);
+        for (let n = 0; n < N; n++) expect(y[n * C + g * Ch + i]).toBeCloseTo(e.reduce((a, p, j) => a + (p / z) * at(n, 2, g * Ch + j), 0), 5);
+      }
+  });
 });

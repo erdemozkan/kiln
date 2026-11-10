@@ -17,3 +17,4 @@ export * from "./convnets";
 export * from "./vits";
 export * from "./hifigan";
 export * from "./speecht5";
+export * from "./florence2";
