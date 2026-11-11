@@ -250,3 +250,14 @@ export async function readAudio(input: AudioInput, rate = 16000): Promise<Float3
   }
   return out;
 }
+
+/** Zero mean, unit variance (variance + 1e-7), as Wav2Vec2FeatureExtractor's do_normalize. */
+export function normalizeAudio(x: Float32Array): Float32Array {
+  let mean = 0;
+  for (let i = 0; i < x.length; i++) mean += x[i]!;
+  mean /= x.length || 1;
+  let v = 0;
+  for (let i = 0; i < x.length; i++) v += (x[i]! - mean) ** 2;
+  const inv = 1 / Math.sqrt(v / (x.length || 1) + 1e-7);
+  return x.map((s) => (s - mean) * inv);
+}

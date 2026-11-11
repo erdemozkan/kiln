@@ -219,6 +219,50 @@ export class VisionEngine {
     return applyHead(c.visual, layerNorm(h.subarray(0, this.cfg.hidden), c.post.w, c.post.b, c.post.eps));
   }
 
+  /**
+   * transformers.js's model outputs for pixel values [3, height, width] as its image processor makes
+   * them: "base" last_hidden_state [T, H] (and pooler_output [H] where the model has a pooler);
+   * "classification" logits [labels]; "clip" image_embeds [D] (projected, not normalized).
+   */
+  async forwardPixels(px: Float32Array, width: number, height: number, head: "base" | "classification" | "clip"): Promise<Record<string, { data: Float32Array; dims: number[] }>> {
+    if (head === "classification" && this.convnet) {
+      const c = this.convnet;
+      const f = await c.model.features(px, width, height);
+      const mean = new Float32Array(f.channels);
+      for (let ch = 0; ch < f.channels; ch++) {
+        let s = 0;
+        for (let r = 0; r < f.rows; r++) s += f.data[r * f.channels + ch]!;
+        mean[ch] = s / f.rows;
+      }
+      const l = applyHead(c.head, c.norm ? layerNorm(mean, c.norm.w, c.norm.b, c.norm.eps) : mean);
+      return { logits: { data: l, dims: [l.length] } };
+    }
+    if (!this.vit) throw new Error("this model takes no pixel values here (vision transformers, CLIP and ResNet / ConvNeXt classifiers do)");
+    const H = this.cfg.hidden;
+    const h = this.cfg.modelType === "dinov2" ? await this.model.forward(px, width, height) : await this.model.forward(px);
+    if (head === "clip") {
+      const c = this.clip;
+      if (!c) throw new Error("this is not a CLIP model");
+      const e = applyHead(c.visual, layerNorm(h.subarray(0, H), c.post.w, c.post.b, c.post.eps));
+      return { image_embeds: { data: e, dims: [e.length] } };
+    }
+    if (head === "classification") {
+      const l = await this.logitsOfHidden(h);
+      return { logits: { data: l, dims: [l.length] } };
+    }
+    const out: Record<string, { data: Float32Array; dims: number[] }> = { last_hidden_state: { data: h, dims: [h.length / H, H] } };
+    if (this.heads.pooler) out.pooler_output = { data: applyHead(this.heads.pooler, h.subarray(0, H)).map(Math.tanh), dims: [H] };
+    return out;
+  }
+
+  /** CLIP's projected text embeddings (not normalized) of token id rows, and exp(logit_scale). */
+  async clipTextEmbeds(rows: readonly number[][]): Promise<{ embeds: Float32Array[]; scale: number }> {
+    const c = this.clip;
+    if (!c) throw new Error("this model has no text tower");
+    const hidden = await c.text.forwardBatch(rows, rows.map((s) => clipPoolIndex(s, c.eosId)));
+    return { embeds: hidden.map((h) => applyHead(c.textProj, h)), scale: c.scale };
+  }
+
   /** CLIP's normalized text embedding of a text. */
   async textEmbed(text: string): Promise<Float32Array> {
     return (await this.textEmbeds([text]))[0]!;
@@ -582,8 +626,12 @@ export class VisionEngine {
       }
       return applyHead(c.head, c.norm ? layerNorm(mean, c.norm.w, c.norm.b, c.norm.eps) : mean);
     }
+    return this.logitsOfHidden(await this.hidden(img));
+  }
+
+  /** Class logits from the vision transformer's last hidden state. */
+  private async logitsOfHidden(h: Float32Array): Promise<Float32Array> {
     if (!this.heads.cls) throw new Error("this model has no classification head");
-    const h = await this.hidden(img);
     const H = this.cfg.hidden;
     if (this.cfg.modelType === "dinov2") {
       const x = new Float32Array(2 * H);

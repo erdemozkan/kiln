@@ -183,6 +183,47 @@ export class EncoderEngine {
     return this.cfg.id2label?.[i] ?? `LABEL_${i}`;
   }
 
+  /**
+   * transformers.js's model outputs for token id rows (no padding; one row per input), each output
+   * per row with its own dims: "base" last_hidden_state [T, H]; "sequence" logits [labels];
+   * "token" logits [T, labels]; "qa" start_logits and end_logits [T]; "mlm" logits [T, vocab].
+   */
+  async forwardHeads(rows: readonly { ids: readonly number[]; typeIds?: readonly number[] }[], head: "base" | "sequence" | "token" | "qa" | "mlm"): Promise<Record<string, { data: Float32Array; dims: number[] }>[]> {
+    for (const r of rows) if (r.ids.length > this.maxLength) throw new Error(`an input has ${r.ids.length} tokens; this model takes ${this.maxLength} (truncate it)`);
+    const H = this.cfg.hidden;
+    const hs = await this.model.forwardMany(rows);
+    const out: Record<string, { data: Float32Array; dims: number[] }>[] = [];
+    for (let i = 0; i < rows.length; i++) {
+      const h = hs[i]!;
+      const T = rows[i]!.ids.length;
+      if (head === "base") out.push({ last_hidden_state: { data: h, dims: [T, H] } });
+      else if (head === "sequence") {
+        const l = await this.classify(h);
+        out.push({ logits: { data: l, dims: [l.length] } });
+      } else if (head === "token" || head === "qa") {
+        const w = await this.need(head === "token" ? "classifier.weight" : "qa_outputs.weight");
+        const b = await this.read(head === "token" ? "classifier.bias" : "qa_outputs.bias");
+        const L = w.length / H;
+        const l = new Float32Array(T * L);
+        for (let t = 0; t < T; t++) l.set(matvec(w, b, this.row(h, t), L, H), t * L);
+        if (head === "token") out.push({ logits: { data: l, dims: [T, L] } });
+        else {
+          const se = [new Float32Array(T), new Float32Array(T)];
+          for (let t = 0; t < T; t++) [se[0]![t], se[1]![t]] = [l[t * 2]!, l[t * 2 + 1]!];
+          out.push({ start_logits: { data: se[0]!, dims: [T] }, end_logits: { data: se[1]!, dims: [T] } });
+        }
+      } else {
+        const rowsOut: Float32Array[] = [];
+        for (let t = 0; t < T; t++) rowsOut.push(await this.maskLogits(this.row(h, t)));
+        const V = rowsOut[0]?.length ?? 0;
+        const l = new Float32Array(T * V);
+        rowsOut.forEach((r, t) => l.set(r, t * V));
+        out.push({ logits: { data: l, dims: [T, V] } });
+      }
+    }
+    return out;
+  }
+
   async featureExtraction(texts: Batch, opts: { pooling?: "none" | "mean" | "cls" | "first_token"; normalize?: boolean } = {}): Promise<FloatTensor> {
     const H = this.cfg.hidden;
     const pooling = opts.pooling ?? "none";

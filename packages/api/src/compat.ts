@@ -496,9 +496,34 @@ export class AutoTokenizer {
   }
 }
 
-/** transformers.js's read_audio: mono samples at `sampling_rate`, from a URL, Blob or bytes. */
-export function read_audio(input: AudioInput, sampling_rate: number): Promise<Float32Array> {
-  return readAudio(input, sampling_rate);
+/**
+ * transformers.js's read_audio: mono samples at `sampling_rate`, from a URL, Blob or bytes, decoded
+ * as it does (the browser's AudioContext at that rate; stereo mixed as √2 · (left + right) / 2, after
+ * ffmpeg). Without an AudioContext (a worker, Node), Kiln's own reader: WAV parsed and resampled,
+ * channels averaged.
+ */
+export async function read_audio(input: AudioInput, sampling_rate: number): Promise<Float32Array> {
+  const Ctx = (globalThis as { AudioContext?: new (o: { sampleRate: number }) => { decodeAudioData(b: ArrayBuffer): Promise<{ numberOfChannels: number; length: number; getChannelData(c: number): Float32Array }>; close?(): Promise<void> } }).AudioContext;
+  if (input instanceof Float32Array || !Ctx) return readAudio(input, sampling_rate);
+  let bytes: ArrayBuffer;
+  if (typeof input === "string" || input instanceof URL) {
+    const r = await fetch(input);
+    if (!r.ok) throw new Error(`${String(input)}: HTTP ${r.status}`);
+    bytes = await r.arrayBuffer();
+  } else if (input instanceof ArrayBuffer) bytes = input.slice(0);
+  else if (input instanceof Uint8Array) bytes = input.slice().buffer;
+  else bytes = await input.arrayBuffer();
+  const ctx = new Ctx({ sampleRate: sampling_rate });
+  try {
+    const d = await ctx.decodeAudioData(bytes);
+    if (d.numberOfChannels !== 2) return d.getChannelData(0);
+    const [l, r] = [d.getChannelData(0), d.getChannelData(1)];
+    const out = new Float32Array(d.length);
+    for (let i = 0; i < d.length; i++) out[i] = (Math.SQRT2 * (l[i]! + r[i]!)) / 2;
+    return out;
+  } finally {
+    await ctx.close?.();
+  }
 }
 
 /**

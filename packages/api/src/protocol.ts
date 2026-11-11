@@ -149,6 +149,13 @@ export interface EncoderInfo {
   labels?: Record<number, string>;
 }
 
+/** Model outputs an encoder returns (see EncoderEngine.forwardHeads). */
+export type EncoderHead = "base" | "sequence" | "token" | "qa" | "mlm";
+/** Model outputs an image model returns: from pixel values, or CLIP's text embeddings ("clip" with texts). */
+export type VisionHead = "base" | "classification" | "clip";
+/** One output tensor of a raw forward pass, per input. */
+export type RawOutputs = Record<string, { data: Float32Array; dims: number[] }>;
+
 export type Request =
   | { id: number; type: "load"; model: string; opts: WireLoadOptions }
   | { id: number; type: "loadEncoder"; model: string; opts: WireEncoderOptions }
@@ -158,6 +165,9 @@ export type Request =
   | { id: number; type: "audioTask"; task: AudioTask; args: unknown[] }
   | { id: number; type: "loadVision"; model: string; opts: WireEncoderOptions }
   | { id: number; type: "visionTask"; task: VisionTask; args: unknown[] }
+  | { id: number; type: "encoderForward"; rows: { ids: number[]; typeIds?: number[] }[]; head: EncoderHead }
+  | { id: number; type: "visionForward"; images?: { data: Float32Array; width: number; height: number }[]; texts?: number[][]; head: VisionHead }
+  | { id: number; type: "generateIds"; ids: number[]; opts: WireGenerateOptions }
   | { id: number; type: "chat"; messages: ChatMessage[]; opts: WireGenerateOptions }
   | { id: number; type: "complete"; prompt: string; opts: WireGenerateOptions }
   | { id: number; type: "abort"; target: number }
@@ -172,7 +182,7 @@ export type Response =
   | { id: number; type: "audioLoaded"; info: AudioInfo }
   | { id: number; type: "visionLoaded"; info: VisionInfo }
   | { id: number; type: "result"; result: unknown }
-  | { id: number; type: "delta"; text: string }
-  | { id: number; type: "done"; stats: GenerateStats | undefined }
+  | { id: number; type: "delta"; text: string; tokenId?: number }
+  | { id: number; type: "done"; stats: GenerateStats | undefined; stopId?: number }
   | { id: number; type: "profiled"; profile: Profile | undefined }
   | { id: number; type: "error"; message: string };

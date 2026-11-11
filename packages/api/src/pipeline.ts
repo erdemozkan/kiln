@@ -673,7 +673,7 @@ export interface Text2TextGenerationPipeline extends Seq2SeqPipelineBase {
 }
 
 /** Encoder dtypes: 8-bit names load as q8, 4-bit as q4, float and "auto" as f32 (encoders are small). */
-function encoderQuant(dtype: string | undefined): "f32" | "q8" | "q4" {
+export function encoderQuant(dtype: string | undefined): "f32" | "q8" | "q4" {
   if (dtype === undefined || dtype === "auto" || dtype === "fp32" || dtype === "fp16" || dtype === "f32") return "f32";
   const q = DTYPES[dtype];
   if (!q) throw new Error(`Kiln: unsupported dtype "${dtype}" (use ${Object.keys(DTYPES).join(", ")})`);

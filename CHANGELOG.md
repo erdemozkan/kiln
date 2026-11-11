@@ -134,6 +134,15 @@ fixes found on the way: added tokens' `lstrip` / `rstrip` (Phi-3.5's chat prompt
 splitting before Metaspace (T5, XLM-R), the "▁" before an added token (NLLB), and Mistral v0.3's
 prefix space.
 
+**AutoModel and AutoProcessor.** transformers.js's model classes on Kiln's engines: `AutoModel`
+and the sequence-classification, token-classification, question-answering and masked-LM heads for
+BERT, DistilBERT and RoBERTa; `AutoModel` and `AutoModelForImageClassification` for ViT, DeiT,
+DINOv2, ResNet and ConvNeXt; CLIP's `CLIPModel` and projection models; `AutoModelForCausalLM` with
+`generate()` (ids in, ids out, generation_config.json defaults, streamers). `AutoProcessor` /
+`AutoImageProcessor` / `AutoFeatureExtractor` for images, Whisper and wav2vec2. Outputs within
+1e-4 of transformers.js's on the same inputs; greedy generation identical. `read_audio` decodes as
+transformers.js does.
+
 **Loading.** Reads ahead of a download in progress are fetched on their own instead of waiting
 (a `pytorch_model.bin` keeps its zip directory at the end, so large checkpoints showed no progress
 until fully downloaded). 2-D tensors saved as transposed views load where the weights are read on

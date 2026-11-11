@@ -2,7 +2,7 @@ import type { Profile } from "@kiln/core";
 import type { GenerateStats, LoadProgress } from "@kiln/runtime";
 import type { ChatMessage } from "@kiln/tokenizers";
 import { createWorker } from "./default-worker";
-import type { VisionInfo, VisionTask, AudioInfo, AudioTask, EncoderInfo, EncoderTask, ModelInfo, Request, Response, Seq2SeqInfo, Seq2SeqTask, WireAudioOptions, WireEncoderOptions, WireGenerateOptions, WireLoadOptions, WireSeq2SeqOptions } from "./protocol";
+import type { EncoderHead, RawOutputs, VisionHead, VisionInfo, VisionTask, AudioInfo, AudioTask, EncoderInfo, EncoderTask, ModelInfo, Request, Response, Seq2SeqInfo, Seq2SeqTask, WireAudioOptions, WireEncoderOptions, WireGenerateOptions, WireLoadOptions, WireSeq2SeqOptions } from "./protocol";
 
 type Listener = (msg: Response) => void;
 type RequestBody = Request extends infer R ? (R extends Request ? Omit<R, "id"> : never) : never;
@@ -63,6 +63,17 @@ abstract class WorkerChannel {
     });
     this.post({ ...body, id } as Request);
     return id;
+  }
+
+  /** Sends a request answered by one result. */
+  protected ask<T>(body: RequestBody): Promise<T> {
+    return new Promise((resolve, reject) =>
+      this.send(body, (msg) => {
+        if (msg.type === "result") resolve(msg.result as T);
+        else if (msg.type === "error") reject(new Error(msg.message));
+        return msg.type === "result" || msg.type === "error";
+      }),
+    );
   }
 
   protected post(msg: Request): void {
@@ -137,6 +148,26 @@ export class KilnModel extends WorkerChannel {
     return this.stream({ type: "complete", prompt, opts: wire }, signal);
   }
 
+  /**
+   * Generates from prompt token ids (transformers.js's `generate`): the new ids, without the stop
+   * token, and `stopId` when one ended the reply. `onToken` sees each id and its text as they come.
+   */
+  generateIds(ids: number[], opts: GenerateOptions = {}, onToken?: (id: number | undefined, text: string) => void): Promise<{ ids: number[]; stopId?: number; stats: GenerateStats | undefined }> {
+    const { signal, ...wire } = opts;
+    const out: number[] = [];
+    return new Promise((resolve, reject) => {
+      const id = this.send({ type: "generateIds", ids, opts: wire }, (msg) => {
+        if (msg.type === "delta") {
+          if (msg.tokenId !== undefined) out.push(msg.tokenId);
+          onToken?.(msg.tokenId, msg.text);
+        } else if (msg.type === "done") resolve({ ids: out, stopId: msg.stopId, stats: msg.stats });
+        else if (msg.type === "error") reject(new Error(msg.message));
+        return msg.type === "done" || msg.type === "error";
+      });
+      signal?.addEventListener("abort", () => this.post({ id: this.nextId++, type: "abort", target: id }), { once: true });
+    });
+  }
+
   private stream(body: RequestBody, signal?: AbortSignal): TextStream {
     const queue: string[] = [];
     let wake: (() => void) | undefined;
@@ -209,6 +240,11 @@ export class KilnEncoder extends WorkerChannel {
       throw err;
     }
     return m;
+  }
+
+  /** Raw model outputs for token id rows, one record of tensors per row (see `EncoderHead`). */
+  forward(rows: { ids: number[]; typeIds?: number[] }[], head: EncoderHead): Promise<RawOutputs[]> {
+    return this.ask({ type: "encoderForward", rows, head });
   }
 
   /** Runs a task with transformers.js's arguments; resolves to its output. */
@@ -366,6 +402,14 @@ export class KilnVision extends WorkerChannel {
    * ({ data, dims }), or with labels first zero-shot classification ([{ score, label }]) and zero-shot
    * detection ([{ score, label, box }]), and the rest.
    */
+  /**
+   * Raw outputs for pixel values ([3, height, width] each, as the image processor makes them) and,
+   * for CLIP, projected text embeddings of token id rows with exp(logit_scale).
+   */
+  forward(inputs: { images?: { data: Float32Array; width: number; height: number }[]; texts?: number[][] }, head: VisionHead): Promise<{ images: RawOutputs[]; texts?: Float32Array[]; scale?: number }> {
+    return this.ask({ type: "visionForward", ...inputs, head });
+  }
+
   run<T>(task: VisionTask, image: unknown, ...args: unknown[]): Promise<T> {
     return new Promise((resolve, reject) =>
       this.send({ type: "visionTask", task, args: [image, ...args] }, (msg) => {

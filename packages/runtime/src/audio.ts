@@ -1,7 +1,7 @@
 // Speech encoders on raw audio (wav2vec2, HuBERT): CTC speech recognition and audio classification,
 // with transformers.js's pre- and post-processing.
 import type { Backend, Tensor } from "@kiln/core";
-import { fetchJSON, fileUrl, listRepoFiles, parseModelId, readPytorchHeader, readSafetensorsHeader, toF32, weightFiles, type ByteSource, type TensorEntry } from "@kiln/loader";
+import { fetchJSON, fileUrl, normalizeAudio, listRepoFiles, parseModelId, readPytorchHeader, readSafetensorsHeader, toF32, weightFiles, type ByteSource, type TensorEntry } from "@kiln/loader";
 import { Wav2Vec2Model, wav2vec2ConfigFromHF, wav2vec2Name, type Wav2Vec2Config } from "@kiln/models";
 import { ctcTokenizer, type CtcTokenizer } from "@kiln/tokenizers";
 import { openBackend, openParsed } from "./load";
@@ -25,16 +25,7 @@ export interface AudioClassificationOptions {
   top_k?: number;
 }
 
-/** Zero mean, unit variance (variance + 1e-7), as Wav2Vec2FeatureExtractor's do_normalize. */
-export function normalizeAudio(x: Float32Array): Float32Array {
-  let mean = 0;
-  for (let i = 0; i < x.length; i++) mean += x[i]!;
-  mean /= x.length || 1;
-  let v = 0;
-  for (let i = 0; i < x.length; i++) v += (x[i]! - mean) ** 2;
-  const inv = 1 / Math.sqrt(v / (x.length || 1) + 1e-7);
-  return x.map((s) => (s - mean) * inv);
-}
+export { normalizeAudio };
 
 /** The highest-scoring id of each row of [rows, width]. */
 export function argmaxRows(data: Float32Array, rows: number, width: number): Int32Array {

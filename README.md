@@ -304,7 +304,7 @@ waited on the previous one's readback; now they are queued back to back and read
 fill-mask was 851 ms (the 30k-word output layer ran in TypeScript; now on the GPU). transformers.js
 loads faster from its cache (0.9 s against 1.8 s for SmolLM2: Kiln converts weights at load) and
 downloads less (its files are pre-quantized), and its runtime adds 6.7 MB (gzipped) of WASM to
-Kiln's 251 KB (the whole package, its worker included).
+Kiln's 258 KB (the whole package, its worker included).
 
 SmolLM2-135M-Instruct, q4, Intel Gen-9 integrated GPU (Intel Mac), Chrome/Dawn. GPU clocks on this
 machine drift 10–15% between runs, so comparisons below are always from one session.
@@ -1044,6 +1044,35 @@ from vocab.json and merges.txt, which then match the ids of the same tokenizers'
 from transformers' by a token per turn; T5 and XLM-R did not split on whitespace before their
 Metaspace step (doubled or trailing spaces made extra "▁" tokens); NLLB's lost a "▁" before an added
 token; and Mistral v0.3's Metaspace step added a "▁" to text already starting with one.
+
+The model side follows: `AutoModel`, `AutoModelForSequenceClassification`,
+`AutoModelForTokenClassification`, `AutoModelForQuestionAnswering` and `AutoModelForMaskedLM` for
+BERT, DistilBERT and RoBERTa; `AutoModel` and `AutoModelForImageClassification` for ViT, DeiT,
+DINOv2, ResNet and ConvNeXt; `CLIPModel`, `CLIPTextModelWithProjection` and
+`CLIPVisionModelWithProjection`; and `AutoModelForCausalLM`, whose `generate()` takes the
+tokenizer's ids (with `max_new_tokens`, sampling options, a streamer, and the defaults of the
+repo's generation_config.json as transformers.js applies them) and returns the sequences as int64
+ids. A model is called with the tokenizer's or processor's output and returns transformers.js's
+tensors (`last_hidden_state`, `logits`, `start_logits` / `end_logits`, `text_embeds`,
+`logits_per_image` …), shaped [batch, tokens, …]; each row runs without its padding, so padded
+positions hold zeros where transformers.js holds the masked rows. `AutoProcessor` (and
+`AutoImageProcessor`, `AutoFeatureExtractor`) reads preprocessor_config.json: images to
+`pixel_values` with Kiln's PIL-exact resize, Whisper audio to `input_features`, wav2vec2 audio to
+`input_values`. The models run in Kiln's worker; the processors and tokenizers on the page.
+
+Against transformers.js 4.3.2 (fp32, WASM) on the same inputs: last_hidden_state of
+all-MiniLM-L6-v2 within 3.3e-6, DistilBERT SST-2 logits within 7.2e-7, BERT NER logits within
+4.8e-6, DistilBERT SQuAD start and end logits within 1.6e-5, BERT's masked-LM logits (30,522 per
+token, values up to 24) within 9.1e-5. SmolLM2-135M-Instruct's greedy `generate()` from the chat
+template's ids gave the same 45 ids, its stop token included (0.33 s against 0.85 s), and the
+streamer received the reply's text. Whisper's `input_features` agreed within 1.2e-7 and wav2vec2's
+`input_values` exactly, and so did `read_audio`, which decodes as transformers.js does (the
+browser's AudioContext at the target rate, stereo mixed as √2 · (left + right) / 2); Kiln's own
+pipelines keep their WAV reader. Images differ before the model: transformers.js resizes in the
+browser, Kiln as PIL does, so the cats photo's pixel values differed by up to 0.82 (ViT's top three
+classes were still the same). Given the same pixels, ViT's logits agreed within 1.4e-5 (0.34 s
+against 1.5 s) and CLIP's `logits_per_image` within 1.3e-5, its text embeddings within 1.6e-7. The
+masked-LM head runs one position at a time (0.24 s against 0.11 s for nine tokens).
 
 T5's learned relative position bias is added to each score by the per-row attention kernels (GPU
 and CPU, buckets computed in the kernel; bucket function equal to transformers' over ±300

@@ -242,6 +242,35 @@ merges.txt) and runs on the calling thread; its ids match transformers.js's on t
 compared. Every pipeline's `tokenizer` is the model's own (an empty object for GGUF files), and
 pipelines take a `RawImage` wherever they take an image. Of `env`, only `remoteHost` does anything.
 
+## transformers.js's AutoModel and AutoProcessor
+
+```js
+import { AutoTokenizer, AutoModel, AutoModelForCausalLM, AutoProcessor, AutoModelForImageClassification, RawImage } from "kiln-webgpu";
+
+const tokenizer = await AutoTokenizer.from_pretrained("sentence-transformers/all-MiniLM-L6-v2");
+const model = await AutoModel.from_pretrained("sentence-transformers/all-MiniLM-L6-v2");
+const { last_hidden_state } = await model(tokenizer(["Hello", "World"], { padding: true })); // [2, tokens, 384]
+
+const lm = await AutoModelForCausalLM.from_pretrained("HuggingFaceTB/SmolLM2-135M-Instruct");
+const t = await AutoTokenizer.from_pretrained("HuggingFaceTB/SmolLM2-135M-Instruct");
+const inputs = t.apply_chat_template(messages, { add_generation_prompt: true, return_dict: true });
+const ids = await lm.generate({ ...inputs, max_new_tokens: 64 }); // int64 [1, prompt + new]
+t.batch_decode(ids, { skip_special_tokens: true });
+
+const processor = await AutoProcessor.from_pretrained("google/vit-base-patch16-224");
+const vit = await AutoModelForImageClassification.from_pretrained("google/vit-base-patch16-224");
+const { logits } = await vit(await processor(await RawImage.read(url)));
+```
+
+Encoders (BERT, DistilBERT, RoBERTa): `AutoModel`, `AutoModelForSequenceClassification`,
+`AutoModelForTokenClassification`, `AutoModelForQuestionAnswering`, `AutoModelForMaskedLM`. Images:
+`AutoModel` and `AutoModelForImageClassification` (ViT, DeiT, DINOv2, ResNet, ConvNeXt), `CLIPModel`,
+`CLIPTextModelWithProjection`, `CLIPVisionModelWithProjection`. Language models:
+`AutoModelForCausalLM` with `generate()` (calling the model directly for logits is not supported).
+`AutoProcessor` makes `pixel_values` (resized as PIL does, so values can differ from
+transformers.js's browser resize), Whisper's `input_features` and wav2vec2's `input_values`.
+`model.dispose()` unloads a model.
+
 ## Kiln's own API
 
 ```ts

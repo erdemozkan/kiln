@@ -1,6 +1,6 @@
 import { readImage, type ImageInput } from "@kiln/loader";
 import { createAudio, createVision, TtsEngine, type VisionEngine, createEncoder, createEngine, createSeq2Seq, type AudioEngine, loadPromptCache, promptCacheName, savePromptCache, type EncoderEngine, type Engine, type Seq2SeqEngine, type Seq2SeqGenerateOptions, type TextDelta } from "@kiln/runtime";
-import type { AudioTask, VisionTask, EncoderTask, Request, Response, Seq2SeqTask } from "./protocol";
+import type { AudioTask, VisionTask, EncoderTask, RawOutputs, Request, Response, Seq2SeqTask } from "./protocol";
 
 /** The slice of DedicatedWorkerGlobalScope we use (lib.webworker conflicts with lib.dom in one program). */
 const scope = self as unknown as {
@@ -323,6 +323,57 @@ scope.onmessage = async (e: MessageEvent<Request>) => {
             post({ id: msg.id, type: "result", result });
           } catch (err) {
             post({ id: msg.id, type: "error", message: err instanceof Error ? err.message : String(err) });
+          }
+        });
+        break;
+      }
+      case "encoderForward": {
+        const enc = encoder;
+        if (!enc) throw new Error("no encoder model loaded");
+        queue = queue.then(async () => {
+          try {
+            post({ id: msg.id, type: "result", result: await enc.forwardHeads(msg.rows, msg.head) });
+          } catch (err) {
+            post({ id: msg.id, type: "error", message: err instanceof Error ? err.message : String(err) });
+          }
+        });
+        break;
+      }
+      case "visionForward": {
+        const v = vision;
+        if (!v) throw new Error("no image model loaded");
+        queue = queue.then(async () => {
+          try {
+            const result: { images: RawOutputs[]; texts?: Float32Array[]; scale?: number } = { images: [] };
+            for (const im of msg.images ?? []) result.images.push(await v.forwardPixels(im.data, im.width, im.height, msg.head));
+            if (msg.texts?.length) {
+              const t = await v.clipTextEmbeds(msg.texts);
+              result.texts = t.embeds;
+              result.scale = t.scale;
+            }
+            post({ id: msg.id, type: "result", result });
+          } catch (err) {
+            post({ id: msg.id, type: "error", message: err instanceof Error ? err.message : String(err) });
+          }
+        });
+        break;
+      }
+      case "generateIds": {
+        const e = engine;
+        if (!e) throw new Error("no model loaded");
+        const ac = new AbortController();
+        aborts.set(msg.id, ac);
+        queue = queue.then(async () => {
+          try {
+            const decoder = e.tokenizer.decoder();
+            for await (const tokenId of e.generateTokens(msg.ids, { ...msg.opts, signal: ac.signal })) post({ id: msg.id, type: "delta", text: decoder.push(tokenId), tokenId });
+            const tail = decoder.flush();
+            if (tail) post({ id: msg.id, type: "delta", text: tail });
+            post({ id: msg.id, type: "done", stats: e.lastStats, stopId: e.lastStopId });
+          } catch (err) {
+            post({ id: msg.id, type: "error", message: err instanceof Error ? err.message : String(err) });
+          } finally {
+            aborts.delete(msg.id);
           }
         });
         break;

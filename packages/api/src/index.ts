@@ -75,4 +75,24 @@ export { readImage, preprocessImage, resizeImage, centerCrop, type RgbImage, typ
 
 export { AutoTokenizer, PreTrainedTokenizer, RawImage, read_audio, env, type BatchEncoding, type ChatTemplateOptions, type PretrainedOptions, type TokenizerCallOptions, type TokenizerConfig } from "./compat";
 export type { TensorType } from "./tensor";
+export {
+  AutoModel,
+  AutoModelForSequenceClassification,
+  AutoModelForTokenClassification,
+  AutoModelForQuestionAnswering,
+  AutoModelForMaskedLM,
+  AutoModelForImageClassification,
+  AutoModelForCausalLM,
+  CLIPModel,
+  CLIPTextModelWithProjection,
+  CLIPVisionModelWithProjection,
+  AutoProcessor,
+  AutoImageProcessor,
+  AutoFeatureExtractor,
+  PreTrainedModel,
+  PreTrainedCausalLM,
+  Processor,
+  type GenerateArgs,
+  type ModelOptions,
+} from "./auto";
 export { kokoroNormalize, kokoroPhonemes, type Phonemizer } from "./kokoro-text";

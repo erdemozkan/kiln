@@ -142,6 +142,8 @@ const BUCKETS = [16, 64, 128];
 export class Engine {
   readonly chatFormat: ChatFormat | undefined;
   lastStats: GenerateStats | undefined;
+  /** The stop token that ended the last generation (undefined when it ended otherwise). */
+  lastStopId: number | undefined;
   private readonly plans = new Map<number, ForwardPlan>();
   private readonly verifyPlans = new Map<number, ForwardPlan>();
   private readonly advances = new Map<Buf, { dispatches: readonly Dispatch[]; destroy(): void }>();
@@ -377,7 +379,7 @@ export class Engine {
     const requested = opts.maxTokens ?? 512;
     const maxTokens = Math.min(requested, maxSeq - promptIds.length);
     /** Set when a stop token ends the reply (as opposed to the caller ending it). */
-    const ended = { stop: false };
+    const ended: { stop: boolean; id?: number } = { stop: false };
     const temperature = opts.temperature ?? 0.7;
     const seed = opts.seed ?? (Math.random() * 2 ** 32) >>> 0;
     const sampling = { topK: opts.topK ?? 0, topP: opts.topP ?? 1, repetitionPenalty: opts.repetitionPenalty ?? 1 };
@@ -389,6 +391,7 @@ export class Engine {
     const grammar = opts.format ? this.matcher(opts.format, [...stop]) : undefined;
     const draftTokens = sampling.repetitionPenalty !== 1 ? 0 : Math.min(MAX_VERIFY_ROWS - 1, Math.max(0, Math.floor(opts.draftTokens ?? (this.backend.name === "cpu" ? 0 : 7))));
     this.busy = true;
+    this.lastStopId = undefined;
     // Reuse the shared prefix, but always prefill at least the last prompt token to get its logits.
     let start = 0;
     const reuse = opts.reuseCache ?? true;
@@ -527,6 +530,7 @@ export class Engine {
         for (const id of ids) {
           if (stop.has(id) || opts.signal?.aborted) {
             ended.stop = stop.has(id);
+            if (ended.stop) ended.id = id;
             done = true;
             break;
           }
@@ -556,6 +560,7 @@ export class Engine {
               ? "stop"
               : "abort";
       this.lastStats = stats;
+      this.lastStopId = ended.stop ? ended.id : undefined;
       this.busy = false;
     }
   }
@@ -590,7 +595,7 @@ export class Engine {
       t0: number;
       grammar: GrammarMatcher | undefined;
       prefillUnits: number;
-      ended: { stop: boolean };
+      ended: { stop: boolean; id?: number };
     },
   ): AsyncGenerator<number> {
     const { stats, grammar } = o;
@@ -631,6 +636,7 @@ export class Engine {
       for (const id of ids) {
         if (o.stop.has(id) || o.signal?.aborted) {
           o.ended.stop = o.stop.has(id);
+          if (o.ended.stop) o.ended.id = id;
           return false;
         }
         if (grammar && !grammar.accept(id)) throw new Error(`grammar: sampled token ${id} is not allowed (mask out of sync)`);
