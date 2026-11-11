@@ -16,7 +16,42 @@ export interface ForwardPlan {
   readonly tokens: Buf;
   /** u32 [1] sampled token for row `step.lastRow`; u32 [T], one per row, for a verify plan. */
   readonly out: Buf;
+  /** Logits [1, vocab] (or [T, vocab] for a verify plan) before sampling, for inspection and tests. */
+  readonly logits: Tensor;
   destroy(): void;
+}
+
+/** The projections a LoRA adapter may update (PEFT's target_modules names). */
+export const LORA_MODULES = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"] as const;
+export type LoraModule = (typeof LORA_MODULES)[number];
+
+/** One projection's low-rank update with its scale folded in: ΔW = B · A, A [rank, in], B [out, rank]. */
+export interface LoraUpdate {
+  rank: number;
+  A: Float32Array;
+  B: Float32Array;
+}
+
+/** An adapter's updates by "layer.module" ("3.q_proj"). */
+export type LoraWeights = ReadonlyMap<string, LoraUpdate>;
+
+/** An adapter laid out for a model's LoRA slots of one rank, in GPU buffers (see `LlamaModel.prepareLora`). */
+export interface LoraBuffers {
+  rank: number;
+  bufs: { A: Buf; B: Buf; aBytes: number; bBytes: number }[];
+  bytes: number;
+}
+
+/**
+ * GPU buffers one adapted matmul adds its update from: A [parts · R, in] and B [out, parts · R],
+ * where a stacked matmul (q/k/v, gate/up) takes its parts' A rows stacked and their B blocks on the
+ * diagonal. R is the slot rank (a multiple of 32); smaller adapters leave the rest zero.
+ */
+interface LoraSlot {
+  parts: { module: LoraModule; n: number }[];
+  k: number;
+  A: Tensor;
+  B: Tensor;
 }
 
 export interface LlamaOptions {
@@ -109,6 +144,8 @@ export class LlamaModel {
   private readonly fusedMlp: boolean;
   /** Image features [imageTokens, hidden], when the model takes images (see `LlamaOptions.imageTokens`). */
   readonly imageFeatures: Buf | undefined;
+  /** LoRA slots by "layer.slot" and their rank, once `enableLora` ran; plans built since add their updates. */
+  private lora: { rank: number; slots: Map<string, LoraSlot> } | undefined;
 
   constructor(
     readonly backend: Backend,
@@ -326,6 +363,143 @@ export class LlamaModel {
     }
   }
 
+  /** The LoRA slot rank (0 when LoRA is off). */
+  get loraRank(): number {
+    return this.lora?.rank ?? 0;
+  }
+
+  /** The slot rank adapters up to `rank` need: a multiple of 32, as the update matmuls' K must be. */
+  static loraSlotRank(rank: number): number {
+    return Math.ceil(rank / 32) * 32;
+  }
+
+  /** The LoRA slots this model's graph has, in a fixed order: per layer, each adapted matmul and the projections stacked in it. */
+  private loraLayout(): { name: string; parts: { module: LoraModule; n: number }[]; k: number }[] {
+    const c = this.cfg;
+    const out: { name: string; parts: { module: LoraModule; n: number }[]; k: number }[] = [];
+    const add = (name: string, parts: LoraModule[], k: number, ns: number[]) => out.push({ name, parts: parts.map((m, i) => ({ module: m, n: ns[i]! })), k });
+    const H = c.hiddenSize;
+    const q = c.numHeads * c.headDim;
+    const kv = c.numKvHeads * c.headDim;
+    for (let l = 0; l < c.numLayers; l++) {
+      const p = `model.layers.${l}`;
+      const I = this.fusedMlp ? this.w(`${p}.mlp.gate_up.weight`).shape[0]! / 2 : this.w(`${p}.mlp.gate_proj.weight`).shape[0]!;
+      if (this.fusedQkv) add(`${l}.qkv`, ["q_proj", "k_proj", "v_proj"], H, [q, kv, kv]);
+      else for (const [m, n] of [["q_proj", q], ["k_proj", kv], ["v_proj", kv]] as const) add(`${l}.${m}`, [m], H, [n]);
+      add(`${l}.o_proj`, ["o_proj"], q, [H]);
+      if (this.fusedMlp) add(`${l}.gate_up`, ["gate_proj", "up_proj"], H, [I, I]);
+      else for (const m of ["gate_proj", "up_proj"] as const) add(`${l}.${m}`, [m], H, [I]);
+      add(`${l}.down_proj`, ["down_proj"], I, [H]);
+    }
+    return out;
+  }
+
+  /** One slot's A and B contents for an adapter (zeros for projections it leaves out). */
+  private loraArrays(slot: { name: string; parts: { module: LoraModule; n: number }[]; k: number }, R: number, weights: LoraWeights | undefined): { A: Float32Array; B: Float32Array } {
+    const layer = slot.name.slice(0, slot.name.indexOf("."));
+    const P = slot.parts.length;
+    const N = slot.parts.reduce((a, b) => a + b.n, 0);
+    const A = new Float32Array(P * R * slot.k);
+    const B = new Float32Array(N * P * R);
+    let row = 0;
+    slot.parts.forEach((part, i) => {
+      const u = weights?.get(`${layer}.${part.module}`);
+      if (u) {
+        const r = u.rank;
+        if (r > R) throw new Error(`LoRA rank ${r} is above the slot rank ${R}`);
+        if (u.A.length !== r * slot.k || u.B.length !== part.n * r) throw new Error(`LoRA ${layer}.${part.module}: expected A [${r}, ${slot.k}] and B [${part.n}, ${r}]`);
+        A.set(u.A, i * R * slot.k);
+        // Granite's residual multiplier is folded into o_proj and down_proj at load; their updates scale with it.
+        const scale = this.cfg.residualScale !== undefined && (part.module === "o_proj" || part.module === "down_proj") ? this.cfg.residualScale : 1;
+        for (let o = 0; o < part.n; o++) for (let j = 0; j < r; j++) B[(row + o) * P * R + i * R + j] = u.B[o * r + j]! * scale;
+      }
+      row += part.n;
+    });
+    return { A, B };
+  }
+
+  /**
+   * Allocates LoRA slots for adapters up to `rank` (see `loraSlotRank`) on every projection, all
+   * zero; or with rank 0 frees them. Plans built before do not see the change, so the caller
+   * rebuilds them.
+   */
+  enableLora(rank: number): void {
+    this.freeLora();
+    if (rank <= 0) return;
+    const R = LlamaModel.loraSlotRank(rank);
+    const slots = new Map<string, LoraSlot>();
+    for (const s of this.loraLayout()) {
+      const { A, B } = this.loraArrays(s, R, undefined);
+      const tensor = (data: Float32Array, shape: number[], label: string): Tensor => {
+        const buf = this.backend.alloc(data.byteLength, "storage", label);
+        this.backend.write(buf, 0, data);
+        return { shape, dtype: "f32", buf };
+      };
+      const N = s.parts.reduce((a, b) => a + b.n, 0);
+      slots.set(s.name, { parts: s.parts, k: s.k, A: tensor(A, [s.parts.length * R, s.k], `lora/${s.name}/A`), B: tensor(B, [N, s.parts.length * R], `lora/${s.name}/B`) });
+    }
+    this.lora = { rank: R, slots };
+  }
+
+  /**
+   * Writes an adapter's updates into the LoRA slots (projections it leaves out get zeros; undefined
+   * clears every slot). Takes effect on the next forward pass, with no plan rebuilt.
+   */
+  setLora(weights: LoraWeights | undefined): void {
+    const L = this.lora;
+    if (!L) throw new Error("LoRA is not enabled on this model (enableLora first)");
+    for (const s of this.loraLayout()) {
+      const slot = L.slots.get(s.name)!;
+      const { A, B } = this.loraArrays(s, L.rank, weights);
+      this.backend.write(slot.A.buf, 0, A);
+      this.backend.write(slot.B.buf, 0, B);
+    }
+  }
+
+  /**
+   * An adapter laid out for slots of `rank` in GPU buffers of its own, so `useLora` can switch to
+   * it with GPU copies alone. Free it with `freeLoraBuffers`.
+   */
+  prepareLora(weights: LoraWeights, rank: number): LoraBuffers {
+    const R = LlamaModel.loraSlotRank(rank);
+    const bufs = this.loraLayout().map((s) => {
+      const { A, B } = this.loraArrays(s, R, weights);
+      const a = this.backend.alloc(A.byteLength, "storage", `lora/${s.name}/A/prepared`);
+      const b = this.backend.alloc(B.byteLength, "storage", `lora/${s.name}/B/prepared`);
+      this.backend.write(a, 0, A);
+      this.backend.write(b, 0, B);
+      return { A: a, B: b, aBytes: A.byteLength, bBytes: B.byteLength };
+    });
+    return { rank: R, bufs, bytes: bufs.reduce((n, b) => n + b.aBytes + b.bBytes, 0) };
+  }
+
+  /** Copies a prepared adapter into the LoRA slots (GPU to GPU), for the next forward pass. */
+  useLora(p: LoraBuffers): void {
+    const L = this.lora;
+    if (!L || L.rank !== p.rank) throw new Error(`useLora: the slots have rank ${L?.rank ?? 0}, the adapter was prepared for ${p.rank}`);
+    this.loraLayout().forEach((s, i) => {
+      const slot = L.slots.get(s.name)!;
+      const b = p.bufs[i]!;
+      this.backend.copy(b.A, 0, slot.A.buf, 0, b.aBytes);
+      this.backend.copy(b.B, 0, slot.B.buf, 0, b.bBytes);
+    });
+  }
+
+  freeLoraBuffers(p: LoraBuffers): void {
+    for (const b of p.bufs) {
+      this.backend.free(b.A);
+      this.backend.free(b.B);
+    }
+  }
+
+  private freeLora(): void {
+    for (const s of this.lora?.slots.values() ?? []) {
+      this.backend.free(s.A.buf);
+      this.backend.free(s.B.buf);
+    }
+    this.lora = undefined;
+  }
+
   setStep(s: StepParams): void {
     this.backend.write(this.step, 0, packStep(s));
   }
@@ -345,6 +519,12 @@ export class LlamaModel {
     const gelu = c.activation === "gelu";
     const norm = (t: Tensor, name: string) => ops.rmsnorm(ctx, t, this.w(name), c.rmsEps);
 
+    const L = this.lora?.slots;
+    /** Adds slot `name`'s LoRA update of input `xin` to `y`: y += B · (A · xin). */
+    const delta = (xin: Tensor, y: Tensor, name: string) => {
+      const s = L!.get(name)!;
+      ops.linear(ctx, ops.linear(ctx, xin, s.A), s.B, { residual: y });
+    };
     const features = this.imageFeatures && { buf: this.imageFeatures, vocab: c.vocabSize };
     const x = ops.embed(ctx, this.w("model.embed_tokens.weight"), tokens, T, c.embedScale ?? 1, features);
     for (let l = 0; l < c.numLayers; l++) {
@@ -367,25 +547,47 @@ export class LlamaModel {
       let q: Tensor;
       if (this.fusedQkv) {
         // RMSNorm → one qkv matmul (+bias) → RoPE fused with the cache write.
-        const qkv = ops.linear(ctx, x, this.w(`${p}.self_attn.qkv.weight`), { norm: inputNorm, bias: this.bias(`${p}.self_attn.qkv.bias`) });
+        let qkv: Tensor;
+        if (L) {
+          // The update reads the normalised input, so the norm runs on its own.
+          const xn = ops.rmsnorm(ctx, x, inputNorm.w, inputNorm.eps);
+          qkv = ops.linear(ctx, xn, this.w(`${p}.self_attn.qkv.weight`), { bias: this.bias(`${p}.self_attn.qkv.bias`) });
+          delta(xn, qkv, `${l}.qkv`);
+        } else qkv = ops.linear(ctx, x, this.w(`${p}.self_attn.qkv.weight`), { norm: inputNorm, bias: this.bias(`${p}.self_attn.qkv.bias`) });
         q = c.qkNorm
           ? ops.qkNormRopeKv(ctx, qkv, this.w(`${p}.self_attn.q_norm.weight`), this.w(`${p}.self_attn.k_norm.weight`), c.rmsEps, kc, vc, attnShape, invFreq, c.ropeInterleaved)
           : ops.ropeKv(ctx, qkv, kc, vc, attnShape, invFreq, c.ropeInterleaved);
       } else {
-        q = this.attentionInputs(ctx, x, l, T, invFreq);
+        q = this.attentionInputs(ctx, x, l, T, invFreq, L ? delta : undefined);
       }
       const a = ops.attention(ctx, q, kc, vc, attnShape);
       if (c.sandwichNorms) {
         // Gemma: the attention output is normalised before the residual add.
         const o = ops.linear(ctx, a, this.w(`${p}.self_attn.o_proj.weight`));
+        if (L) delta(a, o, `${l}.o_proj`);
         ops.addInPlace(ctx, x, norm(o, `${p}.post_attention_layernorm.weight`));
       } else {
         ops.linear(ctx, a, this.w(`${p}.self_attn.o_proj.weight`), { residual: x });
+        if (L) delta(a, x, `${l}.o_proj`);
       }
 
       const mlpNorm = { w: this.w(`${p}.${c.sandwichNorms ? "pre_feedforward_layernorm" : "post_attention_layernorm"}.weight`), eps: c.rmsEps };
       let m: Tensor;
-      if (this.fusedMlp) {
+      if (L) {
+        // Updates go in before the gated activation: gate and up as plain matmuls on the normalised input.
+        const xn = ops.rmsnorm(ctx, x, mlpNorm.w, mlpNorm.eps);
+        if (this.fusedMlp) {
+          const gu = ops.linear(ctx, xn, this.w(`${p}.mlp.gate_up.weight`));
+          delta(xn, gu, `${l}.gate_up`);
+          m = ops.gatedAct(ctx, gu, gelu ? "gelu" : "silu");
+        } else {
+          const h2 = ops.linear(ctx, xn, this.w(`${p}.mlp.gate_proj.weight`));
+          delta(xn, h2, `${l}.gate_proj`);
+          const u = ops.linear(ctx, xn, this.w(`${p}.mlp.up_proj.weight`));
+          delta(xn, u, `${l}.up_proj`);
+          m = ops.siluMul(ctx, h2, u, gelu ? "gelu" : "silu");
+        }
+      } else if (this.fusedMlp) {
         m = ops.linear(ctx, x, this.w(`${p}.mlp.gate_up.weight`), { norm: mlpNorm, silu: !gelu, gelu });
       } else {
         const h2 = ops.linear(ctx, x, this.w(`${p}.mlp.gate_proj.weight`), { norm: mlpNorm });
@@ -394,9 +596,11 @@ export class LlamaModel {
       }
       if (c.sandwichNorms) {
         const d = ops.linear(ctx, m, this.w(`${p}.mlp.down_proj.weight`));
+        if (L) delta(m, d, `${l}.down_proj`);
         ops.addInPlace(ctx, x, norm(d, `${p}.post_feedforward_layernorm.weight`));
       } else {
         ops.linear(ctx, m, this.w(`${p}.mlp.down_proj.weight`), { residual: x });
+        if (L) delta(m, x, `${l}.down_proj`);
       }
     }
     const rows = verify ? view(x, [T, c.hiddenSize]) : ops.copyRow(ctx, view(x, [T, c.hiddenSize]));
@@ -409,7 +613,7 @@ export class LlamaModel {
     // Non-verify plans end copy_row → head matmul → sample.
     const body = verify ? dispatches : dispatches.slice(0, dispatches.length - 3);
     if (!verify && dispatches[body.length]!.label !== "copy_row") throw new Error("buildPlan: unexpected head layout");
-    return { T, dispatches, body, tokens, out, destroy: () => ctx.destroy() };
+    return { T, dispatches, body, tokens, out, logits, destroy: () => ctx.destroy() };
   }
 
   /**
@@ -433,6 +637,7 @@ export class LlamaModel {
       if (t.mins) this.backend.free(t.mins);
     }
     if (this.imageFeatures) this.backend.free(this.imageFeatures);
+    this.freeLora();
     this.backend.free(this.invFreq.buf);
     if (this.localInvFreq !== this.invFreq) this.backend.free(this.localInvFreq.buf);
     this.backend.free(this.step);
@@ -450,7 +655,7 @@ export class LlamaModel {
   }
 
   /** Unfused attention inputs (qk-norm models): separate q/k/v, per-head norms, RoPE, cache write. */
-  private attentionInputs(ctx: Ctx, x: Tensor, l: number, T: number, invFreq: Tensor): Tensor {
+  private attentionInputs(ctx: Ctx, x: Tensor, l: number, T: number, invFreq: Tensor, delta?: (xin: Tensor, y: Tensor, name: string) => void): Tensor {
     const c = this.cfg;
     const D = c.headDim;
     const p = `model.layers.${l}`;
@@ -458,6 +663,11 @@ export class LlamaModel {
     let q = ops.linear(ctx, h, this.w(`${p}.self_attn.q_proj.weight`), this.bias(`${p}.self_attn.q_proj.bias`));
     let k = ops.linear(ctx, h, this.w(`${p}.self_attn.k_proj.weight`), this.bias(`${p}.self_attn.k_proj.bias`));
     const v = ops.linear(ctx, h, this.w(`${p}.self_attn.v_proj.weight`), this.bias(`${p}.self_attn.v_proj.bias`));
+    if (delta) {
+      delta(h, q, `${l}.q_proj`);
+      delta(h, k, `${l}.k_proj`);
+      delta(h, v, `${l}.v_proj`);
+    }
     if (c.qkNorm) {
       const qn = ops.rmsnorm(ctx, q, this.w(`${p}.self_attn.q_norm.weight`), c.rmsEps, D);
       const kn = ops.rmsnorm(ctx, k, this.w(`${p}.self_attn.k_norm.weight`), c.rmsEps, D);

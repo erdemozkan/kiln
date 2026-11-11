@@ -57,6 +57,8 @@ let saving: Promise<void> = Promise.resolve();
 
 /** Writes the engine's cached K/V unless a call has started since or nothing changed. */
 async function saveCache(e: Engine, name: string): Promise<void> {
+  // The prompt cache restores into the base model at the next load: K/V an adapter made would not fit it.
+  if (e.adapterInfo.active !== undefined) return;
   try {
     const snap = await e.exportCache();
     if (snap.tokens.length === savedTokens.length && snap.tokens.every((t, i) => t === savedTokens[i])) return;
@@ -352,6 +354,23 @@ scope.onmessage = async (e: MessageEvent<Request>) => {
               result.scale = t.scale;
             }
             post({ id: msg.id, type: "result", result });
+          } catch (err) {
+            post({ id: msg.id, type: "error", message: err instanceof Error ? err.message : String(err) });
+          }
+        });
+        break;
+      }
+      case "adapter": {
+        const e = engine;
+        if (!e) throw new Error("no model loaded");
+        // After the calls already queued, which run with the adapter they started with.
+        queue = queue.then(async () => {
+          try {
+            let result: unknown;
+            if (msg.op === "load") result = await e.loadAdapter(msg.name!, msg.model!, { revision: msg.revision, endpoint: msg.endpoint });
+            else if (msg.op === "set") e.setAdapter(msg.name ?? null);
+            else if (msg.op === "unload") e.unloadAdapter(msg.name!);
+            post({ id: msg.id, type: "result", result: result ?? e.adapterInfo });
           } catch (err) {
             post({ id: msg.id, type: "error", message: err instanceof Error ? err.message : String(err) });
           }

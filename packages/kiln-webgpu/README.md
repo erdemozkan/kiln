@@ -218,6 +218,29 @@ With a CLIP model, `image-feature-extraction` returns the image embedding (the v
 output). All labels go through the text tower in one batch, alongside the image, and their
 embeddings are cached, so asking about the same labels again only runs the image tower.
 
+## LoRA adapters
+
+Load a base model once, then any number of PEFT LoRA adapters trained on it, and switch between
+them per call:
+
+```js
+const llm = await load("HuggingFaceTB/SmolLM2-135M-Instruct");
+await llm.loadAdapter("science", "Miladsaeedi70/smollm2-135m-scientific-sft-lora");
+await llm.loadAdapter("linkedin", "ArtemMozharov/smollm2-135m-linkedin-translator");
+
+await llm.setAdapter("science");                       // from now on
+llm.chat(messages, { adapter: "linkedin" });           // or for one call
+await llm.setAdapter(null);                            // the base model again
+```
+
+An adapter repo needs adapter_config.json and adapter_model.safetensors; LoRA on q/k/v/o and
+gate/up/down (rank and alpha per module, rsLoRA) is supported, DoRA, embedding adapters and
+`modules_to_save` are not. Each adapter is laid out on the GPU when it loads, so switching between
+loaded adapters is a GPU copy (a few milliseconds); the first switch, and going back to the base
+model, rebuild the forward plans. The update runs beside the base weights (two small f32 matmuls per
+projection), whatever the base weights are stored as (checked with f32 base weights). A switch drops the cached prompt prefixes, whose
+K/V came from other weights, and the prompt cache is not saved while an adapter is in use.
+
 ## transformers.js's tokenizer, RawImage, read_audio and env
 
 transformers.js's lower-level helpers, under the same names:

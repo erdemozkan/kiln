@@ -6,8 +6,12 @@ import { detectChatFormat, type ChatDocument, type ChatFormat, type ChatMessage,
 import { SubmitPacer } from "./pace";
 import { PrefixStore } from "./prefix-store";
 import { DraftGate, acceptedLength, lookupDraft } from "./speculate";
+import { loadLoraAdapter, type LoraAdapter } from "./lora";
+import type { LoraBuffers } from "@kiln/models";
 
 export interface GenerateOptions {
+  /** The LoRA adapter to generate with (a name given to `loadAdapter`), or null for the base model; default the current one. */
+  adapter?: string | null;
   maxTokens?: number;
   /** 0 = greedy (default 0.7). */
   temperature?: number;
@@ -148,6 +152,11 @@ export class Engine {
   private readonly verifyPlans = new Map<number, ForwardPlan>();
   private readonly advances = new Map<Buf, { dispatches: readonly Dispatch[]; destroy(): void }>();
   private readonly chains = new Map<number, Dispatch[]>();
+  /** LoRA adapters loaded, by name, and the one in the slots (undefined: the base model). */
+  private readonly adapters = new Map<string, LoraAdapter>();
+  private activeAdapter: string | undefined;
+  /** Each loaded adapter laid out for the slot rank in GPU buffers, so a switch is GPU copies only. */
+  private readonly prepared = new Map<string, LoraBuffers>();
   private readonly stopIds: Set<number>;
   private busy = false;
   /** Tokens whose K/V currently sit in the cache at positions 0…n-1 (empty while generating). */
@@ -370,6 +379,7 @@ export class Engine {
   async *generateTokens(promptIds: readonly number[], opts: GenerateOptions = {}): AsyncGenerator<number> {
     if (this.busy) throw new Error("Engine is already generating; await or abort the previous call");
     if (promptIds.length === 0) throw new Error("prompt is empty");
+    if (opts.adapter !== undefined) this.setAdapter(opts.adapter);
     const maxSeq = this.model.maxSeq;
     if (promptIds.length >= maxSeq) {
       const trained = this.model.cfg.contextLength;
@@ -809,6 +819,94 @@ export class Engine {
     return true;
   }
 
+  /**
+   * Loads a PEFT LoRA adapter repo under `name` (it is used once `setAdapter(name)` or a call's
+   * `adapter` picks it). Its projections must match this model's shapes.
+   */
+  async loadAdapter(name: string, id: string, opts: { revision?: string; endpoint?: string } = {}): Promise<{ name: string; id: string; rank: number; modules: string[]; base?: string }> {
+    const a = await loadLoraAdapter(id, opts);
+    const c = this.model.cfg;
+    for (const key of a.weights.keys()) if (Number(key.split(".")[0]) >= c.numLayers) throw new Error(`${id} adapts layer ${key.split(".")[0]}, but this model has ${c.numLayers} layers (another base model?)`);
+    const old = this.prepared.get(name);
+    if (old) this.model.freeLoraBuffers(old);
+    this.prepared.delete(name);
+    this.adapters.set(name, a);
+    // Laid out on the GPU now, so switching to it later costs copies only.
+    this.prepareAll();
+    if (this.activeAdapter === name) this.setAdapter(name, true);
+    return { name, id, rank: a.rank, modules: a.modules, base: a.base };
+  }
+
+  /** The slot rank every loaded adapter fits. */
+  private loraRankNeeded(): number {
+    return LlamaModel.loraSlotRank(Math.max(0, ...[...this.adapters.values()].map((x) => x.rank)));
+  }
+
+  /** Lays out every loaded adapter for the slot rank they need, re-laying any prepared for another rank. */
+  private prepareAll(): void {
+    const R = this.loraRankNeeded();
+    for (const [name, a] of this.adapters) {
+      const p = this.prepared.get(name);
+      if (p && p.rank === R) continue;
+      if (p) this.model.freeLoraBuffers(p);
+      this.prepared.set(name, this.model.prepareLora(a.weights, R));
+    }
+  }
+
+  /** Names of the adapters loaded, and the one in use (undefined: the base model). */
+  get adapterInfo(): { loaded: string[]; active: string | undefined } {
+    return { loaded: [...this.adapters.keys()], active: this.activeAdapter };
+  }
+
+  /**
+   * Generates with adapter `name` from now on, or with the base model (null). Switching between
+   * adapters writes their weights into the model's LoRA slots (no plan is rebuilt unless a larger
+   * rank needs bigger slots); going back to the base model frees the slots. Cached prefixes are
+   * dropped either way: their K/V belong to the weights that made them.
+   */
+  setAdapter(name: string | null, force = false): void {
+    if (this.busy) throw new Error("setAdapter: the engine is generating");
+    if (!force && (name ?? undefined) === this.activeAdapter) return;
+    if (name === null) {
+      if (this.model.loraRank) {
+        this.model.enableLora(0);
+        this.dropPlans();
+      }
+    } else {
+      if (!this.adapters.has(name)) throw new Error(`no adapter named "${name}" is loaded (loaded: ${[...this.adapters.keys()].join(", ") || "none"})`);
+      const R = this.loraRankNeeded();
+      if (this.model.loraRank !== R) {
+        // Slots for the largest adapter loaded, so switching among them needs no further rebuild.
+        this.model.enableLora(R);
+        this.dropPlans();
+      }
+      this.prepareAll();
+      this.model.useLora(this.prepared.get(name)!);
+    }
+    this.activeAdapter = name ?? undefined;
+    this.resetCache();
+  }
+
+  /** Forgets adapter `name` (switching to the base model if it was in use). */
+  unloadAdapter(name: string): void {
+    if (this.activeAdapter === name) this.setAdapter(null);
+    this.adapters.delete(name);
+    const p = this.prepared.get(name);
+    if (p) this.model.freeLoraBuffers(p);
+    this.prepared.delete(name);
+  }
+
+  /** Destroys every recorded plan, for a model whose graph changed (LoRA slots added or removed). */
+  private dropPlans(): void {
+    for (const p of this.plans.values()) p.destroy();
+    for (const p of this.verifyPlans.values()) p.destroy();
+    for (const a of this.advances.values()) a.destroy();
+    this.plans.clear();
+    this.verifyPlans.clear();
+    this.advances.clear();
+    this.chains.clear();
+  }
+
   /** Forgets the cached prefix and the saved ones; the next call prefills its whole prompt. */
   resetCache(): void {
     this.cached = [];
@@ -835,6 +933,8 @@ export class Engine {
   }
 
   destroy(): void {
+    for (const p of this.prepared.values()) this.model.freeLoraBuffers(p);
+    this.prepared.clear();
     this.prefixes.clear();
     for (const p of this.plans.values()) p.destroy();
     for (const p of this.verifyPlans.values()) p.destroy();

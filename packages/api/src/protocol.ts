@@ -149,6 +149,18 @@ export interface EncoderInfo {
   labels?: Record<number, string>;
 }
 
+/** A LoRA adapter loaded into a language model. */
+export interface AdapterInfo {
+  name: string;
+  /** The adapter repo. */
+  id: string;
+  rank: number;
+  /** The projections it updates ("q_proj", …). */
+  modules: string[];
+  /** The base model its config names. */
+  base?: string;
+}
+
 /** Model outputs an encoder returns (see EncoderEngine.forwardHeads). */
 export type EncoderHead = "base" | "sequence" | "token" | "qa" | "mlm";
 /** Model outputs an image model returns: from pixel values, or CLIP's text embeddings ("clip" with texts). */
@@ -168,6 +180,7 @@ export type Request =
   | { id: number; type: "encoderForward"; rows: { ids: number[]; typeIds?: number[] }[]; head: EncoderHead }
   | { id: number; type: "visionForward"; images?: { data: Float32Array; width: number; height: number }[]; texts?: number[][]; head: VisionHead }
   | { id: number; type: "generateIds"; ids: number[]; opts: WireGenerateOptions }
+  | { id: number; type: "adapter"; op: "load" | "set" | "unload" | "list"; name?: string | null; model?: string; revision?: string; endpoint?: string }
   | { id: number; type: "chat"; messages: ChatMessage[]; opts: WireGenerateOptions }
   | { id: number; type: "complete"; prompt: string; opts: WireGenerateOptions }
   | { id: number; type: "abort"; target: number }

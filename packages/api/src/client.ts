@@ -2,7 +2,7 @@ import type { Profile } from "@kiln/core";
 import type { GenerateStats, LoadProgress } from "@kiln/runtime";
 import type { ChatMessage } from "@kiln/tokenizers";
 import { createWorker } from "./default-worker";
-import type { EncoderHead, RawOutputs, VisionHead, VisionInfo, VisionTask, AudioInfo, AudioTask, EncoderInfo, EncoderTask, ModelInfo, Request, Response, Seq2SeqInfo, Seq2SeqTask, WireAudioOptions, WireEncoderOptions, WireGenerateOptions, WireLoadOptions, WireSeq2SeqOptions } from "./protocol";
+import type { AdapterInfo, EncoderHead, RawOutputs, VisionHead, VisionInfo, VisionTask, AudioInfo, AudioTask, EncoderInfo, EncoderTask, ModelInfo, Request, Response, Seq2SeqInfo, Seq2SeqTask, WireAudioOptions, WireEncoderOptions, WireGenerateOptions, WireLoadOptions, WireSeq2SeqOptions } from "./protocol";
 
 type Listener = (msg: Response) => void;
 type RequestBody = Request extends infer R ? (R extends Request ? Omit<R, "id"> : never) : never;
@@ -146,6 +146,33 @@ export class KilnModel extends WorkerChannel {
   complete(prompt: string, opts: GenerateOptions = {}): TextStream {
     const { signal, ...wire } = opts;
     return this.stream({ type: "complete", prompt, opts: wire }, signal);
+  }
+
+  /**
+   * Loads a PEFT LoRA adapter repo (adapter_config.json and adapter_model.safetensors, trained on
+   * this base model) under `name`. Use it with `setAdapter(name)` or a call's `{ adapter: name }`.
+   */
+  loadAdapter(name: string, model: string, opts: { revision?: string; endpoint?: string } = {}): Promise<AdapterInfo> {
+    return this.ask({ type: "adapter", op: "load", name, model, ...opts });
+  }
+
+  /**
+   * Generates with adapter `name` from now on (null: the base model). Switching between loaded
+   * adapters takes milliseconds; cached prompt prefixes are dropped, since their K/V came from other
+   * weights.
+   */
+  async setAdapter(name: string | null): Promise<void> {
+    await this.ask({ type: "adapter", op: "set", name });
+  }
+
+  /** Forgets a loaded adapter (back to the base model if it was in use). */
+  async unloadAdapter(name: string): Promise<void> {
+    await this.ask({ type: "adapter", op: "unload", name });
+  }
+
+  /** The adapters loaded and the one in use (undefined: the base model). */
+  adapters(): Promise<{ loaded: string[]; active: string | undefined }> {
+    return this.ask({ type: "adapter", op: "list" });
   }
 
   /**

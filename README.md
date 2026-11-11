@@ -304,7 +304,7 @@ waited on the previous one's readback; now they are queued back to back and read
 fill-mask was 851 ms (the 30k-word output layer ran in TypeScript; now on the GPU). transformers.js
 loads faster from its cache (0.9 s against 1.8 s for SmolLM2: Kiln converts weights at load) and
 downloads less (its files are pre-quantized), and its runtime adds 6.7 MB (gzipped) of WASM to
-Kiln's 258 KB (the whole package, its worker included).
+Kiln's 262 KB (the whole package, its worker included).
 
 SmolLM2-135M-Instruct, q4, Intel Gen-9 integrated GPU (Intel Mac), Chrome/Dawn. GPU clocks on this
 machine drift 10–15% between runs, so comparisons below are always from one session.
@@ -1044,6 +1044,23 @@ from vocab.json and merges.txt, which then match the ids of the same tokenizers'
 from transformers' by a token per turn; T5 and XLM-R did not split on whitespace before their
 Metaspace step (doubled or trailing spaces made extra "▁" tokens); NLLB's lost a "▁" before an added
 token; and Mistral v0.3's Metaspace step added a "▁" to text already starting with one.
+
+LoRA adapters (PEFT's adapter_config.json and adapter_model.safetensors) run beside the base
+weights: `llm.loadAdapter(name, repo)`, then `llm.setAdapter(name)` or a call's `{ adapter: name }`.
+Each projection's update B · (A · x), its scale folded into B, is added to the matmul's output
+before anything fused after it (q/k/v before RoPE and the cache write, gate/up before the gated
+activation, so those norms run on their own); a stacked matmul takes its parts' A rows stacked and
+their B blocks on the diagonal. The updates live in slots sized for the largest rank loaded (a
+multiple of 32), and each adapter is laid out for them on the GPU when it loads, so switching
+between adapters is a GPU copy: 4 to 8 ms between two rank-16 adapters on SmolLM2-135M, against
+245 ms for the first switch, which allocates the slots. On the CPU backend, a random two-layer
+model with runtime LoRA matched the same weights with the updates merged in within 1e-4 (fused and
+unfused, prefill and decode, after swaps), and cleared slots gave the base model back. Against a
+NumPy forward pass of SmolLM2-135M-Instruct with each adapter merged in (float64), greedy decoding
+on WebGPU (f32) gave the same tokens for two prompts with the base model, a seven-projection
+adapter (scientific answers: "Photosynthesis is the process by which plants convert light energy
+into chemical energy.") and a q/v-only one (rewrites for LinkedIn), down to top-two logit margins of
+0.007. Switching drops cached prefixes, whose K/V came from other weights.
 
 The model side follows: `AutoModel`, `AutoModelForSequenceClassification`,
 `AutoModelForTokenClassification`, `AutoModelForQuestionAnswering` and `AutoModelForMaskedLM` for

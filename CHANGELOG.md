@@ -134,6 +134,12 @@ fixes found on the way: added tokens' `lstrip` / `rstrip` (Phi-3.5's chat prompt
 splitting before Metaspace (T5, XLM-R), the "▁" before an added token (NLLB), and Mistral v0.3's
 prefix space.
 
+**LoRA adapters.** `loadAdapter(name, repo)` reads PEFT LoRA adapters (safetensors; per-module
+rank and alpha, rsLoRA) for the decoder LLMs; `setAdapter(name)` or a call's `adapter` switches.
+Updates run beside the base weights in slots sized for the largest rank, each adapter laid out on
+the GPU at load, so switching is a GPU copy (4–8 ms on SmolLM2-135M). Greedy output matches a NumPy
+reference with the adapters merged in.
+
 **AutoModel and AutoProcessor.** transformers.js's model classes on Kiln's engines: `AutoModel`
 and the sequence-classification, token-classification, question-answering and masked-LM heads for
 BERT, DistilBERT and RoBERTa; `AutoModel` and `AutoModelForImageClassification` for ViT, DeiT,

@@ -372,6 +372,15 @@ export function attention(ctx: Ctx, q: Tensor, kc: Buf, vc: Buf, s: AttentionSha
 }
 
 /** act(gate) * up elementwise, SiLU by default. */
+/** act(gate) · up over rows laid out [gate | up] (a stacked gate/up matmul's output): [M, 2N] → [M, N]. */
+export function gatedAct(ctx: Ctx, gu: Tensor, act: "silu" | "gelu" = "silu"): Tensor {
+  const M = rowsOf(gu);
+  const N = lastDim(gu) / 2;
+  const y = ctx.alloc([M, N]);
+  ctx.run(gatedActSpec(act), [ctx.uniform([u32(M * N), u32(N), u32(0), u32(0)]), gu.buf, y.buf], grid1d(M * N), `gated_${act} ${N}`);
+  return y;
+}
+
 export function siluMul(ctx: Ctx, gate: Tensor, up: Tensor, act: "silu" | "gelu" = "silu"): Tensor {
   const n = numel(gate.shape);
   const o = ctx.alloc(gate.shape);
