@@ -304,7 +304,7 @@ waited on the previous one's readback; now they are queued back to back and read
 fill-mask was 851 ms (the 30k-word output layer ran in TypeScript; now on the GPU). transformers.js
 loads faster from its cache (0.9 s against 1.8 s for SmolLM2: Kiln converts weights at load) and
 downloads less (its files are pre-quantized), and its runtime adds 6.7 MB (gzipped) of WASM to
-Kiln's 262 KB (the whole package, its worker included).
+Kiln's 265 KB (the whole package, its worker included).
 
 SmolLM2-135M-Instruct, q4, Intel Gen-9 integrated GPU (Intel Mac), Chrome/Dawn. GPU clocks on this
 machine drift 10–15% between runs, so comparisons below are always from one session.
@@ -1044,6 +1044,26 @@ from vocab.json and merges.txt, which then match the ids of the same tokenizers'
 from transformers' by a token per turn; T5 and XLM-R did not split on whitespace before their
 Metaspace step (doubled or trailing spaces made extra "▁" tokens); NLLB's lost a "▁" before an added
 token; and Mistral v0.3's Metaspace step added a "▁" to text already starting with one.
+
+Retrieval in one library: `Retriever.create({ model })` loads a sentence-transformers embedder
+(its pooling from 1_Pooling/config.json, max_seq_length from sentence_bert_config.json, query and
+passage prompts from config_sentence_transformers.json, or BGE v1.5's and E5's known ones);
+`add(docs)` splits each document at sentence boundaries into chunks of at most max_seq_length of
+the embedder's own tokens, with whole sentences of overlap, and embeds them; `search(query)` is
+exact cosine search over the normalized vectors; `ask(llm, question)` answers with a Kiln LLM over
+the passages found, numbered in the system message in document order, so the same passages make
+the same prefix; `export()` / `fromSnapshot` store and restore an index without embedding again.
+On six short documents of made-up facts and eight questions, the scores agreed with transformers.js
+embeddings of the same chunks within 4.5e-7 for all-MiniLM-L6-v2 (mean pooling) and 2.4e-7 for
+bge-small-en-v1.5 (CLS pooling and its query prompt), with the same and the right top passage for
+all eight questions with each. Qwen2.5-0.5B-Instruct (q8) answered from the passages ("Mount Ardel
+is 3,412 metres tall."; "Ines Calloway made the first recorded ascent of Mount Ardel in 1891."), and
+the second question, over the same passages, reused 201 of its 215 prompt tokens from the cache.
+Asked something the passages do not cover (the capital of Australia, best passage scoring 0.15), the
+0.5B model answered from its own knowledge despite the instructions; `minScore` keeps weak passages
+out. A follow-up is searched on its own words ("And how high is it in feet?" still found the Ardel
+passage). Loading the same embedding model twice in a page fails (its cached file is open in the
+first worker), so retrievers share one through `{ embedder }`.
 
 LoRA adapters (PEFT's adapter_config.json and adapter_model.safetensors) run beside the base
 weights: `llm.loadAdapter(name, repo)`, then `llm.setAdapter(name)` or a call's `{ adapter: name }`.

@@ -95,4 +95,5 @@ export {
   type GenerateArgs,
   type ModelOptions,
 } from "./auto";
+export { Retriever, chunkText, splitSentences, type AskOptions, type Chunk, type DocumentInput, type Hit, type RetrieverOptions, type RetrieverSnapshot, type SearchOptions } from "./retrieval";
 export { kokoroNormalize, kokoroPhonemes, type Phonemizer } from "./kokoro-text";

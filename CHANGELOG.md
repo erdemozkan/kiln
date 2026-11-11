@@ -134,6 +134,11 @@ fixes found on the way: added tokens' `lstrip` / `rstrip` (Phi-3.5's chat prompt
 splitting before Metaspace (T5, XLM-R), the "▁" before an added token (NLLB), and Mistral v0.3's
 prefix space.
 
+**Retrieval.** `Retriever`: sentence-aware chunking by the embedder's tokens, sentence-transformers
+pooling and prompts read from the repo, exact cosine search with filters, `ask(llm, question)` with
+the passages in a stable, cacheable system prompt, and `export()` / `fromSnapshot` to store an
+index. Scores within 5e-7 of transformers.js embeddings (MiniLM, BGE).
+
 **LoRA adapters.** `loadAdapter(name, repo)` reads PEFT LoRA adapters (safetensors; per-module
 rank and alpha, rsLoRA) for the decoder LLMs; `setAdapter(name)` or a call's `adapter` switches.
 Updates run beside the base weights in slots sized for the largest rank, each adapter laid out on

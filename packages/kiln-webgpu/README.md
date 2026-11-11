@@ -218,6 +218,33 @@ With a CLIP model, `image-feature-extraction` returns the image embedding (the v
 output). All labels go through the text tower in one batch, alongside the image, and their
 embeddings are cached, so asking about the same labels again only runs the image tower.
 
+## Retrieval (RAG)
+
+Embeddings, an index and generation in one library:
+
+```js
+import { Retriever, load } from "kiln-webgpu";
+
+const rag = await Retriever.create();            // sentence-transformers/all-MiniLM-L6-v2, or { model: "BAAI/bge-small-en-v1.5" }
+await rag.add(["Some text…", { id: "faq", text: "…", metadata: { url } }]);
+const hits = await rag.search("question", { k: 4 }); // [{ id, docId, text, score, metadata }]
+
+const llm = await load("Qwen/Qwen2.5-0.5B-Instruct");
+const { stream, sources } = await rag.ask(llm, "question", { k: 3 });
+for await (const text of stream) render(text);    // cites passages as [1], [2] … = sources[0], sources[1] …
+
+const snapshot = rag.export();                      // plain data: store it, then Retriever.fromSnapshot(snapshot)
+```
+
+Documents are split into chunks at sentence boundaries, up to the model's max_seq_length in its own
+tokens, with a sentence or two of overlap (`chunkTokens`, `overlapTokens`). The pooling (mean or
+CLS) and query / passage prompts come from the repo's sentence-transformers files (BGE v1.5's and
+E5's prompts are known when the repo does not list them). The index is exact cosine search over
+normalized vectors on the page. `ask` puts the passages in the system message, in document order,
+so a follow-up over the same passages reuses the cached prompt prefix; `rag.prompt(question, hits)`
+gives the messages to build your own call. Retrievers can share one embedding model:
+`Retriever.create({ embedder: rag.embedder })` (also for `fromSnapshot`).
+
 ## LoRA adapters
 
 Load a base model once, then any number of PEFT LoRA adapters trained on it, and switch between
