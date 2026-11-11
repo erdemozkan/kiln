@@ -304,7 +304,7 @@ waited on the previous one's readback; now they are queued back to back and read
 fill-mask was 851 ms (the 30k-word output layer ran in TypeScript; now on the GPU). transformers.js
 loads faster from its cache (0.9 s against 1.8 s for SmolLM2: Kiln converts weights at load) and
 downloads less (its files are pre-quantized), and its runtime adds 6.7 MB (gzipped) of WASM to
-Kiln's 265 KB (the whole package, its worker included).
+Kiln's 268 KB (the whole package, its worker included).
 
 SmolLM2-135M-Instruct, q4, Intel Gen-9 integrated GPU (Intel Mac), Chrome/Dawn. GPU clocks on this
 machine drift 10–15% between runs, so comparisons below are always from one session.
@@ -1044,6 +1044,23 @@ from vocab.json and merges.txt, which then match the ids of the same tokenizers'
 from transformers' by a token per turn; T5 and XLM-R did not split on whitespace before their
 Metaspace step (doubled or trailing spaces made extra "▁" tokens); NLLB's lost a "▁" before an added
 token; and Mistral v0.3's Metaspace step added a "▁" to text already starting with one.
+
+One model, many tasks: `tasks(llm)` gives `classify` (your labels), `extract` (your JSON schema),
+`ner` (your entity types), `answer` (extractive QA) and `summarize`. Classification reads the
+model's probabilities: `llm.scoreChoices(messages, choices)` prefills the chat prompt once (reusing
+the cached prefix) and runs each choice's tokens, then the end-of-turn token, as one verify pass
+(the speculative-decoding plan, up to 32 rows), summing the log-softmax of each row's logits at the
+next token. On the CPU backend its sums matched token-by-token forward passes within 1e-4, after a
+reused prefix and after another prompt too. On small hand-labelled sets with Qwen2.5-0.5B-Instruct
+(q8): 12 of 12 support tickets classified into three custom labels against 7 of 12 for the NLI
+zero-shot pipeline (typeform/distilbert-base-uncased-mnli), 8 of 8 sentiments against 7 of 8 for the
+SST-2 model, 6 of 6 extractive answers with null for both unanswerable questions (DistilBERT SQuAD
+returns a span for those too), an email read into a five-field schema correctly, and 11 of 13 named
+entities (persons, organizations, locations), all typed correctly and none invented, where BERT-NER
+found 13. Two prompt shapes mattered for the 0.5B model. A schema with a `found` flag before the
+answer made it give up on every question, so answerability is a separate scored yes / no. Asking
+an entity's type as an instruction confused people with organizations, while a completion
+(`… "Paris" is a`) typed all 11 correctly.
 
 Retrieval in one library: `Retriever.create({ model })` loads a sentence-transformers embedder
 (its pooling from 1_Pooling/config.json, max_seq_length from sentence_bert_config.json, query and

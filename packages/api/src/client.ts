@@ -149,6 +149,14 @@ export class KilnModel extends WorkerChannel {
   }
 
   /**
+   * The model's log-probability of each choice as its whole reply to `messages` (the choice's tokens
+   * and the end-of-turn token): for picking among labels with real probabilities. Text messages only.
+   */
+  scoreChoices(messages: ChatMessage[], choices: string[], opts: { adapter?: string | null; enableThinking?: boolean } = {}): Promise<number[]> {
+    return this.ask({ type: "score", messages, choices, opts });
+  }
+
+  /**
    * Loads a PEFT LoRA adapter repo (adapter_config.json and adapter_model.safetensors, trained on
    * this base model) under `name`. Use it with `setAdapter(name)` or a call's `{ adapter: name }`.
    */

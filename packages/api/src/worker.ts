@@ -360,6 +360,18 @@ scope.onmessage = async (e: MessageEvent<Request>) => {
         });
         break;
       }
+      case "score": {
+        const e = engine;
+        if (!e) throw new Error("no model loaded");
+        queue = queue.then(async () => {
+          try {
+            post({ id: msg.id, type: "result", result: await e.scoreChoices(msg.messages, msg.choices, msg.opts) });
+          } catch (err) {
+            post({ id: msg.id, type: "error", message: err instanceof Error ? err.message : String(err) });
+          }
+        });
+        break;
+      }
       case "adapter": {
         const e = engine;
         if (!e) throw new Error("no model loaded");

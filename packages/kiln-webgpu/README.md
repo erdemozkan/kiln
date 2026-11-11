@@ -218,6 +218,41 @@ With a CLIP model, `image-feature-extraction` returns the image embedding (the v
 output). All labels go through the text tower in one batch, alongside the image, and their
 embeddings are cached, so asking about the same labels again only runs the image tower.
 
+## One model, many tasks
+
+A loaded LLM covers the tasks that otherwise each need their own model, with your own labels and
+schemas:
+
+```js
+import { load, tasks } from "kiln-webgpu";
+
+const t = tasks(await load("Qwen/Qwen2.5-0.5B-Instruct"));
+await t.classify("My card was charged twice", ["billing", "bug report", "feature request"]);
+// { label: "billing", labels: [...], scores: [...] }: the model's probabilities over the labels
+await t.extract(email, { type: "object", properties: { name: { type: "string" }, day: { enum: ["Mon", "Tue"] } }, required: ["name", "day"] });
+await t.ner("Angela Merkel met Emmanuel Macron in Paris.", ["person", "location"]);
+// [{ entity_group: "person", word: "Angela Merkel", start: 0, end: 13 }, …]
+await t.answer("When did it open?", context);  // { answer: "1907", start, end } or { answer: null }
+await t.summarize(text, { sentences: 2 });
+```
+
+`classify` scores each label as the model's whole reply (its tokens and the end-of-turn token), so
+the scores are probabilities, not a sampled guess; `multi_label: true` asks yes / no per label, and
+`examples` adds labelled turns first. `extract` goes through Kiln's grammar, so its JSON always
+parses and matches the schema. `ner` lists mentions (all types at once, then each type), keeps
+those found verbatim in the text, and types each by scoring the types (or "other", which drops it);
+`fast: true` keeps only the first listing. `answer` first scores whether the context answers the
+question at all (`score`; below `threshold`, 0.5, the answer is null), then copies a span from it.
+Every task takes generation options (`adapter`, `maxTokens`, …) and `instructions` to replace its
+prompt. `llm.scoreChoices(messages, choices)` is the scoring underneath.
+
+With Qwen2.5-0.5B-Instruct (q8), on small hand-labelled sets: 12 of 12 support tickets put in the
+right one of three custom labels (the NLI zero-shot pipeline: 7 of 12), 8 of 8 sentiments (the
+SST-2 model: 7 of 8), 6 of 6 extractive answers including null for both unanswerable questions
+(DistilBERT SQuAD always returns a span), and 11 of 13 person / organization / location mentions,
+all typed right and none invented (BERT-NER found all 13: for the standard types a dedicated model
+is still better; the LLM's are your own types).
+
 ## Retrieval (RAG)
 
 Embeddings, an index and generation in one library:

@@ -180,6 +180,7 @@ export type Request =
   | { id: number; type: "encoderForward"; rows: { ids: number[]; typeIds?: number[] }[]; head: EncoderHead }
   | { id: number; type: "visionForward"; images?: { data: Float32Array; width: number; height: number }[]; texts?: number[][]; head: VisionHead }
   | { id: number; type: "generateIds"; ids: number[]; opts: WireGenerateOptions }
+  | { id: number; type: "score"; messages: ChatMessage[]; choices: string[]; opts: { adapter?: string | null; enableThinking?: boolean } }
   | { id: number; type: "adapter"; op: "load" | "set" | "unload" | "list"; name?: string | null; model?: string; revision?: string; endpoint?: string }
   | { id: number; type: "chat"; messages: ChatMessage[]; opts: WireGenerateOptions }
   | { id: number; type: "complete"; prompt: string; opts: WireGenerateOptions }

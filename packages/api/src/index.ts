@@ -95,5 +95,6 @@ export {
   type GenerateArgs,
   type ModelOptions,
 } from "./auto";
+export { tasks, classify, extract, ner, answer, summarize, type AnswerResult, type ClassifyOptions, type ClassifyResult, type Entity, type NerOptions, type TaskModel, type TaskOptions } from "./tasks";
 export { Retriever, chunkText, splitSentences, type AskOptions, type Chunk, type DocumentInput, type Hit, type RetrieverOptions, type RetrieverSnapshot, type SearchOptions } from "./retrieval";
 export { kokoroNormalize, kokoroPhonemes, type Phonemizer } from "./kokoro-text";

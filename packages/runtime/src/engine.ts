@@ -1,4 +1,4 @@
-import type { Backend, Buf, Dispatch, Profile } from "@kiln/core";
+import { physical, type Backend, type Buf, type Dispatch, type Profile } from "@kiln/core";
 import { GrammarMatcher, TokenTrie, compileFormat, type ResponseFormat } from "@kiln/grammar";
 import { LlamaModel, MAX_VERIFY_ROWS, type ForwardPlan, type Idefics3Processing, type ImagePixels, type VisionTower } from "@kiln/models";
 import { idefics3PromptString, idefics3Tiles } from "./idefics3";
@@ -353,6 +353,102 @@ export class Engine {
     const tools = choice === "required" ? opts.tools : opts.tools.filter((t) => t.function.name === choice.function.name);
     if (!tools.length) throw new Error(`toolChoice names ${JSON.stringify((choice as { function: { name: string } }).function.name)}, which is not among the tools`);
     return { ...opts, format: { type: "tool_call", tools: tools.map((t) => ({ name: t.function.name, parameters: t.function.parameters })) } };
+  }
+
+  /**
+   * Log-probabilities of each choice as the assistant's whole reply to `messages` (the choice's
+   * tokens then the end-of-turn token, so a label is not favoured for being a prefix of another):
+   * for scoring labels with the model's own probabilities. Text messages only.
+   */
+  async scoreChoices(messages: readonly ChatMessage[], choices: readonly string[], opts: { adapter?: string | null; enableThinking?: boolean } = {}): Promise<number[]> {
+    if (!this.chatFormat) throw new Error("this model has no supported chat format");
+    if (messages.some((m) => typeof m.content !== "string")) throw new Error("scoreChoices takes text messages only");
+    const thinks = this.tokenizer.tokenId("<think>") !== undefined;
+    const prompt = this.chatFormat.render(messages, { enableThinking: thinks ? (opts.enableThinking ?? false) : undefined });
+    const promptIds = this.tokenizer.encode(prompt);
+    const end = this.chatFormat.stop.map((s) => this.tokenizer.tokenId(s)).find((id) => id !== undefined) ?? this.model.cfg.eosTokenIds[0];
+    if (end === undefined) throw new Error("this model's chat format has no end-of-turn token to score choices with");
+    const conts = choices.map((c) => {
+      // Encoded with the prompt where the boundary allows, as the model would have produced it.
+      const full = this.tokenizer.encode(prompt + c);
+      const joined = full.length > promptIds.length && promptIds.every((id, i) => full[i] === id);
+      return [...(joined ? full.slice(promptIds.length) : this.tokenizer.encode(c)), end];
+    });
+    if (opts.adapter !== undefined) this.setAdapter(opts.adapter);
+    return this.scoreIds(promptIds, conts);
+  }
+
+  /**
+   * Sum of log-probabilities of each continuation after `promptIds` (up to MAX_VERIFY_ROWS tokens
+   * each): the prompt is prefilled once (reusing the cached prefix), then each continuation runs as
+   * one verify pass whose rows' logits are read back.
+   */
+  async scoreIds(promptIds: readonly number[], conts: readonly (readonly number[])[]): Promise<number[]> {
+    if (this.busy) throw new Error("Engine is already generating; await or abort the previous call");
+    const n = promptIds.length;
+    if (n === 0) throw new Error("prompt is empty");
+    if (promptIds.some((id) => id >= this.model.cfg.vocabSize)) throw new Error("scoring prompts with images is not supported");
+    for (const c of conts) {
+      if (!c.length) throw new Error("a continuation is empty");
+      if (c.length > MAX_VERIFY_ROWS) throw new Error(`a continuation has ${c.length} tokens; at most ${MAX_VERIFY_ROWS} are scored`);
+    }
+    if (n + Math.max(...conts.map((c) => c.length)) > this.model.maxSeq) throw new Error("prompt and choices do not fit the context");
+    const prefix = promptIds.slice(0, n - 1);
+    let start = 0;
+    while (start < this.cached.length && start < prefix.length && this.cached[start] === prefix[start]) start++;
+    if (start < this.model.minReuseStart(this.written)) start = 0;
+    if (start < this.cached.length) this.saveLive();
+    this.cached = [];
+    this.busy = true;
+    let failed = false;
+    let longest = 0;
+    try {
+      const step = { seed: 0, temperature: 0 };
+      let pos = start;
+      while (pos < prefix.length) {
+        const remaining = prefix.length - pos;
+        const top = BUCKETS[BUCKETS.length - 1]!;
+        const T = this.backend.name === "cpu" ? Math.min(remaining, top) : (BUCKETS.find((b) => b >= remaining) ?? top);
+        const k = Math.min(T, remaining);
+        const plan = this.plan(T);
+        const tokens = new Uint32Array(T);
+        tokens.set(prefix.slice(pos, pos + k));
+        this.backend.write(plan.tokens, 0, tokens);
+        this.model.setStep({ pos0: pos, lastRow: k - 1, ...step });
+        this.submit(plan.body, T);
+        pos += k;
+      }
+      const out: number[] = [];
+      for (const c of conts) {
+        const T = c.length;
+        longest = Math.max(longest, T);
+        const plan = this.verifyPlan(T);
+        this.backend.write(plan.tokens, 0, Uint32Array.from([promptIds[n - 1]!, ...c.slice(0, -1)]));
+        this.model.setStep({ pos0: n - 1, lastRow: 0, ...step });
+        this.submit(plan.dispatches, T);
+        const V = plan.logits.shape[1]!;
+        const rows = new Float32Array(await this.backend.readback(physical(plan.logits.buf), 0, T * V * 4));
+        let lp = 0;
+        for (let t = 0; t < T; t++) {
+          const row = rows.subarray(t * V, (t + 1) * V);
+          let max = -Infinity;
+          for (let i = 0; i < V; i++) if (row[i]! > max) max = row[i]!;
+          let sum = 0;
+          for (let i = 0; i < V; i++) sum += Math.exp(row[i]! - max);
+          lp += row[c[t]!]! - max - Math.log(sum);
+        }
+        out.push(lp);
+      }
+      return out;
+    } catch (err) {
+      failed = true;
+      throw err;
+    } finally {
+      // The prefix's K/V stand; positions from n - 1 on hold the last continuation's.
+      this.cached = failed ? [] : [...prefix];
+      this.written = failed ? this.model.maxSeq : Math.max(this.written, n - 1 + longest);
+      this.busy = false;
+    }
   }
 
   async *complete(prompt: string, opts: GenerateOptions = {}): AsyncGenerator<TextDelta> {
