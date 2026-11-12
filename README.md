@@ -1,4 +1,7 @@
-<h1 align="center">Kiln.js</h1>
+<h1 align="center">
+  <img src="docs/media/logo.svg#gh-light-mode-only" alt="Kiln.js" width="300">
+  <img src="docs/media/logo-dark.svg#gh-dark-mode-only" alt="Kiln.js" width="300">
+</h1>
 
 <p align="center"><strong>Run Hugging Face models in the browser on WebGPU, straight from their original weights.</strong></p>
 

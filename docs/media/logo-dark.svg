@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="150 110 760 380" width="380" height="190" role="img" aria-label="kiln">
+  <g fill="#ffffff" stroke="#ffffff" stroke-width="10" stroke-linejoin="round">
+    <!-- k -->
+    <rect x="175" y="135" width="82" height="328" rx="14"/>
+    <path d="M250,300 L340,230 L400,230 L405,240 L315,330 L405,455 L400,463 L345,463 L262,350 L250,350 Z"/>
+    <!-- i -->
+    <rect x="437" y="293" width="74" height="170" rx="12"/>
+    <!-- l -->
+    <rect x="541" y="135" width="78" height="328" rx="14"/>
+    <!-- n -->
+    <rect x="649" y="227" width="78" height="236" rx="12"/>
+    <path d="M700,300 C704,244 742,220 790,220 C848,220 883,254 883,320 L883,451 Q883,463 871,463 L817,463 Q805,463 805,451 L805,332 C805,306 792,294 770,294 C746,294 727,310 727,340 L700,340 Z"/>
+  </g>
+  <!-- the dot of the i, as an opening brace -->
+  <path d="M486,183 C469,181 464,188 464,200 L464,212 C464,220 458,225 449,226 C458,227 464,232 464,240 L464,254 C464,266 469,273 486,271" fill="none" stroke="#f4571b" stroke-width="13" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>
