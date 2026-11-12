@@ -57,3 +57,13 @@ describe("safetensorsFiles", () => {
     expect(requests).toHaveLength(1);
   });
 });
+
+describe("cache keys name the server", async () => {
+  const { cacheKey, parseModelId: parse } = await import("../src");
+  it("keeps Hub keys and separates mirrors", () => {
+    const ref = parse("org/repo");
+    expect(cacheKey(ref, "model.safetensors")).toBe("org/repo@main/model.safetensors");
+    expect(cacheKey(ref, "model.safetensors", "https://huggingface.co/")).toBe("org/repo@main/model.safetensors");
+    expect(cacheKey(ref, "model.safetensors", "https://mirror.example")).toBe("https://mirror.example|org/repo@main/model.safetensors");
+  });
+});

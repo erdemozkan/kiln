@@ -363,7 +363,7 @@ export async function openBackend(device: "auto" | "gpu" | "cpu", cpuThreads?: n
 }
 
 async function open(ref: ModelRef, file: string, endpoint?: string, fresh = false) {
-  return CachedHttpSource.open(fileUrl(ref, file, endpoint), cacheKey(ref, file), { fresh });
+  return CachedHttpSource.open(fileUrl(ref, file, endpoint), cacheKey(ref, file, endpoint), { fresh });
 }
 
 /**

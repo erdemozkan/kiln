@@ -1,4 +1,4 @@
-import { readCacheFile, writeCacheFile } from "@kiln/loader";
+import { endpointPrefix, readCacheFile, writeCacheFile } from "@kiln/loader";
 import type { CacheSnapshot } from "./engine";
 
 /**
@@ -10,10 +10,10 @@ const MAGIC = 0x6b6c6e31; // "kln1"
 
 /**
  * Where a model's prompt cache lives. Everything that changes the cached K/V is in the key: the
- * model and its revision, how the weights are stored, and f16 math.
+ * server, the model and its revision, how the weights are stored, and f16 math.
  */
-export function promptCacheName(model: string, o: { revision?: string; quant?: string; f16Math?: boolean }): string {
-  return `${encodeURIComponent(`${model}@${o.revision ?? "main"}/${o.quant ?? "q4"}${o.f16Math ? "/f16math" : ""}/v${VERSION}`)}.kv`;
+export function promptCacheName(model: string, o: { revision?: string; quant?: string; f16Math?: boolean; endpoint?: string }): string {
+  return `${encodeURIComponent(`${endpointPrefix(o.endpoint)}${model}@${o.revision ?? "main"}/${o.quant ?? "q4"}${o.f16Math ? "/f16math" : ""}/v${VERSION}`)}.kv`;
 }
 
 /** Layout: magic, header length (u32 LE each), JSON header, then the K/V bytes. */

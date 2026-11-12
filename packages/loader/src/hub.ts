@@ -36,9 +36,19 @@ export function safeRepoPath(file: string): string {
   return file;
 }
 
-/** Cache key that pins the file to its repo and revision. */
-export function cacheKey(ref: ModelRef, file: string): string {
-  return `${ref.repo}@${ref.revision}/${file}`;
+/**
+ * Cache key that pins the file to its repo, revision and server. Files from the Hub keep the plain
+ * key; a mirror's are prefixed with its origin, so one server's copy never serves for another's.
+ */
+export function cacheKey(ref: ModelRef, file: string, endpoint?: string): string {
+  return `${endpointPrefix(endpoint)}${ref.repo}@${ref.revision}/${file}`;
+}
+
+/** "" for the Hub, else the endpoint's origin and path followed by "|". */
+export function endpointPrefix(endpoint?: string): string {
+  if (!endpoint) return "";
+  const e = endpoint.replace(/\/+$/, "");
+  return e === "https://huggingface.co" ? "" : `${e}|`;
 }
 
 export async function fetchJSON<T>(url: string, optional = false): Promise<T | undefined> {

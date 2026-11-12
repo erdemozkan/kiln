@@ -3,6 +3,8 @@ import { dashboard } from "./charts";
 
 const $ = <T extends HTMLElement>(id: string) => document.getElementById(id) as T;
 const out = $("out");
+/** Escapes text for HTML: model ids, outputs and errors come from the page's inputs and the model. */
+const esc = (s: unknown) => String(s).replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`);
 
 async function bench(model: string, quant: "q4" | "q8" | "f32"): Promise<BenchResult> {
   const worker = new Worker(new URL("./bench.worker.ts", import.meta.url), { type: "module" });
@@ -41,23 +43,23 @@ function render(r: BenchResult, at = new Date()): void {
       </tbody></table>`,
     )
     .join("");
-  section.innerHTML = `<p class="run-meta">${r.model} · ${r.quant} · ${at.toLocaleString()}</p><div class="dash-host">${dashboard(r, out.clientWidth)}</div>
+  section.innerHTML = `<p class="run-meta">${esc(r.model)} · ${esc(r.quant)} · ${at.toLocaleString()}</p><div class="dash-host">${dashboard(r, out.clientWidth)}</div>
     <details class="raw"><summary>Per-kernel tables and raw numbers</summary>${plans}
     ${(r.chained ?? []).map((c) => `<p class="status">${c.stepsPerSubmit} step(s) per submit: ${c.decodeTokS.toFixed(1)} tok/s · TTFT ${c.ttftMs.toFixed(0)} ms · ${c.sameIds ? "same ids" : "IDS DIFFER"}</p>`).join("")}
     ${r.lanes ? `<p class="status">Load ${(r.loadMs ?? 0).toFixed(0)} ms · tuned lanes: ${Object.entries(r.lanes).map(([k, v]) => `${k}→${v}`).join(", ")}</p>` : ""}
     ${r.prefixReuse ? `<p class="status">Prefix reuse: ${r.prefixReuse.cachedTokens} of ${r.prefixReuse.promptTokens} prompt tokens cached · TTFT ${r.prefixReuse.ttftMs.toFixed(0)} ms (cold ${r.prefixReuse.coldTtftMs.toFixed(0)} ms) · ${r.prefixReuse.matches ? "continuation matches" : "CONTINUATION DIFFERS"}</p>` : ""}
     ${(r.prefillAttention ?? []).map((a) => `<p class="status">Prefill T=${a.T} at ${a.pos0}: tiled attention ${a.tiledMs.toFixed(1)} ms (attention ${a.tiledAttnMs.toFixed(1)}) · per-row ${a.rowsMs.toFixed(1)} ms (attention ${a.rowsAttnMs.toFixed(1)})</p>`).join("")}
-    ${([["JSON schema", r.grammar], ["JSON schema, pretty whitespace", r.grammarPretty]] as const).map(([name, g]) => (g ? `<p class="status">${name}, greedy: ${g.tokens} tokens in ${g.ms.toFixed(0)} ms, ${g.decodeTokS.toFixed(1)} tok/s · masks ${g.maskMs.toFixed(0)} ms · ${g.valid ? "valid JSON" : "INVALID JSON"}: ${g.text.replace(/</g, "&lt;")}</p>` : "")).join("")}
+    ${([["JSON schema", r.grammar], ["JSON schema, pretty whitespace", r.grammarPretty]] as const).map(([name, g]) => (g ? `<p class="status">${name}, greedy: ${g.tokens} tokens in ${g.ms.toFixed(0)} ms, ${g.decodeTokS.toFixed(1)} tok/s · masks ${g.maskMs.toFixed(0)} ms · ${g.valid ? "valid JSON" : "INVALID JSON"}: ${esc(g.text)}</p>` : "")).join("")}
     ${r.subgroups ? `<p class="status">Subgroups (size ≥ ${r.subgroups.minSize}): decode step at 256 ${r.subgroups.stepMsOn.toFixed(2)} ms with, ${r.subgroups.stepMsOff.toFixed(2)} ms without · ${r.subgroups.decodeTokS.toFixed(1)} tok/s (8 per submit) · first ${r.subgroups.matching} of ${r.subgroups.of} greedy tokens match</p>` : ""}
     ${r.f16Math ? `<p class="status">f16 matmul math: ${r.f16Math.decodeTokS.toFixed(1)} tok/s (8 per submit) · step at 256: ${r.f16Math.stepMs256.toFixed(2)} ms · first ${r.f16Math.matching} of ${r.f16Math.of} greedy tokens match f32</p>` : ""}
     ${r.kvF32Match ? `<p class="status">Default vs unfused + f32 KV cache: first ${r.kvF32Match.matching} of ${r.kvF32Match.of} greedy tokens identical · unfused f32-cache step at position 1536: ${r.kvF32Match.stepMs1536.toFixed(2)} ms</p>` : ""}
     ${r.profile ? `<h2 style="font-size:16px">GPU time per kernel: ${r.profile.promptTokens}-token prompt + ${r.profile.generated} tokens, ${r.profile.totalMs.toFixed(0)} ms in total</h2>
       <table><thead><tr><th>Dispatch</th><th>Calls</th><th>ms</th><th>Share</th></tr></thead><tbody>
-      ${r.profile.entries.map((e) => `<tr><td>${e.label}</td><td class="num">${e.calls}</td><td class="num">${e.ms.toFixed(1)}</td><td class="num">${((e.ms / r.profile!.totalMs) * 100).toFixed(1)}%</td></tr>`).join("")}
-      </tbody></table><p class="status">${r.profile.note}</p>` : ""}
+      ${r.profile.entries.map((e) => `<tr><td>${esc(e.label)}</td><td class="num">${e.calls}</td><td class="num">${e.ms.toFixed(1)}</td><td class="num">${((e.ms / r.profile!.totalMs) * 100).toFixed(1)}%</td></tr>`).join("")}
+      </tbody></table><p class="status">${esc(r.profile.note)}</p>` : ""}
     <p class="status">End to end: ${r.e2e.promptTokens} prompt tokens · TTFT ${r.e2e.ttftMs.toFixed(0)} ms · ${r.e2e.generated} tokens at ${r.e2e.decodeTokS.toFixed(1)} tok/s</p>
     ${r.probe ? `<p class="status">${Object.entries(r.probe).map(([k, v]) => `${k} ${v.toFixed(2)}`).join(" · ")}</p>` : ""}
-    <p class="msg">${r.e2e.text.replace(/</g, "&lt;")}</p></details>`;
+    <p class="msg">${esc(r.e2e.text)}</p></details>`;
   out.prepend(section);
   drawn.set(section, r);
 }
@@ -75,7 +77,10 @@ $<HTMLButtonElement>("run").onclick = async () => {
     }
     (window as unknown as { __bench: unknown }).__bench = r;
   } catch (err) {
-    out.insertAdjacentHTML("beforeend", `<p class="error">${String(err)}</p>`);
+    const p = document.createElement("p");
+    p.className = "error";
+    p.textContent = String(err);
+    out.append(p);
     (window as unknown as { __bench: unknown }).__bench = { error: String(err) };
   } finally {
     btn.disabled = false;

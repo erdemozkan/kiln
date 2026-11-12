@@ -10,7 +10,9 @@ $<HTMLInputElement>("file").addEventListener("change", (e) => {
   const f = (e.target as HTMLInputElement).files?.[0];
   if (f) {
     audio = f;
-    $<HTMLAudioElement>("player").src = URL.createObjectURL(f);
+    const player = $<HTMLAudioElement>("player");
+    if (player.src.startsWith("blob:")) URL.revokeObjectURL(player.src);
+    player.src = URL.createObjectURL(f);
   }
 });
 

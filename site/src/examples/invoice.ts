@@ -21,7 +21,9 @@ $("schema").textContent = JSON.stringify(schema, null, 2);
 
 async function show(blob: Blob) {
   image = blob;
-  $<HTMLImageElement>("preview").src = URL.createObjectURL(blob);
+  const img = $<HTMLImageElement>("preview");
+  if (img.src.startsWith("blob:")) URL.revokeObjectURL(img.src);
+  img.src = URL.createObjectURL(blob);
 }
 $<HTMLInputElement>("file").addEventListener("change", (e) => {
   const f = (e.target as HTMLInputElement).files?.[0];
