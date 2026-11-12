@@ -127,6 +127,4 @@ Kiln implements each model family itself, as WebGPU kernels, instead of running 
 
 Kiln is released under the [MIT license](LICENSE). Models keep their own licenses: check a model's card before shipping it (the default background-removal model, RMBG-1.4, is non-commercial).
 
-Made by Erdem Ozkan.
-
-<p align="center">Made in New York with 🧡</p>
+<p align="center">Made in New York with 🧡 by Erdem Ozkan</p>
