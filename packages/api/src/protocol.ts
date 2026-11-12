@@ -41,6 +41,12 @@ export interface WireLoadOptions {
    * back to one does not prefill it again. Default 256 MiB; 0 keeps only the live cache.
    */
   prefixCacheBytes?: number;
+  /**
+   * Keep the weights as converted for the GPU in the cache beside the download (default true), so
+   * later loads skip reading and converting the original file. About a third of the download on top
+   * for q4 from float weights; false keeps only the download.
+   */
+  weightCache?: boolean;
 }
 
 export interface ModelInfo {

@@ -336,6 +336,8 @@ interface Meta {
   complete: boolean;
   /** Bytes known to be flushed to disk; resume point. Missing in old metadata, which then restarts. */
   flushed?: number;
+  /** Converted weights only: what they were converted from and how (see `openConverted`). */
+  stamp?: string;
 }
 
 async function readMeta(dir: FileSystemDirectoryHandle, name: string): Promise<Meta | undefined> {
@@ -422,6 +424,134 @@ export async function writeCacheFile(name: string, parts: readonly Uint8Array[])
   } finally {
     h?.close();
   }
+}
+
+/** Converted weights being read back from the cache. */
+export interface ConvertedReader {
+  mode: "read";
+  /** Reads `length` bytes at `at`; throws `CorruptCacheError` (and drops the entry) when they are not there. */
+  read(at: number, length: number): Uint8Array;
+  close(): void;
+}
+
+/** Converted weights being written to the cache, front to back. */
+export interface ConvertedWriter {
+  mode: "write";
+  /** Appends bytes. False once the store stopped taking them; later calls do nothing. */
+  append(bytes: Uint8Array): boolean;
+  /** Marks the entry complete if every byte was written, and closes it. Returns whether it is usable. */
+  commit(): Promise<boolean>;
+  /** Empties the entry and closes it. */
+  abort(): void;
+}
+
+/** The cache name of a converted-weights entry, as `listCache` reports it. */
+export const convertedKey = (key: string): string => `converted|${key}`;
+
+/**
+ * Weights as the GPU holds them (quantized planes, scales, f32 tensors), kept beside the download so
+ * a later load reads them straight back instead of reading and converting the original file. An entry
+ * is `bytes` long and carries a `stamp` naming what it was made from; it is read only when complete
+ * and its stamp and length match, and otherwise opened for writing from the start. Undefined where
+ * OPFS sync access is missing, or while another tab or worker holds the entry.
+ */
+export async function openConverted(key: string, stamp: string, bytes: number, { segment = SEGMENT }: { segment?: number } = {}): Promise<ConvertedReader | ConvertedWriter | undefined> {
+  if (!opfsAvailable() || !(bytes > 0)) return undefined;
+  const fileName = encodeURIComponent(convertedKey(key));
+  const parts: SyncHandle[] = [];
+  let dir: FileSystemDirectoryHandle;
+  let meta: Meta | undefined;
+  try {
+    dir = await (await navigator.storage.getDirectory()).getDirectoryHandle(DIR, { create: true });
+    meta = await readMeta(dir, fileName);
+    for (let i = 0; i < Math.ceil(bytes / segment); i++) {
+      parts.push(await ((await dir.getFileHandle(partName(fileName, i), { create: true })) as SyncFileHandle).createSyncAccessHandle());
+    }
+  } catch {
+    for (const p of parts) p.close();
+    return undefined;
+  }
+  const handle = new Segments(parts, segment);
+  const save = (m: Meta) => writeMeta(dir, fileName, m);
+  if (meta?.complete && meta.stamp === stamp && meta.size === bytes && handle.getSize() === bytes) {
+    return {
+      mode: "read",
+      read(at, length) {
+        const out = new Uint8Array(length);
+        let n: number | string;
+        try {
+          n = at + length <= bytes ? handle.read(out, { at }) : "past the end";
+        } catch (err) {
+          n = String(err);
+        }
+        if (n !== length) {
+          void save({ size: bytes, complete: false, flushed: 0 }).catch(() => undefined);
+          throw new CorruptCacheError(`${convertedKey(key)}: cached read of ${length} bytes at ${at} returned ${n}`);
+        }
+        return out;
+      },
+      close: () => handle.close(),
+    };
+  }
+  try {
+    // Incomplete first, so an interrupted write is never taken for a finished entry.
+    await save({ size: bytes, complete: false, flushed: 0, stamp });
+    handle.truncate(0);
+  } catch {
+    handle.close();
+    return undefined;
+  }
+  let at = 0;
+  let ok = true;
+  let closed = false;
+  const abort = () => {
+    if (closed) return;
+    closed = true;
+    ok = false;
+    try {
+      handle.truncate(0);
+      handle.flush();
+    } catch {
+      // The metadata already says incomplete.
+    }
+    handle.close();
+  };
+  return {
+    mode: "write",
+    append(data) {
+      if (!ok) return false;
+      let n: number | string;
+      try {
+        n = at + data.byteLength <= bytes ? handle.write(data, { at }) : "past the end";
+      } catch (err) {
+        n = String(err);
+      }
+      if (n !== data.byteLength) {
+        console.warn(`[kiln] ${convertedKey(key)}: cache write of ${data.byteLength} bytes at ${at} returned ${n} (storage full?); not caching the converted weights`);
+        abort();
+        return false;
+      }
+      at += data.byteLength;
+      return true;
+    },
+    async commit() {
+      if (closed) return false;
+      if (at !== bytes) {
+        abort();
+        return false;
+      }
+      closed = true;
+      try {
+        handle.flush();
+        handle.close();
+        await save({ size: bytes, complete: true, flushed: bytes, stamp });
+        return true;
+      } catch {
+        return false;
+      }
+    },
+    abort,
+  };
 }
 
 /** Deletes one cached file, its segments and its metadata. Silently keeps a file another tab or worker has open. */

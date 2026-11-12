@@ -71,6 +71,9 @@ export async function createWebGPUBackend(opts: WebGPUOptions = {}): Promise<Web
   return new WebGPUBackend(device, opts.validateKernels ?? true, deviceId, subgroupMinSize);
 }
 
+/** Largest readback staging buffer kept for reuse. */
+const STAGING_POOL_MAX = 4 * 2 ** 20;
+
 export class WebGPUBackend implements Backend {
   readonly name = "webgpu";
   readonly limits: DeviceLimits;
@@ -267,7 +270,9 @@ export class WebGPUBackend implements Backend {
     await staging.mapAsync(GPUMapMode.READ);
     const out = staging.getMappedRange().slice(0, bytes);
     staging.unmap();
-    pool.push(staging);
+    // Large ones (weights read back for the cache) are not kept: a pool of them would hold their memory for good.
+    if (size <= STAGING_POOL_MAX) pool.push(staging);
+    else staging.destroy();
     return out;
   }
 

@@ -113,6 +113,13 @@ export interface LoadOptions {
    * (`do_image_splitting`), or false for one 512 × 512 view (64 tokens; much faster, less detail).
    */
   imageSplitting?: boolean;
+  /**
+   * Keep the weights as converted for the GPU in the cache beside the download (default true), so
+   * later loads read those instead of converting the original file again. Only where that is clearly
+   * smaller than the original (q4 or q8 from float weights: about a third to a half of it on top);
+   * a GGUF's own quantized tensors and f32 loads are read from the original as before.
+   */
+  weightCache?: boolean;
   onProgress?: (p: LoadProgress) => void;
 }
 
@@ -142,13 +149,15 @@ export async function createEngine(modelId: string, opts: LoadOptions = {}): Pro
             () => undefined,
             (err: unknown) => console.warn("[kiln] matmul tuning failed; using defaults:", err),
           );
-    weights = await loadWeights(backend, files, quant, opts.onProgress);
+    // Converted weights are cached per repo, revision and server; the vision tower's under the same key.
+    const converted = opts.weightCache === false ? undefined : cacheKey(ref, ref.gguf ?? "weights", opts.endpoint);
+    weights = await loadWeights(backend, files, quant, opts.onProgress, converted ? { key: converted } : undefined);
     vision = idefics3
-      ? await openIdefics3Vision(backend, files, idefics3, opts)
+      ? await openIdefics3Vision(backend, files, idefics3, opts, converted)
       : opts.mmproj
         ? await openVision(backend, opts.mmproj.split("/").length >= 3 ? parseModelId(opts.mmproj, opts.revision) : { ...ref, gguf: opts.mmproj }, opts)
         : gemma3 && opts.vision !== false
-          ? await openGemma3Vision(backend, files, gemma3, opts)
+          ? await openGemma3Vision(backend, files, gemma3, opts, converted)
           : undefined;
     if (vision && vision.cfg.projectionDim !== cfg.hiddenSize) throw new Error(`mmproj projects to ${vision.cfg.projectionDim}, but the model is ${cfg.hiddenSize} wide`);
     await tuning;
@@ -272,11 +281,11 @@ interface Idefics3Files {
  * SmolVLM's (Idefics3's) vision tower and connector from the checkpoint's safetensors, under mmproj
  * names (see openTower).
  */
-async function openIdefics3Vision(backend: Backend, files: WeightFile[], info: Idefics3Files, opts: LoadOptions): Promise<VisionTower> {
+async function openIdefics3Vision(backend: Backend, files: WeightFile[], info: Idefics3Files, opts: LoadOptions, converted?: string): Promise<VisionTower> {
   const cfg = visionConfigFromIdefics3(info.config, info.preprocessor);
   const processing = idefics3Processing(info.config, info.preprocessor, cfg);
   if (opts.imageSplitting !== undefined) processing.split = opts.imageSplitting;
-  return openTower(backend, files, cfg, idefics3VisionName, opts, [], async () => {}, processing);
+  return openTower(backend, files, cfg, idefics3VisionName, opts, [], async () => {}, processing, converted);
 }
 
 /**
@@ -284,7 +293,7 @@ async function openIdefics3Vision(backend: Backend, files: WeightFile[], info: I
  * needed): the tower as openTower loads it; the projection, stored [hidden, text width] (x @ W),
  * transposed for the kernels, and the soft-embedding norm stored as 1 + w as the mmproj GGUF does.
  */
-async function openGemma3Vision(backend: Backend, files: WeightFile[], info: Idefics3Files, opts: LoadOptions): Promise<VisionTower> {
+async function openGemma3Vision(backend: Backend, files: WeightFile[], info: Idefics3Files, opts: LoadOptions, converted?: string): Promise<VisionTower> {
   const cfg = visionConfigFromGemma3(info.config, info.preprocessor);
   return openTower(backend, files, cfg, gemma3VisionName, opts, ["mm.input_projection.weight", "mm.soft_emb_norm.weight"], async (read, upload, weights) => {
     const proj = await read("mm.input_projection.weight");
@@ -294,7 +303,7 @@ async function openGemma3Vision(backend: Backend, files: WeightFile[], info: Ide
     const norm = await read("mm.soft_emb_norm.weight");
     addOne(norm);
     weights.set("mm.soft_emb_norm.weight", upload(norm, [norm.length]));
-  });
+  }, undefined, converted);
 }
 
 /**
@@ -312,6 +321,8 @@ async function openTower(
   extra: string[],
   finish: (read: (name: string) => Promise<Float32Array>, upload: (values: Float32Array, shape: number[]) => Tensor, weights: Map<string, Tensor>) => Promise<void>,
   processing?: Idefics3Processing,
+  /** The key the model's converted weights are cached under; the tower's matmul weights go beside them. */
+  converted?: string,
 ): Promise<VisionTower> {
   const quant = opts.quant === "f32" ? "f32" : "q8";
   const linear = /^(v\.blk\.\d+\.(attn_[qkv]|attn_out|ffn_up|ffn_down)|mm\.input_projection)\.weight$/;
@@ -331,13 +342,14 @@ async function openTower(
     }
     const add = (m: Map<string, Tensor>) => m.forEach((t, k) => weights.set(k, t));
     const plain = { name: file.name, source: file.source, tensors: file.tensors };
-    add(await loadWeights(backend, [{ ...plain, rename: only((n) => linear.test(n) && !(pad && mlp.test(n))) }], quant, opts.onProgress));
+    const cached = (part: string) => (converted ? { key: `${converted}|vision/${part}/${file.name}` } : undefined);
+    add(await loadWeights(backend, [{ ...plain, rename: only((n) => linear.test(n) && !(pad && mlp.test(n))) }], quant, opts.onProgress, cached("linear")));
     add(await loadWeights(backend, [{ ...plain, rename: only((n) => !linear.test(n) && !(pad && mlp.test(n))) }], "f32"));
     if (pad) {
       const mine = file.tensors.filter((t) => mlp.test(nameOf(t.name) ?? ""));
       const p = await padMlp(file.source, mine, cfg.intermediate, (n) => !nameOf(n)!.includes("ffn_down"));
       const padded = { name: file.name, source: p.source, tensors: p.tensors };
-      add(await loadWeights(backend, [{ ...padded, rename: only((n) => n.endsWith(".weight")) }], quant));
+      add(await loadWeights(backend, [{ ...padded, rename: only((n) => n.endsWith(".weight")) }], quant, undefined, cached("mlp")));
       add(await loadWeights(backend, [{ ...padded, rename: only((n) => n.endsWith(".bias")) }], "f32"));
     }
   }

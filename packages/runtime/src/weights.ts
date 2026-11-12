@@ -1,6 +1,6 @@
 import { byteSize, f32, packUniform, q4ScaleBytes, roundUp, u32, type Backend, type Buf, type Tensor } from "@kiln/core";
 import { GPU_EXACT_TYPES, convertSpec, exactSpec, gpuConverts, scaleSpec, type GpuExactType, grid1d, MAX_X, type GpuConvertOut, type GpuConvertType } from "@kiln/kernels";
-import { exactPlane, exactQ4, exactQ8, quantizeQ4, quantizeQ8, repackQ4_0, repackQ8_0, rowBytes, toF32, type ByteSource, type TensorEntry } from "@kiln/loader";
+import { exactPlane, exactQ4, exactQ8, openConverted, quantizeQ4, quantizeQ8, repackQ4_0, repackQ8_0, rowBytes, toF32, type ByteSource, type ConvertedReader, type ConvertedWriter, type TensorEntry } from "@kiln/loader";
 import { isQuantizable } from "@kiln/models";
 
 /**
@@ -104,6 +104,190 @@ class GpuConverter {
   }
 }
 
+/** How a tensor is held on the GPU: decided by its name, shape, stored type and the `Quant` setting. */
+interface Layout {
+  shape: number[];
+  rows: number;
+  cols: number;
+  dtype: "f32" | "q4" | "q8";
+  /** Planes that hold the file's own codes (a repack, or code·scale + min), never a second rounding. */
+  isExact: boolean;
+  /** Exact planes with a minimum per block beside the scale. */
+  affine: boolean;
+  bufBytes: number;
+  /** Bytes of scales (and of mins, when affine); 0 for f32. */
+  scaleBytes: number;
+}
+
+function layoutOf(e: TensorEntry, name: string, quant: Quant): Layout {
+  if (e.transposed) throw new Error(`${name}: stored transposed (non-contiguous); only tensors read on the CPU can be`);
+  const shape = e.shape.length === 1 ? e.shape : [e.shape.slice(0, -1).reduce((a, b) => a * b, 1), e.shape[e.shape.length - 1]!];
+  const cols = shape[shape.length - 1]!;
+  const rows = shape.length === 2 ? shape[0]! : 1;
+  const quantizable = isQuantizable(name, shape);
+  if (e.type === "Q4_0" && !quantizable) throw new Error(`${name}: Q4_0 tensor with shape [${shape}] cannot stay quantized`);
+  const exact = exactPlane(e.type);
+  const dtype: "f32" | "q4" | "q8" = !quantizable
+    ? "f32"
+    : e.type === "Q4_0"
+      ? "q4"
+      : quant === "f32"
+        ? "f32"
+        : exact === "q4" || (exact === "q8" && quant !== "q4")
+          ? exact
+          : quant === "auto"
+            ? e.type === "Q6_K" ? "q8" : "q4"
+            : quant;
+  const isExact = dtype === exact;
+  const affine = isExact && (e.type === "Q4_1" || e.type === "Q4_K" || e.type === "Q5_1" || e.type === "Q5_K");
+  return { shape, rows, cols, dtype, isExact, affine, bufBytes: dtype === "f32" ? rows * cols * 4 : rows * byteSize([cols], dtype), scaleBytes: dtype === "f32" ? 0 : q4ScaleBytes(shape) };
+}
+
+const layoutBytes = (l: Layout): number => l.bufBytes + l.scaleBytes * (l.affine ? 2 : 1);
+
+/**
+ * Bumped whenever the same file and setting would give different bytes on the GPU (a converter, a
+ * model's `transform` or `scale`), so converted weights cached by an older build are made again.
+ */
+const CONVERTED_VERSION = 1;
+/** Converted weights are cached when they are at most this fraction of the bytes they were read from. */
+const CONVERTED_MAX_RATIO = 0.75;
+/** Readbacks waiting to be written to the cache before the load pauses for them. */
+const CONVERTED_PENDING = 64 * 2 ** 20;
+
+/** Where `loadWeights` keeps converted weights between loads. */
+export interface ConvertedCache {
+  /** Names the weights among everything cached: the repo, revision and server, and which part of the model. */
+  key: string;
+}
+
+/** 32-bit FNV-1a, for a short fingerprint of a tensor list. */
+function fnv1a(text: string, h = 0x811c9dc5): number {
+  for (let i = 0; i < text.length; i++) h = Math.imul(h ^ text.charCodeAt(i), 0x01000193);
+  return h >>> 0;
+}
+
+interface Planned {
+  file: WeightFile;
+  entry: TensorEntry;
+  name: string;
+  layout: Layout;
+}
+
+/** Every tensor a load keeps, in order, with its place on the GPU. */
+function planOf(files: readonly WeightFile[], quant: Quant): Planned[] {
+  const plan: Planned[] = [];
+  for (const file of files) {
+    for (const entry of file.tensors) {
+      const name = file.rename ? file.rename(entry.name) : entry.name;
+      if (name) plan.push({ file, entry, name, layout: layoutOf(entry, name, quant) });
+    }
+  }
+  return plan;
+}
+
+/**
+ * Opens the cache entry for a load, or nothing when caching would not pay: the converted weights
+ * must be clearly smaller than their source (f32 from an F32 file, or a GGUF's own planes, are read
+ * as fast from the original).
+ */
+async function openCache(cache: ConvertedCache | undefined, plan: readonly Planned[], quant: Quant): Promise<ConvertedReader | ConvertedWriter | undefined> {
+  if (!cache || !plan.length) return undefined;
+  let bytes = 0;
+  let source = 0;
+  let print = fnv1a(quant);
+  for (const { entry, name, layout } of plan) {
+    bytes += layoutBytes(layout);
+    source += entry.byteLength;
+    print = fnv1a(`|${name}:${entry.type}:${layout.dtype}:${layout.affine ? "a" : ""}:${layout.shape.join("x")}:${entry.byteLength}`, print);
+  }
+  if (bytes > source * CONVERTED_MAX_RATIO) return undefined;
+  return openConverted(`${cache.key}|${quant}`, `v${CONVERTED_VERSION}/${plan.length}/${source}/${print.toString(16)}`, bytes);
+}
+
+/** Loads every planned tensor from a cache entry: the bytes go to the GPU as they were read back from it. */
+function loadConverted(backend: Backend, reader: ConvertedReader, plan: readonly Planned[], out: Map<string, Tensor>, onProgress?: (p: LoadProgress) => void): void {
+  const total = plan.reduce((s, p) => s + layoutBytes(p.layout), 0);
+  const file = plan[0]!.file.name;
+  let at = 0;
+  onProgress?.({ file, loaded: 0, total });
+  const fill = (buf: Buf, bytes: number) => {
+    for (let o = 0; o < bytes; o += CHUNK) {
+      const n = Math.min(CHUNK, bytes - o);
+      backend.write(buf, o, reader.read(at, n));
+      at += n;
+      onProgress?.({ file, loaded: at, total });
+    }
+  };
+  for (const { name, layout: l } of plan) {
+    const t: Tensor = {
+      shape: l.shape,
+      dtype: l.dtype,
+      buf: backend.alloc(l.bufBytes, "storage", name),
+      scales: l.dtype !== "f32" ? backend.alloc(l.scaleBytes, "storage", `${name}/scales`) : undefined,
+      mins: l.affine ? backend.alloc(l.scaleBytes, "storage", `${name}/mins`) : undefined,
+    };
+    // In the map before its bytes arrive, so a failed read frees it with the rest.
+    out.set(name, t);
+    fill(t.buf, l.bufBytes);
+    if (t.scales) fill(t.scales, l.scaleBytes);
+    if (t.mins) fill(t.mins, l.scaleBytes);
+  }
+}
+
+/** Reads loaded tensors back from the GPU, in order, into a cache entry; writes trail the readbacks. */
+class ConvertedSink {
+  private readonly queue: Promise<ArrayBuffer>[] = [];
+  private pending = 0;
+  private ok = true;
+
+  constructor(
+    private readonly backend: Backend,
+    private readonly writer: ConvertedWriter,
+  ) {}
+
+  async add(t: Tensor, l: Layout): Promise<void> {
+    if (!this.ok) return;
+    for (const [buf, bytes] of [[t.buf, l.bufBytes], [t.scales, l.scaleBytes], [t.mins, l.scaleBytes]] as const) {
+      if (!buf) continue;
+      for (let o = 0; o < bytes; o += CHUNK) {
+        const n = Math.min(CHUNK, bytes - o);
+        // Enqueued now, so it reads the tensor as loaded whatever the model does with the buffer next.
+        const read = this.backend.readback(buf, o, n);
+        read.catch(() => undefined);
+        this.queue.push(read);
+        this.pending += n;
+      }
+    }
+    if (this.pending >= CONVERTED_PENDING) await this.drain();
+  }
+
+  private async drain(): Promise<void> {
+    const queue = this.queue.splice(0);
+    this.pending = 0;
+    for (const read of queue) {
+      if (!this.ok) continue;
+      try {
+        this.ok = this.writer.append(new Uint8Array(await read));
+      } catch {
+        // A failed readback (a lost device) fails the load elsewhere; here it only ends the caching.
+        this.ok = false;
+        this.writer.abort();
+      }
+    }
+  }
+
+  async finish(): Promise<void> {
+    await this.drain();
+    if (this.ok) await this.writer.commit();
+  }
+
+  abort(): void {
+    this.ok = false;
+    this.writer.abort();
+  }
+}
+
 /**
  * Streams tensors from their sources straight into GPU buffers, converting row-chunks on the way:
  * F16/BF16/K-quants → f32, q8 or q4; GGUF Q8_0 → repacked q8 (unless q4 is asked for), GGUF Q4_0 →
@@ -114,8 +298,25 @@ export async function loadWeights(
   files: readonly WeightFile[],
   quant: Quant,
   onProgress?: (p: LoadProgress) => void,
+  cache?: ConvertedCache,
 ): Promise<Map<string, Tensor>> {
   const out = new Map<string, Tensor>();
+  const plan = planOf(files, quant);
+  let entry = await openCache(cache, plan, quant);
+  if (entry?.mode === "read") {
+    try {
+      loadConverted(backend, entry, plan, out, onProgress);
+      return out;
+    } catch (err) {
+      // The entry was dropped by the failed read: load from the files as if there were none.
+      freeWeights(backend, out);
+      console.warn(`[kiln] cached converted weights could not be read (${String(err)}); converting again`);
+    } finally {
+      entry.close();
+    }
+    entry = undefined;
+  }
+  const sink = entry ? new ConvertedSink(backend, entry) : undefined;
   // The CPU backend has no convert kernels; its planes come from the CPU converters, the same bits.
   const gpu = gpuConvert && backend.name !== "cpu" ? new GpuConverter(backend) : undefined;
   try {
@@ -130,11 +331,19 @@ export async function loadWeights(
       };
       for (const entry of file.tensors) {
         const name = file.rename ? file.rename(entry.name) : entry.name;
-        if (name) out.set(name, await loadTensor(backend, file.source, entry, name, quant, onBytes, file.transform, gpu, file.scale?.(name)));
-        else onBytes(entry.byteLength);
+        if (!name) {
+          onBytes(entry.byteLength);
+          continue;
+        }
+        const layout = layoutOf(entry, name, quant);
+        const t = await loadTensor(backend, file.source, entry, name, layout, onBytes, file.transform, gpu, file.scale?.(name));
+        out.set(name, t);
+        await sink?.add(t, layout);
       }
     }
+    await sink?.finish();
   } catch (err) {
+    sink?.abort();
     // A file that fails part-way must not strand the tensors already on the GPU.
     freeWeights(backend, out);
     throw err;
@@ -159,7 +368,7 @@ async function loadTensor(
   src: ByteSource,
   e: TensorEntry,
   name: string,
-  quant: Quant,
+  layout: Layout,
   onBytes: (n: number) => void,
   transform?: (name: string, values: Float32Array) => void,
   gpu?: GpuConverter,
@@ -171,27 +380,7 @@ async function loadTensor(
     const f = Math.fround(factor ?? 1);
     if (f !== 1) for (let i = 0; i < v.length; i++) v[i] = v[i]! * f;
   };
-  if (e.transposed) throw new Error(`${name}: stored transposed (non-contiguous); only tensors read on the CPU can be`);
-  const shape = e.shape.length === 1 ? e.shape : [e.shape.slice(0, -1).reduce((a, b) => a * b, 1), e.shape[e.shape.length - 1]!];
-  const cols = shape[shape.length - 1]!;
-  const rows = shape.length === 2 ? shape[0]! : 1;
-  const quantizable = isQuantizable(name, shape);
-  if (e.type === "Q4_0" && !quantizable) throw new Error(`${name}: Q4_0 tensor with shape [${shape}] cannot stay quantized`);
-  const exact = exactPlane(e.type);
-  const dtype: "f32" | "q4" | "q8" = !quantizable
-    ? "f32"
-    : e.type === "Q4_0"
-      ? "q4"
-      : quant === "f32"
-        ? "f32"
-        : exact === "q4" || (exact === "q8" && quant !== "q4")
-          ? exact
-          : quant === "auto"
-            ? e.type === "Q6_K" ? "q8" : "q4"
-            : quant;
-  // Exact planes: a repack (Q4_0, Q8_0) or code·scale (+ min) per block, never a second rounding.
-  const isExact = dtype === exact;
-  const affine = isExact && (e.type === "Q4_1" || e.type === "Q4_K" || e.type === "Q5_1" || e.type === "Q5_K");
+  const { shape, rows, cols, dtype, isExact, affine } = layout;
 
   const srcRow = rowBytes(e.type, cols);
   const rowsPerChunk = Math.max(1, Math.floor(CHUNK / srcRow));

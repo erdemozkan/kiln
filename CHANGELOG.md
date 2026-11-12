@@ -1,5 +1,23 @@
 # Changelog
 
+## Unreleased
+
+**Converted-weight cache.** Float weights loaded as q4 or q8 are written to OPFS as converted (read
+back from the GPU after the load), and later loads send those bytes to the GPU without reading the
+original file: about half the cached load time (SmolLM2-135M 1.0–1.9 s against 2.0–3.4 s, SmolVLM-256M
+3.0 s against 6.1 s, same greedy replies), for a third to a half of the download in extra disk and one
+slower first load. Vision towers of SmolVLM and Gemma 3 are cached the same way. Skipped where it
+would not be smaller (f32 loads, a GGUF's own quantized tensors); `weightCache: false` turns it off.
+Readback staging buffers over 4 MiB are no longer pooled.
+
+**Hardening.** Parsing of untrusted model repos is bounded (chat templates, tokenizer regexes, token
+ids, config sizes, tensor entries, repo paths); cache keys include the server; retrieved passages are
+fenced off from instructions; CI actions and CDN snippets are pinned.
+
+**Performance.** Workers are terminated and GPU memory freed when a load fails; large results are
+transferred, not copied; the worker is minified (236 KB gzipped in all); mel filters are sparse;
+`scoreChoices` and the masked-LM head run batched on the GPU.
+
 ## 0.1.0 (2026-11-08)
 
 First release of `kiln-webgpu` (Kiln.js): LLM inference in the browser on WebGPU, loading Hugging

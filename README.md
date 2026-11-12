@@ -226,6 +226,19 @@ Key ideas:
   with 3840, 4.8 with 2048). Reusing a cached prefix stays exact across the ring: a second question
   on the same 1,500 tokens reused 1,494 of them (6.6 s against 88.9 s) with the same tokens as a
   fresh prefill, and a prefix too far behind the ring's oldest key is prefilled from the start.
+- **Converted weights are cached too.** After a load converts float weights to q4 or q8, the planes,
+  scales and f32 tensors are read back from the GPU and written to OPFS beside the download; the next
+  load writes those bytes straight to the GPU and never reads the original file. Reading the 257 MB
+  BF16 file was three quarters of a cached SmolLM2-135M load; the converted weights are 80 MB. In one
+  session on the Intel Mac (which ran slower that day than for the 1.8 s quoted below), cached loads
+  took 1.0–1.9 s with the entry against 2.0–3.4 s without, and SmolVLM-256M (its vision tower's q8
+  weights are cached the same way) 3.0 s against 6.1 s, with identical greedy replies, to an image
+  question too. The load that writes the entry is slower once (SmolVLM: 8.8 s against 6.1 s). An entry
+  is only kept where it is at most three quarters of its source, so f32 loads and a GGUF's own
+  quantized tensors are read from the original as before; it is named by repo, revision, server and
+  setting, stamped with the tensor list it was made from, and made again when either changes, when
+  it cannot be read back, or when a write to it fell short. `load(id, { weightCache: false })` keeps
+  only the download; `listCache()` lists the entries as `converted|…`.
 - **The download is the cache.** In a worker, `CachedHttpSource` writes the download into OPFS and serves
   reads from it as bytes land. Interrupted downloads resume from the last flushed byte recorded in the
   metadata (not the file size, which can include writes lost when a worker is killed), and a cached
@@ -306,7 +319,8 @@ LLM outputs differ in q4 (the two 4-bit schemes round differently) and agree in 
 rows came out of this comparison: feature extraction was 400 ms (each sentence's forward pass
 waited on the previous one's readback; now they are queued back to back and read once), and
 fill-mask was 851 ms (the 30k-word output layer ran in TypeScript; now on the GPU). transformers.js
-loads faster from its cache (0.9 s against 1.8 s for SmolLM2: Kiln converts weights at load) and
+loads faster from its cache (0.9 s against 1.8 s for SmolLM2 when measured; Kiln has since started
+caching its converted weights, which about halves its time, and the pair has not been re-measured) and
 downloads less (its files are pre-quantized), and its runtime adds 6.7 MB (gzipped) of WASM to
 Kiln's 236 KB (the whole package, its worker included).
 
