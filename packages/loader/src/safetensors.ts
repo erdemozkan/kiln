@@ -1,4 +1,4 @@
-import { UnsupportedTensorError, type SrcType, type TensorEntry } from "./entry";
+import { UnsupportedTensorError, type SrcType, type TensorEntry, checkEntries } from "./entry";
 import type { ByteSource } from "./source";
 
 const DTYPES: Record<string, SrcType> = { F32: "F32", F16: "F16", BF16: "BF16" };
@@ -29,13 +29,16 @@ export async function readSafetensorsHeader(src: ByteSource): Promise<Safetensor
       continue;
     }
     const e = value as RawEntry;
-    const type = DTYPES[e.dtype];
+    if (!e || typeof e !== "object") throw new Error(`${src.name}: tensor ${name} has no entry`);
+    const type = Object.prototype.hasOwnProperty.call(DTYPES, e.dtype) ? DTYPES[e.dtype] : undefined;
     // Integer and boolean tensors are buffers (BERT's position_ids, attention masks), never weights.
     if (!type && /^(I|U)(8|16|32|64)$|^BOOL$/.test(e.dtype)) continue;
     if (!type) throw new UnsupportedTensorError(`${name}: safetensors dtype ${e.dtype} is not supported (F32, F16, BF16)`);
-    const [start, end] = e.data_offsets;
+    const [start, end] = Array.isArray(e.data_offsets) ? e.data_offsets : [NaN, NaN];
+    if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end) || start < 0 || end < start) throw new Error(`${src.name}: tensor ${name} has invalid data_offsets`);
     tensors.push({ name, shape: e.shape, type, offset: base + start, byteLength: end - start });
   }
+  checkEntries(src.name, tensors, await src.size());
   tensors.sort((a, b) => a.offset - b.offset);
   return { tensors, metadata };
 }

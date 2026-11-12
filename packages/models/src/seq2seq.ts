@@ -1,6 +1,6 @@
 import { ActivationPool, Ctx, STEP_BYTES, packStep, physical, type Backend, type Buf, type Dispatch, type Tensor } from "@kiln/core";
 import { ops, type Activation } from "@kiln/kernels";
-import { UnsupportedModelError } from "./config";
+import { UnsupportedModelError, configNumber } from "./config";
 
 /**
  * BART-style encoder-decoder models: BART / DistilBART, Marian (OPUS-MT), M2M100 / NLLB, Whisper; and
@@ -49,7 +49,7 @@ export interface Seq2SeqConfig {
 
 const num = (c: Record<string, unknown>, k: string): number => {
   if (typeof c[k] !== "number") throw new UnsupportedModelError(`config.json is missing ${k}`);
-  return c[k] as number;
+  return configNumber(k, c[k]);
 };
 
 function activation(name: unknown): Activation {

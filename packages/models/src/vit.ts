@@ -1,6 +1,6 @@
 import { ActivationPool, Ctx, STEP_BYTES, packStep, physical, type Backend, type Buf, type Dispatch, type Tensor } from "@kiln/core";
 import { ops } from "@kiln/kernels";
-import { UnsupportedModelError } from "./config";
+import { UnsupportedModelError, configNumber } from "./config";
 
 /** Vision transformers from transformers' configs: ViT, DeiT (with its distillation token), CLIP's vision tower, YOLOS. */
 export interface VitConfig {
@@ -44,7 +44,7 @@ export function vitConfigFromHF(config: Record<string, unknown>): VitConfig {
   const num = (k: string, d?: number) => {
     const v = c[k] ?? d;
     if (v === undefined) throw new UnsupportedModelError(`config.json is missing "${k}"`);
-    return Number(v);
+    return configNumber(k, v);
   };
   const actName = String(c.hidden_act ?? "gelu");
   const act = actName === "gelu" ? "gelu" : actName === "quick_gelu" ? "quick_gelu" : actName === "relu" ? "relu" : actName.startsWith("gelu") ? "gelu_tanh" : undefined;

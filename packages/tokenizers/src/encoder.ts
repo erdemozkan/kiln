@@ -1,5 +1,6 @@
 // Tokenizers for encoder models (BERT, DistilBERT, RoBERTa): text, or a pair of texts, to ids with
 // the model's special tokens and segment ids, as tokenizers' post-processors build them.
+import { checkTokenId } from "./pretokenize";
 import { sentencePieceFromJSON } from "./spm";
 import { TemplatedTokenizer, type EncoderTokenizer, type EncoderTokenizerJSON } from "./template";
 import { Tokenizer, type TokenizerJSON } from "./tokenizer";
@@ -42,8 +43,9 @@ export class WordPieceTokenizer extends TemplatedTokenizer {
     super(json.post_processor);
     const v = json.model.vocab;
     this.vocab = new Map(Array.isArray(v) ? v : Object.entries(v));
-    for (const [t, id] of this.vocab) this.idTo[id] = t;
+    for (const [t, id] of this.vocab) this.idTo[checkTokenId(id)] = t;
     for (const t of json.added_tokens ?? []) {
+      checkTokenId(t.id);
       this.added.set(t.content, t.id);
       this.idTo[t.id] = t.content;
       if (t.special) this.specialIds.add(t.id);
@@ -55,7 +57,8 @@ export class WordPieceTokenizer extends TemplatedTokenizer {
     this.maskToken = [...this.added.keys()].find((t) => /mask/i.test(t));
     this.unk = this.vocab.get(json.model.unk_token ?? "[UNK]") ?? 0;
     this.prefix = json.model.continuing_subword_prefix ?? "##";
-    this.maxChars = json.model.max_input_chars_per_word ?? 100;
+    // Longer words become [UNK]; the search is quadratic in this, so a file cannot raise it without bound.
+    this.maxChars = Math.min(Number(json.model.max_input_chars_per_word ?? 100) || 100, 1000);
     const n = json.normalizer;
     this.lower = n?.lowercase ?? false;
     this.strip = n?.strip_accents ?? this.lower;

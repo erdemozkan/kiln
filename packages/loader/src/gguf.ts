@@ -1,4 +1,4 @@
-import { UnsupportedTensorError, rowBytes, type SrcType, type TensorEntry } from "./entry";
+import { UnsupportedTensorError, rowBytes, type SrcType, type TensorEntry, MAX_HEADER_BYTES, checkEntries } from "./entry";
 import type { ByteSource } from "./source";
 
 export type GGUFValue = number | bigint | boolean | string | GGUFValue[];
@@ -47,7 +47,11 @@ class Reader {
   u64() { this.need(8); const v = this.dv.getBigUint64(this.pos, true); this.pos += 8; return v; }
   i64() { this.need(8); const v = this.dv.getBigInt64(this.pos, true); this.pos += 8; return v; }
   /** u64 that must fit in a JS number (counts, sizes, offsets). */
-  size() { return Number(this.u64()); }
+  size() {
+    const v = this.u64();
+    if (v > BigInt(Number.MAX_SAFE_INTEGER)) throw new Error("GGUF: a count or offset is too large");
+    return Number(v);
+  }
   str() {
     const n = this.size();
     this.need(n);
@@ -69,6 +73,8 @@ class Reader {
       case 9: {
         const inner = this.u32();
         const n = this.size();
+        // Every element takes at least a byte: a count beyond the bytes left needs a larger window.
+        if (n > this.bytes.byteLength - this.pos) throw new NeedMore();
         const out: GGUFValue[] = new Array(n);
         for (let i = 0; i < n; i++) out[i] = this.value(inner);
         return out;
@@ -103,6 +109,7 @@ export function parseGGUF(bytes: Uint8Array): GGUFFile {
     raw.push({ name, dims, type: r.u32(), offset: r.size() });
   }
   const alignment = Number(metadata.get("general.alignment") ?? 32);
+  if (!Number.isInteger(alignment) || alignment < 1 || alignment > 65536 || (alignment & (alignment - 1)) !== 0) throw new Error(`GGUF: alignment ${alignment} is not a power of two up to 65536`);
   const dataStart = Math.ceil(r.pos / alignment) * alignment;
   const tensors = raw.map(({ name, dims, type, offset }): TensorEntry => {
     const src = GGML_TYPES[type];
@@ -123,11 +130,14 @@ export function parseGGUF(bytes: Uint8Array): GGUFFile {
 /** Reads a growing prefix until the header fits (tokenizer vocabularies make headers several MB). */
 export async function readGGUFHeader(src: ByteSource, initial = 4 * 2 ** 20): Promise<GGUFFile> {
   const total = await src.size();
-  for (let n = Math.min(initial, total); ; n = Math.min(n * 2, total)) {
+  for (let n = Math.min(initial, total); ; n = Math.min(n * 2, total, MAX_HEADER_BYTES)) {
     try {
-      return parseGGUF(await src.read(0, n));
+      const file = parseGGUF(await src.read(0, n));
+      checkEntries(src.name, file.tensors, total);
+      return file;
     } catch (err) {
       if (!(err instanceof NeedMore) || n === total) throw err;
+      if (n >= MAX_HEADER_BYTES) throw new Error(`${src.name}: GGUF header larger than ${MAX_HEADER_BYTES / 2 ** 20} MB`);
     }
   }
 }

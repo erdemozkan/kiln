@@ -176,6 +176,10 @@ export function readWav(bytes: Uint8Array): { samples: Float32Array; sampleRate:
     } else if (id === "data") {
       if (!fmt) throw new Error("WAV: data before fmt");
       const { format, channels, rate, bits } = fmt;
+      // From the file's header: a wrong rate would size the resampled output (1 Hz → 16,000× the samples).
+      if (!(rate >= 1000 && rate <= 384000) || !(channels >= 1 && channels <= 64) || ![8, 16, 24, 32].includes(bits)) {
+        throw new Error(`WAV: ${channels} channels of ${bits}-bit samples at ${rate} Hz is not supported`);
+      }
       const width = bits / 8;
       const n = Math.floor(Math.min(size, bytes.length - body) / (width * channels));
       const out = new Float32Array(n);
@@ -205,7 +209,10 @@ export function readWav(bytes: Uint8Array): { samples: Float32Array; sampleRate:
 /** Linear-interpolation resampling (for audio not already at the model's rate). */
 export function resample(samples: Float32Array, from: number, to: number): Float32Array {
   if (from === to) return samples;
+  if (!(from > 0 && to > 0)) throw new Error(`resample: invalid rates ${from} → ${to}`);
   const n = Math.floor((samples.length * to) / from);
+  // 2^28 samples is over 4 hours at 16 kHz (1 GiB of float32): anything longer is a bad header or input.
+  if (n > 2 ** 28) throw new Error(`resample: ${n} output samples is too many`);
   const out = new Float32Array(n);
   for (let i = 0; i < n; i++) {
     const p = (i * from) / to;

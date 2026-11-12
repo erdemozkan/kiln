@@ -1,3 +1,8 @@
+/** Throws unless [offset, offset + length) is a valid byte range (integers, not negative). */
+export function checkRange(name: string, offset: number, length: number): void {
+  if (!Number.isSafeInteger(offset) || !Number.isSafeInteger(length) || offset < 0 || length < 0) throw new RangeError(`${name}: invalid read of ${length} bytes at ${offset}`);
+}
+
 /** Random-access bytes. Loaders read tensors roughly in offset order, which the cached source relies on. */
 export interface ByteSource {
   readonly name: string;
@@ -15,6 +20,7 @@ export class MemorySource implements ByteSource {
     return this.bytes.byteLength;
   }
   async read(offset: number, length: number): Promise<Uint8Array> {
+    checkRange(this.name, offset, length);
     if (offset + length > this.bytes.byteLength) throw new RangeError(`${this.name}: read past end`);
     return this.bytes.subarray(offset, offset + length);
   }
@@ -29,6 +35,8 @@ export class BlobSource implements ByteSource {
     return this.blob.size;
   }
   async read(offset: number, length: number): Promise<Uint8Array> {
+    checkRange(this.name, offset, length);
+    if (offset + length > this.blob.size) throw new RangeError(`${this.name}: read past end`);
     return new Uint8Array(await this.blob.slice(offset, offset + length).arrayBuffer());
   }
 }
@@ -57,6 +65,9 @@ export class HttpSource implements ByteSource {
   }
 
   async read(offset: number, length: number): Promise<Uint8Array> {
+    checkRange(this.name, offset, length);
+    // Known size: a read past the end is a bad header, not something to retry.
+    if (this.total !== undefined && offset + length > this.total) throw new RangeError(`${this.name}: read past end`);
     return withRetries(this.name, this.retryMs, async () => {
       const res = await fetch(this.url, { headers: { Range: `bytes=${offset}-${offset + length - 1}` } });
       check(this.url, res);

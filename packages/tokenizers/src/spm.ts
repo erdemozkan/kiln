@@ -1,6 +1,7 @@
 // SentencePiece-style tokenizers for encoder-decoder models: Unigram (T5, Marian) and character BPE
 // (NLLB, M2M100), with SentencePiece's Precompiled normalizer and Metaspace pre-tokenization, from a
 // tokenizer.json or from a SentencePiece .model / .spm file.
+import { checkTokenId } from "./pretokenize";
 import { TemplatedTokenizer, type EncoderTokenizerJSON } from "./template";
 
 const SPACE = "▁";
@@ -12,13 +13,20 @@ const UTF8D = new TextDecoder();
  * whose values index a pool of NUL-terminated replacements. At each position the longest match is
  * replaced; anything unmatched is copied a character at a time (as normalizer.cc does).
  */
+/** Longest replacement a charsmap entry may hold, in bytes (real ones are a few characters). */
+const MAX_REPLACEMENT = 256;
+/** Longest piece, in characters, the Unigram search tries (real vocabularies stay well below). */
+const MAX_PIECE_CHARS = 128;
+
 export class PrecompiledCharsMap {
   private readonly units: Uint32Array;
   private readonly pool: Uint8Array;
 
   constructor(blob: Uint8Array) {
     const dv = new DataView(blob.buffer, blob.byteOffset, blob.byteLength);
+    if (blob.byteLength < 4) throw new Error("precompiled charsmap: too short");
     const trieBytes = dv.getUint32(0, true);
+    if (trieBytes % 4 !== 0 || 4 + trieBytes > blob.byteLength) throw new Error("precompiled charsmap: the trie does not fit the data");
     // Copied unit by unit: `blob` may be a view (a Node Buffer's slice) at any alignment.
     this.units = new Uint32Array(trieBytes >>> 2);
     for (let k = 0; k < this.units.length; k++) this.units[k] = dv.getUint32(4 + 4 * k, true);
@@ -52,7 +60,9 @@ export class PrecompiledCharsMap {
     for (let i = 0; i < bytes.length; ) {
       const m = this.longest(bytes, i);
       if (m) {
-        for (let j = m.value; j < this.pool.length && this.pool[j] !== 0; j++) out.push(this.pool[j]!);
+        // A replacement is a short NUL-terminated string; one that never ends is corrupt data.
+        const end = Math.min(this.pool.length, m.value + MAX_REPLACEMENT);
+        for (let j = m.value; j < end && this.pool[j] !== 0; j++) out.push(this.pool[j]!);
         i += m.len;
         continue;
       }
@@ -105,9 +115,10 @@ export class SentencePieceTokenizer extends TemplatedTokenizer {
     private readonly opts: SentencePieceOptions,
   ) {
     super(post);
-    if (model.kind === "unigram") for (const [p, v] of model.pieces) this.idTo[v.id] = p;
-    else for (const [p, id] of model.vocab) this.idTo[id] = p;
+    if (model.kind === "unigram") for (const [p, v] of model.pieces) this.idTo[checkTokenId(v.id)] = p;
+    else for (const [p, id] of model.vocab) this.idTo[checkTokenId(id)] = p;
     for (const t of added) {
+      checkTokenId(t.id);
       this.added.set(t.content, t.id);
       this.idTo[t.id] = t.content;
       if (t.special) this.specialIds.add(t.id);
@@ -305,7 +316,7 @@ export function sentencePieceFromJSON(json: EncoderTokenizerJSON): SentencePiece
       minScore = Math.min(minScore, score);
       maxLen = Math.max(maxLen, [...p].length);
     });
-    model = { kind: "unigram", pieces, maxLen, unk: m.unk_id ?? 0, unkScore: minScore - 10 };
+    model = { kind: "unigram", pieces, maxLen: Math.min(maxLen, MAX_PIECE_CHARS), unk: m.unk_id ?? 0, unkScore: minScore - 10 };
   } else {
     const vocab = new Map(Object.entries(m.vocab));
     const ranks = new Map<string, number>();
@@ -331,6 +342,7 @@ export function parseSentencePieceModel(bytes: Uint8Array): SpmModel {
     let v = 0;
     let shift = 0;
     for (;;) {
+      if (p.i >= bytes.length || shift > 63) throw new Error("sentencepiece: the model file is truncated or corrupt");
       const b = bytes[p.i++]!;
       v += (b & 0x7f) * 2 ** shift;
       if (!(b & 0x80)) return v;
@@ -345,16 +357,12 @@ export function parseSentencePieceModel(bytes: Uint8Array): SpmModel {
       const field = Math.floor(key / 8);
       const wire = key & 7;
       if (wire === 0) f(field, wire, p, varint(p));
-      else if (wire === 2) {
-        const len = varint(p);
+      else if (wire === 2 || wire === 5 || wire === 1) {
+        const len = wire === 2 ? varint(p) : wire === 5 ? 4 : 8;
+        // A field must lie inside its message: a length past the end would otherwise be walked byte by byte.
+        if (p.i + len > to) throw new Error("sentencepiece: a field runs past the end of its message");
         f(field, wire, p, len);
         p.i += len;
-      } else if (wire === 5) {
-        f(field, wire, p, 4);
-        p.i += 4;
-      } else if (wire === 1) {
-        f(field, wire, p, 8);
-        p.i += 8;
       } else throw new Error(`sentencepiece: unsupported wire type ${wire}`);
     }
   };
@@ -402,7 +410,7 @@ export function marianTokenizer(spm: Uint8Array, vocab: Record<string, number>, 
     maxLen = Math.max(maxLen, [...p.piece].length);
   }
   const tok = new SentencePieceTokenizer(
-    { kind: "unigram", pieces, maxLen, unk, unkScore: minScore - 10 },
+    { kind: "unigram", pieces, maxLen: Math.min(maxLen, MAX_PIECE_CHARS), unk, unkScore: minScore - 10 },
     [eosToken, unkToken, padToken].filter((t) => vocab[t] !== undefined).map((t) => ({ id: vocab[t]!, content: t, special: true })),
     { type: "TemplateProcessing", single: [{ Sequence: { id: "A", type_id: 0 } }, { SpecialToken: { id: eosToken, type_id: 0 } }], special_tokens: { [eosToken]: { ids: [vocab[eosToken]!] } } },
     { charsmap: m.charsmap ? new PrecompiledCharsMap(m.charsmap) : undefined, collapseSpaces: m.removeExtraWhitespaces, prefixSpace: m.addDummyPrefix },

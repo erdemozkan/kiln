@@ -42,3 +42,31 @@ export function rowBytes(type: SrcType, cols: number): number {
 }
 
 export class UnsupportedTensorError extends Error {}
+
+/** Largest header Kiln reads from a weight file (GGUF and legacy PyTorch grow a window to find its end). */
+export const MAX_HEADER_BYTES = 256 * 2 ** 20;
+/** Most elements one tensor may have (64 G: far above any model, far below 2^53). */
+const MAX_ELEMENTS = 2 ** 36;
+
+/** Bytes a tensor of `shape` takes in `type`. */
+export function tensorBytes(type: SrcType, shape: readonly number[]): number {
+  if (!shape.length) return rowBytes(type, 1);
+  const cols = shape[shape.length - 1]!;
+  return shape.slice(0, -1).reduce((a, b) => a * b, 1) * rowBytes(type, cols);
+}
+
+/**
+ * Checks a weight file's tensor table against the file: shapes of non-negative integers, offsets and
+ * lengths that are integers inside the file, and lengths that match shape and type. A file that fails
+ * is corrupt or hostile; reading it anyway would mean garbage weights or multi-GB reads.
+ */
+export function checkEntries(file: string, tensors: readonly TensorEntry[], fileSize: number): void {
+  for (const t of tensors) {
+    const bad = (why: string) => new Error(`${file}: tensor ${t.name} ${why}`);
+    if (!Array.isArray(t.shape) || t.shape.some((d) => !Number.isSafeInteger(d) || d < 0)) throw bad(`has an invalid shape [${String(t.shape)}]`);
+    if (t.shape.reduce((a, b) => a * b, 1) > MAX_ELEMENTS) throw bad("is implausibly large");
+    if (!Number.isSafeInteger(t.offset) || !Number.isSafeInteger(t.byteLength) || t.offset < 0 || t.byteLength < 0) throw bad("has an invalid offset or length");
+    if (t.offset + t.byteLength > fileSize) throw bad(`runs past the end of the file (${t.offset + t.byteLength} > ${fileSize} bytes)`);
+    if (t.byteLength !== tensorBytes(t.type, t.shape)) throw bad(`has ${t.byteLength} bytes, not the ${tensorBytes(t.type, t.shape)} its shape and type need`);
+  }
+}

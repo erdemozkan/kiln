@@ -22,7 +22,18 @@ export function parseModelId(id: string, revision = "main"): ModelRef {
 }
 
 export function fileUrl(ref: ModelRef, file: string, endpoint = "https://huggingface.co"): string {
-  return `${endpoint}/${ref.repo}/resolve/${encodeURIComponent(ref.revision)}/${file}`;
+  return `${endpoint}/${ref.repo}/resolve/${encodeURIComponent(ref.revision)}/${safeRepoPath(file).split("/").map(encodeURIComponent).join("/")}`;
+}
+
+/**
+ * Throws unless `file` is a plain path inside a repo: names come from index files the repo itself
+ * supplies (`weight_map`), which must not climb out of the repo's folder on the server.
+ */
+export function safeRepoPath(file: string): string {
+  if (!file || file.startsWith("/") || /\\|[?#]|[\x00-\x1f]/.test(file) || file.split("/").some((seg) => seg === ".." || seg === "." || seg === "")) {
+    throw new Error(`"${file}" is not a file path inside a repo`);
+  }
+  return file;
 }
 
 /** Cache key that pins the file to its repo and revision. */

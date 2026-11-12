@@ -11,6 +11,21 @@
 
 export class TemplateError extends Error {}
 
+// Chat templates come with the model repo, so a render is bounded: a hostile (or broken) template
+// fails with a TemplateError instead of hanging the page or exhausting memory. Real templates stay
+// orders of magnitude below these.
+/** Longest list `range()` builds (Jinja's sandbox uses the same limit). */
+const MAX_RANGE = 100_000;
+/** Longest string an expression may build, and the most a render may output, in UTF-16 units. */
+const MAX_STRING = 32 * 2 ** 20;
+/** Statements and loop iterations one render may execute. */
+const MAX_STEPS = 2_000_000;
+
+function bounded(s: string): string {
+  if (s.length > MAX_STRING) throw new TemplateError("the template builds a string that is too long");
+  return s;
+}
+
 /** A missing variable or attribute. Renders as "", is falsy, and stays undefined when accessed. */
 class Undef {
   constructor(readonly name: string) {}
@@ -85,7 +100,7 @@ function segment(src: string): Seg[] {
     const block = r.kind !== "out";
     const prev = raw[k - 1];
     if (prev?.kind === "text") {
-      if (r.lt === "-") prev.text = prev.text.replace(/\s+$/, "");
+      if (r.lt === "-") prev.text = prev.text.trimEnd();
       else if (block && r.lt !== "+") {
         // lstrip_blocks: drop spaces and tabs between the start of the line and the tag. Text without
         // a newline starts a line only at the very start of the template.
@@ -663,7 +678,7 @@ function iterate(v: unknown): unknown[] {
 
 function getAttr(obj: unknown, name: string): unknown {
   if (isUndef(obj) || obj === null || obj === undefined) return new Undef(name);
-  if (obj instanceof Namespace) return name in obj.vars ? obj.vars[name] : new Undef(name);
+  if (obj instanceof Namespace) return Object.prototype.hasOwnProperty.call(obj.vars, name) ? obj.vars[name] : new Undef(name);
   if (typeof obj === "string") return strMethod(obj, name) ?? new Undef(name);
   if (Array.isArray(obj)) return listMethod(obj, name) ?? new Undef(name);
   if (typeof obj === "object") {
@@ -694,6 +709,7 @@ function slice(v: unknown, start?: number, stop?: number, step = 1): unknown {
   const n = seq.length;
   const norm = (x: number | undefined, d: number) => (x === undefined ? d : x < 0 ? Math.max(0, n + x) : Math.min(n, x));
   const out: unknown[] = [];
+  if (!Number.isInteger(step) || step === 0) throw new TemplateError("slice step must be a non-zero integer");
   if (step > 0) for (let i = norm(start, 0); i < norm(stop, n); i += step) out.push(seq[i]);
   else {
     const s = start === undefined ? n - 1 : start < 0 ? n + start : Math.min(n - 1, start);
@@ -882,6 +898,8 @@ export class Template {
       namespace: fn((_, kw) => new Namespace({ ...kw })),
       range: fn((args) => {
         const [a, b, s] = args.length === 1 ? [0, Number(args[0]), 1] : [Number(args[0]), Number(args[1]), Number(args[2] ?? 1)];
+        if (![a, b, s].every(Number.isFinite) || s === 0) throw new TemplateError("range() needs finite numbers and a non-zero step");
+        if (Math.max(0, Math.ceil((b - a) / s)) > MAX_RANGE) throw new TemplateError(`range() of more than ${MAX_RANGE} items`);
         const out: number[] = [];
         for (let i = a; s > 0 ? i < b : i > b; i += s) out.push(i);
         return out;
@@ -897,18 +915,35 @@ export class Template {
     const scope = new Scope(root);
     for (const [k, v] of Object.entries(vars)) if (v !== undefined) scope.set(k, wrap(v));
     const out: string[] = [];
+    this.steps = 0;
+    this.written = 0;
     this.exec(this.nodes, scope, out);
     return out.join("");
   }
 
+  /** Statements executed and characters written by the render in progress (see MAX_STEPS, MAX_STRING). */
+  private steps = 0;
+  private written = 0;
+
+  private step(): void {
+    if (++this.steps > MAX_STEPS) throw new TemplateError("the template runs too long (a loop without end?)");
+  }
+
+  private write(out: string[], text: string): void {
+    this.written += text.length;
+    if (this.written > MAX_STRING) throw new TemplateError("the template's output is too long");
+    out.push(text);
+  }
+
   private exec(nodes: Node[], scope: Scope, out: string[]): void {
     for (const n of nodes) {
+      this.step();
       switch (n.k) {
         case "text":
-          out.push(n.text);
+          this.write(out, n.text);
           break;
         case "out":
-          out.push(str(this.eval(n.e, scope)));
+          this.write(out, str(this.eval(n.e, scope)));
           break;
         case "if": {
           const b = n.branches.find((br) => truthy(this.eval(br.test, scope)));
@@ -966,6 +1001,7 @@ export class Template {
     }
     const len = items.length;
     for (let i = 0; i < len; i++) {
+      this.step();
       const s = new Scope(scope);
       this.assign(n.target, items[i], s);
       s.set("loop", {
@@ -1076,18 +1112,25 @@ export class Template {
       case "in":
         return contains(b, a);
       case "~":
-        return str(a) + str(b);
+        return bounded(str(a) + str(b));
       case "+":
-        if (Array.isArray(a) && Array.isArray(b)) return [...a, ...b];
+        if (Array.isArray(a) && Array.isArray(b)) {
+          if (a.length + b.length > 10 * MAX_RANGE) throw new TemplateError("the template builds a list that is too long");
+          return [...a, ...b];
+        }
         if (typeof a === "string" || typeof b === "string") {
           if (typeof a !== "string" || typeof b !== "string") throw new TemplateError(`cannot add ${pyRepr(a)} and ${pyRepr(b)}`);
-          return a + b;
+          return bounded(a + b);
         }
         return Number(a) + Number(b);
       case "-":
         return Number(a) - Number(b);
       case "*":
-        if (typeof a === "string") return a.repeat(Number(b));
+        if (typeof a === "string") {
+          const times = Math.max(0, Math.floor(Number(b)) || 0);
+          if (a.length * times > MAX_STRING) throw new TemplateError("the template builds a string that is too long");
+          return a.repeat(times);
+        }
         return Number(a) * Number(b);
       case "/":
         return Number(a) / Number(b);

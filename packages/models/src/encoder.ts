@@ -1,6 +1,6 @@
 import { ActivationPool, Ctx, STEP_BYTES, packStep, physical, type Backend, type Buf, type Dispatch, type Tensor } from "@kiln/core";
 import { ops } from "@kiln/kernels";
-import { UnsupportedModelError } from "./config";
+import { UnsupportedModelError, configNumber } from "./config";
 
 export type EncoderFamily = "bert" | "distilbert" | "roberta";
 
@@ -28,7 +28,7 @@ export interface EncoderConfig {
 }
 
 const num = (c: Record<string, unknown>, ...keys: string[]): number => {
-  for (const k of keys) if (typeof c[k] === "number") return c[k] as number;
+  for (const k of keys) if (typeof c[k] === "number") return configNumber(k, c[k]);
   throw new UnsupportedModelError(`config.json is missing ${keys.join(" / ")}`);
 };
 

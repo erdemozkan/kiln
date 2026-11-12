@@ -275,3 +275,14 @@ describe("helpers", () => {
     expect(isQuantizable("x.weight", [10, 33])).toBe(false);
   });
 });
+
+describe("config sizes from the repo are bounded", () => {
+  it("rejects absurd layer counts and sizes before allocating", async () => {
+    const { configFromHF } = await import("../src");
+    const base = { model_type: "llama", hidden_size: 64, intermediate_size: 128, num_hidden_layers: 2, num_attention_heads: 2, vocab_size: 100 };
+    expect(configFromHF(base).numLayers).toBe(2);
+    expect(() => configFromHF({ ...base, num_hidden_layers: 1e9 })).toThrow(/not a size Kiln accepts/);
+    expect(() => configFromHF({ ...base, vocab_size: 2.5 })).toThrow(/not a size Kiln accepts/);
+    expect(() => configFromHF({ ...base, model_type: "gemma3_text", num_hidden_layers: 1e9 })).toThrow(/not a size Kiln accepts/);
+  });
+});

@@ -1,6 +1,6 @@
 import { ActivationPool, Ctx, STEP_BYTES, packStep, physical, type Backend, type Buf, type Dispatch, type Tensor } from "@kiln/core";
 import { ops } from "@kiln/kernels";
-import { UnsupportedModelError } from "./config";
+import { UnsupportedModelError, configNumber } from "./config";
 
 /**
  * A SigLIP vision tower and its multimodal projector: Gemma 3's (as llama.cpp's mmproj GGUF describes
@@ -38,7 +38,7 @@ export function visionConfigFromGGUF(meta: Map<string, unknown>): VisionConfig {
   const num = (k: string, fallback?: number) => {
     const v = meta.get(`clip.vision.${k}`) ?? fallback;
     if (v === undefined) throw new UnsupportedModelError(`mmproj: metadata is missing "clip.vision.${k}"`);
-    return Number(v);
+    return configNumber(k, v);
   };
   const triple = (k: string): [number, number, number] => {
     const v = meta.get(`clip.vision.${k}`) as number[] | undefined;
@@ -142,8 +142,11 @@ export function idefics3Processing(config: Record<string, unknown>, preprocessor
   const edge = (k: string, d: number) => Number((preprocessor?.[k] as { longest_edge?: number } | undefined)?.longest_edge ?? d);
   const tileSize = edge("max_image_size", vision.imageSize);
   if (tileSize !== vision.imageSize) throw new UnsupportedModelError(`Idefics3: tiles of ${tileSize} for a ${vision.imageSize} vision tower are not supported`);
+  const longestEdge = edge("size", 4 * tileSize);
+  // From preprocessor_config.json: an absurd edge would size the resize and the tile count.
+  if (!(Number.isInteger(longestEdge) && longestEdge >= tileSize && longestEdge <= 8192)) throw new UnsupportedModelError(`Idefics3: longest_edge ${longestEdge} is not supported (${tileSize} to 8192)`);
   return {
-    longestEdge: edge("size", 4 * tileSize),
+    longestEdge,
     tileSize,
     split: preprocessor?.do_image_splitting !== false,
     resample: Number(preprocessor?.resample ?? 1),

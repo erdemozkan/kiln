@@ -3,7 +3,7 @@
 // describes the tensors is parsed (a small subset of pickle, enough for state dicts); weights are read
 // later straight from their offsets.
 import type { ByteSource } from "./source";
-import { UnsupportedTensorError, type TensorEntry } from "./entry";
+import { UnsupportedTensorError, type TensorEntry, MAX_HEADER_BYTES, checkEntries } from "./entry";
 
 type Float = "F32" | "F16" | "BF16";
 
@@ -316,7 +316,7 @@ function tensorsOf(value: unknown): Map<string, TensorRef> {
 function entries(tensors: Map<string, TensorRef>, storageOffset: (s: StorageRef) => number): TensorEntry[] {
   const out: TensorEntry[] = [];
   for (const [name, t] of tensors) {
-    const info = STORAGES[t.storage.cls];
+    const info = Object.prototype.hasOwnProperty.call(STORAGES, t.storage.cls) ? STORAGES[t.storage.cls] : undefined;
     if (!info) throw new UnsupportedTensorError(`${name}: storage ${t.storage.cls} is not supported`);
     if (!info.type) continue;
     const numel = t.shape.reduce((a, b) => a * b, 1);
@@ -336,11 +336,13 @@ function entries(tensors: Map<string, TensorRef>, storageOffset: (s: StorageRef)
 async function parseGrowing<T>(src: ByteSource, from: number, parse: (b: Uint8Array) => T, first = 1 << 20): Promise<T> {
   const total = await src.size();
   for (let n = first; ; n *= 4) {
-    const len = Math.min(n, total - from);
+    const len = Math.min(n, total - from, MAX_HEADER_BYTES);
     try {
       return parse(await src.read(from, len));
     } catch (e) {
-      if (!(e instanceof RangeError) || from + len >= total) throw e;
+      // Only a pickle that ran out of bytes grows the window (not a stack overflow, also a RangeError).
+      if (!(e instanceof RangeError) || !/truncated/.test(e.message) || from + len >= total) throw e;
+      if (len >= MAX_HEADER_BYTES) throw new Error(`${src.name}: pickle header larger than ${MAX_HEADER_BYTES / 2 ** 20} MB`);
     }
   }
 }
@@ -367,6 +369,8 @@ async function zipEntries(src: ByteSource): Promise<Map<string, { at: number; si
     cdSize = Number(rv.getBigUint64(40, true));
     cdAt = Number(rv.getBigUint64(48, true));
   }
+  // The directory must lie inside the file, with no more entries than its bytes can hold (46 each).
+  if (![count, cdSize, cdAt].every(Number.isSafeInteger) || cdAt + cdSize > total || count * 46 > cdSize) throw new Error("pytorch: bad zip directory");
   const cd = await src.read(cdAt, cdSize);
   const cv = new DataView(cd.buffer, cd.byteOffset, cd.byteLength);
   const td = new TextDecoder();
@@ -394,17 +398,23 @@ async function zipEntries(src: ByteSource): Promise<Map<string, { at: number; si
       x += 4 + len;
     }
     if (method !== 0) throw new Error(`pytorch: ${name} is compressed; only stored zip entries are supported`);
+    if (!Number.isSafeInteger(local) || !Number.isSafeInteger(size) || local + 30 + size > total) throw new Error(`pytorch: zip entry ${name} lies outside the file`);
     out.set(name, { at: local, size });
     p += 46 + nameLen + extraLen + commentLen;
   }
   // Data starts after each local header (its name and extra lengths can differ from the directory's).
-  await Promise.all(
-    [...out.entries()].map(async ([, v]) => {
-      const h = await src.read(v.at, 30);
-      const hv = new DataView(h.buffer, h.byteOffset, h.byteLength);
-      v.at += 30 + hv.getUint16(26, true) + hv.getUint16(28, true);
-    }),
-  );
+  // A few at a time: each is a small read, possibly its own range request.
+  const all = [...out.values()];
+  for (let k = 0; k < all.length; k += 16) {
+    await Promise.all(
+      all.slice(k, k + 16).map(async (v) => {
+        const h = await src.read(v.at, 30);
+        const hv = new DataView(h.buffer, h.byteOffset, h.byteLength);
+        v.at += 30 + hv.getUint16(26, true) + hv.getUint16(28, true);
+        if (v.at + v.size > total) throw new Error("pytorch: a zip entry runs past the end of the file");
+      }),
+    );
+  }
   return out;
 }
 
@@ -412,6 +422,12 @@ const LEGACY_MAGIC = 0x1950a86a20f9469cfc6c;
 
 /** Tensor byte ranges of a pytorch_model.bin (zip or legacy format). */
 export async function readPytorchHeader(src: ByteSource): Promise<{ tensors: TensorEntry[] }> {
+  const header = await readPytorchTensors(src);
+  checkEntries(src.name, header.tensors, await src.size());
+  return header;
+}
+
+async function readPytorchTensors(src: ByteSource): Promise<{ tensors: TensorEntry[] }> {
   const head = await src.read(0, Math.min(4, await src.size()));
   if (head[0] === 0x50 && head[1] === 0x4b) {
     const files = await zipEntries(src);

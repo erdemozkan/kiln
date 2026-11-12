@@ -1,4 +1,4 @@
-import { HttpSource, parseContentRangeTotal, type ByteSource } from "./source";
+import { HttpSource, parseContentRangeTotal, type ByteSource, checkRange } from "./source";
 
 /** Minimal typing for the worker-only OPFS sync handle (not in lib.dom). */
 interface SyncHandle {
@@ -172,6 +172,7 @@ export class CachedHttpSource implements ByteSource {
   }
 
   async read(offset: number, length: number): Promise<Uint8Array> {
+    checkRange(this.name, offset, length);
     if (offset + length > this.total) throw new RangeError(`${this.name}: read past end`);
     // Ahead of the download: fetch just those bytes rather than wait for everything before them, for
     // small reads anywhere past it and large ones far past it (a pytorch_model.bin is a zip whose

@@ -1,5 +1,5 @@
 import { TOOL_CALL_MARKERS, type ChatTemplate } from "./chat";
-import { GPT2_PATTERN, LLAMA3_PATTERN, QWEN2_PATTERN, compilePreTokenizer, splitIsolated, toJsRegex, type PreStep } from "./pretokenize";
+import { GPT2_PATTERN, LLAMA3_PATTERN, QWEN2_PATTERN, checkTokenId, compilePreTokenizer, splitIsolated, toJsRegex, type PreStep } from "./pretokenize";
 
 /** GPT-2 byte ↔ printable-unicode table used by byte-level BPE. */
 function byteTables(): { enc: string[]; dec: Map<string, number> } {
@@ -98,9 +98,10 @@ export class Tokenizer {
   ) {
     merges.forEach((m, i) => this.ranks.set(m, i));
     this.scheme = opts.scheme ?? { kind: "byte-level" };
-    for (const [tok, id] of vocab) this.idToToken[id] = tok;
+    for (const [tok, id] of vocab) this.idToToken[checkTokenId(id)] = tok;
     this.strips = addedTokens.some((t) => t.lstrip || t.rstrip);
     for (const t of addedTokens) {
+      checkTokenId(t.id);
       this.added.set(t.content, t);
       this.idToToken[t.id] = t.content;
       if (t.special) this.specialIds.add(t.id);

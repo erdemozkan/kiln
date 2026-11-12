@@ -2,6 +2,7 @@
 // projection's A and B read as f32, the scale (lora_alpha / r, or / √r with rsLoRA) folded into B.
 import { fetchJSON, fileUrl, parseModelId, readSafetensorsHeader, toF32 } from "@kiln/loader";
 import { LORA_MODULES, type LoraModule, type LoraUpdate, type LoraWeights } from "@kiln/models";
+import { assertLinearRegex } from "@kiln/tokenizers";
 import { openParsed } from "./load";
 
 /** adapter_config.json, as far as Kiln reads it. */
@@ -35,7 +36,11 @@ const TENSOR = /layers\.(\d+)\.(self_attn|mlp)\.([a-z_]+)\.lora_([AB])(?:\.defau
 
 /** PEFT's pattern lookup: a key applies to a module whose name is the key or ends in ".key" (keys may be regexes). */
 function patternValue(patterns: Record<string, number> | undefined, module: string): number | undefined {
-  for (const [key, v] of Object.entries(patterns ?? {})) if (new RegExp(`(^|\\.)(${key})$`).test(module)) return v;
+  for (const [key, v] of Object.entries(patterns ?? {})) {
+    // Keys come from the adapter repo: only patterns that cannot backtrack exponentially are compiled.
+    assertLinearRegex(key, "adapter_config.json pattern");
+    if (new RegExp(`(^|\\.)(${key})$`).test(module)) return v;
+  }
   return undefined;
 }
 

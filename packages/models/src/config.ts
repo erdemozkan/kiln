@@ -68,10 +68,51 @@ export class UnsupportedModelError extends Error {}
 const SUPPORTED = ["llama", "mistral", "qwen2", "qwen3", "granite", "granitemoehybrid", "gemma3_text"];
 
 type HFConfig = Record<string, unknown>;
+/**
+ * Largest values Kiln accepts for a model's sizes, by config.json key and by GGUF metadata key (after
+ * the architecture prefix). Configs come with the repo; these keep a hostile or broken one from
+ * sizing loops and GPU buffers in the billions before any weight is read. Real models sit far below.
+ */
+const SIZE_LIMITS: Record<string, number> = {
+  hidden_size: 65536,
+  intermediate_size: 262144,
+  shared_intermediate_size: 262144,
+  num_hidden_layers: 1024,
+  num_attention_heads: 1024,
+  num_key_value_heads: 1024,
+  head_dim: 4096,
+  vocab_size: 4194304,
+  sliding_window_pattern: 1024,
+  embedding_length: 65536,
+  feed_forward_length: 262144,
+  block_count: 1024,
+  "attention.head_count": 1024,
+  "attention.head_count_kv": 1024,
+  "attention.key_length": 4096,
+};
+
+/**
+ * A number read from a model's config, checked to be finite and below 2^24: sizes, counts and
+ * positions of real models are far below, and nothing larger may size an allocation or a loop.
+ */
+export function configNumber(k: string, v: unknown): number {
+  const n = Number(v);
+  if (!Number.isFinite(n) || Math.abs(n) > 2 ** 24) throw new UnsupportedModelError(`config: "${k}" = ${String(v)} is out of range`);
+  return n;
+}
+
+/** Throws unless a size from the repo is a positive integer within its limit (see SIZE_LIMITS). */
+function sized(k: string, v: number): number {
+  const max = SIZE_LIMITS[k];
+  if (max !== undefined && !(Number.isInteger(v) && v >= 1 && v <= max)) throw new UnsupportedModelError(`config: "${k}" = ${v} is not a size Kiln accepts (1 to ${max})`);
+  if (!Number.isFinite(v)) throw new UnsupportedModelError(`config: "${k}" is not a finite number`);
+  return v;
+}
+
 const num = (c: HFConfig, k: string, fallback?: number): number => {
   const v = c[k] ?? fallback;
   if (typeof v !== "number") throw new UnsupportedModelError(`config.json is missing "${k}"`);
-  return v;
+  return sized(k, v);
 };
 const ids = (v: unknown): number[] => (Array.isArray(v) ? (v as number[]) : typeof v === "number" ? [v] : []);
 
@@ -264,7 +305,7 @@ export function configFromGGUF(meta: Map<string, unknown>, tensorNames: readonly
       v = vs[0];
     }
     if (v === undefined) throw new UnsupportedModelError(`GGUF metadata is missing "${arch}.${k}"`);
-    return Number(v);
+    return sized(k, Number(v));
   };
   const numHeads = get("attention.head_count");
   const hiddenSize = get("embedding_length");

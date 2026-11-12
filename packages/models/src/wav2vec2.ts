@@ -1,6 +1,6 @@
 import { ActivationPool, Ctx, STEP_BYTES, packStep, physical, type Backend, type Buf, type Dispatch, type Tensor } from "@kiln/core";
 import { ops, type Activation } from "@kiln/kernels";
-import { UnsupportedModelError } from "./config";
+import { UnsupportedModelError, configNumber } from "./config";
 
 /** A wav2vec2-style speech encoder (wav2vec2, HuBERT): a convolutional front end on raw 16 kHz samples, then a transformer. */
 export interface Wav2Vec2Config {
@@ -30,7 +30,7 @@ export interface Wav2Vec2Config {
 }
 
 const num = (c: Record<string, unknown>, ...keys: string[]): number => {
-  for (const k of keys) if (typeof c[k] === "number") return c[k] as number;
+  for (const k of keys) if (typeof c[k] === "number") return configNumber(k, c[k]);
   throw new UnsupportedModelError(`config.json is missing ${keys.join(" / ")}`);
 };
 
