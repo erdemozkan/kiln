@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.2.0 (2026-11-12)
 
 **Converted-weight cache.** Float weights loaded as q4 or q8 are written to OPFS as converted (read
 back from the GPU after the load), and later loads send those bytes to the GPU without reading the

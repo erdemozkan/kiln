@@ -7,7 +7,7 @@ safetensors or GGUF directly — no ONNX export, no ahead-of-time compile step. 
 `kiln-webgpu`, one file that also works straight from a CDN, with a transformers.js-style pipeline:
 
 ```ts
-import { pipeline } from "kiln-webgpu"; // or "https://cdn.jsdelivr.net/npm/kiln-webgpu@0.1.0"
+import { pipeline } from "kiln-webgpu"; // or "https://cdn.jsdelivr.net/npm/kiln-webgpu@0.2.0"
 
 const generator = await pipeline("text-generation", "HuggingFaceTB/SmolLM2-135M-Instruct", { dtype: "q4" });
 const [out] = await generator([{ role: "user", content: "Hi!" }], { max_new_tokens: 128 });

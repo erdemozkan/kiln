@@ -7,7 +7,7 @@
 
 <p align="center">
   <img alt="npm: coming soon" src="https://img.shields.io/badge/npm-coming%20soon-cb3837?logo=npm&logoColor=white">
-  <img alt="version 0.1.0" src="https://img.shields.io/badge/version-0.1.0-blue">
+  <img alt="version 0.2.0" src="https://img.shields.io/badge/version-0.2.0-blue">
   <img alt="MIT license" src="https://img.shields.io/badge/license-MIT-green">
   <img alt="Runs on WebGPU" src="https://img.shields.io/badge/runs%20on-WebGPU-005a9c">
   <img alt="241 KB gzipped" src="https://img.shields.io/badge/size-241%20KB%20gzipped-8a2be2">

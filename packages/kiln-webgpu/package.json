@@ -1,6 +1,6 @@
 {
   "name": "kiln-webgpu",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Kiln.js: run LLMs in the browser on WebGPU (CPU fallback), straight from Hugging Face safetensors or GGUF files, with a transformers.js-style pipeline API",
   "license": "MIT",
   "author": "Erdem Ozkan",

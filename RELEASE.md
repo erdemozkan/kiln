@@ -10,7 +10,7 @@ Steps for the first public release. Everything up to step 3 is checked in CI on 
 3. **Set the version.** Edit `packages/kiln-webgpu/package.json` and the heading in `CHANGELOG.md`
    (drop "unreleased", add the date). Commit.
 4. **Publish to npm.** `npm login`, then `npm publish -w kiln-webgpu`. `prepack` builds the package
-   first. Then tag the commit: `git tag kiln-webgpu-v0.1.0 && git push --tags`.
+   first. Then tag the commit: `git tag kiln-webgpu-v0.2.0 && git push --tags`.
 5. **Make the repository public** (GitHub: Settings → General → Danger Zone → Change visibility).
 6. **Publish the site.** Settings → Pages → Source: GitHub Actions. Then Actions → "Deploy demo" →
    Run workflow. The site (docs, examples, migration guide, benchmarks; `site/`) is served from
