@@ -6,7 +6,7 @@
 <p align="center"><strong>Run AI models in the browser on WebGPU, straight from their original weights.</strong></p>
 
 <p align="center">
-  <img alt="npm package: kiln-webgpu" src="https://img.shields.io/badge/npm-kiln--webgpu-cb3837?logo=npm&logoColor=white">
+  <img alt="npm: coming soon" src="https://img.shields.io/badge/npm-coming%20soon-cb3837?logo=npm&logoColor=white">
   <img alt="version 0.1.0" src="https://img.shields.io/badge/version-0.1.0-blue">
   <img alt="MIT license" src="https://img.shields.io/badge/license-MIT-green">
   <img alt="Runs on WebGPU" src="https://img.shields.io/badge/runs%20on-WebGPU-005a9c">
@@ -38,30 +38,20 @@ most existing code moves over by changing the import and the model id.
 ## Prerequisites
 
 - **A browser with WebGPU** for full speed: current Chrome or Edge, Safari 26 or newer, or Firefox 141 or newer on Windows. Without WebGPU, Kiln runs on the CPU (WASM SIMD), more slowly.
-- **Nothing to install** when importing from a CDN. With a bundler, any setup that handles ES modules works (Vite, webpack 5 and others).
+- **Nothing to install** when importing from a URL. With a bundler, any setup that handles ES modules works (Vite, webpack 5 and others).
 - **Node 22.12 or newer** only if you build this repository yourself.
 
 ## Quickstart
 
-Install it:
-
-```bash
-npm install kiln-webgpu
-```
-
-Or import it with no install and no bundler:
+Import it straight from this repository's site, with no install and no bundler:
 
 ```html
 <script type="module">
-  import { pipeline } from "https://cdn.jsdelivr.net/npm/kiln-webgpu@0.1.0";
+  import { pipeline } from "https://erdemozkan.github.io/kiln/kiln-webgpu.js";
 </script>
 ```
 
-The latest build from `main` is also served from this repository's site, with no npm involved:
-
-```js
-import { pipeline } from "https://erdemozkan.github.io/kiln/kiln-webgpu.js";
-```
+> **npm is coming soon.** Kiln is not on npm yet. Once it is published, `npm install kiln-webgpu` and versioned CDN links (`https://cdn.jsdelivr.net/npm/kiln-webgpu`) will work, and the examples below can import from `"kiln-webgpu"` as written. Until then, use the URL above in its place; it always serves the latest build from `main`.
 
 Chat with a model, using the transformers.js-style pipeline:
 
