@@ -20,6 +20,8 @@ import {
 } from "@kiln/tokenizers";
 import { Tensor } from "./tensor";
 
+const UTF8 = new TextDecoder();
+
 /**
  * transformers.js's `env`. Kiln reads `remoteHost` (a mirror of the Hub, used by `AutoTokenizer` and
  * `pipeline` unless a call passes `endpoint`); the other settings are accepted and have no effect:
@@ -195,7 +197,7 @@ class ClipCompat extends TemplatedTokenizer {
     let out = "";
     let run: number[] = [];
     const flush = () => {
-      out += new TextDecoder().decode(Uint8Array.from(run));
+      out += UTF8.decode(Uint8Array.from(run));
       run = [];
     };
     for (const id of ids) {
@@ -302,6 +304,12 @@ export class PreTrainedTokenizer {
    * transformers builds their slow tokenizers.
    */
   static async from_pretrained(id: string, options: PretrainedOptions = {}): Promise<PreTrainedTokenizer & ((text: string | string[], options?: TokenizerCallOptions) => BatchEncoding)> {
+    const { tok, cfg, jinja } = await PreTrainedTokenizer.fetchFiles(id, options);
+    return new this(tok, cfg, jinja) as PreTrainedTokenizer & ((text: string | string[], options?: TokenizerCallOptions) => BatchEncoding);
+  }
+
+  /** The files `from_pretrained` builds a tokenizer from, fetched but not yet parsed into one. */
+  static async fetchFiles(id: string, options: PretrainedOptions = {}): Promise<{ tok: TokenizerJSON | EncoderTokenizerJSON; cfg: TokenizerConfig; jinja: string | undefined }> {
     const ref = parseModelId(id, options.revision);
     const ep = options.endpoint ?? envEndpoint();
     const listing = listRepoFiles(ref, ep);
@@ -319,7 +327,7 @@ export class PreTrainedTokenizer {
       else if (vocabJson && merges) tok = byteLevelJSONFromVocabMerges(vocabJson, merges);
       else throw new Error(`${id} has no tokenizer.json, vocab.txt, or vocab.json and merges.txt`);
     }
-    return new this(tok, cfg, jinja) as PreTrainedTokenizer & ((text: string | string[], options?: TokenizerCallOptions) => BatchEncoding);
+    return { tok, cfg, jinja };
   }
 
   get model_max_length(): number {

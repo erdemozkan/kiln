@@ -262,9 +262,8 @@ export class EncoderModel {
         be.copy(physical(plan.out.buf), 0, buf, 0, bytes);
         outs.push({ buf, bytes });
       }
-      const res: Float32Array[] = [];
-      for (const o of outs) res.push(new Float32Array(await be.readback(o.buf, 0, o.bytes)));
-      return res;
+      // All copies are queued: map them together rather than waiting on each in turn.
+      return await Promise.all(outs.map(async (o) => new Float32Array(await be.readback(o.buf, 0, o.bytes))));
     } finally {
       for (const o of outs) be.free(o.buf);
       // A few lengths stay recorded, trimmed only once nothing queued still uses them.

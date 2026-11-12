@@ -125,14 +125,19 @@ export class KilnModel extends WorkerChannel {
     const m = new KilnModel(worker, undefined as unknown as ModelInfo);
     const { onProgress, worker: _w, persist = true, ...wire } = opts;
     const persistent = persist ? requestPersistence() : Promise.resolve(undefined);
-    m.info = await new Promise<ModelInfo>((resolve, reject) => {
-      m.send({ type: "load", model, opts: wire }, (msg) => {
-        if (msg.type === "progress") onProgress?.(msg.progress);
-        else if (msg.type === "loaded") resolve(msg.info);
-        else if (msg.type === "error") reject(new Error(msg.message));
-        return msg.type === "loaded" || msg.type === "error";
+    try {
+      m.info = await new Promise<ModelInfo>((resolve, reject) => {
+        m.send({ type: "load", model, opts: wire }, (msg) => {
+          if (msg.type === "progress") onProgress?.(msg.progress);
+          else if (msg.type === "loaded") resolve(msg.info);
+          else if (msg.type === "error") reject(new Error(msg.message));
+          return msg.type === "loaded" || msg.type === "error";
+        });
       });
-    });
+    } catch (err) {
+      if (!opts.worker) worker.terminate();
+      throw err;
+    }
     // Not awaited: a permission prompt the user ignores must not hold up the load.
     void persistent.then((v) => (m.info.persistent = v));
     return m;

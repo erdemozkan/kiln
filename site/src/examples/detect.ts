@@ -1,5 +1,7 @@
-import { pipeline, type ZeroShotObjectDetectionPipeline } from "kiln-webgpu";
+import type { ZeroShotObjectDetectionPipeline } from "kiln-webgpu";
 import { $, backendNote, busy, pipelineProgress, status } from "./common";
+// The library loads when a demo first runs, not with the page.
+const kiln = () => import("kiln-webgpu");
 
 const SAMPLE = "https://huggingface.co/datasets/Xenova/transformers.js-docs/resolve/main/cats.jpg";
 let detector: ZeroShotObjectDetectionPipeline | undefined;
@@ -24,7 +26,7 @@ $("run").addEventListener("click", () =>
   busy($<HTMLButtonElement>("run"), async () => {
     if (!image) return;
     status("Loading OWL-ViT…");
-    detector ??= await pipeline("zero-shot-object-detection", "google/owlvit-base-patch32", { progress_callback: pipelineProgress("Loading OWL-ViT") });
+    detector ??= await (await kiln()).pipeline("zero-shot-object-detection", "google/owlvit-base-patch32", { progress_callback: pipelineProgress("Loading OWL-ViT") });
     const labels = $<HTMLInputElement>("labels").value.split(",").map((s) => s.trim()).filter(Boolean);
     status("Detecting…");
     const t0 = performance.now();

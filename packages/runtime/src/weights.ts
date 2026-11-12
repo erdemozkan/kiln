@@ -134,10 +134,24 @@ export async function loadWeights(
         else onBytes(entry.byteLength);
       }
     }
+  } catch (err) {
+    // A file that fails part-way must not strand the tensors already on the GPU.
+    freeWeights(backend, out);
+    throw err;
   } finally {
     gpu?.destroy();
   }
   return out;
+}
+
+/** Frees every buffer of loaded weights (planes, scales and mins). */
+export function freeWeights(backend: Backend, weights: Map<string, Tensor>): void {
+  for (const t of weights.values()) {
+    backend.free(t.buf);
+    if (t.scales) backend.free(t.scales);
+    if (t.mins) backend.free(t.mins);
+  }
+  weights.clear();
 }
 
 async function loadTensor(

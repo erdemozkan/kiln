@@ -108,6 +108,7 @@ export interface WhisperFeatureConfig {
 
 const fftCache = new Map<number, FFT>();
 const filterCache = new Map<string, Float64Array>();
+const spanCache = new Map<string, Int32Array>();
 
 /**
  * Whisper's log-mel spectrogram of up to 30 s of 16 kHz audio, time-major [frames, mels] (3000 × 80):
@@ -132,6 +133,8 @@ export function whisperFeatures(samples: Float32Array, cfg: WhisperFeatureConfig
   const key = `${bins}/${mels}/${sr}`;
   let filters = filterCache.get(key);
   if (!filters) filterCache.set(key, (filters = melFilters(bins, mels, sr)));
+  let spans = spanCache.get(key);
+  if (!spans) spanCache.set(key, (spans = filterSpans(filters, bins, mels)));
   const window = Float64Array.from({ length: nFft }, (_, i) => 0.5 - 0.5 * Math.cos((2 * Math.PI * i) / nFft));
   const re = new Float64Array(nFft);
   const im = new Float64Array(nFft);
@@ -148,7 +151,8 @@ export function whisperFeatures(samples: Float32Array, cfg: WhisperFeatureConfig
     for (let b = 0; b < bins; b++) power[b] = re[b]! * re[b]! + im[b]! * im[b]!;
     for (let m = 0; m < mels; m++) {
       let s = 0;
-      for (let b = 0; b < bins; b++) s += power[b]! * filters[b * mels + m]!;
+      // Each triangle covers a few bins; the zeros outside it add nothing (the sum is the same bits).
+      for (let b = spans[2 * m]!, end = spans[2 * m + 1]!; b < end; b++) s += power[b]! * filters[b * mels + m]!;
       const v = Math.log10(Math.max(s, 1e-10));
       out[t * mels + m] = v;
       if (v > max) max = v;
@@ -156,6 +160,24 @@ export function whisperFeatures(samples: Float32Array, cfg: WhisperFeatureConfig
   }
   for (let i = 0; i < out.length; i++) out[i] = (Math.max(out[i]!, max - 8) + 4) / 4;
   return out;
+}
+
+/** [first, end) of the nonzero bins of each mel filter, as pairs. */
+function filterSpans(filters: Float64Array, bins: number, mels: number): Int32Array {
+  const spans = new Int32Array(2 * mels);
+  for (let m = 0; m < mels; m++) {
+    let lo = bins;
+    let hi = 0;
+    for (let b = 0; b < bins; b++) {
+      if (filters[b * mels + m] !== 0) {
+        lo = Math.min(lo, b);
+        hi = b + 1;
+      }
+    }
+    spans[2 * m] = Math.min(lo, hi);
+    spans[2 * m + 1] = hi;
+  }
+  return spans;
 }
 
 /** Mono samples of a WAV file (PCM 8/16/24/32-bit or float 32), channels averaged. */

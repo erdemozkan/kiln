@@ -1,5 +1,7 @@
-import { load, type JsonSchema, type KilnModel } from "kiln-webgpu";
+import type { JsonSchema, KilnModel } from "kiln-webgpu";
 import { $, backendNote, busy, progress, status } from "./common";
+// The library loads when a demo first runs, not with the page.
+const kiln = () => import("kiln-webgpu");
 
 const SAMPLE = "https://huggingface.co/datasets/Xenova/transformers.js-docs/resolve/main/invoice.png";
 const schema: JsonSchema = {
@@ -34,7 +36,7 @@ $("sample").addEventListener("click", async () => show(await (await fetch(SAMPLE
 $("run").addEventListener("click", () =>
   busy($<HTMLButtonElement>("run"), async () => {
     if (!image) await show(await (await fetch(SAMPLE)).blob());
-    vlm ??= await load("HuggingFaceTB/SmolVLM-500M-Instruct", { onProgress: progress("Loading SmolVLM-500M") });
+    vlm ??= await (await kiln()).load("HuggingFaceTB/SmolVLM-500M-Instruct", { onProgress: progress("Loading SmolVLM-500M") });
     status("Reading the invoice (the first image takes a while: it is cut into tiles)…");
     const t0 = performance.now();
     let json = "";

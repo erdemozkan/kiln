@@ -264,12 +264,37 @@ export { Tensor };
 
 /**
  * The repo's tokenizer on this thread, as transformers.js's pipelines carry one; an empty object for
- * GGUF files and repos without a tokenizer.json. Loaded after the model, so the browser's HTTP cache
- * serves the worker's copy.
+ * GGUF files and repos without a tokenizer.json. Its files are fetched after the model, so the
+ * browser's HTTP cache serves the worker's copy, and parsed only when the tokenizer is first used:
+ * most pipelines never touch it, and a large vocabulary takes a while to build.
  */
 async function sideTokenizer(id: string, options: PipelineOptions): Promise<PreTrainedTokenizer> {
   if (/\.gguf$/i.test(id)) return {} as PreTrainedTokenizer;
-  return PreTrainedTokenizer.from_pretrained(id, { revision: options.revision, endpoint: options.endpoint }).catch(() => ({}) as PreTrainedTokenizer);
+  const files = await PreTrainedTokenizer.fetchFiles(id, { revision: options.revision, endpoint: options.endpoint }).catch(() => undefined);
+  if (!files) return {} as PreTrainedTokenizer;
+  return lazyTokenizer(() => new PreTrainedTokenizer(files.tok, files.cfg, files.jinja));
+}
+
+/**
+ * A stand-in that builds the tokenizer from `make` on first use and then behaves as it: callable, with
+ * its properties, methods and prototype (`instanceof` holds).
+ */
+export function lazyTokenizer(make: () => PreTrainedTokenizer): PreTrainedTokenizer {
+  let real: PreTrainedTokenizer | undefined;
+  const get = () => (real ??= make());
+  // An arrow function as the target: callable like the tokenizer, and with only configurable own keys.
+  return new Proxy((() => undefined) as unknown as PreTrainedTokenizer, {
+    apply: (_t, thisArg, args) => Reflect.apply(get() as unknown as (...a: unknown[]) => unknown, thisArg, args),
+    get: (_t, key) => Reflect.get(get(), key),
+    set: (_t, key, value) => Reflect.set(get(), key, value),
+    has: (_t, key) => Reflect.has(get(), key),
+    ownKeys: () => Reflect.ownKeys(get()),
+    getOwnPropertyDescriptor: (_t, key) => {
+      const d = Reflect.getOwnPropertyDescriptor(get(), key);
+      return d && { ...d, configurable: true };
+    },
+    getPrototypeOf: () => Reflect.getPrototypeOf(get()),
+  });
 }
 
 /** Cosine similarity of two vectors (transformers.js's `cos_sim`). */

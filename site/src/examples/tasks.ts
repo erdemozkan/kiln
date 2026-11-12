@@ -1,13 +1,15 @@
-import { load, tasks, type KilnModel } from "kiln-webgpu";
+import type { KilnModel } from "kiln-webgpu";
 import { $, backendNote, busy, progress, status } from "./common";
+// The library loads when a demo first runs, not with the page.
+const kiln = () => import("kiln-webgpu");
 
 let llm: KilnModel | undefined;
 backendNote();
-const ready = async () => (llm ??= await load("Qwen/Qwen2.5-0.5B-Instruct", { quant: "q8", onProgress: progress("Loading Qwen2.5-0.5B") }));
+const ready = async () => (llm ??= await (await kiln()).load("Qwen/Qwen2.5-0.5B-Instruct", { quant: "q8", onProgress: progress("Loading Qwen2.5-0.5B") }));
 
 $("classify").addEventListener("click", () =>
   busy($<HTMLButtonElement>("classify"), async () => {
-    const t = tasks(await ready());
+    const t = (await kiln()).tasks(await ready());
     const labels = $<HTMLInputElement>("labels").value.split(",").map((s) => s.trim()).filter(Boolean);
     status("Scoring the labels…");
     const r = await t.classify($<HTMLTextAreaElement>("text").value, labels);
@@ -17,7 +19,7 @@ $("classify").addEventListener("click", () =>
 );
 $("ner").addEventListener("click", () =>
   busy($<HTMLButtonElement>("ner"), async () => {
-    const t = tasks(await ready());
+    const t = (await kiln()).tasks(await ready());
     const types = $<HTMLInputElement>("types").value.split(",").map((s) => s.trim()).filter(Boolean);
     status("Finding entities…");
     const text = $<HTMLTextAreaElement>("nertext").value;

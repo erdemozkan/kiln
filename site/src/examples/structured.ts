@@ -1,5 +1,7 @@
-import { load, type JsonSchema, type KilnModel } from "kiln-webgpu";
+import type { JsonSchema, KilnModel } from "kiln-webgpu";
 import { $, backendNote, busy, progress, status } from "./common";
+// The library loads when a demo first runs, not with the page.
+const kiln = () => import("kiln-webgpu");
 
 let llm: KilnModel | undefined;
 backendNote();
@@ -13,7 +15,7 @@ $("run").addEventListener("click", () =>
       status("The schema is not valid JSON.");
       return;
     }
-    llm ??= await load("Qwen/Qwen2.5-0.5B-Instruct", { quant: "q8", onProgress: progress("Loading Qwen2.5-0.5B") });
+    llm ??= await (await kiln()).load("Qwen/Qwen2.5-0.5B-Instruct", { quant: "q8", onProgress: progress("Loading Qwen2.5-0.5B") });
     status("Extracting…");
     const t0 = performance.now();
     let json = "";

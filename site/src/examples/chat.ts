@@ -1,5 +1,7 @@
-import { load, type KilnModel, type ChatMessage } from "kiln-webgpu";
+import type { KilnModel, ChatMessage } from "kiln-webgpu";
 import { $, backendNote, busy, progress, status } from "./common";
+// The library loads when a demo first runs, not with the page.
+const kiln = () => import("kiln-webgpu");
 
 const MODEL = "Qwen/Qwen2.5-0.5B-Instruct";
 let llm: KilnModel | undefined;
@@ -11,7 +13,7 @@ $("send").addEventListener("click", () =>
     const input = $<HTMLTextAreaElement>("input");
     const text = input.value.trim();
     if (!text) return;
-    llm ??= await load(MODEL, { quant: "q8", onProgress: progress("Loading Qwen2.5-0.5B") });
+    llm ??= await (await kiln()).load(MODEL, { quant: "q8", onProgress: progress("Loading Qwen2.5-0.5B") });
     history.push({ role: "user", content: text });
     input.value = "";
     const log = $("output");

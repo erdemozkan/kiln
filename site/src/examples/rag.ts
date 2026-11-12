@@ -1,5 +1,7 @@
-import { Retriever, load, type KilnModel } from "kiln-webgpu";
+import type { KilnModel, Retriever } from "kiln-webgpu";
 import { $, backendNote, busy, pipelineProgress, progress, status } from "./common";
+// The library loads when a demo first runs, not with the page.
+const kiln = () => import("kiln-webgpu");
 
 let rag: Retriever | undefined;
 let llm: KilnModel | undefined;
@@ -11,7 +13,7 @@ $("ask").addEventListener("click", () =>
     const docs = $<HTMLTextAreaElement>("docs").value;
     if (!rag) {
       status("Loading the embedding model…");
-      rag = await Retriever.create({ progress_callback: pipelineProgress("Loading all-MiniLM-L6-v2") });
+      rag = await (await kiln()).Retriever.create({ progress_callback: pipelineProgress("Loading all-MiniLM-L6-v2") });
     }
     if (docs !== indexed) {
       for (const c of [...rag.chunks]) rag.remove(c.docId);
@@ -19,7 +21,7 @@ $("ask").addEventListener("click", () =>
       await rag.add(parts, { onProgress: (d, n) => status(`Embedding ${d} / ${n} chunks…`) });
       indexed = docs;
     }
-    llm ??= await load("Qwen/Qwen2.5-0.5B-Instruct", { quant: "q8", onProgress: progress("Loading Qwen2.5-0.5B") });
+    llm ??= await (await kiln()).load("Qwen/Qwen2.5-0.5B-Instruct", { quant: "q8", onProgress: progress("Loading Qwen2.5-0.5B") });
     const q = $<HTMLInputElement>("question").value;
     const { stream, sources } = await rag.ask(llm, q, { k: 2, minScore: 0.2, temperature: 0, maxTokens: 200 });
     const src = $("sources");

@@ -5,7 +5,6 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Kiln benchmarks</title>
     <meta name="description" content="Kiln against transformers.js on the same machine and inputs: end-to-end speed for 31 tasks, and how closely the outputs agree." />
-    <script src="coi.js"></script>
   </head>
   <body data-page="benchmarks" data-root="">
     <main class="page with-toc">
@@ -34,7 +33,7 @@
           <li><strong>Loading from the cache:</strong> 1.8 s against 0.9 s for SmolLM2-135M. Kiln converts weights as it loads; transformers.js loads a pre-quantized file.</li>
           <li><strong>Download size:</strong> transformers.js's ONNX repos ship pre-quantized files, so a q4 model downloads less; Kiln downloads the original weights once and quantizes them.</li>
           <li><strong>Masked-LM logits through <code>AutoModelForMaskedLM</code>:</strong> 0.24 s against 0.11 s (transformers.js on WASM) for nine tokens, since Kiln computes them one position at a time. The <code>fill-mask</code> pipeline, which reads one position, is 2× faster.</li>
-          <li><strong>The runtime itself is smaller:</strong> Kiln is 268 KB gzipped with its worker; transformers.js adds 6.7 MB of WASM.</li>
+          <li><strong>The runtime itself is smaller:</strong> Kiln is 236 KB gzipped with its worker; transformers.js adds 6.7 MB of WASM.</li>
         </ul>
 
         <h2 id="accuracy">Accuracy</h2>

@@ -45,7 +45,7 @@ import {
 import { Tokenizer, type ChatTemplate, type TokenizerJSON } from "@kiln/tokenizers";
 import { Engine } from "./engine";
 import { llamaMatmulShapes, tuneMatmuls } from "./tune";
-import { loadWeights, type LoadProgress, type Quant, type WeightFile } from "./weights";
+import { freeWeights, loadWeights, type LoadProgress, type Quant, type WeightFile } from "./weights";
 
 export interface LoadOptions {
   /** Weight storage on the GPU: "auto" (default: q4, with GGUF tensors kept at their own precision), "q4", "q8" or "f32". See `Quant`. */
@@ -126,8 +126,15 @@ export async function createEngine(modelId: string, opts: LoadOptions = {}): Pro
   const quant = opts.quant ?? "auto";
   ops.setMatmulF16(!!opts.f16Math && backend.limits.features.has("shader-f16"));
   ops.setSubgroups(!!opts.subgroups);
-  const { cfg, tokenizer, files, idefics3, gemma3 } = ref.gguf ? await openGGUF(ref, opts.endpoint) : await openSafetensors(ref, opts.endpoint);
+  const ownsBackend = !opts.backend;
+  let weights: Map<string, Tensor> | undefined;
+  let vision: VisionTower | undefined;
+  let model: LlamaModel | undefined;
+  let files: Awaited<ReturnType<typeof openSafetensors>>["files"] = [];
   try {
+    const opened = ref.gguf ? await openGGUF(ref, opts.endpoint) : await openSafetensors(ref, opts.endpoint);
+    const { cfg, tokenizer, idefics3, gemma3 } = opened;
+    files = opened.files;
     const tuning =
       opts.tune === false || backend.name === "cpu"
         ? Promise.resolve()
@@ -135,8 +142,8 @@ export async function createEngine(modelId: string, opts: LoadOptions = {}): Pro
             () => undefined,
             (err: unknown) => console.warn("[kiln] matmul tuning failed; using defaults:", err),
           );
-    const weights = await loadWeights(backend, files, quant, opts.onProgress);
-    const vision = idefics3
+    weights = await loadWeights(backend, files, quant, opts.onProgress);
+    vision = idefics3
       ? await openIdefics3Vision(backend, files, idefics3, opts)
       : opts.mmproj
         ? await openVision(backend, opts.mmproj.split("/").length >= 3 ? parseModelId(opts.mmproj, opts.revision) : { ...ref, gguf: opts.mmproj }, opts)
@@ -146,11 +153,22 @@ export async function createEngine(modelId: string, opts: LoadOptions = {}): Pro
     if (vision && vision.cfg.projectionDim !== cfg.hiddenSize) throw new Error(`mmproj projects to ${vision.cfg.projectionDim}, but the model is ${cfg.hiddenSize} wide`);
     await tuning;
     const imageTokens = vision ? (opts.imageSlots ?? 4) * vision.tokensPerImage : 0;
-    const model = new LlamaModel(backend, cfg, weights, { maxSeq: opts.maxSeq, kvDtype: opts.kvDtype, fuse: opts.fuse, imageTokens });
+    model = new LlamaModel(backend, cfg, weights, { maxSeq: opts.maxSeq, kvDtype: opts.kvDtype, fuse: opts.fuse, imageTokens });
     const engine = new Engine(backend, model, tokenizer, vision);
     if (opts.maxSubmitMs !== undefined) engine.maxSubmitMs = opts.maxSubmitMs;
     if (opts.prefixCacheBytes !== undefined) engine.prefixCacheBytes = opts.prefixCacheBytes;
     return engine;
+  } catch (err) {
+    // Release what was built before the failure: the worker may load another model next.
+    try {
+      if (model) model.destroy();
+      else if (weights) freeWeights(backend, weights);
+      vision?.destroy();
+      if (ownsBackend) backend.destroy();
+    } catch {
+      // The original error is the one to report.
+    }
+    throw err;
   } finally {
     for (const f of files) f.source.close?.();
   }

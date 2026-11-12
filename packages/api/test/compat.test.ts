@@ -119,3 +119,20 @@ describe("RawImage", () => {
     expect(Array.from(r.data.slice(0, 6))).toEqual([255, 0, 0, 255, 0, 0]);
   });
 });
+
+describe("the pipeline's lazy tokenizer", () => {
+  it("builds on first use and then behaves as the tokenizer", async () => {
+    const { lazyTokenizer } = await import("../src/pipeline");
+    let built = 0;
+    const lazy = lazyTokenizer(() => (built++, bert())) as ReturnType<typeof bert>;
+    expect(built).toBe(0);
+    expect(lazy instanceof PreTrainedTokenizer).toBe(true);
+    expect(built).toBe(1);
+    const real = bert();
+    expect(lazy.encode("hello world")).toEqual(real.encode("hello world"));
+    expect(lazy("hello")).toEqual(real("hello"));
+    expect(lazy.pad_token_id).toBe(real.pad_token_id);
+    expect(Object.keys(lazy)).toEqual(Object.keys(real));
+    expect(built).toBe(1);
+  });
+});

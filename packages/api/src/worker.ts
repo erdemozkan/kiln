@@ -4,7 +4,7 @@ import type { AudioTask, VisionTask, EncoderTask, RawOutputs, Request, Response,
 
 /** The slice of DedicatedWorkerGlobalScope we use (lib.webworker conflicts with lib.dom in one program). */
 const scope = self as unknown as {
-  postMessage(msg: Response): void;
+  postMessage(msg: Response, transfer?: Transferable[]): void;
   onmessage: ((e: MessageEvent<Request>) => void) | null;
 };
 let engine: Engine | undefined;
@@ -68,7 +68,28 @@ async function saveCache(e: Engine, name: string): Promise<void> {
   }
 }
 
-const post = (msg: Response) => scope.postMessage(msg);
+const post = (msg: Response) => scope.postMessage(msg, msg.type === "result" ? bigBuffers(msg.result) : undefined);
+
+/** Below this a copy costs less than it matters; above it (audio, images, logits) results move without one. */
+const TRANSFER_MIN = 256 * 1024;
+
+/**
+ * The buffers of large typed arrays in a result, to transfer rather than copy. Only arrays that own
+ * their whole buffer qualify, and only large ones: small arrays may be cached in the worker (CLIP's
+ * text embeddings are), and a view's buffer may hold more than the result.
+ */
+function bigBuffers(value: unknown, out = new Set<ArrayBuffer>(), depth = 0): ArrayBuffer[] {
+  if (depth > 5 || value === null || typeof value !== "object") return [...out];
+  if (ArrayBuffer.isView(value)) {
+    const b = value.buffer;
+    if (b instanceof ArrayBuffer && value.byteOffset === 0 && value.byteLength === b.byteLength && b.byteLength >= TRANSFER_MIN) out.add(b);
+  } else if (Array.isArray(value)) {
+    for (const v of value) bigBuffers(v, out, depth + 1);
+  } else {
+    for (const v of Object.values(value)) bigBuffers(v, out, depth + 1);
+  }
+  return [...out];
+}
 
 /**
  * Generation calls run one at a time, in arrival order: a second conversation's call waits for the
@@ -135,6 +156,8 @@ scope.onmessage = async (e: MessageEvent<Request>) => {
         await queue;
         await saving;
         engine?.destroy();
+        engine = undefined;
+        cacheName = undefined;
         engine = await createEngine(msg.model, { ...msg.opts, onProgress: (progress) => post({ id: msg.id, type: "progress", progress }) });
         cacheName = msg.opts.promptCache === false ? undefined : promptCacheName(msg.model, msg.opts);
         savedTokens = [];

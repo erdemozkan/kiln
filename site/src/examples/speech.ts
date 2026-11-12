@@ -1,5 +1,7 @@
-import { pipeline, type SpeechRecognitionPipeline } from "kiln-webgpu";
+import type { SpeechRecognitionPipeline } from "kiln-webgpu";
 import { $, backendNote, busy, pipelineProgress, status } from "./common";
+// The library loads when a demo first runs, not with the page.
+const kiln = () => import("kiln-webgpu");
 
 const SAMPLE = "https://huggingface.co/datasets/Xenova/transformers.js-docs/resolve/main/jfk.wav";
 let asr: SpeechRecognitionPipeline | undefined;
@@ -19,7 +21,7 @@ $<HTMLInputElement>("file").addEventListener("change", (e) => {
 $("run").addEventListener("click", () =>
   busy($<HTMLButtonElement>("run"), async () => {
     status("Loading Whisper…");
-    asr ??= await pipeline("automatic-speech-recognition", "openai/whisper-tiny.en", { progress_callback: pipelineProgress("Loading Whisper") });
+    asr ??= await (await kiln()).pipeline("automatic-speech-recognition", "openai/whisper-tiny.en", { progress_callback: pipelineProgress("Loading Whisper") });
     status("Transcribing…");
     const t0 = performance.now();
     const out = (await asr(audio, { return_timestamps: "word" })) as { text: string; chunks?: { text: string; timestamp: [number, number] }[] };

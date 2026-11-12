@@ -70,6 +70,8 @@ export class ClipTokenizer {
       if (id !== undefined) ids.push(id);
       else if (this.unk !== undefined) ids.push(this.unk);
     }
+    // Bounded: a long stream of distinct words (or hostile input) must not grow it without end.
+    if (this.cache.size >= 50_000) this.cache.clear();
     this.cache.set(word, ids);
     return ids;
   }

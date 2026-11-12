@@ -1,5 +1,7 @@
-import { load, type KilnModel } from "kiln-webgpu";
+import type { KilnModel } from "kiln-webgpu";
 import { $, backendNote, busy, progress, status } from "./common";
+// The library loads when a demo first runs, not with the page.
+const kiln = () => import("kiln-webgpu");
 
 let llm: KilnModel | undefined;
 backendNote();
@@ -7,7 +9,7 @@ backendNote();
 $("run").addEventListener("click", () =>
   busy($<HTMLButtonElement>("run"), async () => {
     if (!llm) {
-      llm = await load("HuggingFaceTB/SmolLM2-135M-Instruct", { onProgress: progress("Loading SmolLM2-135M") });
+      llm = await (await kiln()).load("HuggingFaceTB/SmolLM2-135M-Instruct", { onProgress: progress("Loading SmolLM2-135M") });
       status("Loading the two adapters…");
       await llm.loadAdapter("science", "Miladsaeedi70/smollm2-135m-scientific-sft-lora");
       await llm.loadAdapter("linkedin", "ArtemMozharov/smollm2-135m-linkedin-translator");

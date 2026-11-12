@@ -175,7 +175,17 @@ function topK(scores: Float32Array, k: number, keep: (i: number) => boolean): nu
  * the same model twice in a page fails: its cached weights are open in the first worker.)
  */
 export class Retriever {
-  private vectors = new Float32Array(0);
+  /** Room for more vectors than are stored, grown by doubling so adding in small batches stays linear. */
+  private store = new Float32Array(0);
+  private used = 0;
+  /** The stored vectors, row-major [chunks, dims]. */
+  private get vectors(): Float32Array {
+    return this.store.subarray(0, this.used);
+  }
+  private set vectors(v: Float32Array) {
+    this.store = v;
+    this.used = v.length;
+  }
   private readonly items: Chunk[] = [];
   private docs = 0;
   private ownsEmbedder = true;
@@ -284,14 +294,15 @@ export class Retriever {
       opts.onProgress?.(Math.min(i + batch, fresh.length), fresh.length);
     }
     const added = parts.reduce((n, p) => n + p.length, 0);
-    const v = new Float32Array(this.vectors.length + added);
-    v.set(this.vectors);
-    let at = this.vectors.length;
-    for (const p of parts) {
-      v.set(p, at);
-      at += p.length;
+    if (this.used + added > this.store.length) {
+      const grown = new Float32Array(Math.max(this.used + added, this.store.length * 2));
+      grown.set(this.vectors);
+      this.store = grown;
     }
-    this.vectors = v;
+    for (const p of parts) {
+      this.store.set(p, this.used);
+      this.used += p.length;
+    }
     this.items.push(...fresh);
     return fresh;
   }
@@ -303,7 +314,8 @@ export class Retriever {
     const removed = this.items.length - keep.length;
     if (!removed) return 0;
     const v = new Float32Array(keep.length * D);
-    keep.forEach(([, i], j) => v.set(this.vectors.subarray(i * D, (i + 1) * D), j * D));
+    const vectors = this.vectors;
+    keep.forEach(([, i], j) => v.set(vectors.subarray(i * D, (i + 1) * D), j * D));
     this.vectors = v;
     this.items.splice(0, this.items.length, ...keep.map(([c]) => c));
     return removed;
@@ -315,10 +327,11 @@ export class Retriever {
     const q = await this.embed([query], this.queryPrefix);
     const D = q.length;
     const scores = new Float32Array(this.items.length);
+    const vectors = this.vectors;
     for (let i = 0; i < scores.length; i++) {
       let s = 0;
       const o = i * D;
-      for (let d = 0; d < D; d++) s += q[d]! * this.vectors[o + d]!;
+      for (let d = 0; d < D; d++) s += q[d]! * vectors[o + d]!;
       scores[i] = s;
     }
     const { k = 4, minScore = -Infinity, filter } = opts;
