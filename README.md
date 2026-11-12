@@ -98,10 +98,7 @@ git clone https://github.com/erdemozkan/kiln.git && cd kiln && npm install && np
 Kiln against transformers.js in the same browser on the same machine, on the same inputs. Across 31 task and model pairs, Kiln was faster end to end on every one, with a median speed-up of 2.2×.
 
 <p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="docs/media/benchmarks-dark.svg">
-    <img src="docs/media/benchmarks-light.svg" alt="Bar chart: Kiln is 1.1 to 11.8 times faster than transformers.js on 31 task and model pairs" width="820">
-  </picture>
+  <img src="docs/media/benchmarks.svg" alt="Bar chart: Kiln is 1.1 to 11.8 times faster than transformers.js on 31 task and model pairs" width="820">
 </p>
 
 Measured on an Intel Mac with integrated graphics (Iris Plus 650) in Chrome; times are the median of three warm calls. On an Apple M3, Kiln decodes SmolLM2-135M at about 307 tokens per second.

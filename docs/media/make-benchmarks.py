@@ -1,4 +1,7 @@
-"""Draws docs/media/benchmarks-{light,dark}.svg from the rows in site/src/benchmarks.ts.
+"""Draws docs/media/benchmarks.svg from the rows in site/src/benchmarks.ts.
+
+One file for both of GitHub's themes: a reader's GitHub theme can differ from their system's, which
+is what a themed <picture> follows, so the ink is a gray that reads on white and on GitHub's dark.
 
 Run from the repo root after changing those rows: python3 docs/media/make-benchmarks.py
 """
@@ -15,10 +18,7 @@ for m in re.finditer(r'\{ area: "[^"]+", task: "([^"]+)", model: "([^"]+)", kiln
 assert rows, "no rows found in site/src/benchmarks.ts"
 rows.sort(key=lambda r: -r[1])
 
-THEMES = {
-    "light": dict(bar="#2a78d6", text="#52514e", ink="#0b0b0b", grid="#dcdad5"),
-    "dark": dict(bar="#3987e5", text="#c3c2b7", ink="#f0efec", grid="#34332f"),
-}
+THEMES = {"": dict(bar="#2f7fe0", text="#6e7781", ink="#6e7781", grid="#8b949e")}
 W, LABEL, BAR, GAP, TOP = 820, 330, 14, 7, 30
 H = TOP + len(rows) * (BAR + GAP) + 26
 top = max(s for _, s in rows)
@@ -30,7 +30,7 @@ for name, c in THEMES.items():
          '<style>text{font:12px system-ui,-apple-system,"Segoe UI",sans-serif}</style>',
          f'<text x="0" y="14" fill="{c["ink"]}" style="font-weight:600;font-size:13px">Times faster than transformers.js, end to end (same browser, same machine)</text>']
     for v in range(0, hi + 1, 2 if hi > 10 else 1):
-        o.append(f'<line x1="{x(v):.1f}" x2="{x(v):.1f}" y1="{TOP - 4}" y2="{H - 22}" stroke="{c["grid"]}" stroke-width="0.5"/>')
+        o.append(f'<line x1="{x(v):.1f}" x2="{x(v):.1f}" y1="{TOP - 4}" y2="{H - 22}" stroke="{c["grid"]}" stroke-opacity="0.4" stroke-width="0.5"/>')
         o.append(f'<text x="{x(v):.1f}" y="{H - 6}" text-anchor="middle" fill="{c["text"]}">{v}×</text>')
     o.append(f'<line x1="{x(1):.1f}" x2="{x(1):.1f}" y1="{TOP - 4}" y2="{H - 22}" stroke="{c["text"]}" stroke-width="1.2" stroke-dasharray="4 3"/>')
     o.append(f'<text x="{x(1):.1f}" y="{H - 6}" text-anchor="middle" fill="{c["text"]}">1×</text>')
@@ -42,9 +42,9 @@ for name, c in THEMES.items():
         r = min(4.0, w / 2)
         o.append(f'<text x="{LABEL - 10}" y="{y + BAR - 3}" text-anchor="end" fill="{c["text"]}">{escape(label)}</text>')
         o.append(f'<path d="M{x(0):.1f},{y} h{w - r:.1f} a{r},{r} 0 0 1 {r},{r} v{BAR - 2 * r} a{r},{r} 0 0 1 -{r},{r} h-{w - r:.1f} z" fill="{c["bar"]}"/>')
-        o.append(f'<text x="{x(s) + 6:.1f}" y="{y + BAR - 3}" fill="{c["ink"]}">{s:.1f}×</text>')
+        o.append(f'<text x="{x(s) + 6:.1f}" y="{y + BAR - 3}" fill="{c["ink"]}" style="font-weight:600">{s:.1f}×</text>')
     o.append("</svg>")
-    (root / f"docs/media/benchmarks-{name}.svg").write_text("\n".join(o) + "\n")
+    (root / "docs/media/benchmarks.svg").write_text("\n".join(o) + "\n")
 
 speed = sorted(s for _, s in rows)
 n = len(speed)
