@@ -1,4 +1,4 @@
-import { physical, type Backend, type Buf, type Dispatch, type Profile } from "@kiln/core";
+import { type Backend, type Buf, type Dispatch, type Profile } from "@kiln/core";
 import { GrammarMatcher, TokenTrie, compileFormat, type ResponseFormat } from "@kiln/grammar";
 import { LlamaModel, MAX_VERIFY_ROWS, type ForwardPlan, type Idefics3Processing, type ImagePixels, type VisionTower } from "@kiln/models";
 import { idefics3PromptString, idefics3Tiles } from "./idefics3";
@@ -150,6 +150,8 @@ export class Engine {
   lastStopId: number | undefined;
   private readonly plans = new Map<number, ForwardPlan>();
   private readonly verifyPlans = new Map<number, ForwardPlan>();
+  /** Log-probability scoring of each verify plan's logits, by T (see `scoreIds`). */
+  private readonly scorePlans = new Map<number, ReturnType<LlamaModel["buildScore"]>>();
   private readonly advances = new Map<Buf, { dispatches: readonly Dispatch[]; destroy(): void }>();
   private readonly chains = new Map<number, Dispatch[]>();
   /** LoRA adapters loaded, by name, and the one in the slots (undefined: the base model). */
@@ -418,28 +420,39 @@ export class Engine {
         this.submit(plan.body, T);
         pos += k;
       }
-      const out: number[] = [];
-      for (const c of conts) {
-        const T = c.length;
-        longest = Math.max(longest, T);
-        const plan = this.verifyPlan(T);
-        this.backend.write(plan.tokens, 0, Uint32Array.from([promptIds[n - 1]!, ...c.slice(0, -1)]));
-        this.model.setStep({ pos0: n - 1, lastRow: 0, ...step });
-        this.submit(plan.dispatches, T);
-        const V = plan.logits.shape[1]!;
-        const rows = new Float32Array(await this.backend.readback(physical(plan.logits.buf), 0, T * V * 4));
-        let lp = 0;
-        for (let t = 0; t < T; t++) {
-          const row = rows.subarray(t * V, (t + 1) * V);
-          let max = -Infinity;
-          for (let i = 0; i < V; i++) if (row[i]! > max) max = row[i]!;
-          let sum = 0;
-          for (let i = 0; i < V; i++) sum += Math.exp(row[i]! - max);
-          lp += row[c[t]!]! - max - Math.log(sum);
+      // Each continuation's per-token log-probabilities are computed on the GPU and copied into one
+      // buffer, read back once at the end (4 bytes per token instead of a vocabulary-wide row).
+      const total = conts.reduce((a, c) => a + c.length, 0);
+      const all = this.backend.alloc(total * 4, "storage", "engine/scores");
+      try {
+        let at = 0;
+        for (const c of conts) {
+          const T = c.length;
+          longest = Math.max(longest, T);
+          const plan = this.verifyPlan(T);
+          let score = this.scorePlans.get(T);
+          if (!score) this.scorePlans.set(T, (score = this.model.buildScore(plan)));
+          this.backend.write(plan.tokens, 0, Uint32Array.from([promptIds[n - 1]!, ...c.slice(0, -1)]));
+          this.backend.write(score.targets, 0, Uint32Array.from(c));
+          this.model.setStep({ pos0: n - 1, lastRow: 0, ...step });
+          // The verify plan ends by sampling every row, which scoring does not need.
+          const sampled = plan.dispatches.at(-1)?.label === "sample/rows";
+          this.submit(sampled ? plan.dispatches.slice(0, -1) : plan.dispatches, T);
+          this.backend.submit(score.dispatches);
+          this.backend.copy(score.out, 0, all, at * 4, T * 4);
+          at += T;
         }
-        out.push(lp);
+        const lps = new Float32Array(await this.backend.readback(all, 0, total * 4));
+        at = 0;
+        return conts.map((c) => {
+          let lp = 0;
+          for (let t = 0; t < c.length; t++) lp += lps[at + t]!;
+          at += c.length;
+          return lp;
+        });
+      } finally {
+        this.backend.free(all);
       }
-      return out;
     } catch (err) {
       failed = true;
       throw err;
@@ -996,9 +1009,11 @@ export class Engine {
   private dropPlans(): void {
     for (const p of this.plans.values()) p.destroy();
     for (const p of this.verifyPlans.values()) p.destroy();
+    for (const p of this.scorePlans.values()) p.destroy();
     for (const a of this.advances.values()) a.destroy();
     this.plans.clear();
     this.verifyPlans.clear();
+    this.scorePlans.clear();
     this.advances.clear();
     this.chains.clear();
   }
@@ -1034,9 +1049,11 @@ export class Engine {
     this.prefixes.clear();
     for (const p of this.plans.values()) p.destroy();
     for (const p of this.verifyPlans.values()) p.destroy();
+    for (const p of this.scorePlans.values()) p.destroy();
     for (const a of this.advances.values()) a.destroy();
     this.plans.clear();
     this.verifyPlans.clear();
+    this.scorePlans.clear();
     this.advances.clear();
     this.chains.clear();
     this.model.destroy();

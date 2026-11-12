@@ -70,6 +70,7 @@ import {
   ropeKvSpec,
   ropeSpec,
   sampleSpec,
+  logprobRowsSpec,
   siluMulSpec,
   type KvDtype,
   type MatmulEpilogue,
@@ -838,6 +839,12 @@ export function sample(ctx: Ctx, logits: Tensor, out: Buf, seen: Buf, allowed: B
 export function sampleRows(ctx: Ctx, logits: Tensor, out: Buf, seen: Buf, allowed: Buf): void {
   const V = lastDim(logits);
   ctx.run(sampleSpec(true), [ctx.uniform([u32(V), u32(0), u32(0), u32(0)]), ctx.step, logits.buf, seen, allowed, out], [1, rowsOf(logits), 1]);
+}
+
+/** logits [T, V] and u32 targets [T] → f32 [T] log-probabilities of each row's target. */
+export function logprobRows(ctx: Ctx, logits: Tensor, targets: Buf, out: Buf): void {
+  const V = lastDim(logits);
+  ctx.run(logprobRowsSpec(), [ctx.uniform([u32(V), u32(0), u32(0), u32(0)]), logits.buf, targets, out], [1, rowsOf(logits), 1]);
 }
 
 /** GPU-side step advance: tokens[0] = sampled, history[step.n++] = sampled, mark seen, pos0 += lastRow + 1. */

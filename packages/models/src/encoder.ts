@@ -133,6 +133,9 @@ export function encoderName(name: string): string | undefined {
 }
 
 /** A masked-LM head's weights (decoder undefined: tied to the word embeddings). */
+/** Rows of the masked-LM head per batch: [32, vocab] logits stay well under storage-binding limits. */
+const MLM_ROWS = 32;
+
 export interface MlmHead {
   dense: Float32Array;
   denseBias?: Float32Array;
@@ -144,8 +147,6 @@ export interface MlmHead {
   decoder?: Float32Array;
   bias?: Float32Array;
 }
-
-const numelOf = (t: Tensor) => t.shape.reduce((a, b) => a * b, 1);
 
 /** Body matrices that may be stored quantized (embedding tables, norms and biases stay f32). */
 export const isEncoderMatrix = (name: string): boolean => /^l\d+\.(q|k|v|o|up|down)\.weight$/.test(name);
@@ -275,15 +276,19 @@ export class EncoderModel {
     }
   }
 
-  private mlm: { ctx: Ctx; step: Buf; x: Buf; logits: Tensor; dispatches: readonly Dispatch[]; owned: Tensor[] } | undefined;
+  /** The masked-LM head: its weights (uploaded on first use) and a recorded plan per row count. */
+  private mlm: { step: Buf; owned: Tensor[]; dense: Tensor; denseBias?: Tensor; lnW: Tensor; lnB: Tensor; dec: Tensor; bias?: Tensor; plans: Map<number, { ctx: Ctx; x: Buf; logits: Tensor; dispatches: readonly Dispatch[] }> } | undefined;
 
   /**
-   * A masked-LM head on one hidden row, on the backend: dense → GELU → LayerNorm → vocabulary logits
-   * through the decoder (the word embedding table when tied). Weights are uploaded on first use.
+   * A masked-LM head on hidden rows x [R, H], on the backend: dense → GELU → LayerNorm → vocabulary
+   * logits through the decoder (the word embedding table when tied). Weights are uploaded on first
+   * use. Rows run in batches of up to MLM_ROWS through one matmul each, read back once per batch.
    */
   async maskLogits(x: Float32Array, head: MlmHead): Promise<Float32Array> {
     const be = this.backend;
     const H = this.cfg.hidden;
+    const R = x.length / H;
+    if (!Number.isInteger(R) || R < 1) throw new Error(`maskLogits: ${x.length} values is not a whole number of ${H}-wide rows`);
     if (!this.mlm) {
       const owned: Tensor[] = [];
       const up = (v: Float32Array, shape: number[]): Tensor => {
@@ -296,18 +301,43 @@ export class EncoderModel {
       const V = head.bias?.length ?? (head.decoder ? head.decoder.length / H : this.cfg.vocab);
       const step = be.alloc(STEP_BYTES, "storage", "encoder/mlm-step");
       be.write(step, 0, packStep({ pos0: 0, lastRow: 0, seed: 0, temperature: 0 }));
-      const ctx = new Ctx(be, step, "encoder/mlm", this.pool);
-      const xb = ctx.buffer(H * 4, "encoder/mlm-x");
-      const h = ops.linear(ctx, { shape: [1, H], dtype: "f32", buf: xb }, up(head.dense, [H, H]), { bias: head.denseBias ? up(head.denseBias, [H]) : undefined });
-      ops.gelu(ctx, h, head.exact);
-      const n = ops.layernorm(ctx, h, up(head.lnW, [H]), up(head.lnB, [H]), head.eps);
-      const dec = head.decoder ? up(head.decoder, [V, H]) : this.w("emb.word");
-      const logits = ops.linear(ctx, n, dec, { bias: head.bias ? up(head.bias, [V]) : undefined });
-      this.mlm = { ctx, step, x: xb, logits, dispatches: ctx.dispatches, owned };
+      this.mlm = {
+        step,
+        owned,
+        dense: up(head.dense, [H, H]),
+        denseBias: head.denseBias ? up(head.denseBias, [H]) : undefined,
+        lnW: up(head.lnW, [H]),
+        lnB: up(head.lnB, [H]),
+        dec: head.decoder ? up(head.decoder, [V, H]) : this.w("emb.word"),
+        bias: head.bias ? up(head.bias, [V]) : undefined,
+        plans: new Map(),
+      };
     }
-    be.write(this.mlm.x, 0, x);
-    be.submit(this.mlm.dispatches);
-    return new Float32Array(await be.readback(physical(this.mlm.logits.buf), 0, numelOf(this.mlm.logits) * 4));
+    const m = this.mlm;
+    const V = m.dec.shape[0]!;
+    const out = new Float32Array(R * V);
+    for (let r0 = 0; r0 < R; r0 += MLM_ROWS) {
+      const r = Math.min(MLM_ROWS, R - r0);
+      // Row counts round up to a power of two, so a few plans serve every length.
+      const P = Math.min(MLM_ROWS, 2 ** Math.ceil(Math.log2(r)));
+      let plan = m.plans.get(P);
+      if (!plan) {
+        const ctx = new Ctx(be, m.step, `encoder/mlm${P}`, this.pool);
+        const xb = ctx.buffer(P * H * 4, "encoder/mlm-x");
+        const h = ops.linear(ctx, { shape: [P, H], dtype: "f32", buf: xb }, m.dense, { bias: m.denseBias });
+        ops.gelu(ctx, h, head.exact);
+        const n = ops.layernorm(ctx, h, m.lnW, m.lnB, head.eps);
+        const logits = ops.linear(ctx, n, m.dec, { bias: m.bias });
+        plan = { ctx, x: xb, logits, dispatches: ctx.dispatches };
+        m.plans.set(P, plan);
+      }
+      const rows = new Float32Array(P * H);
+      rows.set(x.subarray(r0 * H, (r0 + r) * H));
+      be.write(plan.x, 0, rows);
+      be.submit(plan.dispatches);
+      out.set(new Float32Array(await be.readback(physical(plan.logits.buf), 0, r * V * 4)), r0 * V);
+    }
+    return out;
   }
 
   private dropPlan(p: Plan): void {
@@ -326,7 +356,7 @@ export class EncoderModel {
     for (const p of this.plans.values()) this.dropPlan(p);
     this.plans.clear();
     if (this.mlm) {
-      this.mlm.ctx.destroy();
+      for (const p of this.mlm.plans.values()) p.ctx.destroy();
       this.backend.free(this.mlm.step);
       for (const t of this.mlm.owned) this.backend.free(t.buf);
       this.mlm = undefined;

@@ -1130,7 +1130,8 @@ pipelines keep their WAV reader. Images differ before the model: transformers.js
 browser, Kiln as PIL does, so the cats photo's pixel values differed by up to 0.82 (ViT's top three
 classes were still the same). Given the same pixels, ViT's logits agreed within 1.4e-5 (0.34 s
 against 1.5 s) and CLIP's `logits_per_image` within 1.3e-5, its text embeddings within 1.6e-7. The
-masked-LM head runs one position at a time (0.24 s against 0.11 s for nine tokens).
+masked-LM head runs every position through one batched matmul (0.15 s against 0.11 s for nine tokens;
+0.24 s when it ran one position at a time).
 
 T5's learned relative position bias is added to each score by the per-row attention kernels (GPU
 and CPU, buckets computed in the kernel; bucket function equal to transformers' over ±300

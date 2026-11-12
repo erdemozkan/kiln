@@ -1,4 +1,4 @@
-import { ActivationPool, Ctx, STEP_BYTES, byteSize, isBlockQuant, packStep, q4ScaleBytes, view, type Backend, type Buf, type Dispatch, type StepParams, type Tensor } from "@kiln/core";
+import { ActivationPool, Ctx, STEP_BYTES, physical, byteSize, isBlockQuant, packStep, q4ScaleBytes, view, type Backend, type Buf, type Dispatch, type StepParams, type Tensor } from "@kiln/core";
 import { ATTN_WG, ops, type KvDtype } from "@kiln/kernels";
 import { ropeInvFreq, type LlamaConfig } from "./config";
 
@@ -614,6 +614,19 @@ export class LlamaModel {
     const body = verify ? dispatches : dispatches.slice(0, dispatches.length - 3);
     if (!verify && dispatches[body.length]!.label !== "copy_row") throw new Error("buildPlan: unexpected head layout");
     return { T, dispatches, body, tokens, out, logits, destroy: () => ctx.destroy() };
+  }
+
+  /**
+   * Records log-probability scoring of a verify plan's logits: `targets` (u32 [T], the id expected
+   * after each row) in, `out` (f32 [T]) the log-probability of each.
+   */
+  buildScore(plan: ForwardPlan): { targets: Buf; out: Buf; dispatches: readonly Dispatch[]; destroy(): void } {
+    const ctx = new Ctx(this.backend, this.step, `S${plan.T}`);
+    const targets = ctx.buffer(plan.T * 4, "targets");
+    const out = ctx.buffer(plan.T * 4, "logprobs");
+    // The logits live in the verify plan's pooled memory: bind its physical buffer, read right after it runs.
+    ops.logprobRows(ctx, { ...plan.logits, buf: physical(plan.logits.buf) }, targets, out);
+    return { targets, out, dispatches: ctx.dispatches, destroy: () => ctx.destroy() };
   }
 
   /**

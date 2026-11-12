@@ -213,12 +213,9 @@ export class EncoderEngine {
           out.push({ start_logits: { data: se[0]!, dims: [T] }, end_logits: { data: se[1]!, dims: [T] } });
         }
       } else {
-        const rowsOut: Float32Array[] = [];
-        for (let t = 0; t < T; t++) rowsOut.push(await this.maskLogits(this.row(h, t)));
-        const V = rowsOut[0]?.length ?? 0;
-        const l = new Float32Array(T * V);
-        rowsOut.forEach((r, t) => l.set(r, t * V));
-        out.push({ logits: { data: l, dims: [T, V] } });
+        // Every position through the head at once (batched rows, not one matmul per token).
+        const l = await this.maskLogits(h.subarray(0, T * H));
+        out.push({ logits: { data: l, dims: [T, l.length / T] } });
       }
     }
     return out;
@@ -359,7 +356,7 @@ export class EncoderEngine {
     return Array.isArray(question) ? out : (out[0] as Answer | Answer[]);
   }
 
-  /** Vocabulary logits at one position through the family's masked-LM head (output layer tied to the embeddings unless stored). */
+  /** Vocabulary logits of hidden rows [R, H] through the family's masked-LM head (output layer tied to the embeddings unless stored). */
   private async maskLogits(x: Float32Array): Promise<Float32Array> {
     const f = this.cfg.family;
     const [dense, ln, bias, decoder] =

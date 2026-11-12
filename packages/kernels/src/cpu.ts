@@ -1135,6 +1135,22 @@ export const cpuCopyRow: CpuKernel = (b) => {
   b[3]!.f32.set(b[2]!.f32.subarray(lastRow * D, lastRow * D + D));
 };
 
+/** CPU twin of logprob_rows: out[r] = logits[r, t_r] − logsumexp(row r). */
+export const cpuLogprobRows: CpuKernel = (b, grid) => {
+  const V = b[0]!.u32[0]!;
+  const logits = b[1]!.f32;
+  const targets = b[2]!.u32;
+  const out = b[3]!.f32;
+  for (let r = 0; r < grid[1]; r++) {
+    const row = logits.subarray(r * V, (r + 1) * V);
+    let m = -Infinity;
+    for (let i = 0; i < V; i++) if (row[i]! > m) m = row[i]!;
+    let z = 0;
+    for (let i = 0; i < V; i++) z += Math.exp(row[i]! - m);
+    out[r] = row[Math.min(targets[r]!, V - 1)]! - m - Math.log(z);
+  }
+};
+
 // ---- sampling ----
 
 const pcg = (v: number): number => {

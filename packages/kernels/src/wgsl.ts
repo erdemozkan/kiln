@@ -3081,6 +3081,47 @@ fn main(${EW_ARGS}) {
  * bitmask, rows back to back), drawing the random numbers a single-row step at position pos0 + y
  * would (speculative verification).
  */
+/**
+ * Log-probability of a target id per logits row: out[r] = logits[r, t_r] − logsumexp(logits[r, :]).
+ * One workgroup per row, so scoring a continuation reads back one float per token, not the vocabulary.
+ */
+export function logprobRowsSpec(): KernelSpec {
+  return spec("logprob_rows", ["uniform", "read", "read", "rw"], cpu.cpuLogprobRows, () => /* wgsl */ `
+struct P { V: u32, _a: u32, _b: u32, _c: u32 }
+@group(0) @binding(0) var<uniform> p: P;
+@group(0) @binding(1) var<storage, read> logits: array<f32>;
+@group(0) @binding(2) var<storage, read> targets: array<u32>;
+@group(0) @binding(3) var<storage, read_write> out: array<f32>;
+var<workgroup> red: array<f32, 256>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(local_invocation_index) li: u32, @builtin(workgroup_id) wid: vec3<u32>) {
+  let base = wid.y * p.V;
+  var mx = -3.0e38;
+  for (var i = li; i < p.V; i += 256u) { mx = max(mx, logits[base + i]); }
+  red[li] = mx;
+  workgroupBarrier();
+  for (var s = 128u; s > 0u; s >>= 1u) {
+    if (li < s) { red[li] = max(red[li], red[li + s]); }
+    workgroupBarrier();
+  }
+  let m = red[0];
+  workgroupBarrier();
+  var z = 0.0;
+  for (var i = li; i < p.V; i += 256u) { z += exp(logits[base + i] - m); }
+  red[li] = z;
+  workgroupBarrier();
+  for (var s = 128u; s > 0u; s >>= 1u) {
+    if (li < s) { red[li] += red[li + s]; }
+    workgroupBarrier();
+  }
+  if (li == 0u) {
+    let t = min(targets[wid.y], p.V - 1u);
+    out[wid.y] = logits[base + t] - m - log(red[0]);
+  }
+}`);
+}
+
 export function sampleSpec(rows = false): KernelSpec {
   return spec(rows ? "sample/rows" : "sample", ["uniform", "read", "read", "read", "read", "rw"], cpu.cpuSample(rows), () => /* wgsl */ `
 ${STEP_WGSL}
