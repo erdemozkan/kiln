@@ -35,6 +35,15 @@ most existing code moves over by changing the import and the model id.
 - **Stays out of the way.** Models run in a worker and stream text back; the page never blocks.
 - **Small.** One 241 KB (gzipped) ES module that also works straight from a CDN, with a CPU fallback where there is no WebGPU.
 
+## Principles
+
+- **Original weights.** A model loads from the files its authors published. No conversion step sits between you and the model.
+- **Correct before fast.** Every model is checked against transformers.js or Python on the same inputs. A speed-up that changes the output isn't one.
+- **Modest hardware first.** The benchmarks are measured on a 2017 laptop with integrated graphics, because that is the kind of machine Kiln was built to put back to work.
+- **Honest numbers.** The benchmarks list where Kiln is slower, not only where it wins.
+- **Small footprint.** One 241 KB file with its worker inside, no runtime dependencies and no WASM runtime to download.
+- **Nothing leaves the browser.** Models run on the user's own device. Prompts, images and audio are never sent to a server.
+
 ## Prerequisites
 
 - **A browser with WebGPU** for full speed: current Chrome or Edge, Safari 26 or newer, or Firefox 141 or newer on Windows. Without WebGPU, Kiln runs on the CPU (WASM SIMD), more slowly.
@@ -122,6 +131,25 @@ Kiln implements each model family itself, as WebGPU kernels, instead of running 
 - **Design, measurements and per-model notes:** [technical notes](docs/technical-notes.md)
 - **Changes:** [CHANGELOG](CHANGELOG.md)
 
-Kiln is released under the [MIT license](LICENSE). Models keep their own licenses: check a model's card before shipping it (the default background-removal model, RMBG-1.4, is non-commercial).
+## Contributing
+
+Contributions are welcome. Kiln supports a model family only once someone has implemented it, so the most useful help is telling us which models you need: [open an issue](https://github.com/erdemozkan/kiln/issues) for a model, a bug or an idea.
+
+To work on the code you need Node 22.12 or newer:
+
+```bash
+npm install
+npm test
+npm run typecheck
+npm run dev
+```
+
+`npm run dev` serves the playground at `http://localhost:5173`. The [technical notes](docs/technical-notes.md) explain the design and how each model was checked, and the [future features plan](docs/future-features-plan.md) lists what is planned next. A change that affects a model's output should come with a comparison against a reference, the same way the existing models were checked.
+
+## License
+
+Kiln's code is [MIT licensed](LICENSE). It has no runtime dependencies.
+
+Model weights are not bundled and keep their publishers' terms: check a model's card before shipping it. The default background-removal model, RMBG-1.4, is licensed for non-commercial use only.
 
 <p align="center">Made in New York with 🧡 by Erdem Ozkan</p>
