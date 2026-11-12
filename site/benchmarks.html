@@ -58,14 +58,14 @@
             </tbody>
           </table>
         </div>
-        <p class="muted prose">Some transformers.js exports differ from their models (Florence-2's attention scale, Kokoro's loudness, OWL models that fail to load in 4.3.2); the README explains each case.</p>
+        <p class="muted prose">Some transformers.js exports differ from their models (Florence-2's attention scale, Kokoro's loudness, OWL models that fail to load in 4.3.2); the technical notes explain each case.</p>
 
         <h2 id="setup">Setup</h2>
         <ul class="prose">
           <li>An Intel Mac with Iris Plus Graphics 650 (an integrated GPU), Chrome. A modest GPU: discrete GPUs and Apple silicon are faster for both libraries.</li>
           <li>On an Apple M3 (MacBook Air, Chromium), Kiln decodes SmolLM2-135M in q4 at about 307 tokens per second, against 59–74 on the Intel GPU; transformers.js was not measured there.</li>
           <li>GPU clocks on this machine drift 10–15% between runs, so each pair was measured in one session.</li>
-          <li>The scripts and raw notes behind every row are in the repository README, with the outputs compared.</li>
+          <li>The scripts and raw notes behind every row are in the repository's technical notes (docs/technical-notes.md), with the outputs compared.</li>
         </ul>
       </article>
     </main>

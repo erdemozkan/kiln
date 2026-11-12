@@ -1,5 +1,5 @@
 // The benchmark page: measured end-to-end timings, Kiln against transformers.js, same machine, same
-// inputs. Every number here comes from the repository README's comparisons.
+// inputs. Every number here comes from the comparisons in docs/technical-notes.md.
 import "./layout.ts";
 
 interface Row {

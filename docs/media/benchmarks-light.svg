@@ -1,0 +1,113 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 820 707" width="820" height="707" role="img" aria-label="Speed-up of Kiln over transformers.js on 31 task and model pairs">
+<style>text{font:12px system-ui,-apple-system,"Segoe UI",sans-serif}</style>
+<text x="0" y="14" fill="#0b0b0b" style="font-weight:600;font-size:13px">Times faster than transformers.js, end to end (same browser, same machine)</text>
+<line x1="330.0" x2="330.0" y1="26" y2="685" stroke="#dcdad5" stroke-width="0.5"/>
+<text x="330.0" y="701" text-anchor="middle" fill="#52514e">0×</text>
+<line x1="403.0" x2="403.0" y1="26" y2="685" stroke="#dcdad5" stroke-width="0.5"/>
+<text x="403.0" y="701" text-anchor="middle" fill="#52514e">2×</text>
+<line x1="476.0" x2="476.0" y1="26" y2="685" stroke="#dcdad5" stroke-width="0.5"/>
+<text x="476.0" y="701" text-anchor="middle" fill="#52514e">4×</text>
+<line x1="549.0" x2="549.0" y1="26" y2="685" stroke="#dcdad5" stroke-width="0.5"/>
+<text x="549.0" y="701" text-anchor="middle" fill="#52514e">6×</text>
+<line x1="622.0" x2="622.0" y1="26" y2="685" stroke="#dcdad5" stroke-width="0.5"/>
+<text x="622.0" y="701" text-anchor="middle" fill="#52514e">8×</text>
+<line x1="695.0" x2="695.0" y1="26" y2="685" stroke="#dcdad5" stroke-width="0.5"/>
+<text x="695.0" y="701" text-anchor="middle" fill="#52514e">10×</text>
+<line x1="768.0" x2="768.0" y1="26" y2="685" stroke="#dcdad5" stroke-width="0.5"/>
+<text x="768.0" y="701" text-anchor="middle" fill="#52514e">12×</text>
+<line x1="366.5" x2="366.5" y1="26" y2="685" stroke="#52514e" stroke-width="1.2" stroke-dasharray="4 3"/>
+<text x="366.5" y="701" text-anchor="middle" fill="#52514e">1×</text>
+<text x="320" y="41" text-anchor="end" fill="#52514e">DETR-ResNet-50 panoptic: Panoptic segmentation</text>
+<path d="M330.0,30 h424.9 a4.0,4.0 0 0 1 4.0,4.0 v6.0 a4.0,4.0 0 0 1 -4.0,4.0 h-424.9 z" fill="#2a78d6"/>
+<text x="764.9" y="41" fill="#0b0b0b">11.8×</text>
+<text x="320" y="62" text-anchor="end" fill="#52514e">Qwen2.5-0.5B, q4: Decoding</text>
+<path d="M330.0,51 h226.9 a4.0,4.0 0 0 1 4.0,4.0 v6.0 a4.0,4.0 0 0 1 -4.0,4.0 h-226.9 z" fill="#2a78d6"/>
+<text x="566.9" y="62" fill="#0b0b0b">6.3×</text>
+<text x="320" y="83" text-anchor="end" fill="#52514e">OWLv2 B/16: Zero-shot detection</text>
+<path d="M330.0,72 h217.0 a4.0,4.0 0 0 1 4.0,4.0 v6.0 a4.0,4.0 0 0 1 -4.0,4.0 h-217.0 z" fill="#2a78d6"/>
+<text x="557.0" y="83" fill="#0b0b0b">6.1×</text>
+<text x="320" y="104" text-anchor="end" fill="#52514e">SegFormer-b0: Semantic segmentation</text>
+<path d="M330.0,93 h185.8 a4.0,4.0 0 0 1 4.0,4.0 v6.0 a4.0,4.0 0 0 1 -4.0,4.0 h-185.8 z" fill="#2a78d6"/>
+<text x="525.8" y="104" fill="#0b0b0b">5.2×</text>
+<text x="320" y="125" text-anchor="end" fill="#52514e">SmolLM2-135M, q4: Decoding</text>
+<path d="M330.0,114 h170.3 a4.0,4.0 0 0 1 4.0,4.0 v6.0 a4.0,4.0 0 0 1 -4.0,4.0 h-170.3 z" fill="#2a78d6"/>
+<text x="510.3" y="125" fill="#0b0b0b">4.8×</text>
+<text x="320" y="146" text-anchor="end" fill="#52514e">flan-t5-small: Text2text</text>
+<path d="M330.0,135 h128.1 a4.0,4.0 0 0 1 4.0,4.0 v6.0 a4.0,4.0 0 0 1 -4.0,4.0 h-128.1 z" fill="#2a78d6"/>
+<text x="468.1" y="146" fill="#0b0b0b">3.6×</text>
+<text x="320" y="167" text-anchor="end" fill="#52514e">SpeechT5 + HiFi-GAN: Text-to-speech</text>
+<path d="M330.0,156 h118.9 a4.0,4.0 0 0 1 4.0,4.0 v6.0 a4.0,4.0 0 0 1 -4.0,4.0 h-118.9 z" fill="#2a78d6"/>
+<text x="458.9" y="167" fill="#0b0b0b">3.4×</text>
+<text x="320" y="188" text-anchor="end" fill="#52514e">Swin2SR: 2× super-resolution</text>
+<path d="M330.0,177 h107.6 a4.0,4.0 0 0 1 4.0,4.0 v6.0 a4.0,4.0 0 0 1 -4.0,4.0 h-107.6 z" fill="#2a78d6"/>
+<text x="447.6" y="188" fill="#0b0b0b">3.1×</text>
+<text x="320" y="209" text-anchor="end" fill="#52514e">DistilBART-CNN-6-6: Summarization, 64 tokens</text>
+<path d="M330.0,198 h102.8 a4.0,4.0 0 0 1 4.0,4.0 v6.0 a4.0,4.0 0 0 1 -4.0,4.0 h-102.8 z" fill="#2a78d6"/>
+<text x="442.8" y="209" fill="#0b0b0b">2.9×</text>
+<text x="320" y="230" text-anchor="end" fill="#52514e">opus-mt-en-de: Translation</text>
+<path d="M330.0,219 h98.0 a4.0,4.0 0 0 1 4.0,4.0 v6.0 a4.0,4.0 0 0 1 -4.0,4.0 h-98.0 z" fill="#2a78d6"/>
+<text x="438.0" y="230" fill="#0b0b0b">2.8×</text>
+<text x="320" y="251" text-anchor="end" fill="#52514e">OWL-ViT B/32: Zero-shot detection</text>
+<path d="M330.0,240 h91.6 a4.0,4.0 0 0 1 4.0,4.0 v6.0 a4.0,4.0 0 0 1 -4.0,4.0 h-91.6 z" fill="#2a78d6"/>
+<text x="431.6" y="251" fill="#0b0b0b">2.6×</text>
+<text x="320" y="272" text-anchor="end" fill="#52514e">DETR-ResNet-50: Object detection</text>
+<path d="M330.0,261 h89.5 a4.0,4.0 0 0 1 4.0,4.0 v6.0 a4.0,4.0 0 0 1 -4.0,4.0 h-89.5 z" fill="#2a78d6"/>
+<text x="429.5" y="272" fill="#0b0b0b">2.6×</text>
+<text x="320" y="293" text-anchor="end" fill="#52514e">Depth Anything V2 small: Depth estimation</text>
+<path d="M330.0,282 h83.1 a4.0,4.0 0 0 1 4.0,4.0 v6.0 a4.0,4.0 0 0 1 -4.0,4.0 h-83.1 z" fill="#2a78d6"/>
+<text x="423.1" y="293" fill="#0b0b0b">2.4×</text>
+<text x="320" y="314" text-anchor="end" fill="#52514e">SmolLM2-135M, q8: Decoding on the CPU</text>
+<path d="M330.0,303 h82.7 a4.0,4.0 0 0 1 4.0,4.0 v6.0 a4.0,4.0 0 0 1 -4.0,4.0 h-82.7 z" fill="#2a78d6"/>
+<text x="422.7" y="314" fill="#0b0b0b">2.4×</text>
+<text x="320" y="335" text-anchor="end" fill="#52514e">DistilBERT MNLI: Zero-shot classification, 5 labels</text>
+<path d="M330.0,324 h80.8 a4.0,4.0 0 0 1 4.0,4.0 v6.0 a4.0,4.0 0 0 1 -4.0,4.0 h-80.8 z" fill="#2a78d6"/>
+<text x="420.8" y="335" fill="#0b0b0b">2.3×</text>
+<text x="320" y="356" text-anchor="end" fill="#52514e">Donut CORD: Receipt to JSON</text>
+<path d="M330.0,345 h75.2 a4.0,4.0 0 0 1 4.0,4.0 v6.0 a4.0,4.0 0 0 1 -4.0,4.0 h-75.2 z" fill="#2a78d6"/>
+<text x="415.2" y="356" fill="#0b0b0b">2.2×</text>
+<text x="320" y="377" text-anchor="end" fill="#52514e">MMS-TTS (VITS): Text-to-speech</text>
+<path d="M330.0,366 h74.7 a4.0,4.0 0 0 1 4.0,4.0 v6.0 a4.0,4.0 0 0 1 -4.0,4.0 h-74.7 z" fill="#2a78d6"/>
+<text x="414.7" y="377" fill="#0b0b0b">2.2×</text>
+<text x="320" y="398" text-anchor="end" fill="#52514e">bert-base-uncased: Fill-mask</text>
+<path d="M330.0,387 h69.5 a4.0,4.0 0 0 1 4.0,4.0 v6.0 a4.0,4.0 0 0 1 -4.0,4.0 h-69.5 z" fill="#2a78d6"/>
+<text x="409.5" y="398" fill="#0b0b0b">2.0×</text>
+<text x="320" y="419" text-anchor="end" fill="#52514e">DistilBERT SST-2: Sentiment analysis</text>
+<path d="M330.0,408 h68.3 a4.0,4.0 0 0 1 4.0,4.0 v6.0 a4.0,4.0 0 0 1 -4.0,4.0 h-68.3 z" fill="#2a78d6"/>
+<text x="408.3" y="419" fill="#0b0b0b">2.0×</text>
+<text x="320" y="440" text-anchor="end" fill="#52514e">Donut DocVQA: Document QA</text>
+<path d="M330.0,429 h65.5 a4.0,4.0 0 0 1 4.0,4.0 v6.0 a4.0,4.0 0 0 1 -4.0,4.0 h-65.5 z" fill="#2a78d6"/>
+<text x="405.5" y="440" fill="#0b0b0b">1.9×</text>
+<text x="320" y="461" text-anchor="end" fill="#52514e">SmolVLM-256M: Image question, one view</text>
+<path d="M330.0,450 h64.2 a4.0,4.0 0 0 1 4.0,4.0 v6.0 a4.0,4.0 0 0 1 -4.0,4.0 h-64.2 z" fill="#2a78d6"/>
+<text x="404.2" y="461" fill="#0b0b0b">1.9×</text>
+<text x="320" y="482" text-anchor="end" fill="#52514e">bert-base-NER: NER</text>
+<path d="M330.0,471 h63.2 a4.0,4.0 0 0 1 4.0,4.0 v6.0 a4.0,4.0 0 0 1 -4.0,4.0 h-63.2 z" fill="#2a78d6"/>
+<text x="403.2" y="482" fill="#0b0b0b">1.8×</text>
+<text x="320" y="503" text-anchor="end" fill="#52514e">DINOv2-small: Image classification</text>
+<path d="M330.0,492 h61.1 a4.0,4.0 0 0 1 4.0,4.0 v6.0 a4.0,4.0 0 0 1 -4.0,4.0 h-61.1 z" fill="#2a78d6"/>
+<text x="401.1" y="503" fill="#0b0b0b">1.8×</text>
+<text x="320" y="524" text-anchor="end" fill="#52514e">Kokoro-82M: Text-to-speech, 82 characters</text>
+<path d="M330.0,513 h56.5 a4.0,4.0 0 0 1 4.0,4.0 v6.0 a4.0,4.0 0 0 1 -4.0,4.0 h-56.5 z" fill="#2a78d6"/>
+<text x="396.5" y="524" fill="#0b0b0b">1.7×</text>
+<text x="320" y="545" text-anchor="end" fill="#52514e">DistilBERT SQuAD: Question answering</text>
+<path d="M330.0,534 h53.4 a4.0,4.0 0 0 1 4.0,4.0 v6.0 a4.0,4.0 0 0 1 -4.0,4.0 h-53.4 z" fill="#2a78d6"/>
+<text x="393.4" y="545" fill="#0b0b0b">1.6×</text>
+<text x="320" y="566" text-anchor="end" fill="#52514e">SmolVLM-256M: Image question, 13 tiles</text>
+<path d="M330.0,555 h48.4 a4.0,4.0 0 0 1 4.0,4.0 v6.0 a4.0,4.0 0 0 1 -4.0,4.0 h-48.4 z" fill="#2a78d6"/>
+<text x="388.4" y="566" fill="#0b0b0b">1.4×</text>
+<text x="320" y="587" text-anchor="end" fill="#52514e">all-MiniLM-L6-v2: Feature extraction, 16 sentences</text>
+<path d="M330.0,576 h48.0 a4.0,4.0 0 0 1 4.0,4.0 v6.0 a4.0,4.0 0 0 1 -4.0,4.0 h-48.0 z" fill="#2a78d6"/>
+<text x="388.0" y="587" fill="#0b0b0b">1.4×</text>
+<text x="320" y="608" text-anchor="end" fill="#52514e">Gemma 3 4B: Describe a photo</text>
+<path d="M330.0,597 h47.5 a4.0,4.0 0 0 1 4.0,4.0 v6.0 a4.0,4.0 0 0 1 -4.0,4.0 h-47.5 z" fill="#2a78d6"/>
+<text x="387.5" y="608" fill="#0b0b0b">1.4×</text>
+<text x="320" y="629" text-anchor="end" fill="#52514e">RMBG-1.4: Background removal</text>
+<path d="M330.0,618 h46.3 a4.0,4.0 0 0 1 4.0,4.0 v6.0 a4.0,4.0 0 0 1 -4.0,4.0 h-46.3 z" fill="#2a78d6"/>
+<text x="386.3" y="629" fill="#0b0b0b">1.4×</text>
+<text x="320" y="650" text-anchor="end" fill="#52514e">ConvNeXt-tiny: Image classification</text>
+<path d="M330.0,639 h38.4 a4.0,4.0 0 0 1 4.0,4.0 v6.0 a4.0,4.0 0 0 1 -4.0,4.0 h-38.4 z" fill="#2a78d6"/>
+<text x="378.4" y="650" fill="#0b0b0b">1.2×</text>
+<text x="320" y="671" text-anchor="end" fill="#52514e">ResNet-50: Image classification</text>
+<path d="M330.0,660 h36.1 a4.0,4.0 0 0 1 4.0,4.0 v6.0 a4.0,4.0 0 0 1 -4.0,4.0 h-36.1 z" fill="#2a78d6"/>
+<text x="376.1" y="671" fill="#0b0b0b">1.1×</text>
+</svg>
