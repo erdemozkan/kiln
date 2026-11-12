@@ -57,6 +57,12 @@ Or import it with no install and no bundler:
 </script>
 ```
 
+The latest build from `main` is also served from this repository's site, with no npm involved:
+
+```js
+import { pipeline } from "https://erdemozkan.github.io/kiln/kiln-webgpu.js";
+```
+
 Chat with a model, using the transformers.js-style pipeline:
 
 ```js

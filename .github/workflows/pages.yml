@@ -30,6 +30,8 @@ jobs:
       - run: npm run build:site
       - run: npm run build:playground
       - run: cp -R examples/playground/dist site/dist/playground
+      # The library itself (one file, its worker inside), importable from any site as …/kiln/kiln-webgpu.js.
+      - run: cp packages/kiln-webgpu/dist/index.js site/dist/kiln-webgpu.js
       - uses: actions/configure-pages@v5
       - uses: actions/upload-pages-artifact@v3
         with:
