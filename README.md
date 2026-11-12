@@ -107,7 +107,7 @@ Where Kiln is slower: loading a model that is already cached, download size for 
 
 ## The story behind Kiln
 
-The idea came from an interview with Sam Altman. His point, as I took it, was that we are wasting the potential of the RAM and GPUs sitting in computers nobody is using. It made me think of my retired 2017 MacBook Pro, an i7 with 16 GB of RAM, doing nothing in a drawer.
+The idea came from an interview. On the *Cheeky Pint* podcast in October 2026, Sam Altman said it is "quite terrible to have everybody have a bunch of the world's limited supply" of memory sitting in personal computers, where by his estimate it is used about 5% of the time ([Yahoo Finance](https://finance.yahoo.com/technology/ai/articles/quite-terrible-sam-altman-says-184500058.html)). His answer was to put that memory in data centers. Mine was the opposite: use what is already there. It made me think of my retired 2017 MacBook Pro, an i7 with 16 GB of RAM, doing nothing in a drawer.
 
 I wanted to put it back to work, and I wanted that to be as easy as opening a web page: no installs, no servers, only a browser. I also wanted other developers like me to be able to use the idle memory and processing power of their own devices for small AI tasks just as easily.
 
