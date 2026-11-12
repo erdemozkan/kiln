@@ -193,7 +193,8 @@ th.num {
   font-size: 1.05rem;
 }
 .brand svg {
-  color: var(--accent);
+  display: block;
+  color: var(--text);
 }
 .site-nav {
   display: flex;

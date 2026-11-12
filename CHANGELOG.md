@@ -20,7 +20,7 @@ ids, config sizes, tensor entries, repo paths); cache keys include the server; r
 fenced off from instructions; CI actions and CDN snippets are pinned.
 
 **Performance.** Workers are terminated and GPU memory freed when a load fails; large results are
-transferred, not copied; the worker is minified (236 KB gzipped in all); mel filters are sparse;
+transferred, not copied; the worker is minified (241 KB gzipped in all); mel filters are sparse;
 `scoreChoices` and the masked-LM head run batched on the GPU.
 
 ## 0.1.0 (2026-11-08)

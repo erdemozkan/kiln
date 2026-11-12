@@ -10,7 +10,7 @@
   <img alt="version 0.1.0" src="https://img.shields.io/badge/version-0.1.0-blue">
   <img alt="MIT license" src="https://img.shields.io/badge/license-MIT-green">
   <img alt="Runs on WebGPU" src="https://img.shields.io/badge/runs%20on-WebGPU-005a9c">
-  <img alt="236 KB gzipped" src="https://img.shields.io/badge/size-236%20KB%20gzipped-8a2be2">
+  <img alt="241 KB gzipped" src="https://img.shields.io/badge/size-241%20KB%20gzipped-8a2be2">
   <img alt="Written in TypeScript" src="https://img.shields.io/badge/TypeScript-3178c6?logo=typescript&logoColor=white">
 </p>
 
@@ -32,7 +32,7 @@ most existing code moves over by changing the import and the model id.
 - **More for LLMs.** Tool calls, LoRA adapters, a retrieval helper, and prompt caching across calls and reloads.
 - **Loads once.** Downloads are cached in the browser, resume if interrupted, and cached models load offline.
 - **Stays out of the way.** Models run in a worker and stream text back; the page never blocks.
-- **Small.** One 236 KB (gzipped) ES module that also works straight from a CDN, with a CPU fallback where there is no WebGPU.
+- **Small.** One 241 KB (gzipped) ES module that also works straight from a CDN, with a CPU fallback where there is no WebGPU.
 
 ## Prerequisites
 

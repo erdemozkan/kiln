@@ -333,7 +333,7 @@ fill-mask was 851 ms (the 30k-word output layer ran in TypeScript; now on the GP
 loads faster from its cache (0.9 s against 1.8 s for SmolLM2 when measured; Kiln has since started
 caching its converted weights, which about halves its time, and the pair has not been re-measured) and
 downloads less (its files are pre-quantized), and its runtime adds 6.7 MB (gzipped) of WASM to
-Kiln's 236 KB (the whole package, its worker included).
+Kiln's 241 KB (the whole package, its worker included).
 
 SmolLM2-135M-Instruct, q4, Intel Gen-9 integrated GPU (Intel Mac), Chrome/Dawn. GPU clocks on this
 machine drift 10–15% between runs, so comparisons below are always from one session.
