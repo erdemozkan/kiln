@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Ask your documents</title>
+    <meta name="description" content="Paste documents (separated by blank lines), ask a question: Kiln embeds the passages, finds the closest, and answers citing them as [1], [2]." />
+    <script src="../coi.js"></script>
+  </head>
+  <body data-page="examples" data-root="../">
+    <main class="page prose">
+      <p><a href="../examples.html">← Examples</a></p>
+      <h1>Ask your documents</h1>
+      <p class="muted">Paste documents (separated by blank lines), ask a question: Kiln embeds the passages, finds the closest, and answers citing them as [1], [2].</p>
+      <p class="tag muted" style="font-family:var(--mono);font-size:0.85rem">all-MiniLM-L6-v2 + Qwen2.5-0.5B-Instruct</p>
+      <div class="demo">
+<label>Documents</label><textarea id="docs" style="min-height:200px">Mount Ardel is the highest peak of the Velmar range. It rises to 3,412 metres. The first recorded ascent was made in 1891 by the surveyor Ines Calloway.
+
+The Tessin Line is a narrow-gauge railway linking the port of Orvik with the mining town of Halde. It opened in 1907, and the journey takes four hours across eleven viaducts.
+
+Brindle cheese is made only in the Lower Fenn valley from goat's milk. It is aged for nine months in limestone caves, which gives it a blue-grey rind.</textarea>
+<label>Question</label><input type="text" id="question" value="Who first climbed the highest peak of the Velmar range?" />
+<div class="row"><button id="ask">Ask</button></div>
+<div id="output" class="output" aria-live="polite"></div>
+<ol id="sources" class="muted" style="font-size:0.88rem"></ol>
+<div id="status" class="status" role="status"></div><progress id="progress" hidden max="1" value="0"></progress>
+      </div>
+      <h2 id="code">The code</h2>
+      <pre><code>const rag = await Retriever.create();
+await rag.add(documents);
+const { stream, sources } = await rag.ask(llm, question, { k: 2 });</code></pre>
+      <p class="muted">Full source: <a href="https://github.com/erdemozkan/kiln/blob/main/site/src/examples/rag.ts">site/src/examples/rag.ts</a></p>
+    </main>
+    <script type="module" src="../src/examples/rag.ts"></script>
+  </body>
+</html>

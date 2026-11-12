@@ -1,0 +1,201 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Kiln docs</title>
+    <meta name="description" content="How to use Kiln (kiln-webgpu): loading models, chat and structured output, pipelines, the transformers.js API, LoRA adapters, retrieval, LLM tasks, speech and vision." />
+    <script src="coi.js"></script>
+  </head>
+  <body data-page="docs" data-root="">
+    <main class="page with-toc">
+      <nav class="toc" aria-label="On this page"></nav>
+      <article class="prose">
+        <h1>Docs</h1>
+        <p class="lead muted">Everything runs in the browser: Kiln downloads a model's files from the Hugging Face Hub once, caches them, and runs the model on the GPU in a worker.</p>
+
+        <h2 id="install">Install</h2>
+        <pre><code>npm install kiln-webgpu</code></pre>
+        <p>Or from a CDN, with no bundler:</p>
+        <pre><code>&lt;script type="module"&gt;
+  import { load } from "https://cdn.jsdelivr.net/npm/kiln-webgpu";
+&lt;/script&gt;</code></pre>
+        <p>
+          The package is one ES module with the model worker inside (started from a blob URL), so there is no worker file to serve. A page with a
+          Content-Security-Policy needs <code>worker-src blob:</code>.
+        </p>
+
+        <h2 id="load">Loading a model</h2>
+        <pre><code>import { load } from "kiln-webgpu";
+
+const llm = await load("Qwen/Qwen2.5-0.5B-Instruct", {
+  quant: "q4",                                   // "auto" (default), "q4", "q8" or "f32"
+  onProgress: (p) =&gt; console.log(p.file, p.loaded, p.total),
+});
+llm.info; // { family, backend: "webgpu" | "cpu", layers, maxSeq, contextLength, ... }</code></pre>
+        <ul>
+          <li>A model id is <code>org/repo</code> (safetensors or pytorch_model.bin) or <code>org/repo/file.gguf</code> for one GGUF file.</li>
+          <li><code>quant: "auto"</code> stores float weights as q4 and keeps a GGUF's tensors at their own precision. Small models (Gemma 3 270M, Granite 4 350M) need <code>"q8"</code> or <code>"f32"</code>.</li>
+          <li>Files are cached in the browser (OPFS) as they download; interrupted downloads resume. <code>listCache()</code> and <code>clearCache()</code> manage the cache.</li>
+          <li>The context defaults to the model's, up to 8,192 tokens and 512 MiB of KV cache; <code>maxSeq</code> sets it.</li>
+          <li>Without WebGPU, Kiln runs on the CPU (WASM SIMD; multithreaded on a cross-origin isolated page). <code>device: "gpu"</code> fails instead, <code>device: "cpu"</code> forces the CPU.</li>
+        </ul>
+        <p>Supported language models: Llama, Mistral, Qwen2, Qwen3, SmolLM, Granite 3 and 4, Gemma 3 (images from 4B up) and SmolVLM.</p>
+
+        <h2 id="chat">Chat and completion</h2>
+        <pre><code>const messages = [
+  { role: "system", content: "You are concise." },
+  { role: "user", content: "Name three uses of a kiln." },
+];
+const stream = llm.chat(messages, { temperature: 0.7, maxTokens: 200 });
+for await (const text of stream) output.append(text);
+const stats = await stream.stats; // { promptTokens, cachedTokens, generatedTokens, decodeMs, stopReason, ... }
+
+llm.complete("Once upon a time", { maxTokens: 50 }); // raw completion, no chat template</code></pre>
+        <p>
+          The model's own chat template renders the prompt. Each call reuses the cached K/V of the earlier prompt that shares the most tokens with it, so a
+          follow-up only prefills what is new; the last conversation's cache also survives a page reload. Pass an <code>AbortSignal</code> as
+          <code>signal</code> to stop a reply.
+        </p>
+        <p>Options: <code>maxTokens</code>, <code>temperature</code> (0 is greedy), <code>topK</code>, <code>topP</code>, <code>repetitionPenalty</code>, <code>seed</code>, <code>stopTokenIds</code>, <code>enableThinking</code> (Qwen3), <code>adapter</code>, <code>format</code>, <code>tools</code>, <code>documents</code>, <code>signal</code>.</p>
+
+        <h2 id="structured">Structured output</h2>
+        <p>Constrain the reply to a JSON Schema, a regex, a list of choices or a GBNF grammar. The constraint is enforced at every token, so the result always parses:</p>
+        <pre><code>const schema = {
+  type: "object",
+  properties: { city: { type: "string" }, population: { type: "integer" } },
+  required: ["city", "population"],
+  additionalProperties: false,
+};
+let json = "";
+for await (const t of llm.chat(messages, { format: { type: "json", schema } })) json += t;
+JSON.parse(json);
+
+llm.chat(messages, { format: { type: "choice", choices: ["yes", "no"] } });
+llm.chat(messages, { format: { type: "regex", pattern: "\\d{3}-\\d{4}" } });
+llm.chat(messages, { format: { type: "grammar", grammar: 'root ::= "yes" | "no"' } });</code></pre>
+        <p>Schemas may use <code>enum</code>, <code>const</code>, <code>anyOf</code> / <code>oneOf</code>, <code>$ref</code>, <code>pattern</code>, <code>format</code> (date, time, date-time, email, uuid, ipv4), <code>minimum</code> / <code>maximum</code> / <code>multipleOf</code>, array and string lengths.</p>
+        <h3 id="tools">Tool calls</h3>
+        <pre><code>const tools = [{ type: "function", function: { name: "get_weather", parameters: { type: "object", properties: { city: { type: "string" } }, required: ["city"] } } }];
+let text = "";
+for await (const t of llm.chat(messages, { tools, toolChoice: "required" })) text += t;
+parseToolCalls(text); // { content, toolCalls: [{ type: "function", function: { name: "get_weather", arguments: { city: "Oslo" } } }] }</code></pre>
+
+        <h2 id="images">Images in chat</h2>
+        <pre><code>const vlm = await load("HuggingFaceTB/SmolVLM-500M-Instruct");
+const reply = vlm.chat([{ role: "user", content: [
+  { type: "image", image: file },                 // Blob, File, ImageBitmap or ImageData
+  { type: "text", text: "Read this invoice. Reply with JSON." },
+] }], { format: { type: "json", schema } });</code></pre>
+        <p>SmolVLM and Gemma 3 (4B and larger, from the transformers checkpoint or a GGUF with its mmproj file) take images. Asking again about the same image reuses its features.</p>
+
+        <h2 id="pipelines">Pipelines</h2>
+        <p>transformers.js's <code>pipeline()</code>, with its task names, options and output shapes:</p>
+        <pre><code>import { pipeline } from "kiln-webgpu";
+
+const classifier = await pipeline("sentiment-analysis");
+await classifier("I love this!"); // [{ label: "POSITIVE", score: 0.9998 }]
+
+const transcriber = await pipeline("automatic-speech-recognition", "openai/whisper-base");
+await transcriber(audioUrl, { return_timestamps: "word" });</code></pre>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Task</th><th>Default model</th></tr></thead>
+            <tbody><tr><td><code>text-generation</code></td><td>HuggingFaceTB/SmolLM2-135M-Instruct</td></tr><tr><td><code>feature-extraction</code></td><td>sentence-transformers/all-MiniLM-L6-v2</td></tr><tr><td><code>text-classification</code></td><td>distilbert/distilbert-base-uncased-finetuned-sst-2-english</td></tr><tr><td><code>token-classification</code></td><td>dslim/bert-base-NER</td></tr><tr><td><code>question-answering</code></td><td>distilbert/distilbert-base-cased-distilled-squad</td></tr><tr><td><code>fill-mask</code></td><td>google-bert/bert-base-uncased</td></tr><tr><td><code>zero-shot-classification</code></td><td>typeform/distilbert-base-uncased-mnli</td></tr><tr><td><code>text2text-generation</code></td><td>google/flan-t5-small</td></tr><tr><td><code>automatic-speech-recognition</code></td><td>openai/whisper-tiny.en</td></tr><tr><td><code>audio-classification</code></td><td>superb/wav2vec2-base-superb-ks</td></tr><tr><td><code>image-classification</code></td><td>google/vit-base-patch16-224</td></tr><tr><td><code>image-feature-extraction</code></td><td>google/vit-base-patch16-224-in21k</td></tr><tr><td><code>zero-shot-image-classification</code></td><td>openai/clip-vit-base-patch32</td></tr><tr><td><code>object-detection</code></td><td>facebook/detr-resnet-50</td></tr><tr><td><code>zero-shot-object-detection</code></td><td>google/owlvit-base-patch32</td></tr><tr><td><code>depth-estimation</code></td><td>depth-anything/Depth-Anything-V2-Small-hf</td></tr><tr><td><code>image-segmentation</code></td><td>facebook/detr-resnet-50-panoptic</td></tr><tr><td><code>background-removal</code></td><td>briaai/RMBG-1.4</td></tr><tr><td><code>image-to-image</code></td><td>caidas/swin2SR-classical-sr-x2-64</td></tr><tr><td><code>image-to-text</code></td><td>nlpconnect/vit-gpt2-image-captioning</td></tr><tr><td><code>document-question-answering</code></td><td>naver-clova-ix/donut-base-finetuned-docvqa</td></tr><tr><td><code>text-to-audio</code></td><td>facebook/mms-tts-eng</td></tr><tr><td><code>summarization</code></td><td>none: pass a model (BART, DistilBART, T5)</td></tr><tr><td><code>translation</code></td><td>none: pass a model (Marian, M2M100, NLLB)</td></tr></tbody>
+          </table>
+        </div>
+        <p>
+          Options take transformers.js's names (<code>max_new_tokens</code>, <code>do_sample</code>, <code>top_k</code>, <code>pooling</code>,
+          <code>aggregation_strategy</code>, <code>return_timestamps</code>, …). <code>dtype</code> picks how weights are stored (q4, q8 or f32 names) and
+          <code>device</code> is <code>"auto"</code>, <code>"webgpu"</code> or <code>"wasm"</code>. See <a href="migrate.html">From transformers.js</a> for the
+          differences.
+        </p>
+
+        <h2 id="lowlevel">transformers.js API</h2>
+        <p><code>AutoTokenizer</code>, <code>AutoModel</code> and its task heads, <code>AutoModelForCausalLM.generate()</code>, <code>AutoProcessor</code>, <code>RawImage</code>, <code>read_audio</code>, <code>Tensor</code> and <code>env</code>:</p>
+        <pre><code>import { AutoTokenizer, AutoModel } from "kiln-webgpu";
+
+const tokenizer = await AutoTokenizer.from_pretrained("sentence-transformers/all-MiniLM-L6-v2");
+const model = await AutoModel.from_pretrained("sentence-transformers/all-MiniLM-L6-v2");
+const { last_hidden_state } = await model(tokenizer(["Hello", "World"], { padding: true }));</code></pre>
+        <p>Details and the full list are in the <a href="migrate.html#lowlevel">migration guide</a>.</p>
+
+        <h2 id="lora">LoRA adapters</h2>
+        <pre><code>const llm = await load("HuggingFaceTB/SmolLM2-135M-Instruct");
+await llm.loadAdapter("science", "Miladsaeedi70/smollm2-135m-scientific-sft-lora");
+await llm.loadAdapter("linkedin", "ArtemMozharov/smollm2-135m-linkedin-translator");
+
+await llm.setAdapter("science");                // from now on
+llm.chat(messages, { adapter: "linkedin" });    // or for one call
+await llm.setAdapter(null);                     // the base model</code></pre>
+        <p>
+          PEFT LoRA adapters (adapter_config.json and adapter_model.safetensors) on the attention and MLP projections. Each adapter is laid out on the GPU
+          when it loads, so switching between loaded adapters takes a few milliseconds. DoRA, embedding adapters and <code>modules_to_save</code> are not
+          supported.
+        </p>
+
+        <h2 id="rag">Retrieval</h2>
+        <pre><code>import { Retriever } from "kiln-webgpu";
+
+const rag = await Retriever.create();                 // all-MiniLM-L6-v2; or { model: "BAAI/bge-small-en-v1.5" }
+await rag.add(documents);                             // strings or { id, text, metadata }
+const hits = await rag.search("question", { k: 4 });
+const { stream, sources } = await rag.ask(llm, "question", { k: 3, minScore: 0.3 });
+const saved = rag.export();                           // plain data for IndexedDB; Retriever.fromSnapshot(saved) restores it</code></pre>
+        <p>
+          Documents are chunked at sentence boundaries by the embedder's own tokens; pooling and query prompts come from the model's sentence-transformers
+          files. <code>ask</code> numbers the passages ([1], [2] …) in the system message in document order, so a follow-up over the same passages reuses the
+          cached prompt. Small LLMs may still answer from their own knowledge; <code>minScore</code> keeps weak passages out.
+        </p>
+
+        <h2 id="tasks">One model, many tasks</h2>
+        <pre><code>import { tasks } from "kiln-webgpu";
+
+const t = tasks(llm);
+await t.classify("My card was charged twice", ["billing", "bug report", "feature request"]);
+await t.extract(email, schema);
+await t.ner(text, ["person", "drug", "hospital"]);
+await t.answer("When did it open?", context);       // { answer, score, start, end } or { answer: null }
+await t.summarize(text, { sentences: 2 });</code></pre>
+        <p>
+          <code>classify</code> returns the model's probabilities over your labels (each scored as its whole reply), not a sampled guess. <code>extract</code>
+          always matches the schema. <code>ner</code> keeps only mentions found verbatim in the text. For standard entity types a dedicated NER model is still
+          more thorough; the LLM's strength is types of your own.
+        </p>
+
+        <h2 id="speech">Speech</h2>
+        <pre><code>const asr = await pipeline("automatic-speech-recognition", "openai/whisper-base");
+await asr(fileOrUrl, { return_timestamps: true, chunk_length_s: 30, language: "french", task: "translate" });
+
+const tts = await pipeline("text-to-speech");          // facebook/mms-tts-eng
+const { audio, sampling_rate } = await tts("Hello!");</code></pre>
+        <p>Whisper (timestamps, word timestamps, long audio), wav2vec2 and HuBERT CTC, audio classification, and SpeechT5, MMS-VITS and Kokoro voices. Audio is a URL, Blob, encoded bytes or 16 kHz samples.</p>
+
+        <h2 id="vision">Vision</h2>
+        <pre><code>const detector = await pipeline("zero-shot-object-detection");   // OWL-ViT
+await detector(image, ["a cat", "a remote control"]);
+
+const remover = await pipeline("background-removal");            // RMBG-1.4 (non-commercial license)
+const cutout = await remover(image);                               // { width, height, channels: 4, data }</code></pre>
+        <p>Images are resized and normalized exactly as Python's transformers does it (PIL's resampling, reimplemented), and can be URLs, Blobs, <code>RawImage</code>, <code>ImageBitmap</code>, <code>ImageData</code> or elements.</p>
+
+        <h2 id="performance">Performance and memory</h2>
+        <ul>
+          <li>Prefer <code>quant: "q4"</code> for LLMs on integrated GPUs; f32 is for checking outputs.</li>
+          <li>Keep one model loaded and reuse it: Kiln caches prompt prefixes across calls, conversations and reloads.</li>
+          <li><code>await llm.startProfile()</code> … <code>await llm.stopProfile()</code> gives GPU time per kernel.</li>
+          <li>The <a href="benchmarks.html">benchmarks</a> list end-to-end timings against transformers.js on the same machine.</li>
+        </ul>
+
+        <h2 id="limits">Limits</h2>
+        <ul>
+          <li>Kiln implements each architecture by hand, so it runs fewer architectures than transformers.js, which runs any ONNX export.</li>
+          <li>One sequence decodes at a time per model; overlapping calls queue.</li>
+          <li>Loading the same model twice in one page fails (its cached file is open in the first worker); share one instance.</li>
+          <li>Repos must ship safetensors, pytorch_model.bin or GGUF weights; ONNX-only repos (most <code>Xenova/</code> ones) do not load.</li>
+        </ul>
+      </article>
+    </main>
+    <script type="module" src="./src/layout.ts"></script>
+  </body>
+</html>

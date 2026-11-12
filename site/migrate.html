@@ -1,0 +1,131 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>From transformers.js</title>
+    <meta name="description" content="Moving code from transformers.js to Kiln: what stays the same, which model ids to use, and every difference to know about." />
+    <script src="coi.js"></script>
+  </head>
+  <body data-page="migrate" data-root="">
+    <main class="page with-toc">
+      <nav class="toc" aria-label="On this page"></nav>
+      <article class="prose">
+        <h1>Coming from transformers.js</h1>
+        <p class="lead muted">
+          Kiln implements transformers.js's pipelines and its lower-level API under the same names, with the same option names and output shapes. Most code
+          moves over by changing the import and the model id. This page lists everything that differs.
+        </p>
+
+        <h2 id="steps">The three steps</h2>
+        <ol>
+          <li>
+            <strong>Change the import.</strong>
+            <pre><code>- import { pipeline, AutoTokenizer } from "@huggingface/transformers";
++ import { pipeline, AutoTokenizer } from "kiln-webgpu";</code></pre>
+          </li>
+          <li>
+            <strong>Point at the original repo.</strong> Kiln reads a model's own weights (safetensors, pytorch_model.bin or GGUF), not ONNX exports. Most
+            <code>Xenova/…</code> and <code>onnx-community/…</code> repos are conversions of a repo you can name directly:
+            <div class="table-wrap">
+              <table>
+                <thead><tr><th>transformers.js</th><th>Kiln</th></tr></thead>
+                <tbody>
+                  <tr><td><code>Xenova/all-MiniLM-L6-v2</code></td><td><code>sentence-transformers/all-MiniLM-L6-v2</code></td></tr>
+                  <tr><td><code>Xenova/distilbert-base-uncased-finetuned-sst-2-english</code></td><td><code>distilbert/distilbert-base-uncased-finetuned-sst-2-english</code></td></tr>
+                  <tr><td><code>Xenova/bert-base-NER</code></td><td><code>dslim/bert-base-NER</code></td></tr>
+                  <tr><td><code>Xenova/whisper-tiny.en</code></td><td><code>openai/whisper-tiny.en</code></td></tr>
+                  <tr><td><code>Xenova/vit-base-patch16-224</code></td><td><code>google/vit-base-patch16-224</code></td></tr>
+                  <tr><td><code>Xenova/clip-vit-base-patch32</code></td><td><code>openai/clip-vit-base-patch32</code></td></tr>
+                  <tr><td><code>onnx-community/Qwen2.5-0.5B-Instruct</code></td><td><code>Qwen/Qwen2.5-0.5B-Instruct</code></td></tr>
+                  <tr><td><code>HuggingFaceTB/SmolLM2-135M-Instruct</code> (its onnx/ folder)</td><td>the same repo (its safetensors)</td></tr>
+                  <tr><td>a GGUF build (not supported)</td><td><code>org/repo/model-Q4_K_M.gguf</code></td></tr>
+                </tbody>
+              </table>
+            </div>
+            The ONNX repo's model card usually names the original under "Base model".
+          </li>
+          <li><strong>Check the differences below</strong> that apply to the APIs you use.</li>
+        </ol>
+
+        <h2 id="options">Load options</h2>
+        <ul>
+          <li><code>dtype</code>: Kiln quantizes at load, so one repo serves every precision. 4-bit names (<code>q4</code>, <code>q4f16</code>, <code>bnb4</code>, <code>int4</code>) load as q4, 8-bit names (<code>q8</code>, <code>int8</code>, <code>uint8</code>) as q8, <code>fp16</code> / <code>fp32</code> as f32. Encoders default to f32, LLMs to q4.</li>
+          <li><code>device</code>: <code>"auto"</code> (default) uses WebGPU where there is one, else the CPU; <code>"webgpu"</code> / <code>"gpu"</code> requires WebGPU; <code>"wasm"</code> / <code>"cpu"</code> forces the CPU. transformers.js defaults to WASM; Kiln defaults to the GPU.</li>
+          <li><code>progress_callback</code> receives <code>initiate</code>, <code>progress</code> and <code>done</code> per file, then <code>ready</code>.</li>
+          <li><code>revision</code> works; <code>cache_dir</code>, <code>local_files_only</code> and <code>session_options</code> do not apply (Kiln caches in OPFS itself).</li>
+          <li><code>env.remoteHost</code> points Kiln at a Hub mirror; other <code>env</code> settings are accepted and ignored.</li>
+        </ul>
+
+        <h2 id="pipelines">Pipelines</h2>
+        <p>Task names, aliases (<code>sentiment-analysis</code>, <code>ner</code>, <code>embeddings</code>, <code>text-to-speech</code>), call options and output shapes follow transformers.js. Differences:</p>
+        <ul>
+          <li><strong>Streamers receive text,</strong> not token ids. <code>new TextStreamer(tokenizer, { callback_function })</code> works unchanged; a custom streamer needs <code>put(text)</code> and <code>end()</code>.</li>
+          <li><strong>text-generation does not read generation_config.json:</strong> greedy unless <code>do_sample: true</code>, and without <code>max_new_tokens</code> a reply runs until the model ends its turn. (<code>AutoModelForCausalLM.generate()</code> does read it.)</li>
+          <li><strong>Encoder batches run without padding:</strong> <code>feature-extraction</code> with <code>pooling: "none"</code> returns zeros past a shorter input's last token, where transformers.js holds the padded rows. Pooled outputs are unaffected.</li>
+          <li><strong>Images are preprocessed as Python does it</strong> (PIL's resampling), not by a canvas resize, so pixel values, and slightly the scores, differ from transformers.js's (they match Python's).</li>
+          <li><strong>Long audio:</strong> past 30 s, Whisper is chunked in 30 s windows by default; transformers.js keeps only the first 30 s unless <code>chunk_length_s</code> is set.</li>
+          <li><strong>Kokoro</strong> takes a phonemizer function (<code>phonemize</code> from the <code>phonemizer</code> package), since espeak-ng is GPL and not bundled.</li>
+          <li>Kiln's own options can be passed too: <code>format</code> (schema-constrained output), <code>tools</code>, <code>signal</code>, <code>adapter</code>.</li>
+        </ul>
+
+        <h2 id="lowlevel">Tokenizers, models and processors</h2>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>transformers.js</th><th>In Kiln</th></tr></thead>
+            <tbody>
+              <tr><td><code>AutoTokenizer</code></td><td>Yes: call, <code>encode</code>, <code>decode</code>, <code>batch_decode</code>, <code>tokenize</code>, padding, truncation, <code>apply_chat_template</code>. Ids equal transformers.js's on the 31 repos compared.</td></tr>
+              <tr><td><code>AutoModel</code></td><td>BERT, DistilBERT, RoBERTa (<code>last_hidden_state</code>); ViT, DeiT, DINOv2, ResNet, ConvNeXt; CLIP.</td></tr>
+              <tr><td><code>AutoModelFor…</code></td><td><code>SequenceClassification</code>, <code>TokenClassification</code>, <code>QuestionAnswering</code>, <code>MaskedLM</code>, <code>ImageClassification</code>, <code>CausalLM</code>.</td></tr>
+              <tr><td><code>CLIPModel</code>, <code>CLIPTextModelWithProjection</code>, <code>CLIPVisionModelWithProjection</code></td><td>Yes.</td></tr>
+              <tr><td><code>model.generate()</code></td><td>For causal LMs: ids in, ids out, sampling options, streamers, generation_config defaults. Calling a causal LM directly for logits is not supported; <code>llm.scoreChoices()</code> scores continuations instead.</td></tr>
+              <tr><td><code>AutoProcessor</code>, <code>AutoImageProcessor</code>, <code>AutoFeatureExtractor</code></td><td>Images (<code>pixel_values</code>), Whisper (<code>input_features</code>), wav2vec2 (<code>input_values</code>).</td></tr>
+              <tr><td><code>RawImage</code>, <code>read_audio</code>, <code>Tensor</code>, <code>cos_sim</code></td><td>Yes. <code>read_audio</code> decodes as transformers.js does. <code>Tensor</code> carries data, dims and <code>tolist()</code>, without transformers.js's tensor math.</td></tr>
+              <tr><td>Other model classes and architectures</td><td>Not yet: use the pipeline for the task, or open an issue for the model.</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>
+          Models run in Kiln's worker and come back as tensors with transformers.js's names and shapes. Each row of a padded batch runs without its
+          padding, so padded positions hold zeros. Masked-LM logits are computed one position at a time.
+        </p>
+
+        <h2 id="before-after">Before and after</h2>
+        <h3>Embeddings</h3>
+        <pre><code>import { pipeline } from "kiln-webgpu";              // was "@huggingface/transformers"
+const extractor = await pipeline("feature-extraction", "sentence-transformers/all-MiniLM-L6-v2"); // was Xenova/all-MiniLM-L6-v2
+const output = await extractor(["Hello world", "Hi"], { pooling: "mean", normalize: true });
+output.tolist();</code></pre>
+        <h3>Chat with streaming</h3>
+        <pre><code>import { pipeline, TextStreamer } from "kiln-webgpu";
+const generator = await pipeline("text-generation", "Qwen/Qwen2.5-0.5B-Instruct", { dtype: "q4" });
+const streamer = new TextStreamer(generator.tokenizer, { skip_prompt: true, callback_function: (t) =&gt; out.append(t) });
+await generator(messages, { max_new_tokens: 256, streamer });</code></pre>
+        <h3>Tokenizer and model</h3>
+        <pre><code>import { AutoTokenizer, AutoModelForSequenceClassification } from "kiln-webgpu";
+const id = "distilbert/distilbert-base-uncased-finetuned-sst-2-english";
+const tokenizer = await AutoTokenizer.from_pretrained(id);
+const model = await AutoModelForSequenceClassification.from_pretrained(id);
+const { logits } = await model(tokenizer(["I love it", "I hate it"], { padding: true }));</code></pre>
+
+        <h2 id="gains">What you get on top</h2>
+        <ul>
+          <li><a href="docs.html#structured">Structured output</a> for any LLM, with text or image prompts.</li>
+          <li>Prompt-prefix caching across calls and reloads; draft tokens for faster decoding.</li>
+          <li><a href="docs.html#lora">LoRA adapters</a>, <a href="docs.html#rag">retrieval</a> and <a href="docs.html#tasks">LLM tasks</a> with your own labels.</li>
+          <li>GGUF files and models without an ONNX export.</li>
+          <li>On the same GPU, faster end to end on every pipeline measured so far. The <a href="benchmarks.html">benchmarks</a> also list where it is slower: loading from the cache, and AutoModel masked-LM logits.</li>
+        </ul>
+
+        <h2 id="missing">What is missing</h2>
+        <ul>
+          <li>Many architectures. transformers.js runs any ONNX graph; Kiln implements each family itself, and the list is shorter.</li>
+          <li>Node.js loading from local folders (<code>env.localModelPath</code>); Kiln loads from the Hub or a mirror.</li>
+          <li>transformers.js's tensor operations (<code>mean</code>, <code>slice</code>, …) on returned tensors.</li>
+          <li>Batched decoding of several prompts at once: Kiln runs them one after another.</li>
+        </ul>
+      </article>
+    </main>
+    <script type="module" src="./src/layout.ts"></script>
+  </body>
+</html>

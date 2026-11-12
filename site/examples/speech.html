@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Speech to text</title>
+    <meta name="description" content="Whisper transcribes a recording with word-level timestamps, computed as transformers.js computes them." />
+    <script src="../coi.js"></script>
+  </head>
+  <body data-page="examples" data-root="../">
+    <main class="page prose">
+      <p><a href="../examples.html">← Examples</a></p>
+      <h1>Speech to text</h1>
+      <p class="muted">Whisper transcribes a recording with word-level timestamps, computed as transformers.js computes them.</p>
+      <p class="tag muted" style="font-family:var(--mono);font-size:0.85rem">whisper-tiny.en</p>
+      <div class="demo">
+<div class="row"><audio id="player" controls></audio><input type="file" id="file" accept="audio/*" /></div>
+<div class="row"><button id="run">Transcribe</button></div>
+<div id="output" class="output"></div>
+<pre class="output mono" id="words" style="max-height:240px;overflow:auto"></pre>
+<div id="status" class="status" role="status"></div><progress id="progress" hidden max="1" value="0"></progress>
+      </div>
+      <h2 id="code">The code</h2>
+      <pre><code>const asr = await pipeline(&quot;automatic-speech-recognition&quot;, &quot;openai/whisper-tiny.en&quot;);
+const { text, chunks } = await asr(file, { return_timestamps: &quot;word&quot; });</code></pre>
+      <p class="muted">Full source: <a href="https://github.com/erdemozkan/kiln/blob/main/site/src/examples/speech.ts">site/src/examples/speech.ts</a></p>
+    </main>
+    <script type="module" src="../src/examples/speech.ts"></script>
+  </body>
+</html>

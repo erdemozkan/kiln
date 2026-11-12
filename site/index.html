@@ -1,0 +1,76 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Kiln: machine learning in the browser on WebGPU</title>
+    <meta name="description" content="Kiln runs Hugging Face models in the browser on WebGPU, from the original safetensors and GGUF files: LLMs with guaranteed structured output, LoRA adapters, retrieval, and the transformers.js tasks and API." />
+    <script src="coi.js"></script>
+  </head>
+  <body data-page="index" data-root="">
+    <main class="page">
+      <section class="hero">
+        <h1>Machine learning in the browser, on WebGPU,<br />straight from Hugging Face.</h1>
+        <p class="lead">
+          Kiln (<code>kiln-webgpu</code>) runs language, vision and speech models on the user's GPU, loading the original safetensors and GGUF files: no ONNX
+          conversion, no server. It speaks transformers.js's API, and adds output that always matches your schema, LoRA adapters you switch in milliseconds,
+          retrieval, and one LLM for many tasks.
+        </p>
+        <div class="cta">
+          <a class="btn primary" href="docs.html">Get started</a>
+          <a class="btn" href="examples.html">Examples</a>
+          <a class="btn" href="migrate.html">Coming from transformers.js</a>
+        </div>
+        <pre><code>npm install kiln-webgpu</code></pre>
+      </section>
+
+      <div class="stats">
+        <div class="stat"><div class="value">4.8×</div><div class="label">faster LLM decoding than transformers.js<br />(SmolLM2-135M, q4, same GPU)</div></div>
+        <div class="stat"><div class="value">24</div><div class="label">pipeline tasks, transformers.js's<br />names and output shapes</div></div>
+        <div class="stat"><div class="value">268 KB</div><div class="label">gzipped, worker included;<br />no WASM runtime to download</div></div>
+      </div>
+
+      <h2 id="quick">Quick start</h2>
+      <pre><code>import { load } from "kiln-webgpu";
+
+const llm = await load("Qwen/Qwen2.5-0.5B-Instruct");
+for await (const text of llm.chat([{ role: "user", content: "Write a haiku about kilns." }])) {
+  document.body.append(text);
+}</code></pre>
+      <p class="muted">The same model as a transformers.js pipeline:</p>
+      <pre><code>import { pipeline } from "kiln-webgpu";
+
+const generator = await pipeline("text-generation", "Qwen/Qwen2.5-0.5B-Instruct");
+const [{ generated_text }] = await generator([{ role: "user", content: "Hello!" }], { max_new_tokens: 64 });</code></pre>
+
+      <h2 id="why">Why Kiln</h2>
+      <div class="grid">
+        <div class="card"><h3>No conversion step</h3><p>Loads the repo as published: safetensors, pytorch_model.bin or a GGUF file. New fine-tunes and llama.cpp quantizations work the day they appear.</p></div>
+        <div class="card"><h3>Output that always parses</h3><p>JSON Schema, regex and grammars are enforced token by token, for text and image prompts alike: read an invoice into your shape, every time.</p></div>
+        <div class="card"><h3>Conversations get cheaper</h3><p>Earlier turns are reused across calls and page reloads; draft tokens speed decoding up. A follow-up prefills only what is new.</p></div>
+        <div class="card"><h3>LoRA adapters in milliseconds</h3><p>Load a base model once and switch PEFT adapters per call with a GPU copy.</p></div>
+        <div class="card"><h3>Retrieval in one library</h3><p>Chunking, embeddings, search and grounded answers with cited passages; the passages' prompt prefix is cached.</p></div>
+        <div class="card"><h3>One model, many tasks</h3><p>Classification with your own labels (real probabilities), extraction, NER and QA from a single LLM download.</p></div>
+        <div class="card"><h3>Checked, not claimed</h3><p>Outputs are compared with Python transformers and transformers.js on the same inputs; the <a href="benchmarks.html">numbers are published</a>.</p></div>
+        <div class="card"><h3>Small</h3><p>One ES module with its worker inside, from a CDN or any bundler. WebGPU where available, a multithreaded CPU fallback where not.</p></div>
+      </div>
+
+      <h2 id="what">What it runs</h2>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Area</th><th>Models</th><th>Tasks</th></tr></thead>
+          <tbody>
+            <tr><td>Language</td><td>Llama, Mistral, Qwen2/3, SmolLM, Granite 3 and 4, Gemma 3; safetensors or GGUF</td><td>chat, completion, tools, structured output, LoRA, <code>text-generation</code></td></tr>
+            <tr><td>Text encoders</td><td>BERT, DistilBERT, RoBERTa, MiniLM, BGE</td><td>embeddings, classification, NER, QA, fill-mask, zero-shot</td></tr>
+            <tr><td>Seq2seq</td><td>BART, T5 / Flan-T5, Marian, M2M100 / NLLB</td><td>summarization, translation, text2text</td></tr>
+            <tr><td>Speech</td><td>Whisper, wav2vec2, HuBERT, SpeechT5, MMS-VITS, Kokoro</td><td>speech recognition with timestamps, audio classification, text-to-speech</td></tr>
+            <tr><td>Vision</td><td>ViT, DeiT, DINOv2, CLIP, ResNet, ConvNeXt, DETR, YOLOS, OWL-ViT / OWLv2, SegFormer, Depth Anything, RMBG, Swin2SR</td><td>classification, detection, zero-shot detection, segmentation, depth, background removal, upscaling</td></tr>
+            <tr><td>Multimodal</td><td>Gemma 3, SmolVLM, Florence-2, Donut, ViT-GPT2</td><td>chat about images, captions, OCR, document QA</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="muted">Requires a browser with WebGPU (Chrome, Edge, Safari 26 and later, Firefox 141 and later on Windows) for full speed; elsewhere Kiln runs on the CPU.</p>
+    </main>
+    <script type="module" src="./src/layout.ts"></script>
+  </body>
+</html>

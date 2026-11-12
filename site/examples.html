@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Kiln examples</title>
+    <meta name="description" content="Runnable examples of Kiln in the browser: chat, structured output, document images, retrieval, LLM tasks, LoRA adapters, speech and zero-shot detection." />
+    <script src="coi.js"></script>
+  </head>
+  <body data-page="examples" data-root="">
+    <main class="page">
+      <h1>Examples</h1>
+      <p class="muted prose">Each runs entirely in your browser. The first run downloads the model from the Hugging Face Hub and caches it; later visits load from the cache. A GPU with WebGPU is strongly recommended.</p>
+      <div class="grid"><a class="card" href="examples/chat.html"><h3>Streaming chat</h3><p>A chat that streams tokens as they decode. Each turn reuses the cached prompt of the last one, so only the new message is prefilled.</p><span class="tag">Qwen2.5-0.5B-Instruct, about 500 MB on first use</span></a><a class="card" href="examples/structured.html"><h3>Text to JSON</h3><p>Extraction into a schema you write. Kiln&#x27;s grammar enforces the schema at every token, so the result always parses and fits.</p><span class="tag">Qwen2.5-0.5B-Instruct</span></a><a class="card" href="examples/invoice.html"><h3>Invoice image to JSON</h3><p>A vision-language model reads a document image straight into your schema. The shape is guaranteed; the values are the model&#x27;s reading, so check them.</p><span class="tag">SmolVLM-500M-Instruct, about 1 GB on first use</span></a><a class="card" href="examples/rag.html"><h3>Ask your documents</h3><p>Paste documents (separated by blank lines), ask a question: Kiln embeds the passages, finds the closest, and answers citing them as [1], [2].</p><span class="tag">all-MiniLM-L6-v2 + Qwen2.5-0.5B-Instruct</span></a><a class="card" href="examples/tasks.html"><h3>One model, many tasks</h3><p>Classification with labels you make up, and named entities of types you choose, from one LLM. Label scores are the model&#x27;s own probabilities.</p><span class="tag">Qwen2.5-0.5B-Instruct</span></a><a class="card" href="examples/lora.html"><h3>Switching LoRA adapters</h3><p>One base model with two PEFT adapters: answers from the base model, a science-tuned adapter, and a LinkedIn-style rewriter. Switching between loaded adapters is a GPU copy.</p><span class="tag">SmolLM2-135M-Instruct + two adapters</span></a><a class="card" href="examples/speech.html"><h3>Speech to text</h3><p>Whisper transcribes a recording with word-level timestamps, computed as transformers.js computes them.</p><span class="tag">whisper-tiny.en</span></a><a class="card" href="examples/detect.html"><h3>Find anything in a photo</h3><p>Zero-shot object detection: boxes for whatever you type, no training.</p><span class="tag">OWL-ViT B/32</span></a></div>
+      <p class="muted">The <a href="playground/index.html">playground</a> has a full chat UI with model picker, and the kernel checks.</p>
+    </main>
+    <script type="module" src="./src/layout.ts"></script>
+  </body>
+</html>

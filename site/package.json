@@ -1,0 +1,15 @@
+{
+  "name": "@kiln/site",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite --port 5190 --strictPort",
+    "build": "vite build"
+  },
+  "dependencies": {
+    "kiln-webgpu": "*"
+  },
+  "devDependencies": {
+    "vite": "7.3.7"
+  }
+}

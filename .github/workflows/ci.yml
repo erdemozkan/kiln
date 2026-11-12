@@ -19,3 +19,5 @@ jobs:
       - run: npm test
       - run: npm run build:package
       - run: npm run build:playground
+      - run: npx tsc -p site/tsconfig.json
+      - run: npm run build -w @kiln/site

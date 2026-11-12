@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Invoice image to JSON</title>
+    <meta name="description" content="A vision-language model reads a document image straight into your schema. The shape is guaranteed; the values are the model&#x27;s reading, so check them." />
+    <script src="../coi.js"></script>
+  </head>
+  <body data-page="examples" data-root="../">
+    <main class="page prose">
+      <p><a href="../examples.html">← Examples</a></p>
+      <h1>Invoice image to JSON</h1>
+      <p class="muted">A vision-language model reads a document image straight into your schema. The shape is guaranteed; the values are the model&#x27;s reading, so check them.</p>
+      <p class="tag muted" style="font-family:var(--mono);font-size:0.85rem">SmolVLM-500M-Instruct, about 1 GB on first use</p>
+      <div class="demo">
+<div class="row"><input type="file" id="file" accept="image/*" /><button class="secondary" id="sample">Use the sample invoice</button></div>
+<img id="preview" alt="" style="max-width:100%;max-height:360px;display:block;margin:8px 0;border-radius:6px" />
+<details><summary>Schema</summary><pre class="mono" id="schema"></pre></details>
+<div class="row"><button id="run">Read it</button></div>
+<pre class="output mono" id="output"></pre>
+<div id="status" class="status" role="status"></div><progress id="progress" hidden max="1" value="0"></progress>
+      </div>
+      <h2 id="code">The code</h2>
+      <pre><code>vlm.chat([{ role: &quot;user&quot;, content: [{ type: &quot;image&quot;, image: file }, { type: &quot;text&quot;, text: prompt }] }],
+  { format: { type: &quot;json&quot;, schema } });</code></pre>
+      <p class="muted">Full source: <a href="https://github.com/erdemozkan/kiln/blob/main/site/src/examples/invoice.ts">site/src/examples/invoice.ts</a></p>
+    </main>
+    <script type="module" src="../src/examples/invoice.ts"></script>
+  </body>
+</html>

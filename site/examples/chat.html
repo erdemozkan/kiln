@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Streaming chat</title>
+    <meta name="description" content="A chat that streams tokens as they decode. Each turn reuses the cached prompt of the last one, so only the new message is prefilled." />
+    <script src="../coi.js"></script>
+  </head>
+  <body data-page="examples" data-root="../">
+    <main class="page prose">
+      <p><a href="../examples.html">← Examples</a></p>
+      <h1>Streaming chat</h1>
+      <p class="muted">A chat that streams tokens as they decode. Each turn reuses the cached prompt of the last one, so only the new message is prefilled.</p>
+      <p class="tag muted" style="font-family:var(--mono);font-size:0.85rem">Qwen2.5-0.5B-Instruct, about 500 MB on first use</p>
+      <div class="demo">
+<div id="output" class="output" aria-live="polite"></div>
+<div class="row"><textarea id="input" placeholder="Ask something…">What is a kiln used for?</textarea></div>
+<div class="row"><button id="send">Send</button></div>
+<div id="status" class="status" role="status"></div><progress id="progress" hidden max="1" value="0"></progress>
+      </div>
+      <h2 id="code">The code</h2>
+      <pre><code>const llm = await load(&quot;Qwen/Qwen2.5-0.5B-Instruct&quot;);
+const stream = llm.chat(history, { maxTokens: 400 });
+for await (const text of stream) reply.append(text);
+(await stream.stats).cachedTokens; // prompt tokens reused from the last turn</code></pre>
+      <p class="muted">Full source: <a href="https://github.com/erdemozkan/kiln/blob/main/site/src/examples/chat.ts">site/src/examples/chat.ts</a></p>
+    </main>
+    <script type="module" src="../src/examples/chat.ts"></script>
+  </body>
+</html>

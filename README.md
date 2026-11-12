@@ -11,6 +11,10 @@ const generator = await pipeline("text-generation", "HuggingFaceTB/SmolLM2-135M-
 const [out] = await generator([{ role: "user", content: "Hi!" }], { max_new_tokens: 128 });
 ```
 
+The site in [`site/`](site) has the docs, runnable examples, a migration guide from transformers.js
+and the benchmarks against it: `npm run dev:site` serves it locally, and the manual Pages workflow
+publishes it.
+
 Kiln's own API streams text:
 
 ```ts

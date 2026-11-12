@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Find anything in a photo</title>
+    <meta name="description" content="Zero-shot object detection: boxes for whatever you type, no training." />
+    <script src="../coi.js"></script>
+  </head>
+  <body data-page="examples" data-root="../">
+    <main class="page prose">
+      <p><a href="../examples.html">← Examples</a></p>
+      <h1>Find anything in a photo</h1>
+      <p class="muted">Zero-shot object detection: boxes for whatever you type, no training.</p>
+      <p class="tag muted" style="font-family:var(--mono);font-size:0.85rem">OWL-ViT B/32</p>
+      <div class="demo">
+<div class="row"><input type="file" id="file" accept="image/*" /></div>
+<canvas id="canvas" style="max-width:100%;height:auto;border-radius:6px;display:block"></canvas>
+<label>Find</label><input type="text" id="labels" value="a cat, a remote control, a blanket" />
+<div class="row"><button id="run">Detect</button></div>
+<div id="status" class="status" role="status"></div><progress id="progress" hidden max="1" value="0"></progress>
+      </div>
+      <h2 id="code">The code</h2>
+      <pre><code>const detector = await pipeline(&quot;zero-shot-object-detection&quot;, &quot;google/owlvit-base-patch32&quot;);
+await detector(image, [&quot;a cat&quot;, &quot;a remote control&quot;], { threshold: 0.15 });</code></pre>
+      <p class="muted">Full source: <a href="https://github.com/erdemozkan/kiln/blob/main/site/src/examples/detect.ts">site/src/examples/detect.ts</a></p>
+    </main>
+    <script type="module" src="../src/examples/detect.ts"></script>
+  </body>
+</html>

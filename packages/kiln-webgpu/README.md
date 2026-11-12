@@ -34,8 +34,8 @@ transformers.js's names: `max_new_tokens`, `do_sample` (default false: greedy; w
 `temperature` 1, `top_k` 50 and `top_p` 1 unless given), `repetition_penalty`, `streamer`,
 `progress_callback` (`initiate` / `progress` / `done` per file, then `ready`). The differences:
 
-- Text tasks only: `"text-generation"` for the decoder families Kiln runs (Llama, Mistral, Qwen2/3,
-  SmolLM, Granite, Gemma 3), and the encoder tasks below for BERT, DistilBERT and RoBERTa models.
+- `"text-generation"` runs the decoder families Kiln implements (Llama, Mistral, Qwen2/3, SmolLM,
+  Granite, Gemma 3); the other tasks, below, have their own model lists.
 - `dtype` picks the format Kiln quantizes to at load: 4-bit names (`q4`, `q4f16`, `bnb4`, `int4`)
   load as q4, 8-bit ones (`q8`, `int8`, `uint8`) as q8, `fp16` / `fp32` as f32.
 - `device` defaults to `"auto"` (WebGPU where there is one, else the CPU); `"wasm"` means the CPU.

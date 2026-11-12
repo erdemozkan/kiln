@@ -1,0 +1,28 @@
+import { pipeline, type SpeechRecognitionPipeline } from "kiln-webgpu";
+import { $, backendNote, busy, pipelineProgress, status } from "./common";
+
+const SAMPLE = "https://huggingface.co/datasets/Xenova/transformers.js-docs/resolve/main/jfk.wav";
+let asr: SpeechRecognitionPipeline | undefined;
+let audio: Blob | string = SAMPLE;
+backendNote();
+$<HTMLAudioElement>("player").src = SAMPLE;
+$<HTMLInputElement>("file").addEventListener("change", (e) => {
+  const f = (e.target as HTMLInputElement).files?.[0];
+  if (f) {
+    audio = f;
+    $<HTMLAudioElement>("player").src = URL.createObjectURL(f);
+  }
+});
+
+$("run").addEventListener("click", () =>
+  busy($<HTMLButtonElement>("run"), async () => {
+    status("Loading Whisper…");
+    asr ??= await pipeline("automatic-speech-recognition", "openai/whisper-tiny.en", { progress_callback: pipelineProgress("Loading Whisper") });
+    status("Transcribing…");
+    const t0 = performance.now();
+    const out = (await asr(audio, { return_timestamps: "word" })) as { text: string; chunks?: { text: string; timestamp: [number, number] }[] };
+    $("output").textContent = out.text.trim();
+    $("words").textContent = (out.chunks ?? []).map((c) => `${c.timestamp[0].toFixed(2).padStart(6)}–${c.timestamp[1].toFixed(2).padEnd(6)} ${c.text.trim()}`).join("\n");
+    status(`${((performance.now() - t0) / 1000).toFixed(1)} s, with word timestamps`);
+  }),
+);

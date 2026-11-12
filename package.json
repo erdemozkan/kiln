@@ -5,14 +5,17 @@
   "type": "module",
   "workspaces": [
     "packages/*",
-    "examples/*"
+    "examples/*",
+    "site"
   ],
   "scripts": {
     "typecheck": "tsc -p tsconfig.json",
     "test": "vitest run",
     "dev": "npm run dev -w @kiln/playground",
     "build:playground": "npm run build -w @kiln/playground",
-    "build:package": "npm run build -w kiln-webgpu"
+    "build:package": "npm run build -w kiln-webgpu",
+    "build:site": "npm run build:package && npm run build -w @kiln/site",
+    "dev:site": "npm run build:package && npm run dev -w @kiln/site"
   },
   "devDependencies": {
     "@webgpu/types": "0.1.40",

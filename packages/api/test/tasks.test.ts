@@ -48,7 +48,8 @@ describe("LLM tasks", () => {
       ["person", "Ms. Kaur", 0.9],
       ["drug", "aspirin", 0.8],
     ]);
-    expect(r.dropped).toBe(1);
+    // "Ibuprofen" is not in the text; "Kaur" lies inside "Ms. Kaur".
+    expect(r.dropped).toBe(2);
   });
 
   it("answer copies a span when the context answers, else null", async () => {

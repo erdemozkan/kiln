@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Kiln benchmarks</title>
+    <meta name="description" content="Kiln against transformers.js on the same machine and inputs: end-to-end speed for 31 tasks, and how closely the outputs agree." />
+    <script src="coi.js"></script>
+  </head>
+  <body data-page="benchmarks" data-root="">
+    <main class="page with-toc">
+      <nav class="toc" aria-label="On this page"></nav>
+      <article style="min-width: 0">
+        <h1>Benchmarks</h1>
+        <p class="lead muted prose">
+          Kiln and transformers.js 4.3.2 in the same browser on the same machine, on the same inputs, both on WebGPU in fp32 unless noted
+          (transformers.js runs the repos' ONNX exports, Kiln the original weights). Times are end to end, the median of three warm calls after one warm-up.
+        </p>
+        <div class="stats">
+          <div class="stat"><div class="value" id="median"></div><div class="label">median speed-up</div></div>
+          <div class="stat"><div class="value" id="count"></div><div class="label">task / model pairs</div></div>
+          <div class="stat"><div class="value">0</div><div class="label">pairs where transformers.js was faster end to end</div></div>
+        </div>
+
+        <h2 id="speed">Speed</h2>
+        <p class="muted">How many times faster Kiln is (transformers.js's time over Kiln's, or Kiln's tokens per second over transformers.js's). The dashed line is parity. Hover or focus a bar for both timings.</p>
+        <div class="chart" id="chart"></div>
+
+        <h2 id="table-head">All measurements</h2>
+        <div class="table-wrap" id="table"></div>
+
+        <h2 id="slower">Where Kiln is slower</h2>
+        <ul class="prose">
+          <li><strong>Loading from the cache:</strong> 1.8 s against 0.9 s for SmolLM2-135M. Kiln converts weights as it loads; transformers.js loads a pre-quantized file.</li>
+          <li><strong>Download size:</strong> transformers.js's ONNX repos ship pre-quantized files, so a q4 model downloads less; Kiln downloads the original weights once and quantizes them.</li>
+          <li><strong>Masked-LM logits through <code>AutoModelForMaskedLM</code>:</strong> 0.24 s against 0.11 s (transformers.js on WASM) for nine tokens, since Kiln computes them one position at a time. The <code>fill-mask</code> pipeline, which reads one position, is 2× faster.</li>
+          <li><strong>The runtime itself is smaller:</strong> Kiln is 268 KB gzipped with its worker; transformers.js adds 6.7 MB of WASM.</li>
+        </ul>
+
+        <h2 id="accuracy">Accuracy</h2>
+        <p class="prose">Speed only counts if the outputs are right. Each model was checked against transformers.js on the same inputs, and many against Python's transformers or an independent NumPy forward pass:</p>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Model</th><th>Checked against</th><th>Result</th></tr></thead>
+            <tbody>
+              <tr><td>LLMs (f32)</td><td>transformers.js; a NumPy reference (Gemma 3)</td><td>identical greedy tokens</td></tr>
+              <tr><td>BERT family</td><td>Python transformers</td><td>scores equal to six decimals</td></tr>
+              <tr><td>Tokenizers, 31 repos</td><td>transformers.js 4.3.2</td><td>identical ids</td></tr>
+              <tr><td>Whisper</td><td>transformers.js</td><td>same text, segments and word timestamps; features within 1.2e-7</td></tr>
+              <tr><td>ViT, DeiT, CLIP</td><td>transformers.js, same pixels</td><td>probabilities within 2.2e-6</td></tr>
+              <tr><td>DETR, YOLOS</td><td>transformers.js, same pixels</td><td>same detections, boxes within 2.3e-6</td></tr>
+              <tr><td>RMBG-1.4, SegFormer, Depth Anything</td><td>transformers.js, same pixels</td><td>a few output bytes one level apart (at most 20 of 307,200)</td></tr>
+              <tr><td>OWLv2</td><td>Python's documented output</td><td>0.665 / 0.613 against 0.665 / 0.614, same boxes</td></tr>
+              <tr><td>Donut DocVQA</td><td>transformers.js</td><td>same answers to 8 questions on 5 pages</td></tr>
+              <tr><td>SmolVLM</td><td>transformers.js, same tiles</td><td>same greedy replies in 17 runs</td></tr>
+              <tr><td>VITS</td><td>transformers.js, noise off</td><td>33,024 samples within 1.4e-4</td></tr>
+              <tr><td>LoRA adapters</td><td>NumPy, adapters merged</td><td>same greedy tokens</td></tr>
+              <tr><td>Image preprocessing</td><td>PIL + NumPy</td><td>identical pixel values</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="muted prose">Some transformers.js exports differ from their models (Florence-2's attention scale, Kokoro's loudness, OWL models that fail to load in 4.3.2); the README explains each case.</p>
+
+        <h2 id="setup">Setup</h2>
+        <ul class="prose">
+          <li>An Intel Mac with Iris Plus Graphics 650 (an integrated GPU), Chrome. A modest GPU: discrete GPUs and Apple silicon are faster for both libraries.</li>
+          <li>On an Apple M3 (MacBook Air, Chromium), Kiln decodes SmolLM2-135M in q4 at about 307 tokens per second, against 59–74 on the Intel GPU; transformers.js was not measured there.</li>
+          <li>GPU clocks on this machine drift 10–15% between runs, so each pair was measured in one session.</li>
+          <li>The scripts and raw notes behind every row are in the repository README, with the outputs compared.</li>
+        </ul>
+      </article>
+    </main>
+    <script type="module" src="./src/benchmarks.ts"></script>
+  </body>
+</html>

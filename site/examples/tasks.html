@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>One model, many tasks</title>
+    <meta name="description" content="Classification with labels you make up, and named entities of types you choose, from one LLM. Label scores are the model&#x27;s own probabilities." />
+    <script src="../coi.js"></script>
+  </head>
+  <body data-page="examples" data-root="../">
+    <main class="page prose">
+      <p><a href="../examples.html">← Examples</a></p>
+      <h1>One model, many tasks</h1>
+      <p class="muted">Classification with labels you make up, and named entities of types you choose, from one LLM. Label scores are the model&#x27;s own probabilities.</p>
+      <p class="tag muted" style="font-family:var(--mono);font-size:0.85rem">Qwen2.5-0.5B-Instruct</p>
+      <div class="demo">
+<label>Support ticket</label><textarea id="text">After the last update the app crashes every time I open my invoices, so I can't download the March statement.</textarea>
+<label>Labels</label><input type="text" id="labels" value="billing, bug report, feature request, praise" />
+<div class="row"><button id="classify">Classify</button></div>
+<label>Text for entities</label><textarea id="nertext">Last week Priya Nair flew from Toronto to Berlin to demo the new Falcon X2 drone for Siemens engineers.</textarea>
+<label>Entity types</label><input type="text" id="types" value="person, city, company, product" />
+<div class="row"><button id="ner">Find entities</button></div>
+<pre class="output mono" id="output"></pre>
+<div id="status" class="status" role="status"></div><progress id="progress" hidden max="1" value="0"></progress>
+      </div>
+      <h2 id="code">The code</h2>
+      <pre><code>const t = tasks(llm);
+await t.classify(text, [&quot;billing&quot;, &quot;bug report&quot;, &quot;feature request&quot;]);
+await t.ner(text, [&quot;person&quot;, &quot;city&quot;, &quot;product&quot;]);</code></pre>
+      <p class="muted">Full source: <a href="https://github.com/erdemozkan/kiln/blob/main/site/src/examples/tasks.ts">site/src/examples/tasks.ts</a></p>
+    </main>
+    <script type="module" src="../src/examples/tasks.ts"></script>
+  </body>
+</html>

@@ -26,10 +26,13 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci
+      # The site (docs, examples, migration guide, benchmarks) at the root, the playground under it.
+      - run: npm run build:site
       - run: npm run build:playground
+      - run: cp -R examples/playground/dist site/dist/playground
       - uses: actions/configure-pages@v5
       - uses: actions/upload-pages-artifact@v3
         with:
-          path: examples/playground/dist
+          path: site/dist
       - id: deploy
         uses: actions/deploy-pages@v4

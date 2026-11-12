@@ -134,6 +134,12 @@ fixes found on the way: added tokens' `lstrip` / `rstrip` (Phi-3.5's chat prompt
 splitting before Metaspace (T5, XLM-R), the "▁" before an added token (NLLB), and Mistral v0.3's
 prefix space.
 
+**Site.** `site/`: a landing page, docs, a migration guide from transformers.js, a benchmark
+page charting the 31 measured task / model pairs against transformers.js, and eight runnable
+examples (chat, text and invoice images to JSON, retrieval, LLM tasks, LoRA switching, Whisper
+with word timestamps, zero-shot detection). Built in CI; published by the manual Pages workflow
+with the playground under it.
+
 **One model, many tasks.** `tasks(llm)`: `classify` with your own labels (the model's
 probabilities, from `llm.scoreChoices`, which scores whole replies in verify passes), `extract` to a
 JSON schema, `ner` with your own entity types (offsets, nothing outside the text), extractive

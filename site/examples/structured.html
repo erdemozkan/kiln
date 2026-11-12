@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Text to JSON</title>
+    <meta name="description" content="Extraction into a schema you write. Kiln&#x27;s grammar enforces the schema at every token, so the result always parses and fits." />
+    <script src="../coi.js"></script>
+  </head>
+  <body data-page="examples" data-root="../">
+    <main class="page prose">
+      <p><a href="../examples.html">← Examples</a></p>
+      <h1>Text to JSON</h1>
+      <p class="muted">Extraction into a schema you write. Kiln&#x27;s grammar enforces the schema at every token, so the result always parses and fits.</p>
+      <p class="tag muted" style="font-family:var(--mono);font-size:0.85rem">Qwen2.5-0.5B-Instruct</p>
+      <div class="demo">
+<label>Text</label><textarea id="text">Hi, this is Dana Whitfield from Orbit Labs (dana.w@orbitlabs.io). Could we meet on Thursday? I'll bring two colleagues, so three of us.</textarea>
+<label>Schema</label><textarea id="schema" style="min-height:180px;font-family:var(--mono);font-size:0.85rem">{
+  "type": "object",
+  "properties": {
+    "name": { "type": "string" },
+    "email": { "type": "string", "format": "email" },
+    "company": { "type": "string" },
+    "meeting_day": { "enum": ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"] },
+    "attendees": { "type": "integer", "minimum": 1 }
+  },
+  "required": ["name", "email", "company", "meeting_day", "attendees"],
+  "additionalProperties": false
+}</textarea>
+<div class="row"><button id="run">Extract</button></div>
+<pre class="output mono" id="output"></pre>
+<div id="status" class="status" role="status"></div><progress id="progress" hidden max="1" value="0"></progress>
+      </div>
+      <h2 id="code">The code</h2>
+      <pre><code>llm.chat(messages, { format: { type: &quot;json&quot;, schema } }); // always valid against schema</code></pre>
+      <p class="muted">Full source: <a href="https://github.com/erdemozkan/kiln/blob/main/site/src/examples/structured.ts">site/src/examples/structured.ts</a></p>
+    </main>
+    <script type="module" src="../src/examples/structured.ts"></script>
+  </body>
+</html>

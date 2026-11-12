@@ -98,6 +98,8 @@ export interface Entity {
 }
 
 export interface NerOptions extends TaskOptions {
+  /** Drop a mention whose best type scores below this (default 0.4). */
+  minScore?: number;
   /**
    * One listing pass over all types (faster) instead of the default: candidates from that pass and
    * from one pass per type, each then typed by scoring the types.
@@ -111,7 +113,9 @@ const MENTIONS: JsonSchema = { type: "object", properties: { mentions: { type: "
  * Named entities of your own types ("person", "drug", "invoice number", …). Mentions are gathered
  * by listing (all types at once, then each type on its own; small models stop lists early), kept
  * only where they occur verbatim in the text, and each is given the type the model scores highest
- * for it there ("other" drops it). `dropped` counts listed mentions not in the text or typed "other".
+ * for it there ("other", or a best type below `minScore`, drops it; a run-on span holding mentions of
+ * other types gives way to them, and otherwise the longer of overlapping spans wins). `dropped`
+ * counts the mentions left out.
  */
 export async function ner(llm: TaskModel, text: string, types: string[], opts: NerOptions = {}): Promise<Entity[] & { dropped: number }> {
   if (!types.length) throw new Error("ner needs at least one entity type");
@@ -149,31 +153,43 @@ export async function ner(llm: TaskModel, text: string, types: string[], opts: N
     if (at < 0) dropped++;
     else words.set(w, at);
   }
-  // A mention inside a longer one ("Merkel" in "Angela Merkel") is the longer one's.
-  const keep = [...words.keys()].filter((w) => ![...words.keys()].some((o) => o !== w && o.includes(w)));
-  const out: Entity[] = [];
-  for (const word of keep) {
+  // Each mention typed: asked as a completion ("… "Paris" is a"), which small models type far better
+  // than an instruction; "other", or a best type below `minScore`, drops it.
+  const minScore = opts.minScore ?? 0.4;
+  const typed: { word: string; type: string; score: number }[] = [];
+  for (const word of words.keys()) {
     let type = listed.find((e) => e.text.trim() === word && e.type)?.type;
     let score = 1;
     if (!opts.fast || !type) {
-      // Asked as a completion ("… "Paris" is a"), which small models type far better than an
-      // instruction; "other" lets a listed word that is no entity of these types drop out.
-      const choices = [...types, "other"];
-      const lp = await llm.scoreChoices([{ role: "system", content: "You label named entities." }, { role: "user", content: `${text}\n\n"${word}" is a` }], choices, {
+      const lp = await llm.scoreChoices([{ role: "system", content: "You label named entities." }, { role: "user", content: `${text}\n\n"${word}" is a` }], [...types, "other"], {
         adapter: opts.adapter,
         enableThinking: opts.enableThinking,
       });
       const p = softmax(lp);
       const best = p.indexOf(Math.max(...p));
-      if (best === types.length) {
+      if (best === types.length || p[best]! < minScore) {
         dropped++;
         continue;
       }
       type = types[best]!;
       score = p[best]!;
     }
+    typed.push({ word, type: type!, score });
+  }
+  // Overlapping mentions: a run-on span, holding two mentions of other types (or one, at five words
+  // or more: "Maria from our finance team in Lisbon"), gives way to its parts; otherwise the longer
+  // span wins over what it contains ("Angela Merkel" over "Merkel").
+  const runOn = (a: (typeof typed)[number]) => {
+    const others = typed.filter((b) => b !== a && a.word.includes(b.word) && b.type !== a.type).length;
+    return others >= 2 || (others >= 1 && a.word.split(/\s+/).length >= 5);
+  };
+  const spans = typed.filter((a) => !runOn(a));
+  const keep = spans.filter((a) => !spans.some((b) => b !== a && b.word.length > a.word.length && b.word.includes(a.word)));
+  dropped += typed.length - keep.length;
+  const out: Entity[] = [];
+  for (const { word, type, score } of keep) {
     // Every occurrence of the mention.
-    for (let at = text.indexOf(word); at >= 0; at = text.indexOf(word, at + word.length)) out.push({ entity_group: type!, word, score, start: at, end: at + word.length });
+    for (let at = text.indexOf(word); at >= 0; at = text.indexOf(word, at + word.length)) out.push({ entity_group: type, word, score, start: at, end: at + word.length });
   }
   out.sort((a, b) => a.start - b.start);
   return Object.assign(out, { dropped });

@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Switching LoRA adapters</title>
+    <meta name="description" content="One base model with two PEFT adapters: answers from the base model, a science-tuned adapter, and a LinkedIn-style rewriter. Switching between loaded adapters is a GPU copy." />
+    <script src="../coi.js"></script>
+  </head>
+  <body data-page="examples" data-root="../">
+    <main class="page prose">
+      <p><a href="../examples.html">← Examples</a></p>
+      <h1>Switching LoRA adapters</h1>
+      <p class="muted">One base model with two PEFT adapters: answers from the base model, a science-tuned adapter, and a LinkedIn-style rewriter. Switching between loaded adapters is a GPU copy.</p>
+      <p class="tag muted" style="font-family:var(--mono);font-size:0.85rem">SmolLM2-135M-Instruct + two adapters</p>
+      <div class="demo">
+<label>Prompt</label><input type="text" id="prompt" value="Explain photosynthesis in one sentence." />
+<div class="row"><button id="run">Run all three</button></div>
+<div class="grid">
+<div class="card"><h3>Base model</h3><p id="base-ms" class="tag"></p><div id="base" class="output"></div></div>
+<div class="card"><h3>science adapter</h3><p id="science-ms" class="tag"></p><div id="science" class="output"></div></div>
+<div class="card"><h3>linkedin adapter</h3><p id="linkedin-ms" class="tag"></p><div id="linkedin" class="output"></div></div>
+</div>
+<div id="status" class="status" role="status"></div><progress id="progress" hidden max="1" value="0"></progress>
+      </div>
+      <h2 id="code">The code</h2>
+      <pre><code>await llm.loadAdapter(&quot;science&quot;, &quot;Miladsaeedi70/smollm2-135m-scientific-sft-lora&quot;);
+await llm.setAdapter(&quot;science&quot;); // or llm.chat(messages, { adapter: &quot;science&quot; })</code></pre>
+      <p class="muted">Full source: <a href="https://github.com/erdemozkan/kiln/blob/main/site/src/examples/lora.ts">site/src/examples/lora.ts</a></p>
+    </main>
+    <script type="module" src="../src/examples/lora.ts"></script>
+  </body>
+</html>
