@@ -3,7 +3,7 @@
   <img src="docs/media/logo-dark.svg#gh-dark-mode-only" alt="Kiln.js" width="300">
 </h1>
 
-<p align="center"><strong>Run Hugging Face models in the browser on WebGPU, straight from their original weights.</strong></p>
+<p align="center"><strong>Run AI models in the browser on WebGPU, straight from their original weights.</strong></p>
 
 <p align="center">
   <img alt="npm package: kiln-webgpu" src="https://img.shields.io/badge/npm-kiln--webgpu-cb3837?logo=npm&logoColor=white">
@@ -15,8 +15,8 @@
 </p>
 
 Kiln is a JavaScript library that runs language, vision and speech models entirely in the browser.
-It reads a model's own files from the Hugging Face Hub (safetensors, `pytorch_model.bin` or GGUF),
-so there is no ONNX export, no compile step and no server. It uses transformers.js's API names, so
+It reads a model's own files (safetensors, `pytorch_model.bin` or GGUF) from the Hugging Face Hub
+or from your own server, so there is no ONNX export, no compile step and no inference server. It uses transformers.js's API names, so
 most existing code moves over by changing the import and the model id.
 
 <p align="center">
@@ -25,7 +25,8 @@ most existing code moves over by changing the import and the model id.
 
 ## Features
 
-- **Original weights, no conversion.** Point at the model's own repo or a single `.gguf` file. Kiln quantizes to 4-bit or 8-bit while loading, so one repo serves every precision.
+- **Original weights, no conversion.** Point at a model's repo on the Hugging Face Hub or a single `.gguf` file. Kiln quantizes to 4-bit or 8-bit while loading, so one repo serves every precision.
+- **Not tied to the Hub.** Pass `endpoint` to load the same files from a mirror or your own static server, including models you trained yourself.
 - **A familiar API.** `pipeline`, `AutoTokenizer`, `AutoModel` and `TextStreamer` with transformers.js's option names and output shapes.
 - **Many tasks.** Chat and text generation, embeddings, classification, NER, question answering, translation, summarization, speech recognition, text-to-speech, image classification, object detection, segmentation, depth, background removal, and image or document questions.
 - **Structured output.** Constrain any LLM's reply to a JSON schema, a regex, a grammar or a list of choices.
