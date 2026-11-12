@@ -2,24 +2,18 @@
 
 Ideas that are not built yet. Each entry says what it is, why it is worth doing, and roughly how.
 
-## Version 0.2.0
+## After 0.2.0
 
-What 0.2.0 already holds on `main` (see the CHANGELOG's "Unreleased" section): the converted-weight
-cache, offline loads, the hardening and performance fixes, and the new README and logo. What is left
-before and around the release, in the order suggested:
+Version 0.2.0 is published on npm (`kiln-webgpu`), the repository is public, and the docs site and
+playground are live on GitHub Pages. Left over from that release:
 
 1. **Re-measure cached loading against transformers.js.** The benchmarks page still lists it under
    "where Kiln is slower", with numbers from two different sessions (1.8 s against 0.9 s, then Kiln
    alone at 1.0–1.9 s). One session with both libraries settles whether that line stays.
-2. **Release prep.** Bump the version to 0.2.0, date the CHANGELOG section, rebuild the package and
-   the site, and run the pre-publish checks in RELEASE.md. Publishing to npm, making the repository
-   public and enabling Pages are done by hand after that.
-3. **After publishing.** Swap the README's static badges for live ones (npm version, CI), and confirm
-   the install line and the CDN link work.
-4. **Bring the other entry pages in line with the README.** The package README (the page npm shows)
+2. **Bring the other entry pages in line with the README.** The package README (the page npm shows)
    and the docs site still open with Hub-first wording.
-5. **Housekeeping.** Delete the merged remote branches, and decide whether commits should use a
-   GitHub noreply email.
+3. **Versioned copies on the Pages site.** It serves only the latest build of `main`
+   (`kiln-webgpu.js`); npm and jsDelivr are the versioned route.
 
 ## Later
 
