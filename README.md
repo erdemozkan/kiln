@@ -239,6 +239,15 @@ Key ideas:
   setting, stamped with the tensor list it was made from, and made again when either changes, when
   it cannot be read back, or when a write to it fell short. `load(id, { weightCache: false })` keeps
   only the download; `listCache()` lists the entries as `converted|…`.
+- **Config, tokenizer and file listing are cached too.** The small files a load reads (config.json,
+  tokenizer.json, the repo's file listing, a missing optional file's 404, Kokoro's voices) are kept in
+  OPFS and answered from there without waiting for the network, so a cached model loads with the server
+  unreachable (checked by loading SmolLM2-135M through a local mirror and stopping the mirror). Once
+  per session each is compared with the server's in the background and replaced if it changed, so an
+  updated repo shows from the following load on. On the Intel Mac's connection the five requests of a
+  SmolLM2-135M load took 180–250 ms from the network and 40–60 ms from the cache; whole loads
+  alternated 2.0–2.9 s without and 2.1–2.8 s with, a difference inside the run-to-run noise.
+  `listCache()` lists the entries as `….hub`.
 - **The download is the cache.** In a worker, `CachedHttpSource` writes the download into OPFS and serves
   reads from it as bytes land. Interrupted downloads resume from the last flushed byte recorded in the
   metadata (not the file size, which can include writes lost when a worker is killed), and a cached

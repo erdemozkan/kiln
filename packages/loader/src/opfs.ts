@@ -396,12 +396,13 @@ export async function readCacheFile(name: string): Promise<Uint8Array | undefine
 }
 
 /**
- * Writes a file to the cache directory from parts, replacing it. Worker-only (sync handle); returns
- * false on failure (a full store, say), which a cache can ignore. A short write leaves the file empty
- * rather than truncated, so readers never see half of it.
+ * Writes a file to the cache directory from parts, replacing it; returns false on failure (a full
+ * store, say), which a cache can ignore. In a worker it uses a sync handle, and a short write leaves
+ * the file empty rather than truncated, so readers never see half of it. Elsewhere it uses a writable
+ * stream where the browser has one (the file is swapped in whole on close).
  */
 export async function writeCacheFile(name: string, parts: readonly Uint8Array[]): Promise<boolean> {
-  if (!opfsAvailable()) return false;
+  if (!opfsAvailable()) return writeCacheStream(name, parts);
   let h: SyncHandle | undefined;
   try {
     const dir = await (await navigator.storage.getDirectory()).getDirectoryHandle(DIR, { create: true });
@@ -423,6 +424,28 @@ export async function writeCacheFile(name: string, parts: readonly Uint8Array[])
     return false;
   } finally {
     h?.close();
+  }
+}
+
+interface Writable {
+  write(data: Uint8Array): Promise<void>;
+  close(): Promise<void>;
+  abort(): Promise<void>;
+}
+
+async function writeCacheStream(name: string, parts: readonly Uint8Array[]): Promise<boolean> {
+  let w: Writable | undefined;
+  try {
+    const dir = await (await navigator.storage.getDirectory()).getDirectoryHandle(DIR, { create: true });
+    const file = (await dir.getFileHandle(name, { create: true })) as FileSystemFileHandle & { createWritable?: () => Promise<Writable> };
+    if (!file.createWritable) return false;
+    w = await file.createWritable();
+    for (const p of parts) await w.write(p);
+    await w.close();
+    return true;
+  } catch {
+    await w?.abort().catch(() => undefined);
+    return false;
   }
 }
 

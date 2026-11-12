@@ -1,7 +1,7 @@
 // Encoder-decoder models (BART, Marian, M2M100 / NLLB) and the text2text tasks transformers.js runs
 // on them: summarization, translation and text2text-generation, with its generation settings.
 import type { Backend, Tensor } from "@kiln/core";
-import { fetchJSON, fetchText, fileUrl, listRepoFiles, parseModelId, readPytorchHeader, readSafetensorsHeader, toF32, weightFiles, whisperFeatures, type ByteSource, type TensorEntry } from "@kiln/loader";
+import { fetchBytes, fetchJSON, fetchText, fileUrl, listRepoFiles, parseModelId, readPytorchHeader, readSafetensorsHeader, toF32, weightFiles, whisperFeatures, type ByteSource, type TensorEntry } from "@kiln/loader";
 import { Seq2SeqModel, T5Model, seq2seqConfigFromHF, seq2seqName, sinusoidalTable, t5ConfigFromHF, t5Name, t5Transform, type Seq2SeqConfig, type T5Config } from "@kiln/models";
 import { byteLevelFromVocabMerges, encoderTokenizerFromJSON, marianTokenizer, type EncoderTokenizer, type EncoderTokenizerJSON } from "@kiln/tokenizers";
 import { openBackend, openParsed } from "./load";
@@ -570,10 +570,7 @@ export async function createSeq2Seq(modelId: string, opts: Seq2SeqLoadOptions = 
     tokenizer = byteLevelFromVocabMerges(vocab!, merges!);
   } else if (cfg.family === "marian" && (await has("source.spm")) && (await has("vocab.json"))) {
     const [spm, vocab] = await Promise.all([
-      fetch(fileUrl(ref, "source.spm", ep)).then(async (r) => {
-        if (!r.ok) throw new Error(`source.spm: HTTP ${r.status}`);
-        return new Uint8Array(await r.arrayBuffer());
-      }),
+      fetchBytes(fileUrl(ref, "source.spm", ep)).then((b) => b!),
       fetchJSON<Record<string, number>>(fileUrl(ref, "vocab.json", ep)),
     ]);
     tokenizer = marianTokenizer(spm, vocab!);

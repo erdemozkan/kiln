@@ -10,6 +10,11 @@ slower first load. Vision towers of SmolVLM and Gemma 3 are cached the same way.
 would not be smaller (f32 loads, a GGUF's own quantized tensors); `weightCache: false` turns it off.
 Readback staging buffers over 4 MiB are no longer pooled.
 
+**Offline loads.** Config, tokenizer and file-listing requests (and Kokoro's voices) are cached in
+OPFS and answered from there, then compared with the server in the background once per session, so a
+cached model loads with the server unreachable and an updated repo shows from the following load on.
+`fetchBytes` joins `fetchJSON` and `fetchText` in the loader.
+
 **Hardening.** Parsing of untrusted model repos is bounded (chat templates, tokenizer regexes, token
 ids, config sizes, tensor entries, repo paths); cache keys include the server; retrieved passages are
 fenced off from instructions; CI actions and CDN snippets are pinned.

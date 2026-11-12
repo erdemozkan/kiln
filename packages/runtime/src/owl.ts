@@ -2,7 +2,7 @@
 // plan and give, per patch, a box and a class embedding; text queries are embedded by the CLIP text
 // tower and matched to the patches on the CPU, so new queries on the same image skip the image.
 import type { Backend, Tensor } from "@kiln/core";
-import { fetchJSON, fileUrl, preprocessImage, readPytorchHeader, readSafetensorsHeader, toF32, toRgb, type ByteSource, type ImageProcessorConfig, type ModelRef, type RgbImage, type TensorEntry } from "@kiln/loader";
+import { fetchJSON, fetchText, fileUrl, preprocessImage, readPytorchHeader, readSafetensorsHeader, toF32, toRgb, type ByteSource, type ImageProcessorConfig, type ModelRef, type RgbImage, type TensorEntry } from "@kiln/loader";
 import { ClipTextModel, OWL_CLASS_EXTRA, VitModel, clipPoolIndex, owlBoxBias, owlConfigFromHF, owlTail, owlTextName, owlVisionName, vitGrid, vitPatchK, type OwlConfig } from "@kiln/models";
 import { ClipTokenizer, type ClipTokenizerJSON } from "@kiln/tokenizers";
 import { imageKey } from "./engine";
@@ -375,10 +375,7 @@ export async function createOwl(
   else {
     const [vocab, merges] = await Promise.all([
       fetchJSON<Record<string, number>>(fileUrl(ref, "vocab.json", ep)),
-      fetch(fileUrl(ref, "merges.txt", ep)).then((r) => {
-        if (!r.ok) throw new Error(`${modelId}: merges.txt: HTTP ${r.status}`);
-        return r.text();
-      }),
+      fetchText(fileUrl(ref, "merges.txt", ep)).then((t) => t!),
     ]);
     const lines = merges.split("\n").filter((l) => l && !l.startsWith("#version"));
     tokJson = { model: { type: "BPE", vocab: vocab!, merges: lines, end_of_word_suffix: "</w>", unk_token: "<|endoftext|>" } };

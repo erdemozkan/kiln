@@ -9,9 +9,9 @@ function serve(routes: Record<string, unknown>) {
   vi.stubGlobal("fetch", async (url: string) => {
     requests.push(url);
     const hit = Object.entries(routes).find(([suffix]) => url.endsWith(suffix));
-    if (!hit) return { ok: false, status: 404, json: async () => ({}) };
+    if (!hit) return new Response("{}", { status: 404 });
     if (hit[1] instanceof Error) throw hit[1];
-    return { ok: true, status: 200, json: async () => hit[1] };
+    return new Response(JSON.stringify(hit[1]));
   });
 }
 

@@ -1,7 +1,7 @@
 // Kokoro text-to-speech (hexgrad/Kokoro-82M: StyleTTS 2 with an iSTFTNet decoder). The networks run on
 // the GPU (see KokoroModel); durations, the harmonic source and its STFT, and the inverse STFT run here.
 import type { Tensor } from "@kiln/core";
-import { fileUrl, type ModelRef } from "@kiln/loader";
+import { fetchBytes, fileUrl, type ModelRef } from "@kiln/loader";
 import { KokoroModel, convMatrix, kokoroConfigFromHF, pad4, type KokoroConfig, type KokoroStyleNorm } from "@kiln/models";
 import { openBackend } from "./load";
 import type { AudioLoadOptions } from "./audio";
@@ -371,9 +371,11 @@ function kokoroEngine(ref: ModelRef, cfg: KokoroConfig, model: KokoroModel, cpu:
     const name = v ?? "af_heart";
     let pack = voices.get(name);
     if (!pack) {
-      const res = await fetch(fileUrl(voiceRepo, `voices/${name}.bin`, opts.endpoint));
-      if (!res.ok) throw new Error(`Kokoro voice "${name}": HTTP ${res.status} (voices are ${KOKORO_VOICES}'s voices/*.bin)`);
-      pack = new Float32Array(await res.arrayBuffer());
+      const bytes = await fetchBytes(fileUrl(voiceRepo, `voices/${name}.bin`, opts.endpoint)).catch((err: unknown) => {
+        throw new Error(`Kokoro voice "${name}": ${err instanceof Error ? err.message : String(err)} (voices are ${KOKORO_VOICES}'s voices/*.bin)`);
+      });
+      // Copied: cached bytes sit 12 bytes into their buffer, and a Float32Array needs its own alignment.
+      pack = new Float32Array(bytes!.slice().buffer);
       voices.set(name, pack);
     }
     return pack;

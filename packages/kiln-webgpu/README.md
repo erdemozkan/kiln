@@ -399,6 +399,8 @@ Weights are cached in the browser (OPFS) as they download, so later loads skip t
 interrupted download resumes. Float weights loaded as q4 or q8 are cached as converted as well (about
 a third to a half of the download on top), so later loads skip reading and converting the original:
 roughly half the load time. `load(id, { weightCache: false })` keeps only the download.
+Config, tokenizer and file-listing requests are cached too and checked against the server in the
+background, so a cached model loads offline and an updated repo shows from the following load on.
 `listCache()` reports what is cached and `clearCache()` deletes it.
 `load` asks the browser to keep the cache (`navigator.storage.persist()`) so it survives low disk
 space; `llm.info.persistent` says whether it agreed, and `load(id, { persist: false })` skips asking.

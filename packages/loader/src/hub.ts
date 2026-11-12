@@ -1,4 +1,5 @@
 /** Hugging Face Hub resolution. A model id is either "org/repo" (safetensors) or "org/repo/file.gguf". */
+import { readCacheFile, writeCacheFile } from "./opfs";
 
 export interface HubOptions {
   revision?: string;
@@ -51,18 +52,103 @@ export function endpointPrefix(endpoint?: string): string {
   return e === "https://huggingface.co" ? "" : `${e}|`;
 }
 
-export async function fetchJSON<T>(url: string, optional = false): Promise<T | undefined> {
+const HUB_MAGIC = 0x6b6c6e68; // "klnh"
+const UTF8 = new TextDecoder();
+
+/** A small repo file as the server answered it: its bytes, or 404. */
+interface HubFile {
+  status: number;
+  bytes?: Uint8Array;
+}
+
+/** The cache file for a repo URL: its cache key (repo@revision/file, as weights use) where the URL has that form. */
+function hubEntryName(url: string): string {
+  const m = /^(.*?)\/([^/]+\/[^/]+)\/resolve\/([^/]+)\/(.+)$/.exec(url);
+  let key = url;
+  try {
+    if (m) key = `${endpointPrefix(m[1])}${m[2]}@${decodeURIComponent(m[3]!)}/${decodeURIComponent(m[4]!)}`;
+  } catch {
+    // Not percent-encoded as fileUrl writes it: the URL itself is the key.
+  }
+  return `${encodeURIComponent(key)}.hub`;
+}
+
+/** Layout: magic, status, body length (u32 LE each), then the body. Anything else is a miss. */
+async function readHubEntry(name: string): Promise<HubFile | undefined> {
+  const b = await readCacheFile(name);
+  if (!b || b.length < 12) return undefined;
+  const dv = new DataView(b.buffer, b.byteOffset, b.byteLength);
+  if (dv.getUint32(0, true) !== HUB_MAGIC || dv.getUint32(8, true) !== b.length - 12) return undefined;
+  const status = dv.getUint32(4, true);
+  return status === 200 ? { status, bytes: b.subarray(12) } : status === 404 ? { status } : undefined;
+}
+
+function writeHubEntry(name: string, f: HubFile): Promise<boolean> {
+  const head = new Uint8Array(12);
+  const dv = new DataView(head.buffer);
+  dv.setUint32(0, HUB_MAGIC, true);
+  dv.setUint32(4, f.status, true);
+  dv.setUint32(8, f.bytes?.length ?? 0, true);
+  return writeCacheFile(name, f.bytes ? [head, f.bytes] : [head]);
+}
+
+async function download(url: string): Promise<HubFile> {
   const res = await fetch(url);
-  if (res.status === 404 && optional) return undefined;
-  if (!res.ok) throw new Error(`${url}: HTTP ${res.status}${res.status === 401 ? " (gated or private model?)" : ""}`);
-  return (await res.json()) as T;
+  return res.ok ? { status: 200, bytes: new Uint8Array(await res.arrayBuffer()) } : { status: res.status };
+}
+
+const sameBytes = (a?: Uint8Array, b?: Uint8Array) => a?.length === b?.length && (!a || !b || a.every((v, i) => v === b[i]));
+
+/** Entries already compared with the server in this session. */
+const checked = new Set<string>();
+
+/**
+ * A small repo file (config, tokenizer, the file listing), cache first: a stored answer is returned
+ * without waiting for the network, then compared with the server's once per session in the background
+ * and replaced if it changed, so an updated repo shows from the following load on. A 404 is stored
+ * too when `keep404` (a file that may not exist is asked for on every load).
+ */
+async function hubFile(url: string, keep404: boolean, name = hubEntryName(url)): Promise<HubFile> {
+  const keeps = (f: HubFile) => f.status === 200 || (keep404 && f.status === 404);
+  const hit = await readHubEntry(name);
+  if (hit && keeps(hit)) {
+    if (!checked.has(name)) {
+      checked.add(name);
+      void download(url)
+        .then((now) => (keeps(now) && (now.status !== hit.status || !sameBytes(now.bytes, hit.bytes)) ? writeHubEntry(name, now) : false))
+        .catch(() => false);
+    }
+    return hit;
+  }
+  const got = await download(url);
+  if (keeps(got)) {
+    checked.add(name);
+    void writeHubEntry(name, got);
+  }
+  return got;
+}
+
+/** The bytes of a repo file, undefined for a missing one when `optional`. Cached; see `hubFile`. */
+export async function fetchBytes(url: string, optional = false): Promise<Uint8Array | undefined> {
+  const f = await hubFile(url, optional);
+  if (f.status === 404 && optional) return undefined;
+  if (!f.bytes) throw new Error(`${url}: HTTP ${f.status}${f.status === 401 ? " (gated or private model?)" : ""}`);
+  return f.bytes;
+}
+
+export async function fetchJSON<T>(url: string, optional = false): Promise<T | undefined> {
+  const text = await fetchText(url, optional);
+  if (text === undefined) return undefined;
+  try {
+    return JSON.parse(text) as T;
+  } catch (err) {
+    throw new Error(`${url}: not JSON (${err instanceof Error ? err.message : String(err)})`);
+  }
 }
 
 export async function fetchText(url: string, optional = false): Promise<string | undefined> {
-  const res = await fetch(url);
-  if (res.status === 404 && optional) return undefined;
-  if (!res.ok) throw new Error(`${url}: HTTP ${res.status}${res.status === 401 ? " (gated or private model?)" : ""}`);
-  return res.text();
+  const bytes = await fetchBytes(url, optional);
+  return bytes && UTF8.decode(bytes);
 }
 
 /**
@@ -71,9 +157,11 @@ export async function fetchText(url: string, optional = false): Promise<string |
  */
 export async function listRepoFiles(ref: ModelRef, endpoint = "https://huggingface.co"): Promise<Set<string> | undefined> {
   try {
-    const res = await fetch(`${endpoint}/api/models/${ref.repo}/revision/${encodeURIComponent(ref.revision)}?expand%5B%5D=siblings`);
-    if (!res.ok) return undefined;
-    const { siblings } = (await res.json()) as { siblings?: { rfilename: string }[] };
+    const url = `${endpoint}/api/models/${ref.repo}/revision/${encodeURIComponent(ref.revision)}?expand%5B%5D=siblings`;
+    // "?" cannot be in a repo path, so the listing's entry never collides with a file's.
+    const f = await hubFile(url, false, `${encodeURIComponent(cacheKey(ref, "?siblings", endpoint))}.hub`);
+    if (!f.bytes) return undefined;
+    const { siblings } = JSON.parse(UTF8.decode(f.bytes)) as { siblings?: { rfilename: string }[] };
     return siblings ? new Set(siblings.map((s) => s.rfilename)) : undefined;
   } catch {
     return undefined;

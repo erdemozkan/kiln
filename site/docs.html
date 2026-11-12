@@ -37,6 +37,7 @@ llm.info; // { family, backend: "webgpu" | "cpu", layers, maxSeq, contextLength,
           <li><code>quant: "auto"</code> stores float weights as q4 and keeps a GGUF's tensors at their own precision. Small models (Gemma 3 270M, Granite 4 350M) need <code>"q8"</code> or <code>"f32"</code>.</li>
           <li>Files are cached in the browser (OPFS) as they download; interrupted downloads resume. <code>listCache()</code> and <code>clearCache()</code> manage the cache.</li>
           <li>Float weights loaded as q4 or q8 are also cached as converted (about a third to a half of the download on top), which roughly halves later loads; <code>weightCache: false</code> keeps only the download.</li>
+          <li>Config, tokenizer and file-listing requests are cached as well and checked against the server in the background: a cached model loads offline, and an updated repo shows from the following load on.</li>
           <li>The context defaults to the model's, up to 8,192 tokens and 512 MiB of KV cache; <code>maxSeq</code> sets it.</li>
           <li>Without WebGPU, Kiln runs on the CPU (WASM SIMD; multithreaded on a cross-origin isolated page). <code>device: "gpu"</code> fails instead, <code>device: "cpu"</code> forces the CPU.</li>
         </ul>

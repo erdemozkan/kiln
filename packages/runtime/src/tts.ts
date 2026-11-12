@@ -1,7 +1,7 @@
 // Text-to-speech: VITS (MMS-TTS) and SpeechT5, with transformers' VitsTokenizer and transformers.js's output shape
 // ({ audio, sampling_rate }).
 import type { Backend, Tensor } from "@kiln/core";
-import { fetchJSON, fileUrl, listRepoFiles, parseModelId, readPytorchHeader, readSafetensorsHeader, toF32, weightFiles, type ByteSource, type ModelRef, type TensorEntry } from "@kiln/loader";
+import { fetchBytes, fetchJSON, fileUrl, listRepoFiles, parseModelId, readPytorchHeader, readSafetensorsHeader, toF32, weightFiles, type ByteSource, type ModelRef, type TensorEntry } from "@kiln/loader";
 import { Seq2SeqModel, SpeechT5Model, UnsupportedModelError, VitsModel, VitsTokenizer, convMatrix, speecht5ConfigFromHF, speecht5Name, speecht5Positional, vitsConfigFromHF, type HifiGanConfig } from "@kiln/models";
 import { CharTokenizer } from "@kiln/tokenizers";
 import { openBackend, openParsed } from "./load";
@@ -250,10 +250,7 @@ export async function createSpeechT5(modelId: string, ref: ModelRef, config: Rec
   const vocId = opts.vocoder ?? "microsoft/speecht5_hifigan";
   const vref = parseModelId(vocId, undefined);
   const [spm, vconfig, vnames] = await Promise.all([
-    fetch(fileUrl(ref, "spm_char.model", ep)).then(async (res) => {
-      if (!res.ok) throw new Error(`${modelId}: spm_char.model: HTTP ${res.status}`);
-      return new Uint8Array(await res.arrayBuffer());
-    }),
+    fetchBytes(fileUrl(ref, "spm_char.model", ep)).then((b) => b!),
     fetchJSON<Record<string, unknown>>(fileUrl(vref, "config.json", ep)),
     listRepoFiles(vref, ep).then((files) => weightFiles(vref, ep, files)),
   ]);
