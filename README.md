@@ -105,6 +105,14 @@ Measured on an Intel Mac with integrated graphics (Iris Plus 650) in Chrome; tim
 
 Where Kiln is slower: loading a model that is already cached, download size for 4-bit models (transformers.js's ONNX repos ship pre-quantized files), and full masked-LM logits through `AutoModelForMaskedLM`. Outputs were checked against transformers.js or Python on every model; the [technical notes](docs/technical-notes.md) have each comparison.
 
+## The story behind Kiln
+
+The idea came from an interview with Sam Altman. His point, as I took it, was that we are wasting the potential of the RAM and GPUs sitting in computers nobody is using. It made me think of my retired 2017 MacBook Pro, an i7 with 16 GB of RAM, doing nothing in a drawer.
+
+I wanted to put it back to work, and I wanted that to be as easy as opening a web page: no installs, no servers, only a browser. I also wanted other developers like me to be able to use the idle memory and processing power of their own devices for small AI tasks just as easily.
+
+So Kiln was born from one idea: don't kill the potential of the hardware we already own. I studied where transformers.js falls short and focused on making models run well on modest, everyday devices, anything that can open a browser with WebGPU.
+
 ## About
 
 Kiln implements each model family itself, as WebGPU kernels, instead of running an exported ONNX graph. That is what lets it load original weights and GGUF files, and it is also why its list of supported architectures is shorter than transformers.js's.
