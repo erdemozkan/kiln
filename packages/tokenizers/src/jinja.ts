@@ -226,6 +226,10 @@ type Expr =
   | { k: "test"; value: Expr; name: string; args: Expr[]; negate: boolean }
   | { k: "un"; op: string; a: Expr }
   | { k: "bin"; op: string; a: Expr; b: Expr }
+  /** `a < b <= c`: each operand is evaluated once, and the chain stops at the first comparison that fails. */
+  | { k: "chain"; first: Expr; rest: [string, Expr][] }
+  /** `*items` among a call's arguments. */
+  | { k: "spread"; e: Expr }
   | { k: "cond"; test: Expr; then: Expr; else?: Expr };
 
 class ExprParser {
@@ -339,20 +343,26 @@ class ExprParser {
     return this.compare();
   }
   private compare(): Expr {
-    let a = this.add();
+    const first = this.add();
+    const rest: [string, Expr][] = [];
     for (;;) {
       const t = this.peek();
       if (t?.t === "op" && ["==", "!=", "<", ">", "<=", ">="].includes(t.v)) {
         this.i++;
-        a = { k: "bin", op: t.v, a, b: this.add() };
+        rest.push([t.v, this.add()]);
       } else if (this.isName("in")) {
         this.i++;
-        a = { k: "bin", op: "in", a, b: this.add() };
+        rest.push(["in", this.add()]);
       } else if (this.isName("not") && this.isName("in", 1)) {
         this.i += 2;
-        a = { k: "un", op: "not", a: { k: "bin", op: "in", a, b: this.add() } };
-      } else return a;
+        rest.push(["not in", this.add()]);
+      } else break;
     }
+    if (!rest.length) return first;
+    // Python's chaining: `a < b < c` is `a < b and b < c`, not `(a < b) < c`.
+    if (rest.length > 1) return { k: "chain", first, rest };
+    const [op, b] = rest[0]!;
+    return op === "not in" ? { k: "un", op: "not", a: { k: "bin", op: "in", a: first, b } } : { k: "bin", op, a: first, b };
   }
   private add(): Expr {
     let a = this.concat();
@@ -507,7 +517,14 @@ class ExprParser {
     const args: Expr[] = [];
     const kwargs: [string, Expr][] = [];
     while (!this.isOp(")")) {
-      if (this.peek()?.t === "name" && this.isOp("=", 1)) {
+      if (this.isOp("**")) {
+        // **mapping: its entries become keyword arguments (kept under the name "**" until the call).
+        this.i++;
+        kwargs.push(["**", this.expr()]);
+      } else if (this.isOp("*")) {
+        this.i++;
+        args.push({ k: "spread", e: this.expr() });
+      } else if (this.peek()?.t === "name" && this.isOp("=", 1)) {
         const name = this.next().v;
         this.i++;
         kwargs.push([name, this.expr()]);
@@ -1119,14 +1136,14 @@ export class Template {
       case "call": {
         const f = this.eval(e.fn, scope);
         if (!(f instanceof Callable)) throw new TemplateError(`${exprName(e.fn)} is not callable`);
-        const args = e.args.map((a) => this.eval(a, scope));
+        const args = this.args(e.args, scope);
         for (const a of args) charge(cost(a));
-        return checked(f.fn(args, Object.fromEntries(e.kwargs.map(([k, v]) => [k, this.eval(v, scope)]))));
+        return checked(f.fn(args, this.kwargs(e.kwargs, scope)));
       }
       case "filter":
-        return this.filter(e.name, this.eval(e.value, scope), e.args.map((a) => this.eval(a, scope)), Object.fromEntries(e.kwargs.map(([k, v]) => [k, this.eval(v, scope)])), scope);
+        return this.filter(e.name, this.eval(e.value, scope), this.args(e.args, scope), this.kwargs(e.kwargs, scope), scope);
       case "test": {
-        const r = test(e.name, this.eval(e.value, scope), e.args.map((a) => this.eval(a, scope)));
+        const r = test(e.name, this.eval(e.value, scope), this.args(e.args, scope));
         return e.negate ? !r : r;
       }
       case "un": {
@@ -1138,7 +1155,49 @@ export class Template {
         return truthy(this.eval(e.test, scope)) ? this.eval(e.then, scope) : e.else ? this.eval(e.else, scope) : new Undef("else");
       case "bin":
         return this.binary(e, scope);
+      case "chain": {
+        let left = this.eval(e.first, scope);
+        for (const [op, operand] of e.rest) {
+          const right = this.eval(operand, scope);
+          const held = this.binary({ k: "bin", op: op === "not in" ? "in" : op, a: { k: "lit", v: left }, b: { k: "lit", v: right } }, scope);
+          if ((op === "not in") === !!held) return false;
+          left = right;
+        }
+        return true;
+      }
+      case "spread":
+        throw new TemplateError("* can only unpack a call's arguments");
     }
+  }
+
+  /** A call's positional arguments, `*items` unpacked in place. */
+  private args(exprs: Expr[], scope: Scope): unknown[] {
+    if (!exprs.some((a) => a.k === "spread")) return exprs.map((a) => this.eval(a, scope));
+    const out: unknown[] = [];
+    for (const a of exprs) {
+      if (a.k !== "spread") out.push(this.eval(a, scope));
+      else {
+        const items = this.eval(a.e, scope);
+        if (!Array.isArray(items) && typeof items !== "string") throw new TemplateError("* needs a list to unpack");
+        for (const x of iterate(items)) out.push(x);
+        if (out.length > MAX_LIST) throw new TemplateError("the template builds a list that is too long");
+      }
+    }
+    return out;
+  }
+
+  /** A call's keyword arguments, `**mapping` unpacked; a later one replaces an earlier one of the same name. */
+  private kwargs(pairs: [string, Expr][], scope: Scope): Record<string, unknown> {
+    const out: Record<string, unknown> = Object.create(null) as Record<string, unknown>;
+    for (const [k, e] of pairs) {
+      const v = this.eval(e, scope);
+      if (k !== "**") out[k] = v;
+      else {
+        if (!v || typeof v !== "object" || Array.isArray(v) || isUndef(v) || v instanceof Callable) throw new TemplateError("** needs a mapping to unpack");
+        for (const [name, x] of Object.entries(v instanceof Namespace ? v.vars : v)) out[name] = x;
+      }
+    }
+    return out;
   }
 
   private binary(e: Extract<Expr, { k: "bin" }>, scope: Scope): unknown {

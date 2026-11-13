@@ -330,3 +330,55 @@ describe("token masks", () => {
     expect(checked).toBeGreaterThan(4);
   });
 });
+
+describe("allOf", () => {
+  it("folds members, the keywords beside them and $ref into one schema", () => {
+    const schema: JsonSchema = {
+      $defs: { Named: { type: "object", properties: { name: { type: "string" } }, required: ["name"] } },
+      description: "a pet",
+      allOf: [{ $ref: "#/$defs/Named" }, { properties: { age: { type: "integer", minimum: 0 } }, required: ["age"] }, { properties: { age: { maximum: 30 } } }],
+    };
+    expect(full(json(schema), '{"name": "Rex", "age": 3}')).toBe(true);
+    expect(full(json(schema), '{"name": "Rex"}')).toBe(false); // age is required by the second member
+    expect(full(json(schema), '{"age": 3}')).toBe(false); // name by the first
+    expect(full(json(schema), '{"name": "Rex", "age": 31}')).toBe(false); // both bounds on age hold
+    expect(full(json(schema), '{"name": "Rex", "age": -1}')).toBe(false);
+    expect(full(json(schema), '{"name": 5, "age": 3}')).toBe(false);
+  });
+
+  it("keeps what one entry beside other keywords used to drop", () => {
+    // pydantic writes a field with a description this way.
+    const schema: JsonSchema = { type: "object", properties: { size: { description: "how big", allOf: [{ enum: ["s", "m", "l"] }], type: "string" } }, required: ["size"] };
+    expect(full(json(schema), '{"size": "m"}')).toBe(true);
+    expect(full(json(schema), '{"size": "xl"}')).toBe(false);
+  });
+
+  it("combines plain types, enums, lengths and bounds", () => {
+    expect(full(json({ allOf: [{ type: "integer" }, { minimum: 2 }, { exclusiveMaximum: 5 }] }), "4")).toBe(true);
+    expect(full(json({ allOf: [{ type: "integer" }, { minimum: 2 }, { exclusiveMaximum: 5 }] }), "5")).toBe(false);
+    expect(full(json({ allOf: [{ type: "integer" }, { minimum: 2 }] }), "2.5")).toBe(false);
+    expect(full(json({ allOf: [{ type: ["number", "string"] }, { type: "integer" }] }), "7")).toBe(true);
+    expect(full(json({ allOf: [{ type: ["number", "string"] }, { type: "integer" }] }), '"7"')).toBe(false);
+    expect(full(json({ allOf: [{ enum: ["a", "b", "c"] }, { enum: ["b", "c", "d"] }] }), '"b"')).toBe(true);
+    expect(full(json({ allOf: [{ enum: ["a", "b", "c"] }, { enum: ["b", "c", "d"] }] }), '"a"')).toBe(false);
+    expect(full(json({ allOf: [{ type: "string", minLength: 2 }, { maxLength: 3 }] }), '"abc"')).toBe(true);
+    expect(full(json({ allOf: [{ type: "string", minLength: 2 }, { maxLength: 3 }] }), '"abcd"')).toBe(false);
+    expect(full(json({ allOf: [{ type: "array", items: { type: "integer" } }, { items: { minimum: 1 }, maxItems: 2 }] }), "[1, 2]")).toBe(true);
+    expect(full(json({ allOf: [{ type: "array", items: { type: "integer" } }, { items: { minimum: 1 }, maxItems: 2 }] }), "[0]")).toBe(false);
+  });
+
+  it("multiplies out anyOf members and drops branches that cannot match", () => {
+    const schema: JsonSchema = { allOf: [{ anyOf: [{ type: "string" }, { type: "integer" }, { type: "null" }] }, { type: ["string", "integer"] }, { anyOf: [{ maxLength: 2 }, { const: 7 }] }] };
+    expect(full(json(schema), '"ab"')).toBe(true);
+    expect(full(json(schema), "7")).toBe(true);
+    expect(full(json(schema), "null")).toBe(false);
+    expect(full(json(schema), '"abc"')).toBe(false);
+  });
+
+  it("refuses what it cannot enforce exactly", () => {
+    expect(() => compileFormat(json({ allOf: [{ type: "string" }, { type: "integer" }] }))).toThrow(/exclude each other/);
+    expect(() => compileFormat(json({ allOf: [{ pattern: "a+" }, { pattern: "b+" }] }))).toThrow(/cannot combine/);
+    expect(() => compileFormat(json({ $defs: { A: { allOf: [{ $ref: "#/$defs/A" }] } }, $ref: "#/$defs/A" }))).toThrow(/refers back to itself/);
+    expect(() => compileFormat(json({ allOf: [{ not: { type: "string" } }] }))).toThrow(/not supported/);
+  });
+});

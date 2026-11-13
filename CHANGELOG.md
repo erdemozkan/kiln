@@ -56,6 +56,16 @@ conversation's was read and written again each turn. When the tokens part ways w
 write cut short costs that segment, not the file. Loading reads one segment at a time. Files of the
 old layout are removed at the model's next load.
 
+**Chat templates: chained comparisons and argument unpacking.** `a < b < c` now means what it does
+in Python (it was read as `(a < b) < c`), and calls take `*list` and `**mapping`, which templates
+using them failed on with `unexpected "*"`.
+
+**JSON schema: `allOf` in full.** Its members, their `$ref`s and the keywords beside it are folded
+into one schema (properties and `required` joined, types and enums intersected, the tighter bound
+kept), and members with `anyOf` are multiplied out. Before, more than one entry was refused, and a
+single entry dropped the keywords written beside it. What cannot be combined exactly (two different
+patterns) is refused by name.
+
 **Fewer requests on a first download.** The request that downloads a weight file also tells its
 size, so the separate one-byte request that asked for it is gone, and the shards of a split
 safetensors model are opened together instead of one after another.

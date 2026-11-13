@@ -84,16 +84,21 @@ export function compileSchema(root: JsonSchema, ws: Whitespace = PRETTY): Node {
   const refs = new Map<string, Node & { nodes: Node[] }>();
   let any: Node | undefined;
 
+  const target = (ref: string): JsonSchema => {
+    const m = /^#\/(\$defs|definitions)\/(.+)$/.exec(ref);
+    const t = m ? (root[m[1] as "$defs" | "definitions"] ?? {})[m[2]!.replace(/~1/g, "/").replace(/~0/g, "~")] : ref === "#" ? root : undefined;
+    if (!t) throw new Error(`schema: cannot resolve $ref "${ref}" (only #, #/$defs/… and #/definitions/…)`);
+    return t;
+  };
+
   const resolve = (ref: string): Node => {
     let node = refs.get(ref);
     if (node) return node;
-    const m = /^#\/(\$defs|definitions)\/(.+)$/.exec(ref);
-    const target = m ? (root[m[1] as "$defs" | "definitions"] ?? {})[m[2]!.replace(/~1/g, "/").replace(/~0/g, "~")] : ref === "#" ? root : undefined;
-    if (!target) throw new Error(`schema: cannot resolve $ref "${ref}" (only #, #/$defs/… and #/definitions/…)`);
+    const t = target(ref);
     // A shell first, so recursive references point back at it.
     node = { kind: "alt", nodes: [] };
     refs.set(ref, node);
-    node.nodes.push(compile(target));
+    node.nodes.push(compile(t));
     return node;
   };
 
@@ -101,15 +106,13 @@ export function compileSchema(root: JsonSchema, ws: Whitespace = PRETTY): Node {
     if (s === true) return (any ??= anyJson(ws));
     if (s === false) throw new Error("schema: `false` matches nothing");
     for (const k of UNSUPPORTED) if (k in s) throw new Error(`schema: "${k}" is not supported`);
+    // allOf first: its members (and the keywords beside it) are folded into one schema.
+    if (s.allOf) return compile(mergeAllOf(s, target));
     if (s.$ref) return resolve(s.$ref);
     if (s.const !== undefined) return lit(JSON.stringify(s.const));
     if (s.enum) return { kind: "alt", nodes: s.enum.map((v) => lit(JSON.stringify(v))) };
     const alts = s.anyOf ?? s.oneOf;
     if (alts) return { kind: "alt", nodes: alts.map(compile) };
-    if (s.allOf) {
-      if (s.allOf.length !== 1) throw new Error("schema: allOf is only supported with one entry");
-      return compile(s.allOf[0]!);
-    }
     const types = s.type === undefined ? undefined : Array.isArray(s.type) ? s.type : [s.type];
     if (!types) {
       if (s.properties || s.additionalProperties !== undefined) return compileType(s, "object");
@@ -154,6 +157,158 @@ export function compileSchema(root: JsonSchema, ws: Whitespace = PRETTY): Node {
   };
 
   return compile(root);
+}
+
+/** Keywords that describe a schema without changing what matches it: the first one met is kept. */
+const ANNOTATIONS = new Set(["title", "description", "default", "examples", "$comment", "$id", "$schema", "deprecated", "readOnly", "writeOnly", "$defs", "definitions"]);
+/** Most alternatives an allOf over anyOf / oneOf members may expand to. */
+const MAX_ALLOF_ALTERNATIVES = 64;
+
+/** Two schemas that nothing matches together: inside alternatives that branch is dropped, elsewhere it is an error. */
+class NoMatch extends Error {}
+
+const sameJson = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b);
+const typesOf = (s: JsonSchema): JsonType[] | undefined => (s.type === undefined ? undefined : Array.isArray(s.type) ? s.type : [s.type]);
+
+/** The lower bound of a schema as [value, exclusive], from either draft's keywords. */
+function lower(s: JsonSchema): [number, boolean] | undefined {
+  const ex = typeof s.exclusiveMinimum === "number" ? s.exclusiveMinimum : undefined;
+  if (ex !== undefined && (s.minimum === undefined || ex >= s.minimum)) return [ex, true];
+  return s.minimum === undefined ? undefined : [s.minimum, s.exclusiveMinimum === true];
+}
+function upper(s: JsonSchema): [number, boolean] | undefined {
+  const ex = typeof s.exclusiveMaximum === "number" ? s.exclusiveMaximum : undefined;
+  if (ex !== undefined && (s.maximum === undefined || ex <= s.maximum)) return [ex, true];
+  return s.maximum === undefined ? undefined : [s.maximum, s.exclusiveMaximum === true];
+}
+
+/**
+ * One schema that matches what both `a` and `b` match (neither holds allOf, anyOf, oneOf or $ref:
+ * `mergeAllOf` has dealt with those). Keywords it cannot combine exactly throw, so an allOf is
+ * either enforced in full or refused; none of it is dropped silently.
+ */
+function intersect(a: JsonSchema, b: JsonSchema): JsonSchema {
+  const out: JsonSchema = { ...a };
+  for (const [k, v] of Object.entries(b)) {
+    if (v === undefined) continue;
+    const have = a[k];
+    if (have === undefined) {
+      out[k] = v;
+      continue;
+    }
+    if (ANNOTATIONS.has(k) || sameJson(have, v)) continue;
+    switch (k) {
+      case "type": {
+        const [x, y] = [typesOf(a)!, typesOf(b)!];
+        // An integer is a number, so "number" on one side keeps "integer" from the other.
+        const both = x.filter((t) => y.includes(t) || (t === "integer" && y.includes("number")));
+        for (const t of y) if (t === "integer" && x.includes("number") && !both.includes("integer")) both.push("integer");
+        if (!both.length) throw new NoMatch(`schema: allOf asks for types that exclude each other (${x.join(", ")} and ${y.join(", ")})`);
+        out.type = both.length === 1 ? both[0]! : both;
+        break;
+      }
+      case "properties": {
+        const props: Record<string, JsonSchema> = { ...a.properties };
+        for (const [name, p] of Object.entries(b.properties!)) props[name] = name in props ? { allOf: [props[name]!, p] } : p;
+        out.properties = props;
+        break;
+      }
+      case "required":
+        out.required = [...new Set([...a.required!, ...b.required!])];
+        break;
+      case "additionalProperties": {
+        const [x, y] = [a.additionalProperties!, b.additionalProperties!];
+        out.additionalProperties = x === false || y === false ? false : x === true ? y : y === true ? x : { allOf: [x, y] };
+        break;
+      }
+      case "items":
+        out.items = { allOf: [a.items!, b.items!] };
+        break;
+      case "enum": {
+        const keep = a.enum!.filter((x) => b.enum!.some((y) => sameJson(x, y)));
+        if (!keep.length) throw new NoMatch("schema: allOf combines enums with no value in common");
+        out.enum = keep;
+        break;
+      }
+      case "minItems":
+      case "minLength":
+        out[k] = Math.max(have as number, v as number);
+        break;
+      case "maxItems":
+      case "maxLength":
+        out[k] = Math.min(have as number, v as number);
+        break;
+      case "minimum":
+      case "maximum":
+      case "exclusiveMinimum":
+      case "exclusiveMaximum":
+        break; // Set together below.
+      case "const":
+        throw new NoMatch("schema: allOf combines two different const values");
+      default:
+        throw new Error(`schema: allOf cannot combine two different "${k}"`);
+    }
+  }
+  // Bounds: the tighter of each side, written back in the draft 6 form.
+  const pick = (x: [number, boolean] | undefined, y: [number, boolean] | undefined, sign: 1 | -1) => (!x ? y : !y ? x : x[0] === y[0] ? ([x[0], x[1] || y[1]] as [number, boolean]) : sign * x[0] > sign * y[0] ? x : y);
+  const [lo, hi] = [pick(lower(a), lower(b), 1), pick(upper(a), upper(b), -1)];
+  for (const k of ["minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum"]) delete out[k];
+  if (lo) out[lo[1] ? "exclusiveMinimum" : "minimum"] = lo[0];
+  if (hi) out[hi[1] ? "exclusiveMaximum" : "maximum"] = hi[0];
+  // A const or an enum beside the other side's: the const must be one of the enum's values.
+  if (out.const !== undefined && out.enum) {
+    if (!out.enum.some((x) => sameJson(x, out.const))) throw new NoMatch("schema: allOf combines a const with an enum that does not hold it");
+    delete out.enum;
+  }
+  return out;
+}
+
+/**
+ * `s` with its allOf folded in: the members, the members' own allOf and $ref (looked up with
+ * `target`), and the keywords beside the allOf become one schema. A member with anyOf or oneOf
+ * turns the result into alternatives, each the rest combined with one of its branches.
+ */
+function mergeAllOf(s: JsonSchema, target: (ref: string) => JsonSchema, depth = 0): JsonSchema {
+  if (depth > 32) throw new Error("schema: allOf refers back to itself");
+  const { allOf, ...beside } = s;
+  // Every part as a list of alternatives; plain parts have one.
+  const parts: JsonSchema[][] = [];
+  const add = (m: JsonSchema | boolean, d: number): void => {
+    if (m === true) return;
+    if (m === false) throw new Error("schema: `false` matches nothing");
+    if (d > 32) throw new Error("schema: allOf refers back to itself");
+    for (const k of UNSUPPORTED) if (k in m) throw new Error(`schema: "${k}" is not supported`);
+    const { allOf: inner, $ref, anyOf, oneOf, ...own } = m;
+    if (Object.keys(own).some((k) => !ANNOTATIONS.has(k))) parts.push([own]);
+    if ($ref) add(target($ref), d + 1);
+    for (const x of inner ?? []) add(x, d + 1);
+    const alts = anyOf ?? oneOf;
+    if (alts) parts.push(alts.map((x) => (x.allOf || x.$ref || x.anyOf || x.oneOf ? mergeAllOf({ allOf: [x] }, target, d + 1) : x)));
+  };
+  add(beside, depth);
+  for (const m of allOf ?? []) add(m, depth + 1);
+  let combined: JsonSchema[] = [{}];
+  for (const alts of parts) {
+    const next: JsonSchema[] = [];
+    let empty: NoMatch | undefined;
+    for (const have of combined) {
+      for (const alt of alts) {
+        // A branch that is itself alternatives (from a nested merge) multiplies out the same way.
+        for (const leaf of alt.anyOf ?? [alt]) {
+          try {
+            next.push(intersect(have, leaf));
+          } catch (err) {
+            if (!(err instanceof NoMatch)) throw err;
+            empty = err;
+          }
+        }
+      }
+    }
+    if (!next.length) throw empty ?? new Error("schema: allOf matches nothing");
+    if (next.length > MAX_ALLOF_ALTERNATIVES) throw new Error(`schema: allOf expands to more than ${MAX_ALLOF_ALTERNATIVES} alternatives`);
+    combined = next;
+  }
+  return combined.length === 1 ? combined[0]! : { anyOf: combined };
 }
 
 /** A schema's numeric bounds (either draft's exclusive keywords) and multipleOf; undefined when there are none. */

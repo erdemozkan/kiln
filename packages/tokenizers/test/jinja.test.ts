@@ -66,3 +66,29 @@ describe("jinja subset", () => {
     expect(() => r("{{ x | frobnicate }}")).toThrow(/unknown filter/);
   });
 });
+
+describe("chained comparisons and argument unpacking", () => {
+  const render = (src: string, vars: Record<string, unknown> = {}) => new Template(src).render(vars);
+  it("chains comparisons as Python does", () => {
+    expect(render("{{ 1 < 2 < 3 }}{{ 1 < 3 < 2 }}{{ 3 > 2 > 1 }}{{ 3 > 2 > 5 }}")).toBe("TrueFalseTrueFalse");
+    expect(render("{{ 0 <= n < 10 }}{{ 0 <= m < 10 }}", { n: 5, m: 10 })).toBe("TrueFalse");
+    expect(render("{{ 1 == 1 != 2 }}{{ 1 < 2 == 2 }}{{ 2 in [1, 2] == true }}")).toBe("TrueTrueFalse");
+    expect(render("{{ 1 < 2 not in [3] }}{{ 'a' in 'abc' in ['abc'] }}")).toBe("TrueTrue");
+    // The middle operand is evaluated once, and nothing after a comparison that fails.
+    expect(render("{% set ns = namespace(n=0) %}{% macro bump() %}{% set ns.n = ns.n + 1 %}5{% endmacro %}{{ 1 < bump() | int < 9 }}{{ ns.n }}")).toBe("True1");
+    expect(render("{{ 2 < 1 < raise_exception('not reached') }}")).toBe("False");
+    // One comparison is what it was.
+    expect(render("{{ 1 < 2 }}{{ 'b' not in 'abc' }}{{ (1 < 2) == true }}")).toBe("TrueFalseTrue");
+  });
+
+  it("unpacks * and ** in calls and filters", () => {
+    expect(render("{{ range(*bounds) | list }}", { bounds: [1, 4] })).toBe("[1, 2, 3]");
+    expect(render("{% macro f(a, b, c='-') %}{{ a }}{{ c }}{{ b }}{% endmacro %}{{ f(*[1, 2]) }} {{ f(0, *[9]) }} {{ f(*[1, 2], **{'c': '+'}) }}")).toBe("1-2 0-9 1+2");
+    expect(render("{{ ['a', 'b'] | join(*[', ']) }}{{ ns | tojson }}", { ns: null })).toBe("a, bnull");
+    expect(render("{% set opts = {'indent': 2} %}{{ [1] | tojson(**opts) }}")).toBe("[\n  1\n]");
+    expect(render("{{ dict(**{'a': 1}, b=2) | tojson }}")).toBe('{"a": 1, "b": 2}');
+    expect(() => render("{{ range(*5) }}")).toThrow(/needs a list/);
+    expect(() => render("{{ range(**[1]) }}")).toThrow(/needs a mapping/);
+    expect(() => render("{{ [*a] }}", { a: [1] })).toThrow();
+  });
+});
