@@ -377,6 +377,30 @@ describe("linear attention kernels (CPU)", () => {
     }
   });
 
+  it("takes value heads in tiled order (GGUF files) as well as grouped", async () => {
+    const [T, Hk, Hv, Dk, Dv] = [5, 2, 6, 8, 4];
+    const r = Hv / Hk;
+    const keys = 2 * Hk * Dk;
+    const C = keys + Hv * Dv;
+    const conv = randn(T * C);
+    const [a, b, aLog, dt] = [randn(T * Hv), randn(T * Hv), randn(Hv), randn(Hv)];
+    const qk = randn(T * keys).map((v) => v / 3);
+    const shape = { keyHeads: Hk, valueHeads: Hv, keyDim: Dk, valueDim: Dv };
+    const want = ref.gatedDeltaRef(qk, conv, a, b, aLog, dt, { T, ...shape });
+    // Grouped head h = kh·r + j sits at tiled position j·Hk + kh.
+    const tiledOf = (h: number) => (h % r) * Hk + Math.floor(h / r);
+    const heads = (f: Float32Array, rows: number, width: number, base = 0, stride = Hv * width) => {
+      const out = f.slice();
+      for (let t = 0; t < rows; t++) for (let h = 0; h < Hv; h++) for (let i = 0; i < width; i++) out[t * stride + base + tiledOf(h) * width + i] = f[t * stride + base + h * width + i]!;
+      return out;
+    };
+    const state = be.alloc(Hv * Dv * Dk * 4);
+    let y!: Tensor;
+    run((ctx) => (y = ops.gatedDelta(ctx, upload(qk, [T, keys]), upload(heads(conv, T, Dv, keys, C), [T, C]), upload(heads(a, T, 1), [T, Hv]), upload(heads(b, T, 1), [T, Hv]), upload(heads(aLog, 1, 1), [Hv]), upload(heads(dt, 1, 1), [Hv]), state, { T, ...shape, tiled: true })));
+    const got = await read(y.buf, T * Hv * Dv);
+    expect(ref.maxAbsDiff(got, heads(want, T, Dv))).toBeLessThan(2e-5);
+  });
+
   it("splits heads into blocks and gates in place", async () => {
     const [T, H, D] = [2, 3, 4];
     const x = randn(T * H * 2 * D);

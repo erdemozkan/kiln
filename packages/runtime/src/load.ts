@@ -28,6 +28,7 @@ import {
   configFromGGUF,
   configFromHF,
   ggufToHF,
+  qwen35GgufValues,
   graniteName,
   phi3Name,
   PHI3_ROPE_SHORT,
@@ -627,7 +628,7 @@ async function ggufModel(file: string, source: ByteSource, gguf: Awaited<ReturnT
       cfg,
       tokenizer: Tokenizer.fromGGUF(gguf.metadata),
       // Norms in gemma3 files already hold 1 + w, so unlike safetensors there is nothing to transform.
-      files: [{ name: file, source, tensors: gguf.tensors, rename: (n) => ggufToHF(n, cfg.family), scale }],
+      files: [{ name: file, source, tensors: gguf.tensors, rename: (n) => ggufToHF(n, cfg.family), scale, ...(cfg.family === "qwen35" ? { transform: qwen35GgufValues } : {}) }],
     };
   } catch (err) {
     source.close?.();

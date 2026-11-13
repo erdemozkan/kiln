@@ -85,6 +85,11 @@ export interface LinearAttentionConfig {
   valueDim: number;
   /** Taps of the causal depthwise convolution over time. */
   convKernel: number;
+  /**
+   * How value heads map to key heads when there are more of them. Checkpoints group them (value head
+   * h uses key head ⌊h / (Hv / Hk)⌋); llama.cpp's converter reorders them so that it is h mod Hk.
+   */
+  tiled?: boolean;
 }
 
 export interface Llama3RopeScaling {
@@ -128,6 +133,12 @@ const SIZE_LIMITS: Record<string, number> = {
   linear_key_head_dim: 256,
   linear_value_head_dim: 256,
   linear_conv_kernel_dim: 16,
+  "ssm.conv_kernel": 16,
+  "ssm.state_size": 256,
+  "ssm.group_count": 1024,
+  "ssm.time_step_rank": 1024,
+  "ssm.inner_size": 262144,
+  full_attention_interval: 1024,
 };
 
 /**
@@ -425,8 +436,8 @@ function ropeScalingFromHF(s: HFConfig | null | undefined): Llama3RopeScaling | 
  */
 export function configFromGGUF(meta: Map<string, unknown>, tensorNames: readonly string[], ropeShort?: ArrayLike<number>): LlamaConfig {
   const arch = String(meta.get("general.architecture"));
-  if (!["llama", "qwen2", "qwen3", "granite", "gemma3", "phi3"].includes(arch)) {
-    throw new UnsupportedModelError(`GGUF architecture "${arch}" is not supported yet (llama, qwen2, qwen3, granite, gemma3, phi3)`);
+  if (!["llama", "qwen2", "qwen3", "qwen35", "granite", "gemma3", "phi3"].includes(arch)) {
+    throw new UnsupportedModelError(`GGUF architecture "${arch}" is not supported yet (llama, qwen2, qwen3, qwen35, granite, gemma3, phi3)`);
   }
   const get = (k: string, fallback?: number): number => {
     let v: unknown = meta.get(`${arch}.${k}`) ?? fallback;
@@ -459,7 +470,8 @@ export function configFromGGUF(meta: Map<string, unknown>, tensorNames: readonly
     ropeInterleaved: arch === "llama" || arch === "granite",
     tieEmbeddings: !tensorNames.includes("output.weight"),
     attentionBias: tensorNames.includes("blk.0.attn_q.bias"),
-    qkNorm: tensorNames.includes("blk.0.attn_q_norm.weight"),
+    // Qwen 3.5's first layer is linear attention, so its q/k norms are not in block 0.
+    qkNorm: arch === "qwen35" || tensorNames.includes("blk.0.attn_q_norm.weight"),
     eosTokenIds: ids(meta.get("tokenizer.ggml.eos_token_id")),
     bosTokenId: meta.has("tokenizer.ggml.bos_token_id") ? Number(meta.get("tokenizer.ggml.bos_token_id")) : undefined,
     contextLength: optNum(meta.get(`${arch}.context_length`)),
@@ -472,6 +484,27 @@ export function configFromGGUF(meta: Map<string, unknown>, tensorNames: readonly
     if (!ropeShort) throw new UnsupportedModelError(`phi3 with LongRoPE: the values of ${PHI3_ROPE_SHORT} are needed`);
     const original = get("rope.scaling.original_context_length");
     return longRope(phi, Array.from(ropeShort), original, phi.contextLength ?? original, optNum(meta.get("phi3.rope.scaling.attn_factor")));
+  }
+  if (arch === "qwen35") {
+    // Which layers are linear attention: listed, or every layer but each `interval`-th.
+    const listed = meta.get("qwen35.attention.recurrent_layers");
+    const interval = get("full_attention_interval", 4);
+    const linearLayers = Array.from({ length: base.numLayers }, (_, l) => (Array.isArray(listed) ? Boolean(listed[l]) : (l + 1) % interval !== 0));
+    const first = linearLayers.indexOf(true);
+    // Newer conversions merge the q/k/v and gate projections (and the two small ones) into one tensor each.
+    if (first >= 0 && !tensorNames.includes(`blk.${first}.attn_gate.weight`)) {
+      throw new UnsupportedModelError("this Qwen 3.5 GGUF stores linear attention's projections merged, which is not supported yet (files with blk.N.attn_gate are)");
+    }
+    const valueHeads = get("ssm.time_step_rank");
+    const keyHeads = get("ssm.group_count");
+    const keyDim = get("ssm.state_size");
+    const inner = get("ssm.inner_size");
+    const linear: LinearAttentionConfig = { keyHeads, valueHeads, keyDim, valueDim: inner / valueHeads, convKernel: get("ssm.conv_kernel"), ...(valueHeads !== keyHeads ? { tiled: true } : {}) };
+    if (!Number.isInteger(linear.valueDim) || valueHeads % keyHeads !== 0 || keyDim % 4 !== 0 || linear.valueDim % 4 !== 0 || keyDim > 256 || linear.valueDim > 256 || linear.convKernel < 2 || linear.convKernel > 16) {
+      throw new UnsupportedModelError("qwen35: these linear attention sizes are not supported");
+    }
+    const rotary = get("rope.dimension_count", base.headDim);
+    return { ...base, ...(rotary !== base.headDim ? { rotaryDims: partialRotary(base.headDim, rotary) } : {}), linearLayers, linear, attnOutputGate: true };
   }
   if (arch !== "granite") return base;
   const logitScale = 1 / get("logit_scale", 1);

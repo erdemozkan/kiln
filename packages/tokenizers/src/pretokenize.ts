@@ -4,6 +4,9 @@ export const GPT2_PATTERN = String.raw`'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+
 export const LLAMA3_PATTERN = String.raw`(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+`;
 export const QWEN2_PATTERN = String.raw`(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+`;
 
+/** Qwen 3.5: combining marks stay with their letters. */
+export const QWEN35_PATTERN = String.raw`(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+`;
+
 /** Largest token id a tokenizer file may use (16M): ids index arrays sized by the largest one. */
 export const MAX_TOKEN_ID = 2 ** 24;
 
@@ -121,7 +124,7 @@ export function assertLinearRegex(source: string, what: string, maxLoops = 3): v
   if (i < source.length) throw bad("unbalanced parentheses");
 }
 
-const KNOWN_PATTERNS = new Set([GPT2_PATTERN, LLAMA3_PATTERN, QWEN2_PATTERN]);
+const KNOWN_PATTERNS = new Set([GPT2_PATTERN, LLAMA3_PATTERN, QWEN2_PATTERN, QWEN35_PATTERN]);
 
 /**
  * Rust-regex → JS: expands scoped case-insensitive groups `(?i:...)`, which JS engines before

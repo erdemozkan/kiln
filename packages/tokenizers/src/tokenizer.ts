@@ -1,5 +1,5 @@
 import { TOOL_CALL_MARKERS, type ChatTemplate } from "./chat";
-import { GPT2_PATTERN, LLAMA3_PATTERN, QWEN2_PATTERN, checkTokenId, compilePreTokenizer, splitIsolated, toJsRegex, type PreStep } from "./pretokenize";
+import { GPT2_PATTERN, LLAMA3_PATTERN, QWEN2_PATTERN, QWEN35_PATTERN, checkTokenId, compilePreTokenizer, splitIsolated, toJsRegex, type PreStep } from "./pretokenize";
 
 /** GPT-2 byte ↔ printable-unicode table used by byte-level BPE. */
 function byteTables(): { enc: string[]; dec: Map<string, number> } {
@@ -148,7 +148,7 @@ export class Tokenizer {
       else vocab.set(t, id);
     });
     // llama.cpp gives dbrx (Granite 4) Llama 3's split, and refact (Granite 3) SmolLM's isolated digits.
-    const pattern = pre === "llama-bpe" || pre === "llama3" || pre === "dbrx" ? LLAMA3_PATTERN : pre.startsWith("qwen") ? QWEN2_PATTERN : GPT2_PATTERN;
+    const pattern = pre === "llama-bpe" || pre === "llama3" || pre === "dbrx" ? LLAMA3_PATTERN : pre === "qwen35" ? QWEN35_PATTERN : pre.startsWith("qwen") ? QWEN2_PATTERN : GPT2_PATTERN;
     const re = toJsRegex(pattern);
     const steps: PreStep[] = [(ps) => ps.flatMap((p) => splitIsolated(p, re))];
     if (pre === "smollm" || pre === "refact") steps.unshift((ps) => ps.flatMap((p) => splitIsolated(p, /\p{N}/gu)));

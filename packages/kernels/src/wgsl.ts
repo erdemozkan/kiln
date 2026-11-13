@@ -3662,7 +3662,7 @@ export function gatedDeltaSpec(Dk: number): KernelSpec {
   if (Dk % 4 !== 0 || Dk < 4 || Dk > 256) throw new Error(`gatedDeltaSpec: key head of ${Dk} must be a multiple of 4, at most 256`);
   const D4 = Dk / 4;
   return spec(`gated_delta/D${Dk}`, ["uniform", "read", "read", "read", "read", "read", "read", "rw", "rw"], cpu.cpuGatedDelta, () => /* wgsl */ `
-struct P { T: u32, Hv: u32, Hk: u32, Dk: u32, Dv: u32, C: u32, vOff: u32, qScale: f32 }
+struct P { T: u32, Hv: u32, Hk: u32, Dk: u32, Dv: u32, C: u32, vOff: u32, qScale: f32, tiled: u32, _a: u32, _b: u32, _c: u32 }
 @group(0) @binding(0) var<uniform> p: P;
 @group(0) @binding(1) var<storage, read> qk: array<vec4<f32>>;
 @group(0) @binding(2) var<storage, read> conv: array<f32>;
@@ -3679,8 +3679,8 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
   let col = wid.x * 64u + li;
   let h = wid.y;
   if (col >= p.Dv) { return; }
-  // Each key head serves Hv / Hk consecutive value heads.
-  let kh = h / (p.Hv / p.Hk);
+  // Each key head serves Hv / Hk value heads: consecutive ones, or every Hk-th when tiled (GGUF files).
+  let kh = select(h / (p.Hv / p.Hk), h % p.Hk, p.tiled == 1u);
   let sb = (h * p.Dv + col) * D4;
   var s: array<vec4<f32>, ${D4}>;
   for (var i = 0u; i < D4; i++) { s[i] = state[sb + i]; }

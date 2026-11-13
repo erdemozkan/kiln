@@ -910,6 +910,8 @@ export interface GatedDeltaShape {
   valueHeads: number;
   keyDim: number;
   valueDim: number;
+  /** Value head h uses key head h mod Hk (GGUF files) where checkpoints use ⌊h / (Hv / Hk)⌋. */
+  tiled?: boolean;
 }
 
 /**
@@ -924,7 +926,7 @@ export function gatedDelta(ctx: Ctx, qk: Tensor, conv: Tensor, a: Tensor, b: Ten
   if (C !== vOff + s.valueHeads * s.valueDim || lastDim(qk) !== vOff) throw new Error(`gatedDelta: rows of ${C} and ${lastDim(qk)} do not fit the heads`);
   if (numel(aLog.shape) !== s.valueHeads || numel(dtBias.shape) !== s.valueHeads) throw new Error("gatedDelta: one A_log and dt_bias per value head");
   const out = ctx.alloc([s.T, s.valueHeads * s.valueDim]);
-  const params = ctx.uniform([u32(s.T), u32(s.valueHeads), u32(s.keyHeads), u32(s.keyDim), u32(s.valueDim), u32(C), u32(vOff), f32(1 / Math.sqrt(s.keyDim))]);
+  const params = ctx.uniform([u32(s.T), u32(s.valueHeads), u32(s.keyHeads), u32(s.keyDim), u32(s.valueDim), u32(C), u32(vOff), f32(1 / Math.sqrt(s.keyDim)), u32(s.tiled ? 1 : 0), u32(0), u32(0), u32(0)]);
   ctx.run(gatedDeltaSpec(s.keyDim), [params, qk.buf, conv.buf, a.buf, b.buf, aLog.buf, dtBias.buf, state, out.buf], [Math.ceil(s.valueDim / 64), s.valueHeads, 1]);
   return out;
 }

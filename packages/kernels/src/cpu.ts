@@ -1569,11 +1569,12 @@ export const cpuGatedDelta: CpuKernel = (b) => {
   const u = b[0]!.u32;
   const [T, Hv, Hk, Dk, Dv, C, vOff] = [u[0]!, u[1]!, u[2]!, u[3]!, u[4]!, u[5]!, u[6]!];
   const qScale = b[0]!.f32[7]!;
+  const tiled = u[8] === 1;
   const [qk, conv, a, bb, alog, dt, state, out] = [b[1]!.f32, b[2]!.f32, b[3]!.f32, b[4]!.f32, b[5]!.f32, b[6]!.f32, b[7]!.f32, b[8]!.f32];
   const qkRow = 2 * Hk * Dk;
   const group = Hv / Hk;
   for (let h = 0; h < Hv; h++) {
-    const kh = Math.floor(h / group);
+    const kh = tiled ? h % Hk : Math.floor(h / group);
     const rate = -Math.exp(alog[h]!);
     for (let t = 0; t < T; t++) {
       const qb = t * qkRow + kh * Dk;
