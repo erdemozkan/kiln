@@ -9,6 +9,7 @@ import {
   fetchJSON,
   fetchText,
   fileUrl,
+  isLocalModel,
   listRepoFiles,
   parseModelId,
   readGGUFHeader,
@@ -164,7 +165,11 @@ function fileModelName(model: ModelSource): string {
 
 /** How a model is shown (`info.model`): the id or URL as given, or a picked file's name. */
 export function modelName(model: ModelSource): string {
-  return typeof model === "string" ? model : fileModelName(model);
+  if (typeof model !== "string") return fileModelName(model);
+  if (!isLocalModel(model)) return model;
+  // A local id is "@local/<name>-<fingerprint>[/file.gguf]": show the file, or the folder's name.
+  const [, slug = "", ...file] = model.split("/");
+  return file.join("/") || slug.replace(/-[a-z0-9]+$/, "");
 }
 
 /**

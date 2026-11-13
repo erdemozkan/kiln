@@ -392,7 +392,17 @@ folder.onchange = async () => {
 };
 ```
 
-The files are read in place and never uploaded. The id lasts until the page reloads.
+The files are read in place and never uploaded. The id lasts until the page reloads. Where the
+browser has file handles (Chrome and Edge), a picked model can be remembered and reopened with one
+click after a reload:
+
+```js
+const handle = await showDirectoryPicker(); // or (await showOpenFilePicker())[0] for a .gguf
+const id = await localModel(handle, { remember: true });
+// On a later visit, from a click (the browser asks to read the files again):
+const [saved] = await savedLocalModels(); // [{ name, kind, open(), forget() }]
+const sameId = await saved.open(); // undefined if the user says no
+```
 
 Several conversations can share one model: each call reuses the cached K/V of whichever earlier
 prompt shares the most tokens with it (kept on the GPU up to `load(id, { prefixCacheBytes })`, 256 MiB

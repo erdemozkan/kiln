@@ -1,4 +1,4 @@
-import { load, localModel, type ChatMessage, type KilnModel, type ResponseFormat } from "@kiln/api";
+import { load, localModel, savedLocalModels, type ChatMessage, type KilnModel, type ResponseFormat } from "@kiln/api";
 import { clearCache, listCache } from "@kiln/loader";
 
 const $ = <T extends HTMLElement>(id: string) => document.getElementById(id) as T;
@@ -8,19 +8,107 @@ const device = $<HTMLSelectElement>("device");
 const loadBtn = $<HTMLButtonElement>("load");
 const fileInput = $<HTMLInputElement>("file");
 const folderInput = $<HTMLInputElement>("folder");
+const recent = $("recent");
+/** A local model picked through the browser's file pickers (remembered) or reopened from the recent list. */
+let picked: string | undefined;
 // Typing a model id means the id is wanted, not the file or folder picked earlier.
-modelInput.addEventListener("input", () => (fileInput.value = folderInput.value = ""));
+modelInput.addEventListener("input", () => {
+  fileInput.value = folderInput.value = "";
+  picked = undefined;
+});
 // Choosing a file or a folder loads it straight away: nobody expects a second click after the dialog.
+const loadNow = () => {
+  if (!loadBtn.disabled) loadBtn.click();
+};
 fileInput.addEventListener("change", () => {
   if (!fileInput.files?.length) return;
   folderInput.value = "";
-  if (!loadBtn.disabled) loadBtn.click();
+  picked = undefined;
+  loadNow();
 });
 folderInput.addEventListener("change", () => {
   if (!folderInput.files?.length) return;
   fileInput.value = "";
-  if (!loadBtn.disabled) loadBtn.click();
+  picked = undefined;
+  loadNow();
 });
+
+type Pickers = {
+  showOpenFilePicker?: (o: { types: { description: string; accept: Record<string, string[]> }[] }) => Promise<FileSystemHandle[]>;
+  showDirectoryPicker?: () => Promise<FileSystemHandle>;
+};
+const pickers = window as unknown as Pickers;
+
+/** Lists the remembered local models as buttons: one click reopens a model after a reload. */
+async function showRecent(): Promise<void> {
+  const saved = await savedLocalModels();
+  recent.hidden = !saved.length;
+  recent.replaceChildren(saved.length ? "Recent local models:" : "");
+  for (const s of saved) {
+    const open = document.createElement("button");
+    open.className = "secondary";
+    open.textContent = s.name;
+    open.title = `Load this ${s.kind === "file" ? "file" : "folder"} again`;
+    open.onclick = async () => {
+      try {
+        const id = await s.open();
+        if (!id) return void (status.textContent = `The browser was not allowed to read ${s.name}.`);
+        usePicked(id);
+      } catch (err) {
+        status.classList.add("error");
+        status.textContent = `${s.name}: ${err instanceof Error ? err.message : String(err)} (moved or deleted? Forget it with ×)`;
+      }
+    };
+    const forget = document.createElement("button");
+    forget.className = "secondary";
+    forget.textContent = "×";
+    forget.title = `Forget ${s.name} (the files stay)`;
+    forget.setAttribute("aria-label", `Forget ${s.name}`);
+    forget.onclick = async () => {
+      await s.forget();
+      await showRecent();
+    };
+    recent.append(open, forget);
+  }
+}
+void showRecent();
+
+function usePicked(id: string): void {
+  picked = id;
+  fileInput.value = folderInput.value = "";
+  loadNow();
+}
+
+// Where the browser has file pickers that return handles (Chrome, Edge), use them: a handle can be
+// remembered and reopened after a reload, which an <input>'s files cannot.
+async function pick(get: () => Promise<FileSystemHandle>): Promise<void> {
+  let handle: FileSystemHandle;
+  try {
+    handle = await get();
+  } catch {
+    return; // The dialog was closed.
+  }
+  try {
+    const id = await localModel(handle, { remember: true });
+    void showRecent();
+    usePicked(id);
+  } catch (err) {
+    status.classList.add("error");
+    status.textContent = err instanceof Error ? err.message : String(err);
+  }
+}
+if (pickers.showOpenFilePicker) {
+  fileInput.addEventListener("click", (e) => {
+    e.preventDefault();
+    void pick(async () => (await pickers.showOpenFilePicker!({ types: [{ description: "GGUF model", accept: { "application/octet-stream": [".gguf"] } }] }))[0]!);
+  });
+}
+if (pickers.showDirectoryPicker) {
+  folderInput.addEventListener("click", (e) => {
+    e.preventDefault();
+    void pick(() => pickers.showDirectoryPicker!());
+  });
+}
 const progress = $<HTMLProgressElement>("progress");
 const status = $("status");
 const log = $("log");
@@ -97,7 +185,7 @@ loadBtn.onclick = async () => {
   try {
     await model?.unload();
     // A picked folder becomes a local model id; a picked .gguf is passed as the file it is.
-    const source = folderInput.files?.length ? await localModel(folderInput.files) : (fileInput.files?.[0] ?? modelInput.value.trim());
+    const source = picked ?? (folderInput.files?.length ? await localModel(folderInput.files) : (fileInput.files?.[0] ?? modelInput.value.trim()));
     model = await load(source, {
       quant: quant.value as "auto" | "q4" | "q8" | "f32",
       device: device.value as "auto" | "gpu" | "cpu",
