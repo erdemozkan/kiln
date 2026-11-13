@@ -302,7 +302,8 @@ export class LlamaModel {
   async readKv(n: number): Promise<Uint8Array> {
     const parts = this.kv.flatMap(({ k, v }, l) => {
       const bytes = Math.min(n, this.slots[l]!) * this.kvRowBytes;
-      return [this.backend.readback(k, 0, bytes), this.backend.readback(v, 0, bytes)];
+      // A layer without a cache (linear attention) has no rows.
+      return bytes ? [this.backend.readback(k, 0, bytes), this.backend.readback(v, 0, bytes)] : [];
     });
     const out = new Uint8Array(this.kvSnapshotBytes(n));
     let at = 0;
@@ -334,6 +335,8 @@ export class LlamaModel {
     const row = this.kvRowBytes;
     const parts = this.kv.flatMap(({ k, v }, l) => {
       const slots = this.slots[l]!;
+      // A layer without a cache (linear attention) has no rows.
+      if (!slots) return [];
       const start = this.kvRangeStart(l, from, to);
       const count = to - start;
       // Position p sits in slot p % slots, so a range may run off the ring's end and go on at slot 0.
@@ -383,6 +386,29 @@ export class LlamaModel {
     );
   }
 
+  /** The bytes of a `saveState` snapshot, buffer after buffer (`stateBytes` of them), for a file. */
+  async readState(saved: readonly Buf[]): Promise<Uint8Array> {
+    const parts = await Promise.all(saved.map((b) => this.backend.readback(b, 0, b.size)));
+    const out = new Uint8Array(this.stateBytes);
+    let at = 0;
+    for (const p of parts) {
+      out.set(new Uint8Array(p), at);
+      at += p.byteLength;
+    }
+    return out;
+  }
+
+  /** Makes `readState`'s bytes the live state. */
+  writeState(data: Uint8Array): void {
+    if (data.length !== this.stateBytes) throw new Error(`writeState: ${data.length} bytes are not this model's state (${this.stateBytes})`);
+    let at = 0;
+    for (const { s, conv } of this.linearState.values())
+      for (const b of [s, conv]) {
+        this.backend.write(b, 0, data.subarray(at, at + b.size));
+        at += b.size;
+      }
+  }
+
   restoreState(saved: readonly Buf[]): void {
     let i = 0;
     for (const { s, conv } of this.linearState.values()) {
@@ -419,6 +445,7 @@ export class LlamaModel {
     let at = 0;
     for (const [l, { k, v }] of this.kv.entries()) {
       const bytes = Math.min(n, this.slots[l]!) * this.kvRowBytes;
+      if (!bytes) continue;
       this.backend.write(k, 0, data.subarray(at, at + bytes));
       this.backend.write(v, 0, data.subarray(at + bytes, at + 2 * bytes));
       at += 2 * bytes;

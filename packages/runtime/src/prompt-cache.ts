@@ -105,12 +105,13 @@ async function readFramed(blob: Blob, at: number, magic: number): Promise<{ json
   }
 }
 
-const count = (v: unknown, max: number): v is number => typeof v === "number" && Number.isInteger(v) && v >= 1 && v <= max;
+const count = (v: unknown, max: number, min = 1): v is number => typeof v === "number" && Number.isInteger(v) && v >= min && v <= max;
 
 function shapeOf(json: unknown): CacheShape | undefined {
   const h = json as Partial<CacheShape> | null;
   if (!h || typeof h.kvDtype !== "string" || !count(h.layers, 4096) || !count(h.rowBytes, 2 ** 24) || !Array.isArray(h.slots) || h.slots.length !== h.layers) return undefined;
-  if (!h.slots.every((s) => count(s, 2 ** 24))) return undefined;
+  // 0 slots: a layer that keeps no keys and values (linear attention).
+  if (!h.slots.every((s) => count(s, 2 ** 24, 0)) || !h.slots.some((s) => s > 0)) return undefined;
   return { kvDtype: h.kvDtype, layers: h.layers, rowBytes: h.rowBytes, slots: h.slots };
 }
 
@@ -156,6 +157,7 @@ export async function loadPromptCache(name: string): Promise<{ snapshot: CacheSn
     let src = 0;
     let base = 0;
     for (const slots of shape.slots) {
+      if (!slots) continue;
       const held = Math.min(n, slots);
       const start = rangeStart(slots, seg.from, seg.to);
       const rows = seg.to - start;
@@ -171,4 +173,45 @@ export async function loadPromptCache(name: string): Promise<{ snapshot: CacheSn
     }
   }
   return { snapshot: { tokens: [...tokens], kvDtype: shape.kvDtype, layers: shape.layers, rowBytes: shape.rowBytes, data }, state: { shape, tokens, segments: segments.map((s) => ({ to: s.to, end: s.end })) } };
+}
+
+const STATES = 0x6b737431; // "kst1"
+
+/** Where the recurrent snapshots of a prompt cache live (see `saveRecurrentStates`). */
+export const stateFileName = (name: string): string => `${name}.state`;
+
+/** A recurrent model's snapshots, as `Engine.exportStates` returns them. */
+export interface RecurrentStates {
+  /** The cached tokens the snapshots were taken on: one after the first `tokens` of them each. */
+  tokens: number[];
+  states: { tokens: number; data: Uint8Array }[];
+}
+
+/**
+ * Writes the snapshots beside the prompt cache `name`, replacing the file: magic, header length,
+ * a JSON header (the token ids up to the longest snapshot, each snapshot's token count and size),
+ * then the snapshots' bytes. A recurrent state cannot be appended to, so the file is small and whole.
+ */
+export async function saveRecurrentStates(name: string, r: RecurrentStates): Promise<boolean> {
+  const longest = Math.max(0, ...r.states.map((s) => s.tokens));
+  const header = { tokens: r.tokens.slice(0, longest), states: r.states.map((s) => ({ tokens: s.tokens, bytes: s.data.length })) };
+  return writeCacheFile(stateFileName(name), [...framed(STATES, header), ...r.states.map((s) => s.data)]);
+}
+
+/** The snapshots saved for `name` that belong to `tokens` (the restored cache's), or none. */
+export async function loadRecurrentStates(name: string, tokens: readonly number[]): Promise<{ tokens: number; data: Uint8Array }[]> {
+  const blob = await readCacheBlob(stateFileName(name));
+  const head = blob && (await readFramed(blob, 0, STATES));
+  const h = head?.json as { tokens?: unknown; states?: unknown } | undefined;
+  if (!blob || !head || !h || !Array.isArray(h.tokens) || !Array.isArray(h.states) || h.states.length > 8) return [];
+  // The snapshots continue the cache only if their tokens are its first ones.
+  if (h.tokens.length > tokens.length || !h.tokens.every((t, i) => t === tokens[i])) return [];
+  const out: { tokens: number; data: Uint8Array }[] = [];
+  let at = head.end;
+  for (const s of h.states as { tokens?: unknown; bytes?: unknown }[]) {
+    if (!count(s.tokens, h.tokens.length) || !count(s.bytes, 2 ** 31) || at + s.bytes > blob.size) return [];
+    out.push({ tokens: s.tokens, data: new Uint8Array(await blob.slice(at, at + s.bytes).arrayBuffer()) });
+    at += s.bytes;
+  }
+  return out;
 }

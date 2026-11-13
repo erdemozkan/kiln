@@ -168,4 +168,40 @@ describe("Qwen 3.5 (linear attention)", () => {
     const alone = await Promise.all(conts.map(async (c2) => (await fresh().scoreIds(first, [c2]))[0]!));
     for (let i = 0; i < conts.length; i++) expect(scores[i]).toBeCloseTo(alone[i]!, 4);
   });
+
+  it("carries on in a new session from the saved keys, values and states", async () => {
+    const be = new CpuBackend({ threads: 1 });
+    const fresh = () => new Engine(be, new LlamaModel(be, CFG, weights(be), { maxSeq: 64, kvDtype: "f32" }), tok());
+    const run = async (e: Engine, prompt: number[], n: number) => {
+      const inner = e as unknown as { decodeIds(ids: number[], o: object): AsyncGenerator<unknown>; cached: number[] };
+      for await (const _ of inner.decodeIds(prompt, { maxTokens: n, temperature: 0 })) void _;
+      return { out: inner.cached.slice(prompt.length), cached: e.lastStats!.cachedTokens };
+    };
+    const first = Array.from({ length: 24 }, (_, i) => 10 + ((i * 11) % 80));
+    const a = fresh();
+    const reply = (await run(a, first, 5)).out;
+    // What a prompt cache file holds: the attention layers' keys and values, and the two newest states.
+    const snapshot = await a.exportCache();
+    const states = await a.exportStates();
+    expect(states.map((s) => s.tokens)).toEqual([first.length - 16, first.length]);
+    expect(a.cacheShape.slots).toEqual([0, 0, 64, 0]);
+
+    const b = fresh();
+    expect(b.importCache(snapshot)).toBe(true);
+    expect(b.importStates(states)).toBe(2);
+    // The next turn: the prompt and reply again, then more. It resumes at the state after the prompt.
+    const next = [...first, ...reply, 91, 92, 93];
+    const resumed = await run(b, next, 5);
+    expect(resumed.cached).toBe(first.length);
+    expect(resumed.out).toEqual((await run(fresh(), next, 5)).out);
+
+    // States that do not fit are left out: another size, or more tokens than the cache holds.
+    const c = fresh();
+    expect(c.importCache(snapshot)).toBe(true);
+    expect(c.importStates([{ tokens: 8, data: new Uint8Array(12) }, { tokens: 500, data: states[0]!.data }])).toBe(0);
+    // Without states the keys and values alone are not resumed from: the whole prompt runs again, correctly.
+    const cold = await run(c, next, 5);
+    expect(cold.cached).toBe(0);
+    expect(cold.out).toEqual(resumed.out);
+  });
 });

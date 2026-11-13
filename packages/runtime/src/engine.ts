@@ -232,6 +232,37 @@ export class Engine {
     return n;
   }
 
+  /**
+   * The newest recurrent snapshots that the cached tokens start with (at most `max`, longest last),
+   * read back from the GPU: what a prompt cache file needs beside the keys and values to resume a
+   * recurrent model in a later session. Empty for other models.
+   */
+  async exportStates(max = 2): Promise<{ tokens: number; data: Uint8Array }[]> {
+    if (this.busy) throw new Error("exportStates: the engine is generating");
+    const live = this.cached;
+    const fit = this.states.filter((s) => s.tokens.length <= live.length && s.tokens.every((t, i) => t === live[i])).sort((a, b) => a.tokens.length - b.tokens.length);
+    const picked = fit.slice(-max);
+    const data = await Promise.all(picked.map((s) => this.model.readState(s.state)));
+    return picked.map((s, i) => ({ tokens: s.tokens.length, data: data[i]! }));
+  }
+
+  /**
+   * Registers snapshots from `exportStates` after `importCache` restored the keys and values: each
+   * is the recurrent state after the first `tokens` cached tokens. Returns how many were taken.
+   */
+  importStates(states: readonly { tokens: number; data: Uint8Array }[]): number {
+    const m = this.model;
+    if (this.busy || !m.recurrent) return 0;
+    let taken = 0;
+    for (const s of [...states].sort((a, b) => a.tokens - b.tokens)) {
+      if (!Number.isInteger(s.tokens) || s.tokens < 1 || s.tokens > this.cached.length || s.data.length !== m.stateBytes) continue;
+      m.writeState(s.data);
+      this.checkpoint(this.cached.slice(0, s.tokens));
+      taken++;
+    }
+    return taken;
+  }
+
   /** Snapshots the model, whose recurrent state must be the state after exactly `tokens`. */
   private checkpoint(tokens: readonly number[]): void {
     const same = this.states.findIndex((s) => s.tokens.length === tokens.length && s.tokens.every((t, i) => t === tokens[i]));
@@ -1030,8 +1061,7 @@ export class Engine {
   /** Loads a snapshot from `exportCache`; returns false (and changes nothing) if it does not fit this model. */
   importCache(s: CacheSnapshot): boolean {
     const m = this.model;
-    // A snapshot holds keys and values only: not enough to resume a recurrent model.
-    if (m.recurrent) return false;
+    // For a recurrent model this restores the attention layers only; `importStates` brings the rest.
     if (this.busy || s.kvDtype !== m.kvDtype || s.layers !== m.cfg.numLayers || s.rowBytes !== m.kvRowBytes || s.tokens.length >= m.maxSeq) return false;
     if (s.data.length !== m.kvSnapshotBytes(s.tokens.length)) return false;
     m.writeKv(s.tokens.length, s.data);

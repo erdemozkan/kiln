@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { loadPromptCache, promptCacheName, savePromptCache, type PromptCacheSource } from "../src/prompt-cache";
+import { loadPromptCache, loadRecurrentStates, promptCacheName, savePromptCache, saveRecurrentStates, type PromptCacheSource } from "../src/prompt-cache";
 
 /** In-memory OPFS: the directory calls and sync-handle methods the cache files use. */
 const files = new Map<string, Uint8Array>();
@@ -50,15 +50,22 @@ afterEach(() => {
  * row is two bytes that name its layer, token and position, so a misplaced row shows.
  */
 class FakeEngine implements PromptCacheSource {
-  readonly cacheShape = { kvDtype: "f16", layers: 2, rowBytes: 2, slots: [12, 3] };
+  readonly cacheShape: { kvDtype: string; layers: number; rowBytes: number; slots: number[] };
   cacheTokens: number[] = [];
   reads = 0;
-  private k = this.cacheShape.slots.map((s) => new Uint8Array(s * 2));
-  private v = this.cacheShape.slots.map((s) => new Uint8Array(s * 2));
+  private k: Uint8Array[];
+  private v: Uint8Array[];
+  /** A layer of 0 slots keeps no keys and values (linear attention). */
+  constructor(slots = [12, 3]) {
+    this.cacheShape = { kvDtype: "f16", layers: 2, rowBytes: 2, slots };
+    this.k = slots.map((s) => new Uint8Array(s * 2));
+    this.v = slots.map((s) => new Uint8Array(s * 2));
+  }
   set(tokens: number[]) {
     this.cacheTokens = tokens;
     tokens.forEach((t, p) =>
       this.cacheShape.slots.forEach((slots, l) => {
+        if (!slots) return;
         this.k[l]!.set([(t * 7 + l) & 255, p], (p % slots) * 2);
         this.v[l]!.set([(t * 7 + l + 100) & 255, p], (p % slots) * 2);
       }),
@@ -173,5 +180,38 @@ describe("prompt cache", () => {
     expect(await loadPromptCache(name)).toBeUndefined();
     files.set(name, new TextEncoder().encode("not a cache file at all"));
     expect(await loadPromptCache(name)).toBeUndefined();
+  });
+
+  it("keeps recurrent states beside the cache, for the tokens they were taken on", async () => {
+    const name = promptCacheName("org/recurrent", {});
+    const tokens = [4, 5, 6, 7, 8, 9];
+    const states = [
+      { tokens: 3, data: Uint8Array.from({ length: 40 }, (_, i) => i) },
+      { tokens: 5, data: Uint8Array.from({ length: 40 }, (_, i) => 200 - i) },
+    ];
+    expect(await loadRecurrentStates(name, tokens)).toEqual([]);
+    expect(await saveRecurrentStates(name, { tokens, states })).toBe(true);
+    expect(await loadRecurrentStates(name, tokens)).toEqual(states);
+    // A cache that goes on differently before the last state, or is shorter than it, does not own them.
+    expect(await loadRecurrentStates(name, [4, 5, 6, 7, 1, 9])).toEqual([]);
+    expect(await loadRecurrentStates(name, [4, 5, 6])).toEqual([]);
+    // One that only differs after it does.
+    expect(await loadRecurrentStates(name, [4, 5, 6, 7, 8, 1, 2])).toEqual(states);
+    const file = `${name}.state`;
+    files.set(file, files.get(file)!.slice(0, -3)); // cut short
+    expect(await loadRecurrentStates(name, tokens)).toEqual([]);
+  });
+
+  it("round-trips a cache whose layers partly keep no keys and values", async () => {
+    const name = promptCacheName("org/mixed", {});
+    const e = new FakeEngine([0, 12]);
+    e.set([5, 6, 7, 8]);
+    let state = await savePromptCache(name, e);
+    e.set([5, 6, 7, 8, 9, 10]);
+    state = await savePromptCache(name, e, state);
+    const back = await loadPromptCache(name);
+    expect(back?.snapshot.tokens).toEqual([5, 6, 7, 8, 9, 10]);
+    expect(back?.snapshot).toEqual(e.snapshot());
+    expect(back?.state).toEqual(state);
   });
 });

@@ -1,5 +1,5 @@
 import { adoptLocalModel, readImage, setAccessToken, type ImageInput } from "@kiln/loader";
-import { createAudio, createVision, TtsEngine, type VisionEngine, createEncoder, createEngine, modelKey, modelName, createSeq2Seq, type AudioEngine, loadPromptCache, promptCacheName, savePromptCache, type PromptCacheState, type EncoderEngine, type Engine, type Seq2SeqEngine, type Seq2SeqGenerateOptions, type TextDelta } from "@kiln/runtime";
+import { createAudio, createVision, TtsEngine, type VisionEngine, createEncoder, createEngine, modelKey, modelName, createSeq2Seq, type AudioEngine, loadPromptCache, loadRecurrentStates, promptCacheName, savePromptCache, saveRecurrentStates, type PromptCacheState, type EncoderEngine, type Engine, type Seq2SeqEngine, type Seq2SeqGenerateOptions, type TextDelta } from "@kiln/runtime";
 import type { AudioTask, VisionTask, EncoderTask, RawOutputs, Request, Response, Seq2SeqTask } from "./protocol";
 
 /** The slice of DedicatedWorkerGlobalScope we use (lib.webworker conflicts with lib.dom in one program). */
@@ -53,6 +53,8 @@ const aborts = new Map<number, AbortController>();
 /** Prompt cache file of the loaded model (undefined when off), and what it holds (undefined: unknown, so the next save starts it over). */
 let cacheName: string | undefined;
 let saved: PromptCacheState | undefined;
+/** The token counts of the recurrent snapshots last written beside the prompt cache (Qwen 3.5). */
+let savedStates = "";
 let saving: Promise<void> = Promise.resolve();
 
 /** Writes the engine's cached K/V unless a call has started since or nothing changed. */
@@ -64,6 +66,12 @@ async function saveCache(e: Engine, name: string): Promise<void> {
     const before = saved;
     saved = undefined;
     saved = await savePromptCache(name, e, before);
+    // A recurrent model also needs its state after some of those tokens: written when it changed.
+    if (saved && e.model.recurrent) {
+      const states = await e.exportStates();
+      const key = states.map((s) => s.tokens).join(",");
+      if (states.length && key !== savedStates && (await saveRecurrentStates(name, { tokens: saved.tokens, states }))) savedStates = key;
+    }
   } catch {
     // Busy with the next call, or storage refused: the cache is only an optimisation. What the file
     // holds is unknown now, so the next save writes it whole.
@@ -168,12 +176,19 @@ scope.onmessage = async (e: MessageEvent<Request>) => {
         cacheName = undefined;
         engine = await createEngine(msg.model, { ...msg.opts, onProgress: (progress) => post({ id: msg.id, type: "progress", progress }) });
         // A file model's prompt cache is named by the file (name, size, time) or a hash of its URL.
-        // The prompt cache stores keys and values; a recurrent model (Qwen 3.5) needs its state too, which it does not hold yet.
-        cacheName = msg.opts.promptCache === false || engine.model.recurrent ? undefined : promptCacheName(modelKey(msg.model), msg.opts);
+        cacheName = msg.opts.promptCache === false ? undefined : promptCacheName(modelKey(msg.model), msg.opts);
         saved = undefined;
+        savedStates = "";
         const stored = cacheName ? await loadPromptCache(cacheName) : undefined;
         // A file that does not fit this model (another context size, say) is started over at the next save.
-        if (stored && engine.importCache(stored.snapshot)) saved = stored.state;
+        if (stored && engine.importCache(stored.snapshot)) {
+          saved = stored.state;
+          // A recurrent model resumes from its saved states; without them the keys and values alone are not used.
+          if (cacheName && engine.model.recurrent) {
+            const states = await loadRecurrentStates(cacheName, stored.snapshot.tokens);
+            if (engine.importStates(states)) savedStates = states.map((s) => s.tokens).join(",");
+          }
+        }
         const cfg = engine.model.cfg;
         post({
           id: msg.id,
