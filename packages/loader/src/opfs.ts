@@ -1,3 +1,4 @@
+import { hubFetch, httpError } from "./auth";
 import { isLocalUrl, localBlob } from "./local";
 import { BlobSource, HttpSource, check, parseContentRangeTotal, withRetries, type ByteSource, checkRange } from "./source";
 
@@ -159,7 +160,7 @@ export class CachedHttpSource implements ByteSource {
     // A file not seen before: the request that downloads it also tells its size, so no separate
     // request asks for it first.
     const first = meta ? undefined : await withRetries(key, retryMs, async () => {
-      const res = await fetch(url, { headers: { Range: "bytes=0-" } });
+      const res = await hubFetch(url, { headers: { Range: "bytes=0-" } });
       check(url, res);
       return res;
     });
@@ -315,10 +316,10 @@ export class CachedHttpSource implements ByteSource {
   private async fetchRest(url: string): Promise<"done" | "retry"> {
     const opened = this.have === 0 ? this.first : undefined;
     this.first = undefined;
-    const res = opened ?? (await fetch(url, { headers: { Range: `bytes=${this.have}-` } }));
+    const res = opened ?? (await hubFetch(url, { headers: { Range: `bytes=${this.have}-` } }));
     if (res.status === 200 && this.have > 0) this.have = 0; // server ignored Range: restart
     else if (res.status >= 500 || res.status === 429) throw new RetryableError(`${url}: HTTP ${res.status}`);
-    else if (res.status !== 206 && res.status !== 200) throw new Error(`${url}: HTTP ${res.status}`);
+    else if (res.status !== 206 && res.status !== 200) throw new Error(httpError(url, res.status));
     const total = parseContentRangeTotal(res.headers.get("Content-Range"));
     if (total !== undefined && total !== this.total) throw new Error(`${url}: size changed (${this.total} → ${total})`);
     const reader = res.body!.getReader();

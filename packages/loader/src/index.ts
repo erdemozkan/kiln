@@ -1,3 +1,4 @@
+export * from "./auth";
 export * from "./source";
 export * from "./opfs";
 export * from "./entry";

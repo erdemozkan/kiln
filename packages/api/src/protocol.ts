@@ -178,6 +178,8 @@ export type Request =
   | { id: number; type: "load"; model: string | Blob; opts: WireLoadOptions }
   /** The files of a local model ("@local/…"), sent before the first request that names it. Not answered. */
   | { id: number; type: "local"; model: string; files: [string, Blob][] }
+  /** The Hub access token (see `setAccessToken`), sent before the first request after it changed; null clears it. Not answered. */
+  | { id: number; type: "token"; token: string | null }
   | { id: number; type: "loadEncoder"; model: string; opts: WireEncoderOptions }
   | { id: number; type: "loadSeq2Seq"; model: string; opts: WireSeq2SeqOptions }
   | { id: number; type: "loadAudio"; model: string; opts: WireAudioOptions }

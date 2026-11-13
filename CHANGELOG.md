@@ -74,6 +74,13 @@ to 2.7 nats (1 to 5%) on Qwen3-0.6B, SmolLM2-135M and Phi-3.5-mini, where f16 mo
 greedy answers to a 470-token question were unchanged on all three. Decode speed is within 10% of f16. The default stays
 f16. On the CPU backend an f8 cache takes the TypeScript attention path, not the WASM one.
 
+**Access tokens for gated and private models.** `setAccessToken(token)` makes requests for repo
+files carry a Hugging Face access token, so gated repos (the original Llama and Gemma ones) and
+private ones load. The token is sent to `https://huggingface.co` only: not to a mirror, an
+`endpoint`, or the URL of one .gguf (the restriction llama.cpp 1.0 put on `HF_TOKEN`). It is kept in
+memory, handed to the workers, and never written to the cache. A refusal by the Hub now says what
+to do (set a token, or accept the model's terms).
+
 **Fewer requests on a first download.** The request that downloads a weight file also tells its
 size, so the separate one-byte request that asked for it is gone, and the shards of a split
 safetensors model are opened together instead of one after another.

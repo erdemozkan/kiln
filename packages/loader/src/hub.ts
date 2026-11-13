@@ -1,5 +1,6 @@
 /** Hugging Face Hub resolution. A model id is either "org/repo" (safetensors) or "org/repo/file.gguf". */
 import { isLocalModel, isLocalUrl, localBlob, localListing, localUrl } from "./local";
+import { hubFetch, httpError } from "./auth";
 import { readCacheFile, writeCacheFile } from "./opfs";
 
 export interface HubOptions {
@@ -97,7 +98,7 @@ function writeHubEntry(name: string, f: HubFile): Promise<boolean> {
 }
 
 async function download(url: string): Promise<HubFile> {
-  const res = await fetch(url);
+  const res = await hubFetch(url);
   return res.ok ? { status: 200, bytes: new Uint8Array(await res.arrayBuffer()) } : { status: res.status };
 }
 
@@ -146,7 +147,7 @@ export async function fetchBytes(url: string, optional = false): Promise<Uint8Ar
   const f = await hubFile(url, optional);
   if (f.status === 404 && optional) return undefined;
   if (!f.bytes && isLocalUrl(url)) throw new Error(`the model folder has no ${url.replace(/^[a-z-]+:\/\/[^/]+\//, "")}`);
-  if (!f.bytes) throw new Error(`${url}: HTTP ${f.status}${f.status === 401 ? " (gated or private model?)" : ""}`);
+  if (!f.bytes) throw new Error(httpError(url, f.status));
   return f.bytes;
 }
 

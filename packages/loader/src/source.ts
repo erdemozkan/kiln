@@ -1,3 +1,4 @@
+import { hubFetch, httpError } from "./auth";
 /** Throws unless [offset, offset + length) is a valid byte range (integers, not negative). */
 export function checkRange(name: string, offset: number, length: number): void {
   if (!Number.isSafeInteger(offset) || !Number.isSafeInteger(length) || offset < 0 || length < 0) throw new RangeError(`${name}: invalid read of ${length} bytes at ${offset}`);
@@ -54,7 +55,7 @@ export class HttpSource implements ByteSource {
   async size(): Promise<number> {
     if (this.total === undefined) {
       this.total = await withRetries(this.name, this.retryMs, async () => {
-        const res = await fetch(this.url, { headers: { Range: "bytes=0-0" } });
+        const res = await hubFetch(this.url, { headers: { Range: "bytes=0-0" } });
         check(this.url, res);
         const total = parseContentRangeTotal(res.headers.get("Content-Range")) ?? Number(res.headers.get("Content-Length"));
         await res.body?.cancel();
@@ -69,7 +70,7 @@ export class HttpSource implements ByteSource {
     // Known size: a read past the end is a bad header, not something to retry.
     if (this.total !== undefined && offset + length > this.total) throw new RangeError(`${this.name}: read past end`);
     return withRetries(this.name, this.retryMs, async () => {
-      const res = await fetch(this.url, { headers: { Range: `bytes=${offset}-${offset + length - 1}` } });
+      const res = await hubFetch(this.url, { headers: { Range: `bytes=${offset}-${offset + length - 1}` } });
       check(this.url, res);
       const buf = new Uint8Array(await res.arrayBuffer());
       // A server that ignores Range sends the whole file.
@@ -85,7 +86,7 @@ class TransientError extends Error {}
 
 export function check(url: string, res: Response): void {
   if (res.status >= 500 || res.status === 429) throw new TransientError(`${url}: HTTP ${res.status}`);
-  if (res.status !== 206 && res.status !== 200) throw new Error(`${url}: HTTP ${res.status}`);
+  if (res.status !== 206 && res.status !== 200) throw new Error(httpError(url, res.status));
 }
 
 /** Runs `f`, retrying transient failures up to 4 times after 1, 2, 4 and 8 × `retryMs`. */

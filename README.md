@@ -27,6 +27,7 @@ most existing code moves over by changing the import and the model id.
 
 - **Original weights, no conversion.** Point at a model's repo on the Hugging Face Hub or a single `.gguf` file. Kiln quantizes to 4-bit or 8-bit while loading, so one repo serves every precision.
 - **Not tied to the Hub.** Pass `endpoint` to load the same files from a mirror or your own static server, including models you trained yourself. A single `.gguf` also loads from any URL. Models on the user's own computer load too, from a picked `.gguf` file or a picked model folder, read in place with nothing uploaded.
+- **Gated and private models.** `setAccessToken(token)` adds a Hugging Face access token to requests for repo files. It is sent to `https://huggingface.co` only, never to a mirror, an `endpoint` or the URL of a single file.
 - **A familiar API.** `pipeline`, `AutoTokenizer`, `AutoModel` and `TextStreamer` with transformers.js's option names and output shapes.
 - **Many tasks.** Chat and text generation, embeddings, classification, NER, question answering, translation, summarization, speech recognition, text-to-speech, image classification, object detection, segmentation, depth, background removal, and image or document questions.
 - **Structured output.** Constrain any LLM's reply to a JSON schema, a regex, a grammar or a list of choices.

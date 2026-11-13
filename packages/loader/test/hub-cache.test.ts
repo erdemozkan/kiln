@@ -104,7 +104,7 @@ describe("small repo files are cached", () => {
   it("does not store errors, or a 404 for a required file", async () => {
     routes = { "config.json": 401 };
     const hub = await session();
-    await expect(hub.fetchJSON(url)).rejects.toThrow("HTTP 401 (gated or private model?)");
+    await expect(hub.fetchJSON(url)).rejects.toThrow(/HTTP 401 \(.*gated or private model/);
     routes = {};
     await expect(hub.fetchJSON(url)).rejects.toThrow("HTTP 404");
     await settle();

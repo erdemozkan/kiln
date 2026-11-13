@@ -1,7 +1,7 @@
 import type { Profile } from "@kiln/core";
 import type { GenerateStats, LoadProgress } from "@kiln/runtime";
 import type { ChatMessage } from "@kiln/tokenizers";
-import { isLocalModel, localModelFiles, localRepo } from "@kiln/loader";
+import { accessToken, isLocalModel, localModelFiles, localRepo } from "@kiln/loader";
 import { createWorker } from "./default-worker";
 import { localModel, type LocalModelInput } from "./local";
 import type { AdapterInfo, EncoderHead, RawOutputs, VisionHead, VisionInfo, VisionTask, AudioInfo, AudioTask, EncoderInfo, EncoderTask, ModelInfo, Request, Response, Seq2SeqInfo, Seq2SeqTask, WireAudioOptions, WireEncoderOptions, WireGenerateOptions, WireLoadOptions, WireSeq2SeqOptions } from "./protocol";
@@ -63,9 +63,21 @@ abstract class WorkerChannel {
     this.listeners.set(id, (msg) => {
       if (onMsg(msg)) this.listeners.delete(id);
     });
+    this.shareToken();
     this.shareLocal(body);
     this.post({ ...body, id } as Request);
     return id;
+  }
+
+  /** The access token this worker was last given. */
+  private sentToken: string | null = null;
+
+  /** Hands the worker the Hub access token when it is not the one it has (its requests are the ones that need it). */
+  private shareToken(): void {
+    const token = accessToken() ?? null;
+    if (token === this.sentToken) return;
+    this.sentToken = token;
+    this.post({ id: 0, type: "token", token });
   }
 
   /** Sends a request answered by one result. */
