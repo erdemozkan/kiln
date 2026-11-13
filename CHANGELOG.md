@@ -31,6 +31,11 @@ own address (`…/kiln/0.2.0/kiln-webgpu.js`, listed in `…/kiln/versions.json`
 checked against the registry's checksum, so a page that imports the library from the site can pin a
 version instead of following `main`.
 
+**Phi-3.** The `phi3` family loads from safetensors and GGUF: Phi-3 mini and medium, and the LongRoPE
+variants (Phi-3.5 mini, Phi-3 128k) up to their original 4096-token context, with the short rotary
+factors and the attention factor applied. Their stacked `qkv_proj` and `gate_up_proj` are the stacked
+matmuls Kiln already runs. Phi-4 mini (rotary on part of each head) is refused with a clear message.
+
 **A download closed just short of its end now finishes.** A GGUF whose last bytes the model does not
 read (bartowski's SmolLM2-135M Q4_K_M, for one) was never marked complete, so up to 32 MiB of it was
 downloaded again on every load. A source closed with at most 64 MiB left runs to the end first; one

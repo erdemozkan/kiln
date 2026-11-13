@@ -1,6 +1,6 @@
-/** Normalised config for every Llama-shaped decoder (Llama 2/3, Mistral, Qwen2/2.5, Qwen3, SmolLM, Granite, Gemma 3). */
+/** Normalised config for every Llama-shaped decoder (Llama 2/3, Mistral, Qwen2/2.5, Qwen3, SmolLM, Granite, Gemma 3, Phi-3). */
 export interface LlamaConfig {
-  family: "llama" | "qwen2" | "qwen3" | "gemma3";
+  family: "llama" | "qwen2" | "qwen3" | "gemma3" | "phi3";
   hiddenSize: number;
   intermediateSize: number;
   numLayers: number;
@@ -16,6 +16,13 @@ export interface LlamaConfig {
    * it applies to the global layers only; the sliding layers' rope is unscaled.
    */
   ropeLinear?: number;
+  /**
+   * LongRoPE (Phi-3.5, Phi-3 128k): each rotary frequency is divided by its factor. These are the
+   * checkpoint's short factors, which hold up to `maxPositions` tokens.
+   */
+  ropeFactors?: number[];
+  /** The longest context this config is valid for; a longer `maxSeq` is refused (LongRoPE's short factors). */
+  maxPositions?: number;
   /** GGUF llama checkpoints have Q/K permuted for interleaved (GPT-J style) rotary pairs. */
   ropeInterleaved: boolean;
   tieEmbeddings: boolean;
@@ -65,7 +72,10 @@ export interface Llama3RopeScaling {
 
 export class UnsupportedModelError extends Error {}
 
-const SUPPORTED = ["llama", "mistral", "qwen2", "qwen3", "granite", "granitemoehybrid", "gemma3_text"];
+/** The tensor a phi3 GGUF keeps LongRoPE's short factors in. */
+export const PHI3_ROPE_SHORT = "rope_factors_short.weight";
+
+const SUPPORTED = ["llama", "mistral", "qwen2", "qwen3", "granite", "granitemoehybrid", "gemma3_text", "phi3"];
 
 type HFConfig = Record<string, unknown>;
 /**
@@ -157,7 +167,7 @@ export function configFromHF(c: HFConfig, generation?: HFConfig): LlamaConfig {
   }
   const numHeads = num(c, "num_attention_heads");
   const hiddenSize = num(c, "hidden_size");
-  const family = type === "qwen2" ? "qwen2" : type === "qwen3" ? "qwen3" : type === "gemma3_text" ? "gemma3" : "llama";
+  const family = type === "qwen2" ? "qwen2" : type === "qwen3" ? "qwen3" : type === "gemma3_text" ? "gemma3" : type === "phi3" ? "phi3" : "llama";
   if (family === "gemma3") return gemma3({ ...GEMMA3_DEFAULTS, ...c }, generation);
   const base: LlamaConfig = {
     family,
@@ -170,7 +180,7 @@ export function configFromHF(c: HFConfig, generation?: HFConfig): LlamaConfig {
     vocabSize: num(c, "vocab_size"),
     rmsEps: num(c, "rms_norm_eps", 1e-6),
     ropeTheta: num(c, "rope_theta", 10000),
-    ropeScaling: ropeScalingFromHF(c.rope_scaling as HFConfig | null | undefined),
+    ropeScaling: type === "phi3" ? undefined : ropeScalingFromHF(c.rope_scaling as HFConfig | null | undefined),
     ropeInterleaved: false,
     tieEmbeddings: Boolean(c.tie_word_embeddings ?? false),
     attentionBias: family === "qwen2" ? true : Boolean(c.attention_bias ?? false),
@@ -179,7 +189,45 @@ export function configFromHF(c: HFConfig, generation?: HFConfig): LlamaConfig {
     bosTokenId: typeof c.bos_token_id === "number" ? c.bos_token_id : undefined,
     contextLength: optNum(c.max_position_embeddings),
   };
+  if (type === "phi3") return phi3(c, base);
   return type === "granite" || type === "granitemoehybrid" ? granite(c, base) : base;
+}
+
+/**
+ * Phi-3 (`phi3`: Phi-3 mini and medium, Phi-3.5 mini): Llama with q/k/v stored as one `qkv_proj` and
+ * gate/up as one `gate_up_proj` (see `phi3Name`), which is how Kiln runs them anyway. The 128k
+ * variants use LongRoPE: per-frequency factors, a short set up to the original context and a long set
+ * past it, and attention inputs scaled by a constant. Kiln applies the short set, so those models run
+ * up to their original context (4096 tokens). Phi-4 mini rotates only part of each head and is refused.
+ */
+function phi3(c: HFConfig, base: LlamaConfig): LlamaConfig {
+  if (typeof c.partial_rotary_factor === "number" && c.partial_rotary_factor !== 1) {
+    throw new UnsupportedModelError(`phi3 with partial_rotary_factor ${c.partial_rotary_factor} (Phi-4 mini) is not supported yet`);
+  }
+  const s = c.rope_scaling as HFConfig | null | undefined;
+  if (!s) return base;
+  const type = s.rope_type ?? s.type;
+  if (type !== "longrope" && type !== "su" && type !== "yarn") throw new UnsupportedModelError(`phi3 rope_scaling type "${String(type)}" is not supported yet`);
+  if (type === "yarn") throw new UnsupportedModelError('phi3 rope_scaling type "yarn" is not supported yet (longrope is)');
+  const original = num(c, "original_max_position_embeddings");
+  return longRope(base, s.short_factor, original, base.contextLength ?? original, optNum(s.attention_factor));
+}
+
+/** Applies LongRoPE's short factors and its attention factor (√(1 + ln(scale) / ln(original)) unless the checkpoint states one). */
+function longRope(base: LlamaConfig, short: unknown, original: number, trained: number, attnFactor?: number): LlamaConfig {
+  const half = base.headDim / 2;
+  if (!Array.isArray(short) || short.length !== half || short.some((v) => typeof v !== "number" || !(v > 0))) {
+    throw new UnsupportedModelError(`LongRoPE needs ${half} positive short factors`);
+  }
+  const scale = trained / original;
+  const factor = attnFactor ?? (scale <= 1 ? 1 : Math.sqrt(1 + Math.log(scale) / Math.log(original)));
+  // cos and sin are both multiplied by the factor, so q·k grows by its square.
+  return { ...base, ropeFactors: short as number[], attnScale: factor ** 2 * base.headDim ** -0.5, contextLength: original, maxPositions: original };
+}
+
+/** Phi-3's stacked projections under the names Kiln's stacked matmuls use. */
+export function phi3Name(name: string): string {
+  return name.replace(".self_attn.qkv_proj.", ".self_attn.qkv.").replace(".mlp.gate_up_proj.", ".mlp.gate_up.");
 }
 
 /**
@@ -291,10 +339,14 @@ function ropeScalingFromHF(s: HFConfig | null | undefined): Llama3RopeScaling | 
   };
 }
 
-export function configFromGGUF(meta: Map<string, unknown>, tensorNames: readonly string[]): LlamaConfig {
+/**
+ * `ropeShort` holds the values of a phi3 file's `rope_factors_short.weight` tensor (LongRoPE), which
+ * the caller reads from the file: they are data, not metadata.
+ */
+export function configFromGGUF(meta: Map<string, unknown>, tensorNames: readonly string[], ropeShort?: ArrayLike<number>): LlamaConfig {
   const arch = String(meta.get("general.architecture"));
-  if (!["llama", "qwen2", "qwen3", "granite", "gemma3"].includes(arch)) {
-    throw new UnsupportedModelError(`GGUF architecture "${arch}" is not supported yet (llama, qwen2, qwen3, granite, gemma3)`);
+  if (!["llama", "qwen2", "qwen3", "granite", "gemma3", "phi3"].includes(arch)) {
+    throw new UnsupportedModelError(`GGUF architecture "${arch}" is not supported yet (llama, qwen2, qwen3, granite, gemma3, phi3)`);
   }
   const get = (k: string, fallback?: number): number => {
     let v: unknown = meta.get(`${arch}.${k}`) ?? fallback;
@@ -332,6 +384,14 @@ export function configFromGGUF(meta: Map<string, unknown>, tensorNames: readonly
     bosTokenId: meta.has("tokenizer.ggml.bos_token_id") ? Number(meta.get("tokenizer.ggml.bos_token_id")) : undefined,
     contextLength: optNum(meta.get(`${arch}.context_length`)),
   };
+  if (arch === "phi3") {
+    const rotary = get("rope.dimension_count", base.headDim);
+    if (rotary !== base.headDim) throw new UnsupportedModelError(`phi3 rotating ${rotary} of ${base.headDim} head dimensions (Phi-4 mini) is not supported yet`);
+    if (!tensorNames.includes(PHI3_ROPE_SHORT)) return base;
+    if (!ropeShort) throw new UnsupportedModelError(`phi3 with LongRoPE: the values of ${PHI3_ROPE_SHORT} are needed`);
+    const original = get("rope.scaling.original_context_length");
+    return longRope(base, Array.from(ropeShort), original, base.contextLength ?? original, optNum(meta.get("phi3.rope.scaling.attn_factor")));
+  }
   if (arch !== "granite") return base;
   const logitScale = 1 / get("logit_scale", 1);
   const embed = get("embedding_scale", 1);
@@ -399,13 +459,14 @@ function gemma3FromGGUF(meta: Map<string, unknown>, tensorNames: readonly string
 }
 
 /** RoPE inverse frequencies, with Llama 3 long-context scaling applied when configured. */
-export function ropeInvFreq(cfg: Pick<LlamaConfig, "headDim" | "ropeTheta" | "ropeScaling" | "ropeLinear">): Float32Array {
+export function ropeInvFreq(cfg: Pick<LlamaConfig, "headDim" | "ropeTheta" | "ropeScaling" | "ropeLinear" | "ropeFactors">): Float32Array {
   const half = cfg.headDim / 2;
   const out = new Float32Array(half);
   const s = cfg.ropeScaling;
   for (let i = 0; i < half; i++) {
     let f = 1 / cfg.ropeTheta ** ((2 * i) / cfg.headDim);
     if (cfg.ropeLinear) f /= cfg.ropeLinear;
+    if (cfg.ropeFactors) f /= cfg.ropeFactors[i]!;
     if (s) {
       const lowWave = s.originalMaxPositions / s.lowFreqFactor;
       const highWave = s.originalMaxPositions / s.highFreqFactor;

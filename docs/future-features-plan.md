@@ -15,6 +15,11 @@ playground are live on GitHub Pages. Versioned copies on the Pages site are scri
 The largest gap against transformers.js, which runs any ONNX graph while Kiln implements each model
 family itself. Pick the next families by what people ask for.
 
+Phi-3 and 3.5 are done (unreleased). Open in that family: Phi-4 mini, which rotates only three quarters
+of each head and needs a rope kernel for that; LongRoPE past the original 4096 tokens (the long
+factors); and a run of the safetensors checkpoints, whose name mapping is unit-tested but which were
+not loaded here (7.6 GB each).
+
 ### More ways to load local models
 
 Done, unreleased: `load` takes a `.gguf` `File` the user picked, and the URL of one `.gguf` on any

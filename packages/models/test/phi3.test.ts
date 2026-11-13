@@ -1,0 +1,91 @@
+import { describe, expect, it } from "vitest";
+import { UnsupportedModelError, configFromGGUF, configFromHF, defaultMaxSeq, ggufToHF, phi3Name, ropeInvFreq } from "../src";
+
+// Phi-3-mini-4k-instruct's config.json, as far as Kiln reads it.
+const mini4k = {
+  model_type: "phi3",
+  hidden_size: 3072,
+  intermediate_size: 8192,
+  num_hidden_layers: 32,
+  num_attention_heads: 32,
+  num_key_value_heads: 32,
+  vocab_size: 32064,
+  rms_norm_eps: 1e-5,
+  rope_theta: 10000,
+  rope_scaling: null,
+  max_position_embeddings: 4096,
+  original_max_position_embeddings: 4096,
+  tie_word_embeddings: false,
+  bos_token_id: 1,
+  eos_token_id: 32000,
+};
+const short = Array.from({ length: 48 }, (_, i) => 1 + i / 100);
+
+describe("Phi-3", () => {
+  it("maps the 4k config as a plain Llama-shaped decoder", () => {
+    const c = configFromHF(mini4k, { eos_token_id: [32000, 32001, 32007] });
+    expect(c).toMatchObject({ family: "phi3", headDim: 96, numKvHeads: 32, attentionBias: false, qkNorm: false, ropeInterleaved: false, tieEmbeddings: false, contextLength: 4096 });
+    expect(c.eosTokenIds).toEqual([32000, 32001, 32007]);
+    expect(c.ropeFactors).toBeUndefined();
+    expect(c.attnScale).toBeUndefined();
+    expect(c.maxPositions).toBeUndefined();
+  });
+
+  it("applies LongRoPE's short factors and attention factor, within the original context", () => {
+    const c = configFromHF({ ...mini4k, max_position_embeddings: 131072, rope_scaling: { type: "longrope", short_factor: short, long_factor: short.map((v) => v * 10) } });
+    expect(c.ropeFactors).toEqual(short);
+    // √(1 + ln(32) / ln(4096)) on cos and sin, so its square on the scores.
+    expect(c.attnScale).toBeCloseTo((1 + Math.log(32) / Math.log(4096)) / Math.sqrt(96), 12);
+    expect(c.contextLength).toBe(4096);
+    expect(c.maxPositions).toBe(4096);
+    expect(defaultMaxSeq(c)).toBeLessThanOrEqual(4096);
+    const plain = ropeInvFreq({ ...c, ropeFactors: undefined });
+    const scaled = ropeInvFreq(c);
+    for (const i of [0, 7, 47]) expect(scaled[i]).toBeCloseTo(plain[i]! / short[i]!, 6);
+  });
+
+  it("refuses what it cannot run", () => {
+    expect(() => configFromHF({ ...mini4k, partial_rotary_factor: 0.75 })).toThrow(UnsupportedModelError);
+    expect(() => configFromHF({ ...mini4k, rope_scaling: { type: "longrope", short_factor: [1, 2, 3] } })).toThrow("48 positive short factors");
+    expect(() => configFromHF({ ...mini4k, rope_scaling: { type: "yarn" } })).toThrow(UnsupportedModelError);
+  });
+
+  it("names the stacked projections as Kiln's stacked matmuls", () => {
+    expect(phi3Name("model.layers.3.self_attn.qkv_proj.weight")).toBe("model.layers.3.self_attn.qkv.weight");
+    expect(phi3Name("model.layers.3.mlp.gate_up_proj.weight")).toBe("model.layers.3.mlp.gate_up.weight");
+    expect(phi3Name("model.layers.3.mlp.down_proj.weight")).toBe("model.layers.3.mlp.down_proj.weight");
+    expect(ggufToHF("blk.3.attn_qkv.weight", "phi3")).toBe("model.layers.3.self_attn.qkv.weight");
+    expect(ggufToHF("blk.3.ffn_up.weight", "phi3")).toBe("model.layers.3.mlp.gate_up.weight");
+    expect(ggufToHF("blk.3.ffn_up.weight")).toBe("model.layers.3.mlp.up_proj.weight");
+    expect(ggufToHF("rope_factors_short.weight", "phi3")).toBeUndefined();
+  });
+
+  it("reads a GGUF, with and without LongRoPE", () => {
+    const meta = new Map<string, unknown>([
+      ["general.architecture", "phi3"],
+      ["phi3.context_length", 4096],
+      ["phi3.embedding_length", 3072],
+      ["phi3.feed_forward_length", 8192],
+      ["phi3.block_count", 32],
+      ["phi3.attention.head_count", 32],
+      ["phi3.attention.head_count_kv", 32],
+      ["phi3.attention.layer_norm_rms_epsilon", 1e-5],
+      ["phi3.rope.dimension_count", 96],
+      ["tokenizer.ggml.tokens", new Array(32064).fill("x")],
+      ["tokenizer.ggml.eos_token_id", 32000],
+      ["tokenizer.ggml.bos_token_id", 1],
+    ]);
+    const names = ["token_embd.weight", "output.weight", "blk.0.attn_qkv.weight", "blk.0.ffn_up.weight"];
+    const c = configFromGGUF(meta, names);
+    // Unlike llama files, phi3 files keep rotary pairs in halves (no permuted q/k).
+    expect(c).toMatchObject({ family: "phi3", headDim: 96, vocabSize: 32064, ropeInterleaved: false, tieEmbeddings: false, attentionBias: false, contextLength: 4096 });
+    const long = new Map([...meta, ["phi3.context_length", 131072], ["phi3.rope.scaling.original_context_length", 4096], ["phi3.rope.scaling.attn_factor", 1.19]]);
+    const withFactors = [...names, "rope_factors_short.weight", "rope_factors_long.weight"];
+    expect(() => configFromGGUF(long, withFactors)).toThrow("rope_factors_short.weight are needed");
+    const l = configFromGGUF(long, withFactors, Float32Array.from(short));
+    expect(l.ropeFactors!.length).toBe(48);
+    expect(l.attnScale).toBeCloseTo(1.19 ** 2 / Math.sqrt(96), 10);
+    expect(l.maxPositions).toBe(4096);
+    expect(() => configFromGGUF(new Map([...meta, ["phi3.rope.dimension_count", 72]]), names)).toThrow("Phi-4 mini");
+  });
+});

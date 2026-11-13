@@ -27,12 +27,19 @@ const GEMMA3_BLOCK: Record<string, string> = {
   post_ffw_norm: "post_feedforward_layernorm",
 };
 
+/** Phi-3 files keep q/k/v as one tensor and gate/up as one (in `ffn_up`): the stacked weights Kiln runs. */
+const PHI3_BLOCK: Record<string, string> = {
+  ...BLOCK,
+  attn_qkv: "self_attn.qkv",
+  ffn_up: "mlp.gate_up",
+};
+
 /** Returns undefined for tensors the model does not use (e.g. rope_freqs). */
 export function ggufToHF(name: string, arch = "llama"): string | undefined {
   if (GLOBAL[name]) return GLOBAL[name];
   const m = name.match(/^blk\.(\d+)\.(\w+)\.(weight|bias)$/);
   if (!m) return undefined;
-  const mapped = (arch === "gemma3" ? GEMMA3_BLOCK : BLOCK)[m[2]!];
+  const mapped = (arch === "gemma3" ? GEMMA3_BLOCK : arch === "phi3" ? PHI3_BLOCK : BLOCK)[m[2]!];
   return mapped ? `model.layers.${m[1]}.${mapped}.${m[3]}` : undefined;
 }
 

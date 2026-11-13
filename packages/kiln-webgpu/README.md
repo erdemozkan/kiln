@@ -37,7 +37,7 @@ transformers.js's names: `max_new_tokens`, `do_sample` (default false: greedy; w
 `progress_callback` (`initiate` / `progress` / `done` per file, then `ready`). The differences:
 
 - `"text-generation"` runs the decoder families Kiln implements (Llama, Mistral, Qwen2/3, SmolLM,
-  Granite, Gemma 3); the other tasks, below, have their own model lists.
+  Granite, Phi-3, Gemma 3); the other tasks, below, have their own model lists.
 - `dtype` picks the format Kiln quantizes to at load: 4-bit names (`q4`, `q4f16`, `bnb4`, `int4`)
   load as q4, 8-bit ones (`q8`, `int8`, `uint8`) as q8, `fp16` / `fp32` as f32.
 - `device` defaults to `"auto"` (WebGPU where there is one, else the CPU); `"wasm"` means the CPU.
@@ -477,7 +477,8 @@ The reply always parses and fits the schema; whether the values are right is sti
 
 ## Models
 
-Llama, Mistral, Qwen2, Qwen3, SmolLM, Granite 3 and 4 (350M to 2B), Gemma 3 (270M to 4B and larger;
+Llama, Mistral, Qwen2, Qwen3, SmolLM, Granite 3 and 4 (350M to 2B), Phi-3 and 3.5 (the 128k variants
+up to 4096 tokens of context), Gemma 3 (270M to 4B and larger;
 images as above) and SmolVLM (images as above) decoders, from
 safetensors (F32/F16/BF16) or GGUF (F32/F16/BF16/Q4_0/Q4_1/Q5_0/Q5_1/Q8_0/Q4_K/Q5_K/Q6_K).
 Weights are held on the GPU as q4, q8 or f32. The default, `quant: "auto"`, stores float weights as q4

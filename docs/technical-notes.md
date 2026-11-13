@@ -42,7 +42,7 @@ const json = llm.chat(messages, { format: { type: "json", schema } }); // or { t
 |---|---|
 | `@kiln/api` | Main-thread client, worker RPC, streaming `TextStream`, transformers.js-style `pipeline` |
 | `@kiln/runtime` | `Engine`: chunked prefill, pipelined decode, weight streaming |
-| `@kiln/models` | Code-defined architectures (Llama / Mistral / Qwen2 / Qwen3 / SmolLM / Granite / Gemma 3 / SmolVLM), HF + GGUF config mapping |
+| `@kiln/models` | Code-defined architectures (Llama / Mistral / Qwen2 / Qwen3 / SmolLM / Granite / Phi-3 / Gemma 3 / SmolVLM), HF + GGUF config mapping |
 | `@kiln/tokenizers` | Byte-level and SentencePiece-style BPE from `tokenizer.json` or GGUF metadata, streaming UTF-8 decode, a Jinja interpreter for chat templates |
 | `@kiln/grammar` | JSON / JSON Schema / choice grammars as a byte-level pushdown matcher, token masks over a vocabulary trie |
 | `@kiln/kernels` | WGSL kernels, op wrappers, CPU reference implementations |
@@ -516,6 +516,8 @@ Models run end to end (greedy answers to fixed questions checked by hand; tool c
 | `granite` | granite-3.3-2b-instruct (`<\|tool_call\|>` calls) | safetensors (5 GB), GGUF Q4_K_M | 5.5 tok/s (q8), 6.4 tok/s (Q4_K_M) |
 | `granitemoehybrid` | granite-4.0-350m (tool calls), with `quant: "q8"` | safetensors, GGUF Q8_0 | 26 tok/s; 38.7 tok/s (Q8_0) |
 | `granitemoehybrid` | granite-4.0-1b (tool calls) | safetensors (3.3 GB) | 11.5 tok/s (q4) |
+| `phi3` | Phi-3-mini-4k-instruct (3.8B; recalls a code word 1,700 tokens back) | GGUF q4 (2.3 GB) | 4.1 tok/s |
+| `phi3` | Phi-3.5-mini-instruct (LongRoPE short factors, context capped at 4096; same recall) | GGUF Q4_K_M (2.3 GB) | 4.4 tok/s |
 | `gemma3` | Gemma 3 4B-it (recalls a fact 1,100 and 3,000 tokens back; images) | GGUF Q4_0 (2.4 GB) + mmproj-F16; safetensors (8.6 GB, the vision tower in the same files) | 177–180 ms GPU per step (about 5.5 tok/s); 24.6 tok/s on an M3 |
 | `idefics3` | SmolVLM-256M-Instruct, SmolVLM-500M-Instruct (images in chat) | safetensors | a 640 × 480 photo in about 17 s (13 tiles), 2–4 s without splitting |
 
@@ -1248,7 +1250,7 @@ Paris right now?" with `<|tool_call|>[{"name": "get_weather", "arguments": {"cit
 The q8 reply matched the NumPy reference (extended to Granite 3's separate gate and up projections)
 token for token, all 28 and the end of turn.
 
-Other architectures are rejected at load: SmolLM3, hybrid (Mamba) and mixture-of-experts Granite, Phi-3, Gemma 1/2, mixture-of-experts
+Other architectures are rejected at load: SmolLM3, hybrid (Mamba) and mixture-of-experts Granite, Phi-4 mini, Gemma 1/2, mixture-of-experts
 models, Llama 4, and rope scaling other than Llama 3's and linear (Gemma 3).
 
 GGUF `gemma3` files load the way llama.cpp writes them: norms already hold Gemma's 1 + w, and the

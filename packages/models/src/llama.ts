@@ -156,6 +156,9 @@ export class LlamaModel {
     this.kvDtype = opts.kvDtype ?? "f16";
     this.imageFeatures = opts.imageTokens ? backend.alloc(opts.imageTokens * cfg.hiddenSize * 4, "storage", "image/features") : undefined;
     this.maxSeq = opts.maxSeq ?? defaultMaxSeq(cfg, this.kvDtype);
+    if (cfg.maxPositions !== undefined && this.maxSeq > cfg.maxPositions) {
+      throw new Error(`maxSeq ${this.maxSeq} is past the ${cfg.maxPositions} tokens this model's rotary factors are loaded for`);
+    }
     const kvBytes = this.kvDtype === "f16" ? 2 : 4;
     this.step = backend.alloc(STEP_BYTES, "storage", "step");
     this.history = backend.alloc(this.maxSeq * 4, "storage", "history");
@@ -185,8 +188,9 @@ export class LlamaModel {
         : this.invFreq;
     this.w("model.embed_tokens.weight");
     const fuse = typeof opts.fuse === "object" ? { qkv: true, mlp: true, ...opts.fuse } : { qkv: opts.fuse ?? true, mlp: opts.fuse ?? true };
-    this.fusedQkv = fuse.qkv && this.fuse("self_attn", ["q_proj", "k_proj", "v_proj"], "qkv", cfg.attentionBias);
-    // Granite 4 checkpoints store gate_up already stacked.
+    // Phi-3 checkpoints store qkv already stacked.
+    this.fusedQkv = weights.has("model.layers.0.self_attn.qkv.weight") || (fuse.qkv && this.fuse("self_attn", ["q_proj", "k_proj", "v_proj"], "qkv", cfg.attentionBias));
+    // Granite 4 and Phi-3 checkpoints store gate_up already stacked.
     this.fusedMlp = weights.has("model.layers.0.mlp.gate_up.weight") || (fuse.mlp && this.fuse("mlp", ["gate_proj", "up_proj"], "gate_up", false));
   }
 

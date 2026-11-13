@@ -29,6 +29,8 @@ import {
   configFromHF,
   ggufToHF,
   graniteName,
+  phi3Name,
+  PHI3_ROPE_SHORT,
   idefics3Processing,
   idefics3TextName,
   idefics3VisionName,
@@ -524,7 +526,7 @@ async function openSafetensors(ref: ModelRef, endpoint?: string): Promise<{ cfg:
   // Gemma's RMSNorm scales by (1 + w); folding the 1 in at load keeps one norm kernel for every family.
   const transform = cfg.family === "gemma3" ? (name: string, v: Float32Array) => (name.endsWith("norm.weight") ? addOne(v) : undefined) : undefined;
   // Multimodal Gemma 3 (4B and up): load the language model's weights under their text names, skip the rest.
-  const rename = config!.model_type === "gemma3" ? multimodalTextName : config!.model_type === "granitemoehybrid" ? graniteName : idefics3 ? idefics3TextName : undefined;
+  const rename = config!.model_type === "gemma3" ? multimodalTextName : config!.model_type === "granitemoehybrid" ? graniteName : config!.model_type === "phi3" ? phi3Name : idefics3 ? idefics3TextName : undefined;
   const scale = cfg.residualScale !== undefined || cfg.logitScale !== undefined ? (name: string) => weightScale(cfg, name) : undefined;
   const files: WeightFile[] = [];
   try {
@@ -585,9 +587,12 @@ async function openGGUFFile(model: ModelSource): Promise<OpenedGGUF> {
   return ggufModel(file, source, header);
 }
 
-function ggufModel(file: string, source: ByteSource, gguf: Awaited<ReturnType<typeof readGGUFHeader>>): OpenedGGUF {
+async function ggufModel(file: string, source: ByteSource, gguf: Awaited<ReturnType<typeof readGGUFHeader>>): Promise<OpenedGGUF> {
   try {
-    const cfg = configFromGGUF(gguf.metadata, gguf.tensors.map((t) => t.name));
+    // Phi-3's LongRoPE factors are a small tensor, not metadata: the config needs its values.
+    const factors = gguf.tensors.find((t) => t.name === PHI3_ROPE_SHORT);
+    const ropeShort = factors && toF32(factors.type as Parameters<typeof toF32>[0], await source.read(factors.offset, factors.byteLength), factors.shape.reduce((a, b) => a * b, 1));
+    const cfg = configFromGGUF(gguf.metadata, gguf.tensors.map((t) => t.name), ropeShort);
     const scale = cfg.residualScale !== undefined || cfg.logitScale !== undefined ? (name: string) => weightScale(cfg, name) : undefined;
     return {
       cfg,
