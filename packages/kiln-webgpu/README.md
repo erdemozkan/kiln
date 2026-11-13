@@ -380,6 +380,20 @@ const llm = await load("https://example.com/models/my-model-Q4_K_M.gguf");
 fileInput.onchange = async () => { const local = await load(fileInput.files[0]); };
 ```
 
+A whole model folder on the user's disk (what the Hub repo holds: config.json, the tokenizer files and
+the weights) loads through `localModel`, which returns an id that works wherever a Hub id does:
+
+```js
+import { localModel, load, pipeline } from "kiln-webgpu";
+// <input id="folder" type="file" webkitdirectory>, or a handle from showDirectoryPicker()
+folder.onchange = async () => {
+  const id = await localModel(folder.files);
+  const llm = await load(id); // or: await pipeline("automatic-speech-recognition", id)
+};
+```
+
+The files are read in place and never uploaded. The id lasts until the page reloads.
+
 Several conversations can share one model: each call reuses the cached K/V of whichever earlier
 prompt shares the most tokens with it (kept on the GPU up to `load(id, { prefixCacheBytes })`, 256 MiB
 by default), and calls that overlap run one after another.

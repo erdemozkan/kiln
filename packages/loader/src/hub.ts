@@ -1,4 +1,5 @@
 /** Hugging Face Hub resolution. A model id is either "org/repo" (safetensors) or "org/repo/file.gguf". */
+import { isLocalModel, isLocalUrl, localBlob, localListing, localUrl } from "./local";
 import { readCacheFile, writeCacheFile } from "./opfs";
 
 export interface HubOptions {
@@ -23,6 +24,7 @@ export function parseModelId(id: string, revision = "main"): ModelRef {
 }
 
 export function fileUrl(ref: ModelRef, file: string, endpoint = "https://huggingface.co"): string {
+  if (isLocalModel(ref.repo)) return localUrl(ref.repo, safeRepoPath(file));
   return `${endpoint}/${ref.repo}/resolve/${encodeURIComponent(ref.revision)}/${safeRepoPath(file).split("/").map(encodeURIComponent).join("/")}`;
 }
 
@@ -42,6 +44,8 @@ export function safeRepoPath(file: string): string {
  * key; a mirror's are prefixed with its origin, so one server's copy never serves for another's.
  */
 export function cacheKey(ref: ModelRef, file: string, endpoint?: string): string {
+  // A local model's id already tells its files apart; no server or revision is involved.
+  if (isLocalModel(ref.repo)) return `${ref.repo}/${file}`;
   return `${endpointPrefix(endpoint)}${ref.repo}@${ref.revision}/${file}`;
 }
 
@@ -109,6 +113,10 @@ const checked = new Set<string>();
  * too when `keep404` (a file that may not exist is asked for on every load).
  */
 async function hubFile(url: string, keep404: boolean, name = hubEntryName(url)): Promise<HubFile> {
+  if (isLocalUrl(url)) {
+    const blob = localBlob(url);
+    return blob ? { status: 200, bytes: new Uint8Array(await blob.arrayBuffer()) } : { status: 404 };
+  }
   const keeps = (f: HubFile) => f.status === 200 || (keep404 && f.status === 404);
   const hit = await readHubEntry(name);
   if (hit && keeps(hit)) {
@@ -132,6 +140,7 @@ async function hubFile(url: string, keep404: boolean, name = hubEntryName(url)):
 export async function fetchBytes(url: string, optional = false): Promise<Uint8Array | undefined> {
   const f = await hubFile(url, optional);
   if (f.status === 404 && optional) return undefined;
+  if (!f.bytes && isLocalUrl(url)) throw new Error(`the model folder has no ${url.replace(/^[a-z-]+:\/\/[^/]+\//, "")}`);
   if (!f.bytes) throw new Error(`${url}: HTTP ${f.status}${f.status === 401 ? " (gated or private model?)" : ""}`);
   return f.bytes;
 }
@@ -156,6 +165,7 @@ export async function fetchText(url: string, optional = false): Promise<string |
  * API (a mirror or a static server) or refuses it; callers then probe for optional files instead.
  */
 export async function listRepoFiles(ref: ModelRef, endpoint = "https://huggingface.co"): Promise<Set<string> | undefined> {
+  if (isLocalModel(ref.repo)) return localListing(ref.repo);
   try {
     const url = `${endpoint}/api/models/${ref.repo}/revision/${encodeURIComponent(ref.revision)}?expand%5B%5D=siblings`;
     // "?" cannot be in a repo path, so the listing's entry never collides with a file's.

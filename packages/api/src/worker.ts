@@ -1,4 +1,4 @@
-import { readImage, type ImageInput } from "@kiln/loader";
+import { adoptLocalModel, readImage, type ImageInput } from "@kiln/loader";
 import { createAudio, createVision, TtsEngine, type VisionEngine, createEncoder, createEngine, modelKey, modelName, createSeq2Seq, type AudioEngine, loadPromptCache, promptCacheName, savePromptCache, type EncoderEngine, type Engine, type Seq2SeqEngine, type Seq2SeqGenerateOptions, type TextDelta } from "@kiln/runtime";
 import type { AudioTask, VisionTask, EncoderTask, RawOutputs, Request, Response, Seq2SeqTask } from "./protocol";
 
@@ -152,6 +152,9 @@ scope.onmessage = async (e: MessageEvent<Request>) => {
   const msg = e.data;
   try {
     switch (msg.type) {
+      case "local":
+        adoptLocalModel(msg.model, msg.files);
+        break;
       case "load": {
         await queue;
         await saving;

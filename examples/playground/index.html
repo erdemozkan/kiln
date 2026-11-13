@@ -31,6 +31,10 @@
         <label for="file">or open a .gguf file from this computer (it is read in place, nothing is uploaded):</label>
         <input id="file" type="file" accept=".gguf" />
       </div>
+      <div class="row status">
+        <label for="folder">or open a model folder (config.json, the tokenizer files and safetensors weights, as a Hub repo has them):</label>
+        <input id="folder" type="file" webkitdirectory />
+      </div>
       <progress id="progress" max="1" value="0"></progress>
       <div id="status" class="status">Not loaded.</div>
       <div class="row status cache">

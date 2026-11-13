@@ -119,7 +119,7 @@ const { logits } = await model(tokenizer(["I love it", "I hate it"], { padding: 
         <h2 id="missing">What is missing</h2>
         <ul>
           <li>Many architectures. transformers.js runs any ONNX graph; Kiln implements each family itself, and the list is shorter.</li>
-          <li>Node.js loading from local folders (<code>env.localModelPath</code>); Kiln loads from the Hub or a mirror.</li>
+          <li>Node.js loading from local folders (<code>env.localModelPath</code>). In the browser, Kiln loads from the Hub, a mirror, or a folder the user picks (<code>localModel</code>).</li>
           <li>transformers.js's tensor operations (<code>mean</code>, <code>slice</code>, …) on returned tensors.</li>
           <li>Batched decoding of several prompts at once: Kiln runs them one after another.</li>
         </ul>

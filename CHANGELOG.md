@@ -7,6 +7,14 @@ place, and the URL of one `.gguf` on any server, downloaded into the cache like 
 prompt cache works for both (a file is keyed by its name, size and modification time, a URL by a hash
 of itself). The playground has a file picker. Other formats still need their repo layout.
 
+**Models from a folder on the user's disk.** `localModel(files)` registers a picked folder (a folder
+`<input>`'s files, a directory handle, or a map of paths to Blobs) and returns an id, "@local/…", that
+loads wherever a Hub id does: `load`, `pipeline`, the Auto classes. The folder is laid out as a Hub
+repo is, so safetensors and pytorch_model.bin models of every supported family load from disk, not
+only GGUF. Files are read in place; the id carries a fingerprint of them, so converted weights and
+the prompt cache are reused until a file changes. The playground has a folder picker, and loads a
+picked file or folder as soon as it is chosen.
+
 **A download closed just short of its end now finishes.** A GGUF whose last bytes the model does not
 read (bartowski's SmolLM2-135M Q4_K_M, for one) was never marked complete, so up to 32 MiB of it was
 downloaded again on every load. A source closed with at most 64 MiB left runs to the end first; one

@@ -176,6 +176,8 @@ export type RawOutputs = Record<string, { data: Float32Array; dims: number[] }>;
 
 export type Request =
   | { id: number; type: "load"; model: string | Blob; opts: WireLoadOptions }
+  /** The files of a local model ("@local/…"), sent before the first request that names it. Not answered. */
+  | { id: number; type: "local"; model: string; files: [string, Blob][] }
   | { id: number; type: "loadEncoder"; model: string; opts: WireEncoderOptions }
   | { id: number; type: "loadSeq2Seq"; model: string; opts: WireSeq2SeqOptions }
   | { id: number; type: "loadAudio"; model: string; opts: WireAudioOptions }

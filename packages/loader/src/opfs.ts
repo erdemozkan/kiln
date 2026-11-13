@@ -1,4 +1,5 @@
-import { HttpSource, parseContentRangeTotal, type ByteSource, checkRange } from "./source";
+import { isLocalUrl, localBlob } from "./local";
+import { BlobSource, HttpSource, parseContentRangeTotal, type ByteSource, checkRange } from "./source";
 
 /** Minimal typing for the worker-only OPFS sync handle (not in lib.dom). */
 interface SyncHandle {
@@ -143,6 +144,11 @@ export class CachedHttpSource implements ByteSource {
       finishOnClose = FINISH_ON_CLOSE,
     }: { fresh?: boolean; segment?: number; retryMs?: number; readAhead?: number; finishOnClose?: number } = {},
   ): Promise<ByteSource> {
+    if (isLocalUrl(url)) {
+      const blob = localBlob(url);
+      if (!blob) throw new Error(`the model folder has no ${url.replace(/^[a-z-]+:\/\/[^/]+\//, "")}`);
+      return new BlobSource(blob, key);
+    }
     if (!opfsAvailable()) return new HttpSource(url);
     const root = await navigator.storage.getDirectory();
     const dir = await root.getDirectoryHandle(DIR, { create: true });

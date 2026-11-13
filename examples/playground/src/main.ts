@@ -1,4 +1,4 @@
-import { load, type ChatMessage, type KilnModel, type ResponseFormat } from "@kiln/api";
+import { load, localModel, type ChatMessage, type KilnModel, type ResponseFormat } from "@kiln/api";
 import { clearCache, listCache } from "@kiln/loader";
 
 const $ = <T extends HTMLElement>(id: string) => document.getElementById(id) as T;
@@ -7,8 +7,20 @@ const quant = $<HTMLSelectElement>("quant");
 const device = $<HTMLSelectElement>("device");
 const loadBtn = $<HTMLButtonElement>("load");
 const fileInput = $<HTMLInputElement>("file");
-// Typing a model id means the id is wanted, not the file picked earlier.
-modelInput.addEventListener("input", () => (fileInput.value = ""));
+const folderInput = $<HTMLInputElement>("folder");
+// Typing a model id means the id is wanted, not the file or folder picked earlier.
+modelInput.addEventListener("input", () => (fileInput.value = folderInput.value = ""));
+// Choosing a file or a folder loads it straight away: nobody expects a second click after the dialog.
+fileInput.addEventListener("change", () => {
+  if (!fileInput.files?.length) return;
+  folderInput.value = "";
+  if (!loadBtn.disabled) loadBtn.click();
+});
+folderInput.addEventListener("change", () => {
+  if (!folderInput.files?.length) return;
+  fileInput.value = "";
+  if (!loadBtn.disabled) loadBtn.click();
+});
 const progress = $<HTMLProgressElement>("progress");
 const status = $("status");
 const log = $("log");
@@ -84,7 +96,9 @@ loadBtn.onclick = async () => {
   const t0 = performance.now();
   try {
     await model?.unload();
-    model = await load(fileInput.files?.[0] ?? modelInput.value.trim(), {
+    // A picked folder becomes a local model id; a picked .gguf is passed as the file it is.
+    const source = folderInput.files?.length ? await localModel(folderInput.files) : (fileInput.files?.[0] ?? modelInput.value.trim());
+    model = await load(source, {
       quant: quant.value as "auto" | "q4" | "q8" | "f32",
       device: device.value as "auto" | "gpu" | "cpu",
       onProgress: (p) => {

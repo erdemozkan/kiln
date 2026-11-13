@@ -6,5 +6,6 @@ export * from "./pytorch";
 export * from "./gguf";
 export * from "./convert";
 export * from "./hub";
+export * from "./local";
 export * from "./audio";
 export * from "./image";

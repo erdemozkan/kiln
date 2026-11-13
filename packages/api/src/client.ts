@@ -1,6 +1,7 @@
 import type { Profile } from "@kiln/core";
 import type { GenerateStats, LoadProgress } from "@kiln/runtime";
 import type { ChatMessage } from "@kiln/tokenizers";
+import { isLocalModel, localModelFiles, localRepo } from "@kiln/loader";
 import { createWorker } from "./default-worker";
 import type { AdapterInfo, EncoderHead, RawOutputs, VisionHead, VisionInfo, VisionTask, AudioInfo, AudioTask, EncoderInfo, EncoderTask, ModelInfo, Request, Response, Seq2SeqInfo, Seq2SeqTask, WireAudioOptions, WireEncoderOptions, WireGenerateOptions, WireLoadOptions, WireSeq2SeqOptions } from "./protocol";
 
@@ -61,6 +62,7 @@ abstract class WorkerChannel {
     this.listeners.set(id, (msg) => {
       if (onMsg(msg)) this.listeners.delete(id);
     });
+    this.shareLocal(body);
     this.post({ ...body, id } as Request);
     return id;
   }
@@ -74,6 +76,22 @@ abstract class WorkerChannel {
         return msg.type === "result" || msg.type === "error";
       }),
     );
+  }
+
+  /** Local models whose files this worker already has. */
+  private readonly shared = new Set<string>();
+
+  /** Hands the worker the files of any local model ("@local/…") the request names, once per worker. */
+  private shareLocal(body: RequestBody): void {
+    const opts = (body as { opts?: unknown }).opts;
+    for (const v of [...Object.values(body), ...(opts && typeof opts === "object" ? Object.values(opts) : [])]) {
+      if (typeof v !== "string" || !isLocalModel(v)) continue;
+      const repo = localRepo(v);
+      const files = localModelFiles(repo);
+      if (!files || this.shared.has(repo)) continue;
+      this.shared.add(repo);
+      this.post({ id: 0, type: "local", model: repo, files: [...files] });
+    }
   }
 
   protected post(msg: Request): void {
