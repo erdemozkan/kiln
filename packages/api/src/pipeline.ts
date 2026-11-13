@@ -5,6 +5,7 @@ import type { LoadProgress } from "@kiln/runtime";
 import type { ChatMessage } from "@kiln/tokenizers";
 import { KilnVision, KilnAudio, KilnEncoder, KilnModel, KilnSeq2Seq, type GenerateOptions, type LoadOptions, type TextStream } from "./client";
 import { fetchJSON, fileUrl, parseModelId, readAudio, type AudioInput } from "@kiln/loader";
+import { localModel, type LocalModelInput } from "./local";
 import { Tensor } from "./tensor";
 import { PreTrainedTokenizer, RawImage, envEndpoint } from "./compat";
 import type { VisionInfo, AudioInfo, EncoderInfo, EncoderTask, ModelInfo, Seq2SeqInfo, Seq2SeqTask } from "./protocol";
@@ -706,6 +707,13 @@ export function encoderQuant(dtype: string | undefined): "f32" | "q8" | "q4" {
 }
 
 /**
+ * What a pipeline loads: a Hub id ("org/repo", "org/repo/file.gguf"), a local model id from
+ * `localModel`, or the picked files themselves (anything `localModel` takes: a .gguf `File`, a folder
+ * input's files, a file or directory handle). "text-generation" also takes the URL of one .gguf.
+ */
+export type PipelineModel = string | LocalModelInput;
+
+/**
  * transformers.js-style entry point: "text-generation" for decoder LLMs (safetensors or GGUF), and for
  * encoder models (BERT, DistilBERT, RoBERTa from safetensors) "feature-extraction" ("embeddings"),
  * "text-classification" ("sentiment-analysis"), "token-classification" ("ner"),
@@ -716,36 +724,40 @@ export function encoderQuant(dtype: string | undefined): "f32" | "q8" | "q4" {
  *   const extractor = await pipeline("feature-extraction", "sentence-transformers/all-MiniLM-L6-v2");
  *   const output = await extractor(["Hello", "World"], { pooling: "mean", normalize: true });
  */
-export async function pipeline(task: "text-generation", model?: string, options?: PipelineOptions): Promise<TextGenerationPipeline>;
-export async function pipeline(task: "feature-extraction" | "embeddings", model?: string, options?: PipelineOptions): Promise<FeatureExtractionPipeline>;
-export async function pipeline(task: "text-classification" | "sentiment-analysis", model?: string, options?: PipelineOptions): Promise<TextClassificationPipeline>;
-export async function pipeline(task: "token-classification" | "ner", model?: string, options?: PipelineOptions): Promise<TokenClassificationPipeline>;
-export async function pipeline(task: "question-answering", model?: string, options?: PipelineOptions): Promise<QuestionAnsweringPipeline>;
-export async function pipeline(task: "fill-mask", model?: string, options?: PipelineOptions): Promise<FillMaskPipeline>;
-export async function pipeline(task: "zero-shot-classification", model?: string, options?: PipelineOptions): Promise<ZeroShotClassificationPipeline>;
-export async function pipeline(task: "summarization", model?: string, options?: PipelineOptions): Promise<SummarizationPipeline>;
-export async function pipeline(task: "translation", model?: string, options?: PipelineOptions): Promise<TranslationPipeline>;
-export async function pipeline(task: "text2text-generation", model?: string, options?: PipelineOptions): Promise<Text2TextGenerationPipeline>;
-export async function pipeline(task: "automatic-speech-recognition", model?: string, options?: PipelineOptions): Promise<SpeechRecognitionPipeline>;
-export async function pipeline(task: "audio-classification", model?: string, options?: PipelineOptions): Promise<AudioClassificationPipeline>;
-export async function pipeline(task: "image-classification", model?: string, options?: PipelineOptions): Promise<ImageClassificationPipeline>;
-export async function pipeline(task: "image-feature-extraction", model?: string, options?: PipelineOptions): Promise<ImageFeatureExtractionPipeline>;
-export async function pipeline(task: "zero-shot-image-classification", model?: string, options?: PipelineOptions): Promise<ZeroShotImageClassificationPipeline>;
-export async function pipeline(task: "object-detection", model?: string, options?: PipelineOptions): Promise<ObjectDetectionPipeline>;
-export async function pipeline(task: "zero-shot-object-detection", model?: string, options?: PipelineOptions): Promise<ZeroShotObjectDetectionPipeline>;
-export async function pipeline(task: "depth-estimation", model?: string, options?: PipelineOptions): Promise<DepthEstimationPipeline>;
-export async function pipeline(task: "image-segmentation", model?: string, options?: PipelineOptions): Promise<ImageSegmentationPipeline>;
-export async function pipeline(task: "background-removal", model?: string, options?: PipelineOptions): Promise<BackgroundRemovalPipeline>;
-export async function pipeline(task: "image-to-image", model?: string, options?: PipelineOptions): Promise<ImageToImagePipeline>;
-export async function pipeline(task: "image-to-text", model?: string, options?: PipelineOptions): Promise<ImageToTextPipeline>;
-export async function pipeline(task: "document-question-answering", model?: string, options?: PipelineOptions): Promise<DocumentQuestionAnsweringPipeline>;
-export async function pipeline(task: "text-to-audio" | "text-to-speech", model?: string, options?: PipelineOptions): Promise<TextToAudioPipeline>;
-export async function pipeline(task: PipelineTask, model?: string, options: PipelineOptions = {}): Promise<unknown> {
+export async function pipeline(task: "text-generation", model?: PipelineModel, options?: PipelineOptions): Promise<TextGenerationPipeline>;
+export async function pipeline(task: "feature-extraction" | "embeddings", model?: PipelineModel, options?: PipelineOptions): Promise<FeatureExtractionPipeline>;
+export async function pipeline(task: "text-classification" | "sentiment-analysis", model?: PipelineModel, options?: PipelineOptions): Promise<TextClassificationPipeline>;
+export async function pipeline(task: "token-classification" | "ner", model?: PipelineModel, options?: PipelineOptions): Promise<TokenClassificationPipeline>;
+export async function pipeline(task: "question-answering", model?: PipelineModel, options?: PipelineOptions): Promise<QuestionAnsweringPipeline>;
+export async function pipeline(task: "fill-mask", model?: PipelineModel, options?: PipelineOptions): Promise<FillMaskPipeline>;
+export async function pipeline(task: "zero-shot-classification", model?: PipelineModel, options?: PipelineOptions): Promise<ZeroShotClassificationPipeline>;
+export async function pipeline(task: "summarization", model?: PipelineModel, options?: PipelineOptions): Promise<SummarizationPipeline>;
+export async function pipeline(task: "translation", model?: PipelineModel, options?: PipelineOptions): Promise<TranslationPipeline>;
+export async function pipeline(task: "text2text-generation", model?: PipelineModel, options?: PipelineOptions): Promise<Text2TextGenerationPipeline>;
+export async function pipeline(task: "automatic-speech-recognition", model?: PipelineModel, options?: PipelineOptions): Promise<SpeechRecognitionPipeline>;
+export async function pipeline(task: "audio-classification", model?: PipelineModel, options?: PipelineOptions): Promise<AudioClassificationPipeline>;
+export async function pipeline(task: "image-classification", model?: PipelineModel, options?: PipelineOptions): Promise<ImageClassificationPipeline>;
+export async function pipeline(task: "image-feature-extraction", model?: PipelineModel, options?: PipelineOptions): Promise<ImageFeatureExtractionPipeline>;
+export async function pipeline(task: "zero-shot-image-classification", model?: PipelineModel, options?: PipelineOptions): Promise<ZeroShotImageClassificationPipeline>;
+export async function pipeline(task: "object-detection", model?: PipelineModel, options?: PipelineOptions): Promise<ObjectDetectionPipeline>;
+export async function pipeline(task: "zero-shot-object-detection", model?: PipelineModel, options?: PipelineOptions): Promise<ZeroShotObjectDetectionPipeline>;
+export async function pipeline(task: "depth-estimation", model?: PipelineModel, options?: PipelineOptions): Promise<DepthEstimationPipeline>;
+export async function pipeline(task: "image-segmentation", model?: PipelineModel, options?: PipelineOptions): Promise<ImageSegmentationPipeline>;
+export async function pipeline(task: "background-removal", model?: PipelineModel, options?: PipelineOptions): Promise<BackgroundRemovalPipeline>;
+export async function pipeline(task: "image-to-image", model?: PipelineModel, options?: PipelineOptions): Promise<ImageToImagePipeline>;
+export async function pipeline(task: "image-to-text", model?: PipelineModel, options?: PipelineOptions): Promise<ImageToTextPipeline>;
+export async function pipeline(task: "document-question-answering", model?: PipelineModel, options?: PipelineOptions): Promise<DocumentQuestionAnsweringPipeline>;
+export async function pipeline(task: "text-to-audio" | "text-to-speech", model?: PipelineModel, options?: PipelineOptions): Promise<TextToAudioPipeline>;
+export async function pipeline(task: PipelineTask, model?: PipelineModel, options: PipelineOptions = {}): Promise<unknown> {
   if (options.endpoint === undefined && envEndpoint()) options = { ...options, endpoint: envEndpoint() };
   const t = ALIASES[task] ?? task;
-  const id = model ?? DEFAULT_MODELS[t];
+  // Picked files become a local model id, which every loader below takes like a Hub id.
+  const id = model === undefined ? DEFAULT_MODELS[t] : typeof model === "string" ? model : await localModel(model);
   if (!id) {
     throw new Error(`Kiln: unsupported pipeline task "${task}" (Kiln runs ${Object.keys(DEFAULT_MODELS).map((k) => `"${k}"`).join(", ")})`);
+  }
+  if (/^https?:\/\//i.test(id) && t !== "text-generation") {
+    throw new Error(`Kiln: "${task}" cannot load from the URL of one file (only a .gguf language model can); give the model's repo as org/repo, with \`endpoint\` for your own server`);
   }
   if (t === "text-generation") {
     const m = await KilnModel.load(id, toLoadOptions(id, options));

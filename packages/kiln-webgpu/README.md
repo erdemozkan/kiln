@@ -392,6 +392,9 @@ folder.onchange = async () => {
 };
 ```
 
+`load` and `pipeline` also take the picked files themselves (`pipeline("text-generation", fileInput.files[0])`,
+`load(folder.files)`), which registers them for you.
+
 The files are read in place and never uploaded. The id lasts until the page reloads. Where the
 browser has file handles (Chrome and Edge), a picked model can be remembered and reopened with one
 click after a reload:

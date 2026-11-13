@@ -11,6 +11,7 @@ export {
   Tensor,
   cos_sim,
   DEFAULT_MODELS,
+  type PipelineModel,
   type FeatureExtractionPipeline,
   type TextClassificationPipeline,
   type TokenClassificationPipeline,

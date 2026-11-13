@@ -101,3 +101,10 @@ describe("encoder pipeline helpers", () => {
     expect(cos_sim([1, 2], [-1, -2])).toBeCloseTo(-1);
   });
 });
+
+describe("pipeline model sources", () => {
+  it("refuses the URL of one file for tasks that need a repo", async () => {
+    const { pipeline } = await import("../src/pipeline");
+    await expect(pipeline("feature-extraction", "https://example.com/models/model.safetensors")).rejects.toThrow("cannot load from the URL of one file");
+  });
+});

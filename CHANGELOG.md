@@ -21,6 +21,11 @@ lists what is kept: each entry reopens to the same id after a reload, so its con
 prompt cache are found again, or is forgotten. Chrome and Edge have such handles; elsewhere the user
 picks again. The playground lists remembered models as buttons.
 
+**`pipeline()` and `load()` take picked files.** Beside a model id, `pipeline(task, model)` accepts
+what `localModel` does (a .gguf `File`, a folder input's files, a file or directory handle), and
+"text-generation" the URL of one .gguf; `load` accepts a folder's files and handles as well as a
+.gguf `File`. A task that needs a repo says so when given the URL of one file.
+
 **A download closed just short of its end now finishes.** A GGUF whose last bytes the model does not
 read (bartowski's SmolLM2-135M Q4_K_M, for one) was never marked complete, so up to 32 MiB of it was
 downloaded again on every load. A source closed with at most 64 MiB left runs to the end first; one

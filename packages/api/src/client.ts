@@ -3,6 +3,7 @@ import type { GenerateStats, LoadProgress } from "@kiln/runtime";
 import type { ChatMessage } from "@kiln/tokenizers";
 import { isLocalModel, localModelFiles, localRepo } from "@kiln/loader";
 import { createWorker } from "./default-worker";
+import { localModel, type LocalModelInput } from "./local";
 import type { AdapterInfo, EncoderHead, RawOutputs, VisionHead, VisionInfo, VisionTask, AudioInfo, AudioTask, EncoderInfo, EncoderTask, ModelInfo, Request, Response, Seq2SeqInfo, Seq2SeqTask, WireAudioOptions, WireEncoderOptions, WireGenerateOptions, WireLoadOptions, WireSeq2SeqOptions } from "./protocol";
 
 type Listener = (msg: Response) => void;
@@ -138,7 +139,9 @@ export class KilnModel extends WorkerChannel {
     super(worker);
   }
 
-  static async load(model: string | Blob, opts: LoadOptions = {}): Promise<KilnModel> {
+  static async load(model: string | LocalModelInput, opts: LoadOptions = {}): Promise<KilnModel> {
+    // A .gguf Blob loads as it is; a folder's files or a handle become a local model id first.
+    if (typeof model !== "string" && !(model instanceof Blob)) model = await localModel(model);
     const worker = opts.worker ?? createWorker();
     const m = new KilnModel(worker, undefined as unknown as ModelInfo);
     const { onProgress, worker: _w, persist = true, ...wire } = opts;

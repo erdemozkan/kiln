@@ -199,7 +199,7 @@ scope.onmessage = async (e: MessageEvent<Request>) => {
           id: msg.id,
           type: "encoderLoaded",
           info: {
-            model: msg.model,
+            model: modelName(msg.model),
             family: enc.cfg.family,
             layers: enc.cfg.layers,
             hiddenSize: enc.cfg.hidden,
@@ -222,7 +222,7 @@ scope.onmessage = async (e: MessageEvent<Request>) => {
           id: msg.id,
           type: "seq2seqLoaded",
           info: {
-            model: msg.model,
+            model: modelName(msg.model),
             family: m.cfg.family,
             encoderLayers: m.cfg.encLayers,
             decoderLayers: m.cfg.decLayers,
@@ -245,9 +245,9 @@ scope.onmessage = async (e: MessageEvent<Request>) => {
           type: "audioLoaded",
           info:
             a instanceof TtsEngine
-              ? { model: msg.model, family: a.info.family, head: "tts", layers: a.info.layers, hiddenSize: a.info.hidden, backend: a.backend.name, cpuThreads: a.backend.name === "cpu" ? (a.backend as { threads?: number }).threads : undefined }
+              ? { model: modelName(msg.model), family: a.info.family, head: "tts", layers: a.info.layers, hiddenSize: a.info.hidden, backend: a.backend.name, cpuThreads: a.backend.name === "cpu" ? (a.backend as { threads?: number }).threads : undefined }
               : {
-                  model: msg.model,
+                  model: modelName(msg.model),
                   family: a.cfg.modelType,
                   head: a.classifier ? "classification" : "ctc",
                   layers: a.cfg.layers,
@@ -269,7 +269,7 @@ scope.onmessage = async (e: MessageEvent<Request>) => {
           id: msg.id,
           type: "visionLoaded",
           info: {
-            model: msg.model,
+            model: modelName(msg.model),
             ...v.summary(),
             backend: v.backend.name,
             cpuThreads: v.backend.name === "cpu" ? (v.backend as { threads?: number }).threads : undefined,
