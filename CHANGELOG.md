@@ -55,10 +55,20 @@ A recurrent state cannot be cut back to an earlier position the way keys and val
 engine keeps snapshots of it (with the attention layers' keys and values) after each prompt and 16
 tokens before its end, up to 256 MiB of them, and a call resumes from the longest one its prompt
 starts with: a follow-up chat turn reused 425 of 463 tokens. For these models the prefix store,
-speculative decoding, the prompt cache file and LoRA adapters are off, and prefill runs in exact
-sizes (padding rows would enter the state). Not yet: GGUF files, images, and the larger sizes on a
-real run. With 4-bit weights the 0.8B model makes slips it does not make with `quant: "q8"` (17 + 26
-came out as 33).
+speculative decoding and LoRA adapters are off, and prefill runs in exact sizes (padding rows would
+enter the state). Not yet: images. With Kiln's own 4-bit conversion of the safetensors weights the
+0.8B model makes slips it does not make with `quant: "q8"` or from a Q4_K_M GGUF (17 + 26 came out
+as 33).
+
+**Qwen 3.5 from GGUF.** llama.cpp's files load as well (unsloth's 0.8B and 2B Q4_K_M checked: 15
+and 6 to 7.5 tokens/s): its tensor names for linear attention, the sizes from the `ssm.*` metadata,
+the decay rates it stores as −exp(A_log), the `qwen35` pre-tokenizer, and value heads in the tiled
+order its converter writes when there are more of them than key heads. Files whose converter merged
+the layer's projections into one tensor are refused by name.
+
+**Prompt cache for Qwen 3.5.** The cache file holds the attention layers' keys and values as for
+any model; a small file beside it (`….kv.state`) holds the two newest recurrent snapshots, rewritten
+when they change, and both are restored at load, so a conversation resumes after a reload.
 
 **Hardening against hostile model repos.** Three ways a crafted repo could freeze the tab are closed.
 The check on regexes from `tokenizer.json` and adapter configs now also refuses patterns that are
