@@ -21,6 +21,9 @@ class FakeHandle {
 }
 const dir = {
   getDirectoryHandle: async () => dir,
+  removeEntry: async (name: string) => {
+    if (!files.delete(name)) throw new Error("NotFoundError");
+  },
   getFileHandle: async (name: string, o?: { create?: boolean }) => {
     if (!files.has(name)) {
       if (!o?.create) throw new Error("NotFoundError");
@@ -133,6 +136,16 @@ describe("prompt cache", () => {
     const other = await savePromptCache(name, e, { ...state!, shape: { ...state!.shape, slots: [12, 4] } });
     expect(other?.segments.map((s) => s.to)).toEqual([4]);
     expect((await loadPromptCache(name))?.snapshot).toEqual(e.snapshot());
+  });
+
+  it("removes the files earlier layouts left for the same model", async () => {
+    const name = promptCacheName("org/model", { quant: "q4" });
+    const old = [name.replace("v3.kv", "v2.kv"), name.replace("v3.kv", "v1.kv")];
+    const other = promptCacheName("org/other", {}).replace("v3.kv", "v2.kv");
+    for (const n of [...old, other]) files.set(n, new Uint8Array(8));
+    expect(await loadPromptCache(name)).toBeUndefined();
+    for (const n of old) expect(files.has(n), n).toBe(false);
+    expect(files.has(other)).toBe(true);
   });
 
   it("keys on everything that changes the cached values", () => {

@@ -54,7 +54,7 @@ after a chat turn only the new tokens' K/V is read back from the GPU and added, 
 conversation's was read and written again each turn. When the tokens part ways with what is saved
 (an edited message), the file is cut at the last segment both share and continues from there. A
 write cut short costs that segment, not the file. Loading reads one segment at a time. Files of the
-old layout are ignored and replaced.
+old layout are removed at the model's next load.
 
 **Fewer requests on a first download.** The request that downloads a weight file also tells its
 size, so the separate one-byte request that asked for it is gone, and the shards of a split

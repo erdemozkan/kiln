@@ -455,6 +455,16 @@ export async function readCacheFile(name: string): Promise<Uint8Array | undefine
   }
 }
 
+/** Removes a file from the cache directory; a file that is not there (or is held open) is left as is. */
+export async function removeCacheFile(name: string): Promise<void> {
+  try {
+    const dir = await (await navigator.storage.getDirectory()).getDirectoryHandle(DIR);
+    await dir.removeEntry(name);
+  } catch {
+    // Nothing to remove, or not removable now: the next load tries again.
+  }
+}
+
 /** A cache file as a Blob, to read in slices (a large file need not be in memory whole); undefined if missing. */
 export async function readCacheBlob(name: string): Promise<Blob | undefined> {
   try {

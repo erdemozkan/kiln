@@ -1,4 +1,4 @@
-import { endpointPrefix, readCacheBlob, writeCacheFile } from "@kiln/loader";
+import { endpointPrefix, readCacheBlob, removeCacheFile, writeCacheFile } from "@kiln/loader";
 import type { CacheShape, CacheSnapshot } from "./engine";
 
 /**
@@ -18,6 +18,13 @@ const MAX_JSON = 64 * 2 ** 20;
  */
 export function promptCacheName(model: string, o: { revision?: string; quant?: string; f16Math?: boolean; endpoint?: string }): string {
   return `${encodeURIComponent(`${endpointPrefix(o.endpoint)}${model}@${o.revision ?? "main"}/${o.quant ?? "q4"}${o.f16Math ? "/f16math" : ""}/v${VERSION}`)}.kv`;
+}
+
+/** The names `name` had under earlier layouts: files nothing reads any more. */
+export function oldPromptCacheNames(name: string): string[] {
+  const suffix = `${encodeURIComponent(`/v${VERSION}`)}.kv`;
+  if (!name.endsWith(suffix)) return [];
+  return Array.from({ length: VERSION - 1 }, (_, i) => `${name.slice(0, -suffix.length)}${encodeURIComponent(`/v${i + 1}`)}.kv`);
 }
 
 /** What a prompt cache file holds, as the writer needs it to append: its tokens, and where each segment ends. */
@@ -114,6 +121,8 @@ function shapeOf(json: unknown): CacheShape | undefined {
  * the one before, so a write that was interrupted costs that segment, not the file.
  */
 export async function loadPromptCache(name: string): Promise<{ snapshot: CacheSnapshot; state: PromptCacheState } | undefined> {
+  // Files of earlier layouts for this model would otherwise stay on disk for good.
+  await Promise.all(oldPromptCacheNames(name).map(removeCacheFile));
   const blob = await readCacheBlob(name);
   if (!blob) return undefined;
   const head = await readFramed(blob, 0, MAGIC);
