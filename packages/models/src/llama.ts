@@ -57,7 +57,11 @@ interface LoraSlot {
 export interface LlamaOptions {
   /** KV cache length in tokens (default `defaultMaxSeq`). */
   maxSeq?: number;
-  /** KV cache storage: f16 (default) halves the cache and the attention reads; f32 for exactness. */
+  /**
+   * KV cache storage: f16 (default) halves the cache and the attention reads; f32 for exactness; f8
+   * (8-bit floats, FP8 E4M3) halves it again, so twice the context fits the same memory, at some
+   * cost in fidelity.
+   */
   kvDtype?: KvDtype;
   /**
    * Stack q/k/v and gate/up into single matmuls (default true). False keeps the unfused graph; an
@@ -93,9 +97,12 @@ export function ringSlots(cfg: LlamaConfig, maxSeq: number, l: number): number {
   return win ? Math.min(maxSeq, Math.max(ATTN_WG, win + RING_SLACK)) : maxSeq;
 }
 
+/** Bytes one cached value takes. */
+const KV_BYTES: Record<KvDtype, number> = { f32: 4, f16: 2, f8: 1 };
+
 /** KV cache bytes of a model at a context length: keys and values of every layer, rings included. */
 export function kvCacheBytes(cfg: LlamaConfig, maxSeq: number, kvDtype: KvDtype = "f16"): number {
-  const row = cfg.numKvHeads * cfg.headDim * (kvDtype === "f16" ? 2 : 4);
+  const row = cfg.numKvHeads * cfg.headDim * KV_BYTES[kvDtype];
   let slots = 0;
   for (let l = 0; l < cfg.numLayers; l++) slots += ringSlots(cfg, maxSeq, l);
   return 2 * slots * row;
@@ -159,7 +166,7 @@ export class LlamaModel {
     if (cfg.maxPositions !== undefined && this.maxSeq > cfg.maxPositions) {
       throw new Error(`maxSeq ${this.maxSeq} is past the ${cfg.maxPositions} tokens this model's rotary factors are loaded for`);
     }
-    const kvBytes = this.kvDtype === "f16" ? 2 : 4;
+    const kvBytes = KV_BYTES[this.kvDtype];
     this.step = backend.alloc(STEP_BYTES, "storage", "step");
     this.history = backend.alloc(this.maxSeq * 4, "storage", "history");
     this.seen = backend.alloc(Math.ceil(cfg.vocabSize / 32) * 4, "storage", "seen");
@@ -248,7 +255,7 @@ export class LlamaModel {
 
   /** Bytes of one position's K (or V) in one layer's cache. */
   get kvRowBytes(): number {
-    return this.cfg.numKvHeads * this.cfg.headDim * (this.kvDtype === "f16" ? 2 : 4);
+    return this.cfg.numKvHeads * this.cfg.headDim * KV_BYTES[this.kvDtype];
   }
 
   /** Bytes `readKv(n)` returns: each layer's first min(n, slots) K rows and as many V rows. */

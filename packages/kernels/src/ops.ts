@@ -266,8 +266,10 @@ export function qkNormRopeKv(ctx: Ctx, qkv: Tensor, qNorm: Tensor, kNorm: Tensor
 /** Writes k/v into the caches at positions pos0…; `slots` < maxSeq makes the cache a ring (slot = position % slots). */
 export function kvWrite(ctx: Ctx, k: Tensor, v: Tensor, kc: Buf, vc: Buf, T: number, maxSeq: number, kv: KvDtype = "f32", slots = maxSeq): void {
   const row = numel(k.shape) / T;
-  if (kv === "f16" && row % 2 !== 0) throw new Error(`kvWrite: f16 cache needs an even row (row=${row})`);
-  const threads = kv === "f16" ? (T * row) / 2 : T * row;
+  // Packed caches are written a word at a time: two halves, or four 8-bit codes.
+  const per = kv === "f8" ? 4 : kv === "f16" ? 2 : 1;
+  if (row % per !== 0) throw new Error(`kvWrite: an ${kv} cache needs a row that is a multiple of ${per} (row=${row})`);
+  const threads = (T * row) / per;
   ctx.run(kvWriteSpec(kv), [ctx.uniform([u32(T), u32(row), u32(maxSeq), u32(slots)]), ctx.step, k.buf, v.buf, kc, vc], grid1d(threads));
 }
 

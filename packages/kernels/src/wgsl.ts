@@ -17,11 +17,21 @@ export const MM_SLICE = 32768;
 const FLAT = /* wgsl */ `let idx = gid.x + gid.y * nw.x * ${EW}u;`;
 const EW_ARGS = /* wgsl */ `@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nw: vec3<u32>`;
 
-/** KV-cache storage: f32, or f16 pairs packed into u32 with pack2x16float (core WGSL, no feature needed). */
-export type KvDtype = "f32" | "f16";
+/**
+ * KV-cache storage: f32; f16 pairs packed into u32 with pack2x16float (core WGSL, no feature needed);
+ * or f8, four 8-bit floats per u32 (OCP FP8 E4M3: a sign, 4 exponent bits, 3 mantissa bits; ±448,
+ * about 1 part in 16 between neighbours), a quarter of f32's memory.
+ */
+export type KvDtype = "f32" | "f16" | "f8";
+
+/** Element type of a cache buffer the kernels write: packed formats are words. */
+const kvStore = (kv: KvDtype): string => (kv === "f32" ? "f32" : "u32");
 
 /** WGSL for reading the cache: kc as 4-element groups, vc element-wise. */
 function kvRead(kv: KvDtype): { kDecl: string; vDecl: string; k4: (i: string) => string; v1: (i: string) => string } {
+  if (kv === "f8") {
+    return { kDecl: "array<u32>", vDecl: "array<u32>", k4: (i) => `fp8x4(kc[${i}])`, v1: (i) => `fp8x4(vc[(${i}) / 4u])[(${i}) % 4u]` };
+  }
   return kv === "f16"
     ? {
         kDecl: "array<vec2<u32>>",
@@ -32,6 +42,34 @@ function kvRead(kv: KvDtype): { kDecl: string; vDecl: string; k4: (i: string) =>
     : { kDecl: "array<vec4<f32>>", vDecl: "array<f32>", k4: (i) => `kc[${i}]`, v1: (i) => `vc[${i}]` };
 }
 const KV4_FN = /* wgsl */ `fn kv4(w: vec2<u32>) -> vec4<f32> { return vec4<f32>(unpack2x16float(w.x), unpack2x16float(w.y)); }`;
+/**
+ * FP8 E4M3, four codes per word, lowest byte first. A code is sign (bit 7), exponent e (bits 6-3,
+ * bias 7) and mantissa m (bits 2-0): (1 + m/8)·2^(e-7), or m·2^-9 when e is 0. Decoding builds the
+ * f32's bits (exact on every driver, where exp2 and ldexp may not be); encoding rounds the f32's own
+ * exponent and mantissa bits to the nearest code and clamps at ±448 (the code past it is NaN in the
+ * format and never written). `cpu.toF8` and `cpu.F8` are the same in TypeScript.
+ */
+const FP8_FN = /* wgsl */ `fn fp8x4(w: u32) -> vec4<f32> {
+  let c = (vec4<u32>(w) >> vec4<u32>(0u, 8u, 16u, 24u)) & vec4<u32>(255u);
+  let e = (c >> vec4<u32>(3u)) & vec4<u32>(15u);
+  let m = c & vec4<u32>(7u);
+  let sign = (c & vec4<u32>(128u)) << vec4<u32>(24u);
+  let normal = bitcast<vec4<f32>>(sign | ((e + vec4<u32>(120u)) << vec4<u32>(23u)) | (m << vec4<u32>(20u)));
+  let small = bitcast<vec4<f32>>(sign | bitcast<vec4<u32>>(vec4<f32>(m) * 0.001953125));
+  return select(normal, small, e == vec4<u32>(0u));
+}
+fn fp8pack(v: vec4<f32>) -> u32 {
+  let b = bitcast<vec4<u32>>(v);
+  let a = b & vec4<u32>(0x7fffffffu);
+  // Exponent and top three mantissa bits, rounded on the bit below; 960 = (127 - 7) << 3.
+  let r = (a + vec4<u32>(0x80000u)) >> vec4<u32>(20u);
+  let normal = min(r, vec4<u32>(1086u)) - vec4<u32>(960u);
+  let small = min(vec4<u32>(min(abs(v), vec4<f32>(1.0)) * 512.0 + 0.5), vec4<u32>(8u));
+  let c = select(normal, small, r < vec4<u32>(968u)) | ((b >> vec4<u32>(24u)) & vec4<u32>(128u));
+  return c.x | (c.y << 8u) | (c.z << 16u) | (c.w << 24u);
+}`;
+/** The helper functions a kernel reading or writing a `kv` cache needs. */
+const kvFns = (kv: KvDtype): string => (kv === "f16" ? KV4_FN : kv === "f8" ? FP8_FN : "");
 
 /** A number as a WGSL f32 literal. */
 const f32Lit = (x: number): string => (Number.isInteger(x) ? `${x}.0` : String(x));
@@ -675,20 +713,30 @@ fn main(${EW_ARGS}) {
 /** Writes k/v rows [T, rowSize] into the caches at positions pos0..pos0+T (slot = position % cap). */
 export function kvWriteSpec(kv: KvDtype = "f32"): KernelSpec {
   const h = kv === "f16";
-  return spec(`kv_write/${kv}`, ["uniform", "read", "read", "read", "rw", "rw"], cpu.cpuKvWrite(kv === "f16"), () => /* wgsl */ `
+  return spec(`kv_write/${kv}`, ["uniform", "read", "read", "read", "rw", "rw"], cpu.cpuKvWrite(kv), () => /* wgsl */ `
 ${STEP_WGSL}
+${kvFns(kv)}
 struct P { T: u32, row: u32, maxSeq: u32, cap: u32 }
 @group(0) @binding(0) var<uniform> p: P;
 @group(0) @binding(1) var<storage, read> st: Step;
 @group(0) @binding(2) var<storage, read> k: array<f32>;
 @group(0) @binding(3) var<storage, read> v: array<f32>;
-@group(0) @binding(4) var<storage, read_write> kc: array<${h ? "u32" : "f32"}>;
-@group(0) @binding(5) var<storage, read_write> vc: array<${h ? "u32" : "f32"}>;
+@group(0) @binding(4) var<storage, read_write> kc: array<${kvStore(kv)}>;
+@group(0) @binding(5) var<storage, read_write> vc: array<${kvStore(kv)}>;
 
 @compute @workgroup_size(${EW})
 fn main(${EW_ARGS}) {
   ${FLAT}
-${h
+${kv === "f8"
+  ? `  // One thread per four elements (one word of codes).
+  let e = idx * 4u;
+  if (e >= p.T * p.row) { return; }
+  let t = e / p.row;
+  if (st.pos0 + t >= p.maxSeq) { return; }
+  let dst = (((st.pos0 + t) % p.cap) * p.row + e % p.row) / 4u;
+  kc[dst] = fp8pack(vec4<f32>(k[e], k[e + 1u], k[e + 2u], k[e + 3u]));
+  vc[dst] = fp8pack(vec4<f32>(v[e], v[e + 1u], v[e + 2u], v[e + 3u]));`
+  : h
   ? `  // One thread per element pair.
   let e = idx * 2u;
   if (e >= p.T * p.row) { return; }
@@ -736,9 +784,9 @@ const ATTN_P = (third: string) => `struct P { T: u32, H: u32, Hkv: u32, D: u32, 
 export function attentionSpec(kv: KvDtype = "f32", rel = false): KernelSpec {
   const r = kvRead(kv);
   const bindings: BindingKind[] = rel ? ["uniform", "read", "read", "read", "read", "read", "rw"] : ["uniform", "read", "read", "read", "read", "rw"];
-  return spec(`attention/online/${kv}${rel ? "/t5bias" : ""}`, bindings, cpu.cpuAttention(kv === "f16", rel), () => /* wgsl */ `
+  return spec(`attention/online/${kv}${rel ? "/t5bias" : ""}`, bindings, cpu.cpuAttention(kv, rel), () => /* wgsl */ `
 ${STEP_WGSL}
-${kv === "f16" ? KV4_FN : ""}
+${kvFns(kv)}
 ${ATTN_P("_a")}
 ${FIRST_KEY_WGSL}
 @group(0) @binding(0) var<uniform> p: P;
@@ -945,7 +993,7 @@ export function attentionSpanSpec(D: number, tile: SpanTile): KernelSpec {
   const PT = 16 * RQ;
   const SMN = spanVec4s(D, tile);
   const unroll = (n: number, f: (i: number) => string) => Array.from({ length: n }, (_, i) => f(i)).join("\n");
-  return spec(`attention/span/f32/D${D}/RT${RT}/DC${DC}`, ["uniform", "read", "read", "read", "read", "rw"], cpu.cpuAttention(false), () => /* wgsl */ `
+  return spec(`attention/span/f32/D${D}/RT${RT}/DC${DC}`, ["uniform", "read", "read", "read", "read", "rw"], cpu.cpuAttention("f32"), () => /* wgsl */ `
 ${STEP_WGSL}
 ${ATTN_P("_a")}
 ${FIRST_KEY_WGSL}
@@ -1114,12 +1162,14 @@ export function attentionTiledSpec(kv: KvDtype, D: number, tile: AttentionTile =
   const KP = D4 + 1; // padded row stride (vec4) of the key/value tile, so rows start in different banks
   const TPR = Math.floor(256 / R);
   const load =
-    kv === "f16"
-      ? { kDecl: "array<vec2<u32>>", vDecl: "array<vec2<u32>>", k: "kv4(kc[i])", v: "kv4(vc[i])" }
-      : { kDecl: "array<vec4<f32>>", vDecl: "array<vec4<f32>>", k: "kc[i]", v: "vc[i]" };
-  return spec(`attention/tiled/${kv}/D${D}/R${R}/BK${BK}`, ["uniform", "read", "read", "read", "read", "rw"], cpu.cpuAttention(kv === "f16"), () => /* wgsl */ `
+    kv === "f8"
+      ? { kDecl: "array<u32>", vDecl: "array<u32>", k: "fp8x4(kc[i])", v: "fp8x4(vc[i])" }
+      : kv === "f16"
+        ? { kDecl: "array<vec2<u32>>", vDecl: "array<vec2<u32>>", k: "kv4(kc[i])", v: "kv4(vc[i])" }
+        : { kDecl: "array<vec4<f32>>", vDecl: "array<vec4<f32>>", k: "kc[i]", v: "vc[i]" };
+  return spec(`attention/tiled/${kv}/D${D}/R${R}/BK${BK}`, ["uniform", "read", "read", "read", "read", "rw"], cpu.cpuAttention(kv), () => /* wgsl */ `
 ${STEP_WGSL}
-${kv === "f16" ? KV4_FN : ""}
+${kvFns(kv)}
 ${ATTN_P("_a")}
 ${FIRST_KEY_WGSL}
 @group(0) @binding(0) var<uniform> p: P;
@@ -1280,7 +1330,7 @@ export function attentionSplitSpec(kv: KvDtype = "f32"): KernelSpec {
   const r = kvRead(kv);
   return spec(`attention/split/${kv}`, ["uniform", "read", "read", "read", "read", "rw", "rw"], undefined, () => /* wgsl */ `
 ${STEP_WGSL}
-${kv === "f16" ? KV4_FN : ""}
+${kvFns(kv)}
 ${ATTN_P("S")}
 ${FIRST_KEY_WGSL}
 @group(0) @binding(0) var<uniform> p: P;
@@ -1295,7 +1345,7 @@ var<workgroup> qs: array<vec4<f32>, ${ATTN_WG / 4}>;
 var<workgroup> part: array<f32, 64>;
 var<workgroup> sc: array<f32, ${ATTN_CHUNK}>;
 var<workgroup> red: array<f32, 64>;
-${kv === "f16" ? "var<workgroup> vpart: array<vec2<f32>, 64>;" : ""}
+${kv === "f16" ? "var<workgroup> vpart: array<vec2<f32>, 64>;" : kv === "f8" ? "var<workgroup> vpart: array<vec4<f32>, 64>;" : ""}
 
 @compute @workgroup_size(64)
 fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) li: u32) {
@@ -1363,7 +1413,39 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
     ml[row * 2u] = m;
     ml[row * 2u + 1u] = red[0];
   }
-${kv === "f16"
+${kv === "f8"
+  ? `  // V: one word of four codes per thread; when D / 4 < 64, groups of threads split the keys and are summed.
+  let quads = p.D / 4u;
+  let groups = max(1u, 64u / quads);
+  let g = select(0u, li / quads, quads < 64u);
+  let vs = stride / 4u;
+  let vo = ko / 4u;
+  for (var pi = li % quads; pi < quads; pi += 64u) {
+    var acc = vec4<f32>(0.0);
+    if (g < groups) {
+      for (var j = g; j < cnt; j += groups) { acc += sc[j] * fp8x4(vc[vo + wrap(sb + j) * vs + pi]); }
+    }
+    if (quads < 64u) {
+      vpart[li] = acc;
+    } else {
+      let ob = row * p.D + 4u * pi;
+      po[ob] = acc.x;
+      po[ob + 1u] = acc.y;
+      po[ob + 2u] = acc.z;
+      po[ob + 3u] = acc.w;
+    }
+  }
+  workgroupBarrier();
+  if (quads < 64u && li < quads) {
+    var total = vec4<f32>(0.0);
+    for (var k = 0u; k < groups; k++) { total += vpart[k * quads + li]; }
+    let ob = row * p.D + 4u * li;
+    po[ob] = total.x;
+    po[ob + 1u] = total.y;
+    po[ob + 2u] = total.z;
+    po[ob + 3u] = total.w;
+  }`
+  : kv === "f16"
   ? `  // V: one packed pair per thread; when D / 2 < 64, groups of threads split the keys and are summed.
   let pairs = p.D / 2u;
   let groups = max(1u, 64u / pairs);
@@ -3293,8 +3375,9 @@ fn main() {
  */
 export function qkNormRopeKvSpec(interleaved: boolean, kv: KvDtype = "f32"): KernelSpec {
   const h = kv === "f16";
-  return spec(`qknorm_rope_kv/${interleaved ? "interleaved" : "half"}/${kv}`, ["uniform", "read", "read", "read", "read", "read", "rw", "rw", "rw"], cpu.cpuQkNormRopeKv(interleaved, h), () => /* wgsl */ `
+  return spec(`qknorm_rope_kv/${interleaved ? "interleaved" : "half"}/${kv}`, ["uniform", "read", "read", "read", "read", "read", "rw", "rw", "rw"], cpu.cpuQkNormRopeKv(interleaved, kv), () => /* wgsl */ `
 ${STEP_WGSL}
+${kvFns(kv)}
 struct P { T: u32, H: u32, Hkv: u32, D: u32, maxSeq: u32, cap: u32, eps: f32, _c: u32 }
 @group(0) @binding(0) var<uniform> p: P;
 @group(0) @binding(1) var<storage, read> st: Step;
@@ -3303,8 +3386,8 @@ struct P { T: u32, H: u32, Hkv: u32, D: u32, maxSeq: u32, cap: u32, eps: f32, _c
 @group(0) @binding(4) var<storage, read> qw: array<f32>;
 @group(0) @binding(5) var<storage, read> kw: array<f32>;
 @group(0) @binding(6) var<storage, read_write> qo: array<f32>;
-@group(0) @binding(7) var<storage, read_write> kc: array<${h ? "u32" : "f32"}>;
-@group(0) @binding(8) var<storage, read_write> vc: array<${h ? "u32" : "f32"}>;
+@group(0) @binding(7) var<storage, read_write> kc: array<${kvStore(kv)}>;
+@group(0) @binding(8) var<storage, read_write> vc: array<${kvStore(kv)}>;
 var<workgroup> row: array<f32, 256>;
 var<workgroup> red: array<f32, 256>;
 
@@ -3323,7 +3406,9 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
   if (hh >= p.H + p.Hkv) {
     // v: copied into the cache as is.
     let c = (hh - p.H - p.Hkv) * D + i;
-${h
+${kv === "f8"
+  ? `    if (live && i < D && i % 4u == 0u) { vc[(slot + c) / 4u] = fp8pack(vec4<f32>(x, qkv[base + i + 1u], qkv[base + i + 2u], qkv[base + i + 3u])); }`
+  : h
   ? `    if (live && i < D && i % 2u == 0u) { vc[(slot + c) / 2u] = pack2x16float(vec2<f32>(x, qkv[base + i + 1u])); }`
   : `    if (live && i < D) { vc[slot + c] = x; }`}
     return;
@@ -3361,7 +3446,12 @@ ${interleaved
     return;
   }
   let c = (hh - p.H) * D + i;
-${h
+${kv === "f8"
+  ? `  workgroupBarrier();
+  red[i] = out;
+  workgroupBarrier();
+  if (live && i < D && i % 4u == 0u) { kc[(slot + c) / 4u] = fp8pack(vec4<f32>(red[i], red[i + 1u], red[i + 2u], red[i + 3u])); }`
+  : h
   ? `  workgroupBarrier();
   red[i] = out;
   workgroupBarrier();
@@ -3378,16 +3468,17 @@ ${h
  */
 export function ropeKvSpec(interleaved: boolean, kv: KvDtype = "f32"): KernelSpec {
   const h = kv === "f16";
-  return spec(`rope_kv/${interleaved ? "interleaved" : "half"}/${kv}`, ["uniform", "read", "read", "read", "rw", "rw", "rw"], cpu.cpuRopeKv(interleaved, h), () => /* wgsl */ `
+  return spec(`rope_kv/${interleaved ? "interleaved" : "half"}/${kv}`, ["uniform", "read", "read", "read", "rw", "rw", "rw"], cpu.cpuRopeKv(interleaved, kv), () => /* wgsl */ `
 ${STEP_WGSL}
+${kvFns(kv)}
 struct P { T: u32, H: u32, Hkv: u32, D: u32, maxSeq: u32, cap: u32, _b: u32, _c: u32 }
 @group(0) @binding(0) var<uniform> p: P;
 @group(0) @binding(1) var<storage, read> st: Step;
 @group(0) @binding(2) var<storage, read> invFreq: array<f32>;
 @group(0) @binding(3) var<storage, read> qkv: array<f32>;
 @group(0) @binding(4) var<storage, read_write> qo: array<f32>;
-@group(0) @binding(5) var<storage, read_write> kc: array<${h ? "u32" : "f32"}>;
-@group(0) @binding(6) var<storage, read_write> vc: array<${h ? "u32" : "f32"}>;
+@group(0) @binding(5) var<storage, read_write> kc: array<${kvStore(kv)}>;
+@group(0) @binding(6) var<storage, read_write> vc: array<${kvStore(kv)}>;
 
 /** Rotated value of element idx (column i of its head) at position pos. */
 fn rot(idx: u32, i: u32, pos: u32) -> f32 {
@@ -3434,7 +3525,19 @@ fn main(${EW_ARGS}) {
   }
   if (pos >= p.maxSeq) { return; }
   let dst = (pos % p.cap) * kn + (c - qn) % kn;
-${h
+${kv === "f8"
+  ? `  // A word holds two pairs: the thread of the first one computes the second as well and writes both.
+  if (dst % 4u != 0u) { return; }
+  var next: vec2<f32>;
+  if (c >= qn + kn) {
+    next = vec2<f32>(qkv[e + 2u], qkv[e + 3u]);
+  } else {
+    let i2 = (c + 2u) % p.D;
+    next = vec2<f32>(rot(e + 2u, i2, pos), rot(e + 3u, i2 + 1u, pos));
+  }
+  let word = fp8pack(vec4<f32>(pair, next));
+  if (c < qn + kn) { kc[dst / 4u] = word; } else { vc[dst / 4u] = word; }`
+  : h
   ? `  let packed = pack2x16float(pair);
   if (c < qn + kn) { kc[dst / 2u] = packed; } else { vc[dst / 2u] = packed; }`
   : `  if (c < qn + kn) { kc[dst] = pair.x; kc[dst + 1u] = pair.y; } else { vc[dst] = pair.x; vc[dst + 1u] = pair.y; }`}

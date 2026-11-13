@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { Ctx, STEP_BYTES, packStep, type Tensor } from "@kiln/core";
 import { dequantQ4, dequantQ8, exactQ4, exactQ8, quantizeQ4, quantizeQ8 } from "@kiln/loader";
 import { CpuBackend, ops, ref } from "../src";
-import { toF16 } from "../src/cpu";
+import { F8, toF16, toF8 } from "../src/cpu";
 import { WasmHeap } from "../src/simd";
 
 let seed = 99;
@@ -103,6 +103,30 @@ describe.each([
     expect(ref.maxAbsDiff(await read(o, T * H * D), want)).toBeLessThan(1e-4);
   });
 
+  it("attention over an f8 ring cache with a sliding window matches the reference", async () => {
+    const [T, H, Hkv, D, maxSeq, slots, window, pos0] = [2, 4, 2, 16, 512, 300, 270, 400];
+    const row = Hkv * D;
+    // Values across the format's range: most near 1, some tiny, some large.
+    const wide = (n: number) => randn(n).map((v, i) => v * (i % 7 === 0 ? 0.01 : i % 11 === 0 ? 40 : 1));
+    const kf = wide(maxSeq * row);
+    const vf = wide(maxSeq * row);
+    const ringK = new Uint32Array((slots * row) / 4);
+    const ringV = new Uint32Array((slots * row) / 4);
+    const word = (f: Float32Array, at: number) => (toF8(f[at]!) | (toF8(f[at + 1]!) << 8) | (toF8(f[at + 2]!) << 16) | (toF8(f[at + 3]!) << 24)) >>> 0;
+    for (let j = 0; j < pos0 + T; j++)
+      for (let e = 0; e < row; e += 4) {
+        const s = ((j % slots) * row + e) / 4;
+        ringK[s] = word(kf, j * row + e);
+        ringV[s] = word(vf, j * row + e);
+      }
+    const q = randn(T * H * D);
+    let o!: Tensor;
+    run(pos0, (ctx) => (o = ops.attention(ctx, upload(q, [T, H * D]), upload(ringK, [0]).buf, upload(ringV, [0]).buf, { T, H, Hkv, D, maxSeq, kv: "f8", window, slots })));
+    const f8 = (v: number) => F8[toF8(v)]!;
+    const want = ref.attentionRef(q, kf.map(f8), vf.map(f8), { T, H, Hkv, D, pos0, window });
+    expect(ref.maxAbsDiff(await read(o, T * H * D), want)).toBeLessThan(1e-3);
+  });
+
   it("samples greedily and feeds the token back", async () => {
     const V = 100;
     const logits = randn(V);
@@ -172,5 +196,40 @@ describe("CPU profiling", () => {
     expect(p.entries[0]!.calls).toBe(4);
     expect(p.totalMs).toBeCloseTo(p.entries[0]!.ms);
     await expect(be.stopProfile()).rejects.toThrow();
+  });
+});
+
+describe("FP8 E4M3 codes", () => {
+  it("decodes every code and encodes it back", () => {
+    for (let c = 0; c < 256; c++) {
+      if ((c & 0x7f) === 0x7f) continue; // NaN in the format: never written
+      expect(toF8(F8[c]!), String(c)).toBe(c);
+    }
+    expect(F8[0x7e]).toBe(448);
+    expect(F8[0x08]).toBe(2 ** -6);
+    expect(F8[0x01]).toBe(2 ** -9);
+    expect(F8[0x38]).toBe(1);
+    expect(F8[0xb8]).toBe(-1);
+  });
+
+  it("rounds to the nearest code, keeps tiny values and clamps large ones", () => {
+    const finite = Array.from(F8).filter((_, c) => (c & 0x7f) !== 0x7f);
+    let s = 7;
+    const rnd = () => ((s = (s * 1103515245 + 12345) >>> 0) / 2 ** 32) * 2 - 1;
+    for (let i = 0; i < 20000; i++) {
+      const x = Math.fround(rnd() * 2 ** Math.floor(rnd() * 12));
+      const got = F8[toF8(x)]!;
+      const best = finite.reduce((m, v) => Math.min(m, Math.abs(v - x)), Infinity);
+      expect(Math.abs(got - x), String(x)).toBeLessThanOrEqual(best * (1 + 1e-6));
+      // A value keeps its sign, and is off by 1 part in 16 at most (less near zero in absolute terms).
+      if (x !== 0) expect(Math.sign(got) === Math.sign(x) || got === 0).toBe(true);
+      if (Math.abs(x) >= 2 ** -6 && Math.abs(x) <= 448) expect(Math.abs(got - x)).toBeLessThanOrEqual(Math.abs(x) / 16 + 1e-9);
+    }
+    expect(F8[toF8(1e6)]).toBe(448);
+    expect(F8[toF8(-1e6)]).toBe(-448);
+    expect(F8[toF8(Infinity)]).toBe(448);
+    expect(F8[toF8(0)]).toBe(0);
+    expect(F8[toF8(0.001)]).toBe(2 ** -9);
+    expect(F8[toF8(0.0005)]).toBe(0);
   });
 });

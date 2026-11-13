@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { physical, type Tensor } from "@kiln/core";
-import { CpuBackend } from "@kiln/kernels";
+import { CpuBackend, toF8 } from "@kiln/kernels";
 import { LlamaModel, type LlamaConfig } from "@kiln/models";
 import { Tokenizer } from "@kiln/tokenizers";
 import { Engine } from "../src/engine";
@@ -101,5 +101,35 @@ describe("Engine.scoreIds", () => {
     await engine.scoreIds([...prompt, 50, 51], [[1]]);
     expect((await engine.scoreIds(prompt, [conts[2]!]))[0]).toBeCloseTo(got[2]!, 5);
     engine.destroy();
+  });
+});
+
+describe("f8 KV cache", () => {
+  it("stores what the f32 cache holds, as FP8 codes, and still predicts the same tokens", async () => {
+    const be = new CpuBackend({ threads: 1 });
+    const prompt = [5, 17, 33, 41, 8, 90, 12, 3, 77, 21, 4, 60];
+    const run = async (kvDtype: "f32" | "f8") => {
+      const m = new LlamaModel(be, CFG, weights(be), { maxSeq: 64, kvDtype });
+      const plan = m.buildPlan(prompt.length);
+      be.write(plan.tokens, 0, Uint32Array.from(prompt));
+      m.setStep({ pos0: 0, lastRow: prompt.length - 1, seed: 0, temperature: 0 });
+      be.submit(plan.dispatches);
+      const logits = new Float32Array(await be.readback(physical(plan.logits.buf), 0, plan.logits.shape[0]! * plan.logits.shape[1]! * 4));
+      const kv = await m.readKv(prompt.length);
+      const rowBytes = m.kvRowBytes;
+      m.destroy();
+      return { logits, kv, rowBytes };
+    };
+    const exact = await run("f32");
+    const small = await run("f8");
+    expect(small.rowBytes * 4).toBe(exact.rowBytes);
+    expect(small.kv.length * 4).toBe(exact.kv.length);
+    // Layer 0's keys and values depend on the tokens only, so its codes are the f32 values' codes.
+    const first = 2 * prompt.length * exact.rowBytes;
+    const f32 = new Float32Array(exact.kv.buffer, exact.kv.byteOffset, first / 4);
+    for (let i = 0; i < f32.length; i++) expect(small.kv[i], String(i)).toBe(toF8(f32[i]!));
+    // A random-weight model is a harsh case (no trained margin between tokens), so only the best token is compared.
+    const best = (l: Float32Array) => l.indexOf(Math.max(...l));
+    expect(best(small.logits)).toBe(best(exact.logits));
   });
 });

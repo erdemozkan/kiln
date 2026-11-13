@@ -371,6 +371,18 @@ How it got there, each step measured in one session with identical greedy output
   saved. The fused graph produces the same 128 greedy tokens as the unfused one.
 - **f16 KV cache** (pairs packed with `pack2x16float`, no `shader-f16` needed): at position 1536,
   21.8 → 18.8 ms per step, split attention 7.6 → 4.9 ms. Same 128 greedy tokens as the f32 cache.
+- **f8 KV cache** (`kvDtype: "f8"`, opt-in): OCP FP8 E4M3 codes, four per u32. Decoding builds the
+  f32's bits with shifts (no exp2 or ldexp, which drivers may round); encoding rounds the f32's own
+  exponent and top mantissa bits. A word is written by one thread, so the writers that work a pair
+  per thread (rope + cache) let the thread of a word's first pair compute the second too. Half of
+  f16's memory. Measured against f32 on a 470-token prompt: answer log-probabilities move by 0.3 to
+  2.7 nats per 10 to 15 token answer (Qwen3-0.6B Q4_K_M, SmolLM2-135M), f16 by 0.02; greedy answers
+  unchanged; decode 16.8 to 17.8 against 18.7 tokens/s (Qwen3-0.6B), level on SmolLM2-135M. The
+  error is relative (about 1.8% rms per value, whatever its size), so large values carry most of
+  it; 8-bit integers with a scale per head row should be about 2.5 times more exact for the same
+  bytes (an estimate; not built), at the price of a second layout in every attention kernel. The rounding also makes the
+  GPU and CPU backends drift apart by as much as either drifts from f32 (their inputs differ in the
+  fifth digit, which flips codes), where with f16 they agree to 0.01 nats. 60 kernel checks cover it.
 - **Memory planner:** liveness-based placement in one pool shared by all plans, plus online-softmax
   prefill attention instead of a [T, heads, maxSeq] f32 score buffer (9 MiB at T = 128 for this model,
   and it grows with context and heads). Intermediates 19.3 → 1.8 MiB. The new attention is also faster:

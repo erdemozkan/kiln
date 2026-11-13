@@ -49,14 +49,48 @@ const F16 = (() => {
   return t;
 })();
 
+// ---- f8 (OCP FP8 E4M3), as the kernels' fp8pack / fp8x4 use it ----
 
-/** Writes elements e and e + 1 (e even) of a cache. */
+/** f32 → FP8 E4M3 code: nearest (ties away from zero), clamped at ±448, subnormals kept. */
+export function toF8(x: number): number {
+  f32v[0] = x;
+  const b = u32v[0]!;
+  const sign = (b >>> 24) & 0x80;
+  // Exponent and top three mantissa bits, rounded on the bit below; 960 = (127 - 7) << 3.
+  const r = ((b & 0x7fffffff) + 0x80000) >>> 20;
+  if (r < 968) return sign | Math.min(8, Math.floor(Math.min(Math.abs(f32v[0]!), 1) * 512 + 0.5));
+  return sign | (Math.min(r, 1086) - 960);
+}
+
+/** FP8 E4M3 code → value. */
+export const F8 = (() => {
+  const t = new Float32Array(256);
+  for (let c = 0; c < 256; c++) {
+    const e = (c >> 3) & 15;
+    const m = c & 7;
+    const v = e === 0 ? m * 2 ** -9 : (8 + m) * 2 ** (e - 10);
+    t[c] = c & 0x80 ? -v : v;
+  }
+  return t;
+})();
+
+/** How a KV cache stores its values (the kernels' KvDtype). */
+type Kv = "f32" | "f16" | "f8";
+
 /**
- * Writes element pairs (e, e + 1) of a cache: packed halves or two floats. The view is taken once,
- * since a heap buffer's view getter is too slow to call per element.
+ * Writes element pairs (e, e + 1; e even) of a cache: two 8-bit codes, packed halves or two floats.
+ * The view is taken once, since a heap buffer's view getter is too slow to call per element.
  */
-function cacheWriter(c: CpuView, f16: boolean): (e: number, a: number, b: number) => void {
-  if (f16) {
+function cacheWriter(c: CpuView, kv: Kv): (e: number, a: number, b: number) => void {
+  if (kv === "f8") {
+    const u = c.u32;
+    return (e, a, b) => {
+      const w = e >>> 2;
+      const shift = (e & 3) * 8;
+      u[w] = ((u[w]! & ~(0xffff << shift)) | ((toF8(a) | (toF8(b) << 8)) << shift)) >>> 0;
+    };
+  }
+  if (kv === "f16") {
     const u = c.u32;
     return (e, a, b) => void (u[e >>> 1] = (toF16(a) | (toF16(b) << 16)) >>> 0);
   }
@@ -321,7 +355,7 @@ export function cpuRope(interleaved: boolean): CpuKernel {
   };
 }
 
-export function cpuKvWrite(f16: boolean): CpuKernel {
+export function cpuKvWrite(f16: Kv): CpuKernel {
   return (b) => {
     const [T, row, maxSeq, cap] = [b[0]!.u32[0]!, b[0]!.u32[1]!, b[0]!.u32[2]!, b[0]!.u32[3]!];
     const { pos0 } = step(b[1]!);
@@ -342,7 +376,7 @@ export function cpuKvWrite(f16: boolean): CpuKernel {
 /** Shared tail of the fused rope + cache-write kernels: q out, rotated k and raw v into the caches. */
 function qkvToCache(
   b: readonly CpuView[],
-  f16: boolean,
+  f16: Kv,
   f: Float32Array,
   interleaved: boolean,
   /** Normalises head hh (at base) into `into` and returns it; undefined rotates the raw values. */
@@ -385,13 +419,13 @@ function qkvToCache(
   }
 }
 
-export function cpuRopeKv(interleaved: boolean, f16: boolean): CpuKernel {
+export function cpuRopeKv(interleaved: boolean, f16: Kv): CpuKernel {
   return (b) => {
     qkvToCache(b, f16, b[2]!.f32, interleaved, undefined, b[4]!.f32, b[5]!, b[6]!);
   };
 }
 
-export function cpuQkNormRopeKv(interleaved: boolean, f16: boolean): CpuKernel {
+export function cpuQkNormRopeKv(interleaved: boolean, f16: Kv): CpuKernel {
   return (b) => {
     const u = b[0]!.u32;
     const [H, D] = [u[1]!, u[3]!];
@@ -423,9 +457,20 @@ export function cpuQkNormRopeKv(interleaved: boolean, f16: boolean): CpuKernel {
 
 /** Causal GQA attention over the cache, with the sliding window and ring slots of ATTN_P. */
 /** Row `e / D` (D values from element e) of a cache, decoded into out. */
-function kvRow(u: Uint32Array, f: Float32Array, e: number, D: number, f16: boolean, out: Float32Array): void {
-  if (!f16) {
+function kvRow(u: Uint32Array, f: Float32Array, e: number, D: number, kv: Kv, out: Float32Array): void {
+  if (kv === "f32") {
     for (let i = 0; i < D; i++) out[i] = f[e + i]!;
+    return;
+  }
+  if (kv === "f8") {
+    // e and D are multiples of 4: whole words, four codes each.
+    for (let i = 0, w = e >>> 2; i < D; i += 4, w++) {
+      const x = u[w]!;
+      out[i] = F8[x & 0xff]!;
+      out[i + 1] = F8[(x >>> 8) & 0xff]!;
+      out[i + 2] = F8[(x >>> 16) & 0xff]!;
+      out[i + 3] = F8[x >>> 24]!;
+    }
     return;
   }
   // e and D are even: whole words, two halves each.
@@ -455,7 +500,8 @@ export function t5Bucket(rel: number, bidirectional: boolean, buckets: number, m
   return ret + Math.min(large, nb - 1);
 }
 
-export function cpuAttention(f16: boolean, rel = false): CpuKernel {
+export function cpuAttention(kv: Kv, rel = false): CpuKernel {
+  const f16 = kv === "f16";
   let scores = new Float32Array(0);
   return (b) => {
     const u = b[0]!.u32;
@@ -467,7 +513,8 @@ export function cpuAttention(f16: boolean, rel = false): CpuKernel {
     const heap = (b[2] as HeapView).heap;
     // T5's position bias is added to each score in TypeScript below (the WASM path takes the max first).
     const table = rel ? b[5]!.f32 : undefined;
-    if (heap && !rel && D % (f16 ? 8 : 4) === 0) {
+    // The WASM kernels read f32 and f16 caches; an f8 cache takes the TypeScript path below.
+    if (heap && !rel && kv !== "f8" && D % (f16 ? 8 : 4) === 0) {
       // The per-key work in WASM SIMD, on the caches in place, for all the query heads of a KV head at
       // once (each cache row read and widened once); masking and the softmax stay here.
       const G = H / Hkv;
@@ -522,7 +569,7 @@ export function cpuAttention(f16: boolean, rel = false): CpuKernel {
         for (let i = 0; i < D; i++) qs[i] = q[qo + i]! * scale;
         let mx = -Infinity;
         for (let j = first; j < n; j++) {
-          kvRow(ku, kf, (j % cap) * stride + kvh * D, D, f16, row);
+          kvRow(ku, kf, (j % cap) * stride + kvh * D, D, kv, row);
           let d = 0;
           for (let i = 0; i < D; i++) d += qs[i]! * row[i]!;
           if (table) d += table[t5Bucket(j - pos, bidir, buckets, maxDist) * H + h]!;
@@ -533,7 +580,7 @@ export function cpuAttention(f16: boolean, rel = false): CpuKernel {
         for (let j = first; j < n; j++) l += scores[j] = Math.exp(scores[j]! - mx);
         acc.fill(0);
         for (let j = first; j < n; j++) {
-          kvRow(vu, vf, (j % cap) * stride + kvh * D, D, f16, row);
+          kvRow(vu, vf, (j % cap) * stride + kvh * D, D, kv, row);
           const p = scores[j]!;
           for (let i = 0; i < D; i++) acc[i]! += p * row[i]!;
         }

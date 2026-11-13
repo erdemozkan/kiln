@@ -64,7 +64,7 @@ export interface LoadOptions {
    * one does not prefill it again. Default 256 MiB; 0 keeps only the live cache.
    */
   prefixCacheBytes?: number;
-  /** KV cache storage, f16 (default) or f32. */
+  /** KV cache storage: f16 (default), f32, or f8 (8-bit floats: half of f16's memory, less exact). */
   kvDtype?: KvDtype;
   /** f16 dot products in matmuls when the GPU has shader-f16 (default false; accumulation stays f32). */
   f16Math?: boolean;

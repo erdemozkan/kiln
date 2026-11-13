@@ -1,6 +1,6 @@
 import { createWebGPUBackend } from "@kiln/backend-webgpu";
 import { Ctx, STEP_BYTES, packStep, type Backend, type Buf, type StepParams, type Tensor } from "@kiln/core";
-import { CpuBackend, gpuConverts, ops, ref, t5Bucket as cpuT5Bucket } from "@kiln/kernels";
+import { CpuBackend, F8, gpuConverts, ops, ref, t5Bucket as cpuT5Bucket, toF8 } from "@kiln/kernels";
 import { dequantQ4, dequantQ8, f16ToF32, MemorySource, quantizeQ4, quantizeQ8, rowBytes, type SrcType } from "@kiln/loader";
 import { loadWeights, setGpuConvert } from "@kiln/runtime";
 
@@ -36,6 +36,19 @@ const packHalf = (a: Float32Array) => {
   return out;
 };
 const unpackHalf = (w: Uint32Array) => f16ToF32(new Uint8Array(w.buffer, w.byteOffset, w.length * 4));
+/** Four FP8 E4M3 codes per word, as an f8 KV cache holds them. */
+const packF8 = (a: Float32Array) => {
+  const out = new Uint32Array(a.length / 4);
+  for (let i = 0; i < out.length; i++) out[i] = (toF8(a[4 * i]!) | (toF8(a[4 * i + 1]!) << 8) | (toF8(a[4 * i + 2]!) << 16) | (toF8(a[4 * i + 3]!) << 24)) >>> 0;
+  return out;
+};
+const unpackF8 = (w: Uint32Array) => Float32Array.from(new Uint8Array(w.buffer, w.byteOffset, w.length * 4), (c) => F8[c]!);
+/** What an f8 cache holds for these values. */
+const asF8 = (a: Float32Array) => unpackF8(packF8(a));
+/** Error of each stored value relative to what was to be stored (to its size, or to the smallest normal step near zero). */
+const f8Error = (got: Float32Array, want: Float32Array) => got.map((g, i) => Math.abs(g - want[i]!) / Math.max(Math.abs(want[i]!), 2 ** -6));
+/** A stored value is at most half a step from the value: 1 part in 16 just above a power of two. */
+const F8_STEP = 1 / 16 + 1e-3;
 
 async function main() {
   // ?backend=cpu checks the CPU backend's TypeScript kernels against the same references.
@@ -106,6 +119,8 @@ async function main() {
     return ctx;
   };
   const check = (kernel: string, name: string, got: Float32Array, want: Float32Array, tol: number) => {
+    // Progress for whoever drives the page: the last check started.
+    (window as unknown as { __kernelProgress: string }).__kernelProgress = `${results.length}: ${kernel} ${name}`;
     // The CPU backend's q4/q8 matmuls take integer dot products with x as int16 per 32-value block
     // (about 2e-5 of the block's largest value per element), so their error also scales with the
     // outputs' size: large in the gated checks, where two outputs of ~60 are multiplied.
@@ -310,6 +325,13 @@ async function main() {
     const words = async (b: Buf, n: number) => new Uint32Array(await be.readback(b, 0, n * 4));
     check("rope_kv/f16", `k cache ${tag}`, unpackHalf(await words(kc16.buf, wantK.length / 2)), wantK, 2e-3);
     check("rope_kv/f16", `v cache ${tag}`, unpackHalf(await words(vc16.buf, wantV.length / 2)), wantV, 2e-3);
+    const kc8 = upload(new Uint32Array((maxSeq * Hkv * D) / 4), [0]);
+    const vc8 = upload(new Uint32Array((maxSeq * Hkv * D) / 4), [0]);
+    await run({ ...S0, pos0 }, (ctx) => ops.ropeKv(ctx, upload(qkv, [T, W]), kc8.buf, vc8.buf, { T, H, Hkv, D, maxSeq, kv: "f8" }, upload(inv, [D / 2]), interleaved));
+    const gotK8 = unpackF8(await words(kc8.buf, wantK.length / 4));
+    check("rope_kv/f8", `k cache ${tag}`, f8Error(gotK8, wantK), new Float32Array(wantK.length), F8_STEP);
+    // v is copied, so its codes are exactly the values' codes.
+    check("rope_kv/f8", `v cache ${tag}`, unpackF8(await words(vc8.buf, wantV.length / 4)), asF8(wantV), 0);
   }
 
   // Per-head q/k norm + RoPE + cache write after a stacked qkv matmul (Qwen3, Gemma 3), including a
@@ -340,15 +362,21 @@ async function main() {
     }
     const tag = `T${T} H${H}/${Hkv} D${D} pos${pos0} slots${slots} ${interleaved ? "interleaved" : "rotate-half"}`;
     const shape = { T, H, Hkv, D, maxSeq, slots };
-    for (const kv of ["f32", "f16"] as const) {
-      const kc = upload(kv === "f16" ? new Uint32Array((slots * row) / 2) : new Float32Array(slots * row), [0]);
-      const vc = upload(kv === "f16" ? new Uint32Array((slots * row) / 2) : new Float32Array(slots * row), [0]);
+    for (const kv of ["f32", "f16", "f8"] as const) {
+      const empty = () => (kv === "f8" ? new Uint32Array((slots * row) / 4) : kv === "f16" ? new Uint32Array((slots * row) / 2) : new Float32Array(slots * row));
+      const kc = upload(empty(), [0]);
+      const vc = upload(empty(), [0]);
       let qo!: Tensor;
       await run({ ...S0, pos0 }, (ctx) => (qo = ops.qkNormRopeKv(ctx, upload(qkv, [T, W]), upload(qw, [D]), upload(kw, [D]), eps, kc.buf, vc.buf, { ...shape, kv }, upload(inv, [D / 2]), interleaved)));
-      const cache = async (b: Buf) => (kv === "f16" ? unpackHalf(new Uint32Array(await be.readback(b, 0, slots * row * 2))) : await download(b, slots * row));
+      const cache = async (b: Buf) => (kv === "f8" ? unpackF8(new Uint32Array(await be.readback(b, 0, slots * row))) : kv === "f16" ? unpackHalf(new Uint32Array(await be.readback(b, 0, slots * row * 2))) : await download(b, slots * row));
       // Normalised values reach about 10 (weights 1 + N(0, 1)), so f32 rounding alone is ~1e-4.
       const tol = kv === "f16" ? 2e-2 : 5e-4;
       check(`qknorm_rope_kv/${kv}`, `q ${tag}`, await download(qo.buf, q.length), wantQ, 5e-4);
+      if (kv === "f8") {
+        check(`qknorm_rope_kv/${kv}`, `k cache ${tag}`, f8Error(await cache(kc.buf), wantK), new Float32Array(wantK.length), F8_STEP);
+        check(`qknorm_rope_kv/${kv}`, `v cache ${tag}`, await cache(vc.buf), asF8(wantV), 0);
+        continue;
+      }
       check(`qknorm_rope_kv/${kv}`, `k cache ${tag}`, await cache(kc.buf), wantK, tol);
       check(`qknorm_rope_kv/${kv}`, `v cache ${tag}`, await cache(vc.buf), wantV, kv === "f16" ? 2e-3 : 0);
     }
@@ -389,6 +417,8 @@ async function main() {
       check("attention", tag, await download(o.buf, q.length), want, 1e-4);
       await run({ ...S0, pos0 }, (ctx) => (o = ops.attention(ctx, upload(q, [T, H * D]), upload(packHalf(kc), [0]).buf, upload(packHalf(vc), [0]).buf, { T, H, Hkv, D, maxSeq, kv: "f16" })));
       check("attention/f16", tag, await download(o.buf, q.length), wantH, 1e-4);
+      await run({ ...S0, pos0 }, (ctx) => (o = ops.attention(ctx, upload(q, [T, H * D]), upload(packF8(kc), [0]).buf, upload(packF8(vc), [0]).buf, { T, H, Hkv, D, maxSeq, kv: "f8" })));
+      check("attention/f8", tag, await download(o.buf, q.length), ref.attentionRef(q, asF8(kc), asF8(vc), { T, H, Hkv, D, pos0 }), 1e-4);
     }
     ops.setPrefillAttention("tiled");
   }
@@ -410,6 +440,8 @@ async function main() {
       check("attention/window", tag, await download(o.buf, q.length), want, 1e-4);
       await run({ ...S0, pos0 }, (ctx) => (o = ops.attention(ctx, upload(q, [T, H * D]), upload(packHalf(kc), [0]).buf, upload(packHalf(vc), [0]).buf, { T, H, Hkv, D, maxSeq, kv: "f16", scale, window })));
       check("attention/window/f16", tag, await download(o.buf, q.length), wantH, 1e-4);
+      await run({ ...S0, pos0 }, (ctx) => (o = ops.attention(ctx, upload(q, [T, H * D]), upload(packF8(kc), [0]).buf, upload(packF8(vc), [0]).buf, { T, H, Hkv, D, maxSeq, kv: "f8", scale, window })));
+      check("attention/window/f8", tag, await download(o.buf, q.length), ref.attentionRef(q, asF8(kc), asF8(vc), { T, H, Hkv, D, pos0, scale, window }), 1e-4);
     }
     ops.setPrefillAttention("tiled");
   }
@@ -486,6 +518,8 @@ async function main() {
       check("attention/ring", tag, await download(o.buf, q.length), want, 1e-4);
       await run({ ...S0, pos0 }, (ctx) => (o = ops.attention(ctx, upload(q, [T, H * D]), upload(packHalf(ring(kc)), [0]).buf, upload(packHalf(ring(vc)), [0]).buf, { ...shape, kv: "f16" })));
       check("attention/ring/f16", tag, await download(o.buf, q.length), wantH, 1e-4);
+      await run({ ...S0, pos0 }, (ctx) => (o = ops.attention(ctx, upload(q, [T, H * D]), upload(packF8(ring(kc)), [0]).buf, upload(packF8(ring(vc)), [0]).buf, { ...shape, kv: "f8" })));
+      check("attention/ring/f8", tag, await download(o.buf, q.length), ref.attentionRef(q, asF8(kc), asF8(vc), { T, H, Hkv, D, pos0, scale, window }), 1e-4);
     }
     ops.setPrefillAttention("tiled");
   }
@@ -527,6 +561,19 @@ async function main() {
     const words = async (b: Buf, n: number) => new Uint32Array(await be.readback(b, 0, n * 4));
     check("kv_write/f16", "k", unpackHalf(await words(kc16.buf, wantK.length / 2)), wantK, 2e-3);
     check("kv_write/f16", "v", unpackHalf(await words(vc16.buf, wantV.length / 2)), wantV, 2e-3);
+    // Values across the format's range: tiny, ordinary, large, past its ±448.
+    const spread = (a: Float32Array) => a.map((x, i) => x * [1, 0.004, 30, 0.02, 900, 1, 0.3, 4][i % 8]!);
+    const [k8, v8] = [spread(k), spread(v)];
+    const kc8 = upload(new Uint32Array((maxSeq * row) / 4), [0]);
+    const vc8 = upload(new Uint32Array((maxSeq * row) / 4), [0]);
+    await run({ ...S0, pos0 }, (ctx) => ops.kvWrite(ctx, upload(k8, [T, row]), upload(v8, [T, row]), kc8.buf, vc8.buf, T, maxSeq, "f8"));
+    const placed = (a: Float32Array) => {
+      const out = new Float32Array(maxSeq * row);
+      out.set(a, pos0 * row);
+      return asF8(out);
+    };
+    check("kv_write/f8", "k", unpackF8(await words(kc8.buf, wantK.length / 4)), placed(k8), 0);
+    check("kv_write/f8", "v", unpackF8(await words(vc8.buf, wantV.length / 4)), placed(v8), 0);
   }
 
   {

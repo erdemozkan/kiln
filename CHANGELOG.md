@@ -66,6 +66,14 @@ kept), and members with `anyOf` are multiplied out. Before, more than one entry 
 single entry dropped the keywords written beside it. What cannot be combined exactly (two different
 patterns) is refused by name.
 
+**8-bit KV cache.** `load(model, { kvDtype: "f8" })` keeps keys and values as 8-bit floats (OCP FP8
+E4M3, four to a word, the format llama.cpp 1.0 added), half the memory of the default f16: within the
+same 512 MiB budget Qwen3-0.6B's default context goes from 4,608 to 8,192 tokens, and the prompt
+cache file halves. It costs some fidelity: log-probabilities of 10 to 15 token answers moved by 0.3
+to 2.7 nats (1 to 5%) on Qwen3-0.6B and SmolLM2-135M, where f16 moves them by 0.02; greedy answers
+to a 470-token question were unchanged on both. Decode speed is within 10% of f16. The default stays
+f16. On the CPU backend an f8 cache takes the TypeScript attention path, not the WASM one.
+
 **Fewer requests on a first download.** The request that downloads a weight file also tells its
 size, so the separate one-byte request that asked for it is gone, and the shards of a split
 safetensors model are opened together instead of one after another.

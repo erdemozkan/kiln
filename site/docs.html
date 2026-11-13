@@ -41,6 +41,7 @@ llm.info; // { family, backend: "webgpu" | "cpu", layers, maxSeq, contextLength,
           <li>Float weights loaded as q4 or q8 are also cached as converted (about a third to a half of the download on top), which roughly halves later loads; <code>weightCache: false</code> keeps only the download.</li>
           <li>Config, tokenizer and file-listing requests are cached as well and checked against the server in the background: a cached model loads offline, and an updated repo shows from the following load on.</li>
           <li>The context defaults to the model's, up to 8,192 tokens and 512 MiB of KV cache; <code>maxSeq</code> sets it.</li>
+          <li><code>kvDtype: "f8"</code> stores the KV cache in 8-bit floats: half the memory of the default (<code>"f16"</code>), so twice the context fits, at a small cost in fidelity. <code>"f32"</code> is exact.</li>
           <li>Without WebGPU, Kiln runs on the CPU (WASM SIMD; multithreaded on a cross-origin isolated page). <code>device: "gpu"</code> fails instead, <code>device: "cpu"</code> forces the CPU.</li>
         </ul>
         <p>Supported language models: Llama, Mistral, Qwen2, Qwen3, SmolLM, Granite 3 and 4, Phi-3 and 3.5 (up to 4096 tokens of context), Gemma 3 (images from 4B up) and SmolVLM.</p>
