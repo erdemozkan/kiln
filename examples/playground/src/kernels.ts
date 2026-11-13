@@ -335,6 +335,70 @@ async function main() {
     check("rope_kv/f8", `v cache ${tag}`, unpackF8(await words(vc8.buf, wantV.length / 4)), asF8(wantV), 0);
   }
 
+  // Qwen 3.5's linear attention: the convolution and the recurrence, in one call and split across
+  // calls (the state they carry must make both the same), with sizes like the model's and smaller.
+  for (const [T, Hk, Hv, Dk, Dv, K, chunks] of [[9, 2, 4, 8, 12, 4, [9]], [9, 2, 4, 8, 12, 4, [1, 2, 1, 5]], [6, 16, 16, 128, 128, 4, [6]], [6, 16, 16, 128, 128, 4, [1, 1, 4]], [40, 4, 4, 64, 96, 3, [40]]] as const) {
+    const keys = 2 * Hk * Dk;
+    const C = keys + Hv * Dv;
+    const x = randn(T * C);
+    const w = randn(C * K);
+    const [a, b, aLog, dt] = [randn(T * Hv).map((v) => v * 3), randn(T * Hv), randn(Hv), randn(Hv)];
+    const wantConv = ref.causalConvRef(x, w, T, C, K);
+    // Queries and keys of the reference: each head of the convolution output at unit length.
+    const qk = new Float32Array(T * keys);
+    for (let t = 0; t < T; t++)
+      for (let hd = 0; hd < keys / Dk; hd++) {
+        let ss = 0;
+        for (let i = 0; i < Dk; i++) ss += wantConv[t * C + hd * Dk + i]! ** 2;
+        for (let i = 0; i < Dk; i++) qk[t * keys + hd * Dk + i] = wantConv[t * C + hd * Dk + i]! / Math.sqrt(ss + 1e-6);
+      }
+    const shape = { keyHeads: Hk, valueHeads: Hv, keyDim: Dk, valueDim: Dv };
+    const want = ref.gatedDeltaRef(qk, wantConv, a, b, aLog, dt, { T, ...shape });
+    const convState = upload(new Float32Array((K - 1) * C), [0]);
+    const state = upload(new Float32Array(Hv * Dv * Dk), [0]);
+    const l2 = upload(new Float32Array(Dk).fill(1 / Math.sqrt(Dk)), [Dk]);
+    const gotConv = new Float32Array(T * C);
+    const got = new Float32Array(T * Hv * Dv);
+    let at = 0;
+    for (const n of chunks) {
+      const rows = (f: Float32Array, width: number) => upload(f.slice(at * width, (at + n) * width), [n, width]);
+      let y!: Tensor;
+      let o!: Tensor;
+      await run(S0, (ctx) => {
+        y = ops.causalConv(ctx, rows(x, C), upload(w, [C, K]), convState.buf);
+        const head = ctx.alloc([n, keys]);
+        ops.cols(ctx, head, y, { n: keys });
+        const unit = ops.rmsnorm(ctx, head, l2, 1e-6 / Dk, Dk);
+        o = ops.gatedDelta(ctx, unit, y, rows(a, Hv), rows(b, Hv), upload(aLog, [Hv]), upload(dt, [Hv]), state.buf, { T: n, ...shape });
+      });
+      gotConv.set(await download(y.buf, n * C), at * C);
+      got.set(await download(o.buf, n * Hv * Dv), at * Hv * Dv);
+      at += n;
+    }
+    const tag = `T${T} heads ${Hk}/${Hv} D${Dk}/${Dv} K${K} in ${chunks.length} call${chunks.length > 1 ? "s" : ""}`;
+    check("causal_conv", tag, gotConv, wantConv, 1e-4);
+    check("gated_delta", tag, got, want, 2e-4);
+  }
+  {
+    const [T, H, D] = [3, 8, 256];
+    const x = randn(T * H * 2 * D);
+    let q!: Tensor;
+    let g!: Tensor;
+    await run(S0, (ctx) => {
+      const xt = upload(x, [T, H * 2 * D]);
+      q = ops.headSlices(ctx, xt, { H, D, blocks: 2, pick: 0 });
+      g = ops.headSlices(ctx, xt, { H, D, blocks: 2, pick: 1 });
+    });
+    const part = (pick: number) => Float32Array.from({ length: T * H * D }, (_, i) => x[(Math.floor(i / D) * 2 + pick) * D + (i % D)]!);
+    check("head_slices", "queries", await download(q.buf, T * H * D), part(0), 0);
+    check("head_slices", "gates", await download(g.buf, T * H * D), part(1), 0);
+    const y = randn(1000);
+    const gate = randn(1000).map((v) => v * 6);
+    const yt = upload(y, [1, 1000]);
+    await run(S0, (ctx) => ops.sigmoidMul(ctx, yt, upload(gate, [1, 1000])));
+    check("sigmoid_mul", "n1000", await download(yt.buf, 1000), y.map((v, i) => v / (1 + Math.exp(-gate[i]!))), 1e-5);
+  }
+
   // Per-head q/k norm + RoPE + cache write after a stacked qkv matmul (Qwen3, Gemma 3), including a
   // ring cache that wraps (positions 13…15 of 14 slots land in 13, 0, 1).
   for (const [T, H, Hkv, D, pos0, maxSeq, slots, interleaved] of [[3, 4, 2, 64, 5, 12, 12, false], [3, 4, 2, 64, 5, 12, 12, true], [2, 8, 4, 256, 9, 32, 32, false], [3, 2, 1, 256, 13, 64, 14, false]] as const) {

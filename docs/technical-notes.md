@@ -534,6 +534,7 @@ Models run end to end (greedy answers to fixed questions checked by hand; tool c
 | `phi3` | Phi-3-mini-4k-instruct (3.8B; recalls a code word 1,700 tokens back) | GGUF q4 (2.3 GB) | 4.1 tok/s |
 | `phi3` | Phi-3.5-mini-instruct (LongRoPE short factors, context capped at 4096; same recall) | GGUF Q4_K_M (2.3 GB) | 4.4 tok/s |
 | `phi3` | Phi-4-mini-instruct (rope on 96 of each head's 128 dimensions; four facts recalled from a 442-token prompt) | GGUF Q4_K_M (2.5 GB) | 4.3 tok/s |
+| `qwen35` | Qwen3.5-0.8B (18 linear-attention layers, 6 gated attention layers; four facts recalled from a 458-token prompt; three chat turns) | safetensors bf16 → q4 (1.75 GB) | 20 to 23 tok/s |
 | `gemma3` | Gemma 3 4B-it (recalls a fact 1,100 and 3,000 tokens back; images) | GGUF Q4_0 (2.4 GB) + mmproj-F16; safetensors (8.6 GB, the vision tower in the same files) | 177–180 ms GPU per step (about 5.5 tok/s); 24.6 tok/s on an M3 |
 | `idefics3` | SmolVLM-256M-Instruct, SmolVLM-500M-Instruct (images in chat) | safetensors | a 640 × 480 photo in about 17 s (13 tiles), 2–4 s without splitting |
 

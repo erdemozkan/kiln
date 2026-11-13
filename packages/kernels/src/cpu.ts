@@ -1526,3 +1526,74 @@ export const cpuChannelApply: CpuKernel = (b) => {
       o[n * C + c] = t;
     }
 };
+
+// ---- Qwen 3.5: gated attention output and linear attention (see the specs in wgsl.ts) ----
+
+export const cpuHeadSlices: CpuKernel = (b) => {
+  const [T, H, D, B, pick] = Array.from(b[0]!.u32.subarray(0, 5)) as [number, number, number, number, number];
+  const [src, dst] = [b[1]!.f32, b[2]!.f32];
+  for (let head = 0; head < T * H; head++) {
+    const from = (head * B + pick) * D;
+    for (let i = 0; i < D; i++) dst[head * D + i] = src[from + i]!;
+  }
+};
+
+export const cpuSigmoidMul: CpuKernel = (b) => {
+  const n = b[0]!.u32[0]!;
+  const [g, x] = [b[1]!.f32, b[2]!.f32];
+  for (let i = 0; i < n; i++) x[i] = x[i]! / (1 + Math.exp(-g[i]!));
+};
+
+export const cpuCausalConv: CpuKernel = (b) => {
+  const [T, C, K] = [b[0]!.u32[0]!, b[0]!.u32[1]!, b[0]!.u32[2]!];
+  const [x, w, state, y] = [b[1]!.f32, b[2]!.f32, b[3]!.f32, b[4]!.f32];
+  const back = K - 1;
+  for (let t = 0; t < T; t++)
+    for (let c = 0; c < C; c++) {
+      let acc = 0;
+      for (let j = 0; j < K; j++) acc += w[c * K + j]! * (t + j >= back ? x[(t + j - back) * C + c]! : state[(t + j) * C + c]!);
+      const s = Math.fround(acc);
+      y[t * C + c] = s / (1 + Math.exp(-s));
+    }
+};
+
+export const cpuCausalConvState: CpuKernel = (b) => {
+  const [T, C, K] = [b[0]!.u32[0]!, b[0]!.u32[1]!, b[0]!.u32[2]!];
+  const [x, state] = [b[1]!.f32, b[2]!.f32];
+  const back = K - 1;
+  for (let c = 0; c < C; c++)
+    for (let r = 0; r < back; r++) state[r * C + c] = T + r >= back ? x[(T + r - back) * C + c]! : state[(T + r) * C + c]!;
+};
+
+export const cpuGatedDelta: CpuKernel = (b) => {
+  const u = b[0]!.u32;
+  const [T, Hv, Hk, Dk, Dv, C, vOff] = [u[0]!, u[1]!, u[2]!, u[3]!, u[4]!, u[5]!, u[6]!];
+  const qScale = b[0]!.f32[7]!;
+  const [qk, conv, a, bb, alog, dt, state, out] = [b[1]!.f32, b[2]!.f32, b[3]!.f32, b[4]!.f32, b[5]!.f32, b[6]!.f32, b[7]!.f32, b[8]!.f32];
+  const qkRow = 2 * Hk * Dk;
+  const group = Hv / Hk;
+  for (let h = 0; h < Hv; h++) {
+    const kh = Math.floor(h / group);
+    const rate = -Math.exp(alog[h]!);
+    for (let t = 0; t < T; t++) {
+      const qb = t * qkRow + kh * Dk;
+      const kb = qb + Hk * Dk;
+      const ax = a[t * Hv + h]! + dt[h]!;
+      const decay = Math.exp(rate * (ax > 20 ? ax : Math.log1p(Math.exp(ax))));
+      const beta = 1 / (1 + Math.exp(-bb[t * Hv + h]!));
+      for (let col = 0; col < Dv; col++) {
+        const sb = (h * Dv + col) * Dk;
+        let mem = 0;
+        for (let i = 0; i < Dk; i++) mem += state[sb + i]! * qk[kb + i]!;
+        const delta = (conv[t * C + vOff + h * Dv + col]! - mem * decay) * beta;
+        let o = 0;
+        for (let i = 0; i < Dk; i++) {
+          const s = Math.fround(state[sb + i]! * decay + qk[kb + i]! * delta);
+          state[sb + i] = s;
+          o += s * qk[qb + i]!;
+        }
+        out[(t * Hv + h) * Dv + col] = o * qScale;
+      }
+    }
+  }
+};

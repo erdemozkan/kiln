@@ -41,7 +41,24 @@ of each attention head and leaves the rest without position. The rope kernels (p
 cache write, and fused with q/k norm) now take the number of rotated elements, from the number of
 frequencies they are given, so Phi-4 mini loads from GGUF and safetensors (GGUF Q4_K_M checked: 4.3
 tokens/s, facts recalled from a 442-token prompt). Qwen 3.5 and Gemma 4 use the same scheme on their
-full-attention layers; they are not supported yet, as each also needs new kinds of layers.
+full-attention layers.
+
+**Qwen 3.5 (text).** The `qwen3_5` family loads from its safetensors repos (Qwen/Qwen3.5-0.8B
+checked; the larger sizes share the code). Three of every four layers are linear attention, a gated
+delta net: a causal convolution over time, then a recurrent state per head, then a gated norm. They
+run in new kernels (`causal_conv`, `gated_delta`, `head_slices`, `sigmoid_mul`) on the GPU and the
+CPU; the others are attention with q/k norm, rotary on the first quarter of each head, and a gate
+on the output that `q_proj` computes beside the query. The 0.8B model answers correctly at 20 to 23
+tokens/s and reads a prompt at 120 to 150 tokens/s; a cached load takes 5.7 s.
+
+A recurrent state cannot be cut back to an earlier position the way keys and values can, so the
+engine keeps snapshots of it (with the attention layers' keys and values) after each prompt and 16
+tokens before its end, up to 256 MiB of them, and a call resumes from the longest one its prompt
+starts with: a follow-up chat turn reused 425 of 463 tokens. For these models the prefix store,
+speculative decoding, the prompt cache file and LoRA adapters are off, and prefill runs in exact
+sizes (padding rows would enter the state). Not yet: GGUF files, images, and the larger sizes on a
+real run. With 4-bit weights the 0.8B model makes slips it does not make with `quant: "q8"` (17 + 26
+came out as 33).
 
 **Hardening against hostile model repos.** Three ways a crafted repo could freeze the tab are closed.
 The check on regexes from `tokenizer.json` and adapter configs now also refuses patterns that are

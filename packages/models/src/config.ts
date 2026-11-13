@@ -1,6 +1,6 @@
 /** Normalised config for every Llama-shaped decoder (Llama 2/3, Mistral, Qwen2/2.5, Qwen3, SmolLM, Granite, Gemma 3, Phi-3). */
 export interface LlamaConfig {
-  family: "llama" | "qwen2" | "qwen3" | "gemma3" | "phi3";
+  family: "llama" | "qwen2" | "qwen3" | "qwen35" | "gemma3" | "phi3";
   hiddenSize: number;
   intermediateSize: number;
   numLayers: number;
@@ -36,6 +36,14 @@ export interface LlamaConfig {
   qkNorm: boolean;
   eosTokenIds: number[];
   bosTokenId?: number;
+  /**
+   * Qwen 3.5: the layers that mix tokens with linear attention (a gated delta net: a causal
+   * convolution, then a recurrent state per head) where the others use attention, and its sizes.
+   */
+  linearLayers?: boolean[];
+  linear?: LinearAttentionConfig;
+  /** Qwen 3.5: q_proj computes a gate beside each head's query; the attention output is multiplied by its sigmoid. */
+  attnOutputGate?: boolean;
   /** Gated MLP activation (default silu). */
   activation?: "silu" | "gelu";
   /** Embeddings are multiplied by this (Gemma: sqrt(hidden), rounded to the checkpoint's dtype). */
@@ -68,6 +76,17 @@ export interface LlamaConfig {
 
 const optNum = (v: unknown): number | undefined => (typeof v === "number" && v > 0 ? v : typeof v === "bigint" && v > 0n ? Number(v) : undefined);
 
+/** Sizes of a linear-attention (gated delta net) layer. */
+export interface LinearAttentionConfig {
+  /** Heads of the queries and keys, and of the values (a multiple of the former: each key head serves that many value heads). */
+  keyHeads: number;
+  valueHeads: number;
+  keyDim: number;
+  valueDim: number;
+  /** Taps of the causal depthwise convolution over time. */
+  convKernel: number;
+}
+
 export interface Llama3RopeScaling {
   factor: number;
   lowFreqFactor: number;
@@ -80,7 +99,7 @@ export class UnsupportedModelError extends Error {}
 /** The tensor a phi3 GGUF keeps LongRoPE's short factors in. */
 export const PHI3_ROPE_SHORT = "rope_factors_short.weight";
 
-const SUPPORTED = ["llama", "mistral", "qwen2", "qwen3", "granite", "granitemoehybrid", "gemma3_text", "phi3"];
+const SUPPORTED = ["llama", "mistral", "qwen2", "qwen3", "qwen3_5_text", "granite", "granitemoehybrid", "gemma3_text", "phi3"];
 
 type HFConfig = Record<string, unknown>;
 /**
@@ -104,6 +123,11 @@ const SIZE_LIMITS: Record<string, number> = {
   "attention.head_count": 1024,
   "attention.head_count_kv": 1024,
   "attention.key_length": 4096,
+  linear_num_key_heads: 1024,
+  linear_num_value_heads: 1024,
+  linear_key_head_dim: 256,
+  linear_value_head_dim: 256,
+  linear_conv_kernel_dim: 16,
 };
 
 /**
@@ -167,12 +191,18 @@ export function configFromHF(c: HFConfig, generation?: HFConfig): LlamaConfig {
     const eos = [...ids(c.eos_token_id), ...ids(text.eos_token_id)];
     return gemma3({ ...GEMMA3_DEFAULTS, torch_dtype: c.torch_dtype, ...text, eos_token_id: eos, bos_token_id: text.bos_token_id ?? c.bos_token_id }, generation);
   }
+  if (type === "qwen3_5") {
+    // The multimodal checkpoint (every Qwen 3.5 is one): run its language model, ignore the vision tower.
+    const text = c.text_config as HFConfig | undefined;
+    if (!text) throw new UnsupportedModelError('model_type "qwen3_5" without a text_config');
+    return configFromHF({ ...text, model_type: "qwen3_5_text", eos_token_id: [...ids(c.eos_token_id), ...ids(text.eos_token_id)], tie_word_embeddings: text.tie_word_embeddings ?? c.tie_word_embeddings }, generation);
+  }
   if (!SUPPORTED.includes(type)) {
     throw new UnsupportedModelError(`model_type "${type}" is not supported yet (supported: ${SUPPORTED.join(", ")})`);
   }
   const numHeads = num(c, "num_attention_heads");
   const hiddenSize = num(c, "hidden_size");
-  const family = type === "qwen2" ? "qwen2" : type === "qwen3" ? "qwen3" : type === "gemma3_text" ? "gemma3" : type === "phi3" ? "phi3" : "llama";
+  const family = type === "qwen2" ? "qwen2" : type === "qwen3" ? "qwen3" : type === "qwen3_5_text" ? "qwen35" : type === "gemma3_text" ? "gemma3" : type === "phi3" ? "phi3" : "llama";
   if (family === "gemma3") return gemma3({ ...GEMMA3_DEFAULTS, ...c }, generation);
   const base: LlamaConfig = {
     family,
@@ -189,13 +219,48 @@ export function configFromHF(c: HFConfig, generation?: HFConfig): LlamaConfig {
     ropeInterleaved: false,
     tieEmbeddings: Boolean(c.tie_word_embeddings ?? false),
     attentionBias: family === "qwen2" ? true : Boolean(c.attention_bias ?? false),
-    qkNorm: family === "qwen3",
+    qkNorm: family === "qwen3" || family === "qwen35",
     eosTokenIds: [...new Set([...ids(c.eos_token_id), ...ids(generation?.eos_token_id)])],
     bosTokenId: typeof c.bos_token_id === "number" ? c.bos_token_id : undefined,
     contextLength: optNum(c.max_position_embeddings),
   };
   if (type === "phi3") return phi3(c, base);
+  if (family === "qwen35") return qwen35(c, base);
   return type === "granite" || type === "granitemoehybrid" ? granite(c, base) : base;
+}
+
+/**
+ * Qwen 3.5's language model: most layers are linear attention (`linearLayers`), every fourth is
+ * attention with a gated output, q/k norms and rotary on the first quarter of each head. Text
+ * positions are the same on all three axes of its multimodal rotary, which is then plain rotary.
+ */
+function qwen35(c: HFConfig, base: LlamaConfig): LlamaConfig {
+  const types = c.layer_types;
+  if (!Array.isArray(types) || types.length !== base.numLayers || !types.every((t) => t === "linear_attention" || t === "full_attention")) {
+    throw new UnsupportedModelError("qwen3_5: layer_types must name every layer as linear_attention or full_attention");
+  }
+  if (Array.isArray(c.mlp_only_layers) && c.mlp_only_layers.length) throw new UnsupportedModelError("qwen3_5 with mlp_only_layers is not supported yet");
+  const rope = (c.rope_parameters ?? {}) as HFConfig;
+  if ((rope.rope_type ?? "default") !== "default") throw new UnsupportedModelError(`qwen3_5 rope_type "${String(rope.rope_type)}" is not supported yet`);
+  const factor = typeof rope.partial_rotary_factor === "number" ? rope.partial_rotary_factor : 1;
+  const linear: LinearAttentionConfig = {
+    keyHeads: num(c, "linear_num_key_heads"),
+    valueHeads: num(c, "linear_num_value_heads"),
+    keyDim: num(c, "linear_key_head_dim"),
+    valueDim: num(c, "linear_value_head_dim"),
+    convKernel: num(c, "linear_conv_kernel_dim"),
+  };
+  if (linear.valueHeads % linear.keyHeads !== 0) throw new UnsupportedModelError("qwen3_5: value heads must be a multiple of key heads");
+  // The kernels take a head of at most 256, in whole vec4s, and at least two taps.
+  if (linear.keyDim % 4 !== 0 || linear.valueDim % 4 !== 0 || linear.convKernel < 2) throw new UnsupportedModelError("qwen3_5: these linear attention sizes are not supported");
+  return {
+    ...base,
+    ropeTheta: typeof rope.rope_theta === "number" ? configNumber("rope_theta", rope.rope_theta) : base.ropeTheta,
+    ...(factor !== 1 ? { rotaryDims: partialRotary(base.headDim, Math.floor(base.headDim * factor)) } : {}),
+    linearLayers: types.map((t) => t === "linear_attention"),
+    linear,
+    attnOutputGate: c.attn_output_gate !== false,
+  };
 }
 
 /**

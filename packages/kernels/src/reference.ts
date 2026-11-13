@@ -120,3 +120,58 @@ export function maxAbsDiff(a: Float32Array, b: Float32Array): number {
   for (let i = 0; i < a.length; i++) m = Math.max(m, Math.abs(a[i]! - b[i]!));
   return m;
 }
+
+/** Causal depthwise convolution with SiLU over x [T, C], weights [C, K], zeros before the first row (F.conv1d with padding K − 1, cut to T). */
+export function causalConvRef(x: Float32Array, w: Float32Array, T: number, C: number, K: number): Float32Array {
+  const y = new Float32Array(T * C);
+  for (let t = 0; t < T; t++)
+    for (let c = 0; c < C; c++) {
+      let acc = 0;
+      for (let j = 0; j < K; j++) if (t + j - (K - 1) >= 0) acc += w[c * K + j]! * x[(t + j - (K - 1)) * C + c]!;
+      y[t * C + c] = acc / (1 + Math.exp(-acc));
+    }
+  return y;
+}
+
+/**
+ * Linear attention's gated delta rule as transformers' torch_recurrent_gated_delta_rule runs it, one
+ * head at a time with its state [Dk, Dv]. qk [T, 2·Hk·Dk] (queries then keys, normalised), values in
+ * the last Hv·Dv columns of conv [T, C], a and b [T, Hv]. Returns [T, Hv·Dv].
+ */
+export function gatedDeltaRef(
+  qk: Float32Array,
+  conv: Float32Array,
+  a: Float32Array,
+  b: Float32Array,
+  aLog: Float32Array,
+  dt: Float32Array,
+  s: { T: number; keyHeads: number; valueHeads: number; keyDim: number; valueDim: number },
+): Float32Array {
+  const { T, keyHeads: Hk, valueHeads: Hv, keyDim: Dk, valueDim: Dv } = s;
+  const keys = 2 * Hk * Dk;
+  const C = keys + Hv * Dv;
+  const out = new Float32Array(T * Hv * Dv);
+  for (let h = 0; h < Hv; h++) {
+    const kh = Math.floor(h / (Hv / Hk));
+    const S = Array.from({ length: Dk }, () => new Float64Array(Dv));
+    for (let t = 0; t < T; t++) {
+      const q = Array.from({ length: Dk }, (_, i) => qk[t * keys + kh * Dk + i]! / Math.sqrt(Dk));
+      const k = Array.from({ length: Dk }, (_, i) => qk[t * keys + Hk * Dk + kh * Dk + i]!);
+      const g = -Math.exp(aLog[h]!) * Math.log1p(Math.exp(a[t * Hv + h]! + dt[h]!));
+      const beta = 1 / (1 + Math.exp(-b[t * Hv + h]!));
+      for (const row of S) for (let j = 0; j < Dv; j++) row[j]! *= Math.exp(g);
+      for (let j = 0; j < Dv; j++) {
+        let mem = 0;
+        for (let i = 0; i < Dk; i++) mem += S[i]![j]! * k[i]!;
+        const delta = (conv[t * C + keys + h * Dv + j]! - mem) * beta;
+        let o = 0;
+        for (let i = 0; i < Dk; i++) {
+          S[i]![j]! += k[i]! * delta;
+          o += S[i]![j]! * q[i]!;
+        }
+        out[(t * Hv + h) * Dv + j] = o;
+      }
+    }
+  }
+  return out;
+}

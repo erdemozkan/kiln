@@ -151,6 +151,9 @@ const MIN_SAVED_TOKENS = 32;
 /** Prefill buckets. Prompts longer than the largest bucket are prefilled in chunks. */
 const BUCKETS = [16, 64, 128];
 
+/** Tokens before a prompt's end at which a recurrent model is snapshotted as well (see `decodeIds`). */
+const RESUME_TAIL = 16;
+
 export class Engine {
   readonly chatFormat: ChatFormat | undefined;
   lastStats: GenerateStats | undefined;
@@ -190,6 +193,64 @@ export class Engine {
    * live cache or a saved one, shares the most tokens with its prompt; the live cache is saved first
    * when a call would overwrite it. Continuing one conversation saves nothing.
    */
+  /**
+   * Recurrent models (Qwen 3.5's linear-attention layers): snapshots after a token prefix, newest
+   * last. Each holds the recurrent state and the attention layers' keys and values up to there. A
+   * call can only start from one of these (or from nothing): the state cannot be cut back to an
+   * arbitrary position the way keys and values can.
+   */
+  private states: { tokens: number[]; state: Buf[]; kv: Buf[]; bytes: number }[] = [];
+
+  /** GPU bytes the snapshots may take together; the newest is kept whatever its size. */
+  private static readonly STATE_BUDGET = 256 * 2 ** 20;
+
+  /**
+   * Puts the model where a call over `ids` can resume: at the longest snapshot whose tokens start
+   * `ids` and that is no longer than `max`, or at the empty state. `live` is how many positions of
+   * the cache still hold this sequence's keys and values; a snapshot past it brings its own back.
+   * Returns the position to prefill from.
+   */
+  private rewind(ids: readonly number[], live: number, max: number): number {
+    let best: (typeof this.states)[number] | undefined;
+    for (const s of this.states) {
+      const n = s.tokens.length;
+      if (n > max || n <= (best?.tokens.length ?? 0)) continue;
+      if (s.tokens.every((t, i) => t === ids[i])) best = s;
+    }
+    if (!best) {
+      this.model.resetState();
+      return 0;
+    }
+    const n = best.tokens.length;
+    this.model.restoreState(best.state);
+    if (n > live) {
+      this.model.restoreKv(n, best.kv);
+      this.written = n;
+    }
+    // Most recently used last.
+    this.states = [...this.states.filter((s) => s !== best), best];
+    return n;
+  }
+
+  /** Snapshots the model, whose recurrent state must be the state after exactly `tokens`. */
+  private checkpoint(tokens: readonly number[]): void {
+    const same = this.states.findIndex((s) => s.tokens.length === tokens.length && s.tokens.every((t, i) => t === tokens[i]));
+    if (same >= 0) this.dropState(same);
+    const n = tokens.length;
+    const bytes = this.model.stateBytes + this.model.kvSnapshotBytes(n);
+    let total = this.states.reduce((sum, s) => sum + s.bytes, bytes);
+    while (this.states.length && total > Engine.STATE_BUDGET) {
+      total -= this.states[0]!.bytes;
+      this.dropState(0);
+    }
+    this.states.push({ tokens: [...tokens], state: this.model.saveState(), kv: this.model.saveKv(n), bytes });
+  }
+
+  private dropState(i: number): void {
+    const s = this.states.splice(i, 1)[0];
+    for (const b of [...(s?.state ?? []), ...(s?.kv ?? [])]) this.backend.free(b);
+  }
+
   private readonly prefixes = new PrefixStore<Buf[]>(256 * 2 ** 20, (bufs) => bufs.forEach((b) => this.backend.free(b)));
 
   get prefixCacheBytes(): number {
@@ -407,6 +468,8 @@ export class Engine {
     let start = 0;
     while (start < this.cached.length && start < prefix.length && this.cached[start] === prefix[start]) start++;
     if (start < this.model.minReuseStart(this.written)) start = 0;
+    const recurrent = this.model.recurrent;
+    if (recurrent) start = this.rewind(prefix, start, prefix.length);
     if (start < this.cached.length) this.saveLive();
     this.cached = [];
     this.busy = true;
@@ -418,7 +481,8 @@ export class Engine {
       while (pos < prefix.length) {
         const remaining = prefix.length - pos;
         const top = BUCKETS[BUCKETS.length - 1]!;
-        const T = this.backend.name === "cpu" ? Math.min(remaining, top) : (BUCKETS.find((b) => b >= remaining) ?? top);
+        // A recurrent state would take padding rows for tokens: exact sizes only.
+        const T = this.backend.name === "cpu" || recurrent ? Math.min(remaining, top) : (BUCKETS.find((b) => b >= remaining) ?? top);
         const k = Math.min(T, remaining);
         const plan = this.plan(T);
         const tokens = new Uint32Array(T);
@@ -432,9 +496,13 @@ export class Engine {
       // buffer, read back once at the end (4 bytes per token instead of a vocabulary-wide row).
       const total = conts.reduce((a, c) => a + c.length, 0);
       const all = this.backend.alloc(total * 4, "storage", "engine/scores");
+      // Every continuation starts from the state after the prefix, which each one moves on.
+      if (recurrent) this.checkpoint(prefix);
+      const afterPrefix = recurrent ? this.states.at(-1)!.state : undefined;
       try {
         let at = 0;
         for (const c of conts) {
+          if (afterPrefix && at > 0) this.model.restoreState(afterPrefix);
           const T = c.length;
           longest = Math.max(longest, T);
           const plan = this.verifyPlan(T);
@@ -516,7 +584,9 @@ export class Engine {
     const stop = new Set([...this.stopIds, ...(opts.stopTokenIds ?? [])]);
     const t0 = performance.now();
     const grammar = opts.format ? this.matcher(opts.format, [...stop]) : undefined;
-    const draftTokens = sampling.repetitionPenalty !== 1 ? 0 : Math.min(MAX_VERIFY_ROWS - 1, Math.max(0, Math.floor(opts.draftTokens ?? (this.backend.name === "cpu" ? 0 : 7))));
+    // Drafts are checked by running them and discarding what was wrong, which a recurrent state cannot undo.
+    const recurrent = this.model.recurrent;
+    const draftTokens = sampling.repetitionPenalty !== 1 || recurrent ? 0 : Math.min(MAX_VERIFY_ROWS - 1, Math.max(0, Math.floor(opts.draftTokens ?? (this.backend.name === "cpu" ? 0 : 7))));
     this.busy = true;
     this.lastStopId = undefined;
     // Reuse the shared prefix, but always prefill at least the last prompt token to get its logits.
@@ -529,7 +599,11 @@ export class Engine {
       // further back would read overwritten keys, so the prompt is prefilled from the start instead.
       if (start < this.model.minReuseStart(this.written)) start = 0;
     }
-    const saved = reuse ? this.prefixes.best(promptIds, start, (w) => this.model.minReuseStart(w)) : undefined;
+    if (recurrent) {
+      if (reuse) start = this.rewind(promptIds, start, promptIds.length - 1);
+      else this.model.resetState();
+    }
+    const saved = reuse && !recurrent ? this.prefixes.best(promptIds, start, (w) => this.model.minReuseStart(w)) : undefined;
     // The live cache is about to be overwritten past `start` (or replaced): keep it for later calls.
     if (saved || start < this.cached.length) this.saveLive();
     if (saved) {
@@ -561,7 +635,12 @@ export class Engine {
       let pos = start;
       let out = this.plan(1).out;
       let prefillUnits = 0;
+      // A recurrent model is also snapshotted a little before the prompt's end: the next turn's prompt
+      // repeats this one only up to the template's last tokens (an empty thinking block after the
+      // assistant header, say, which the history then leaves out), and can resume no later than that.
+      const early = recurrent ? promptIds.length - RESUME_TAIL : -1;
       while (pos < promptIds.length) {
+        if (pos === early && pos > start) this.checkpoint(promptIds.slice(0, pos));
         const span = spans.find(([, hi]) => hi > pos);
         let T: number;
         let n: number;
@@ -571,11 +650,12 @@ export class Engine {
           T = n = span[1] - pos;
           bidi = { spanLo: span[0], spanHi: span[1] };
         } else {
-          const remaining = (span ? span[0] : promptIds.length) - pos;
+          const remaining = (span ? span[0] : pos < early ? early : promptIds.length) - pos;
           const top = BUCKETS[BUCKETS.length - 1]!;
           // Padding rows are nearly free on a GPU, which reuses a few plan sizes, but cost their full
           // work on the CPU, which builds a plan of the exact size instead.
-          T = this.backend.name === "cpu" ? Math.min(remaining, top) : (BUCKETS.find((b) => b >= remaining) ?? top);
+          // A recurrent state would take padding rows for tokens: exact sizes only.
+          T = this.backend.name === "cpu" || recurrent ? Math.min(remaining, top) : (BUCKETS.find((b) => b >= remaining) ?? top);
           n = Math.min(T, remaining);
         }
         const plan = this.plan(T);
@@ -588,6 +668,9 @@ export class Engine {
         pos += n;
         out = plan.out;
       }
+      // The state after the prompt: where the next turn, which repeats this prompt and goes on, resumes.
+      // (After the reply it has run past the last token kept, since decode steps are queued ahead.)
+      if (recurrent) this.checkpoint(promptIds);
 
       if (draftTokens > 0) {
         spoken = [...promptIds];
@@ -947,6 +1030,8 @@ export class Engine {
   /** Loads a snapshot from `exportCache`; returns false (and changes nothing) if it does not fit this model. */
   importCache(s: CacheSnapshot): boolean {
     const m = this.model;
+    // A snapshot holds keys and values only: not enough to resume a recurrent model.
+    if (m.recurrent) return false;
     if (this.busy || s.kvDtype !== m.kvDtype || s.layers !== m.cfg.numLayers || s.rowBytes !== m.kvRowBytes || s.tokens.length >= m.maxSeq) return false;
     if (s.data.length !== m.kvSnapshotBytes(s.tokens.length)) return false;
     m.writeKv(s.tokens.length, s.data);
@@ -962,6 +1047,7 @@ export class Engine {
    * `adapter` picks it). Its projections must match this model's shapes.
    */
   async loadAdapter(name: string, id: string, opts: { revision?: string; endpoint?: string } = {}): Promise<{ name: string; id: string; rank: number; modules: string[]; base?: string }> {
+    if (this.model.recurrent) throw new Error("adapters are not supported for models with linear-attention layers yet");
     const a = await loadLoraAdapter(id, opts);
     const c = this.model.cfg;
     for (const key of a.weights.keys()) if (Number(key.split(".")[0]) >= c.numLayers) throw new Error(`${id} adapts layer ${key.split(".")[0]}, but this model has ${c.numLayers} layers (another base model?)`);
@@ -1056,7 +1142,8 @@ export class Engine {
   /** Saves the live cache's K/V (GPU to GPU) unless it is short or already saved. */
   private saveLive(): void {
     const n = this.cached.length;
-    if (n < MIN_SAVED_TOKENS || this.prefixes.budget <= 0) return;
+    // Keys and values alone do not restore a recurrent model: its snapshots are kept in `states`.
+    if (n < MIN_SAVED_TOKENS || this.prefixes.budget <= 0 || this.model.recurrent) return;
     this.prefixes.add(this.cached, this.written, this.model.kvSnapshotBytes(n), () => this.model.saveKv(n));
   }
 
@@ -1076,6 +1163,7 @@ export class Engine {
     for (const p of this.prepared.values()) this.model.freeLoraBuffers(p);
     this.prepared.clear();
     this.prefixes.clear();
+    while (this.states.length) this.dropState(0);
     for (const p of this.plans.values()) p.destroy();
     for (const p of this.verifyPlans.values()) p.destroy();
     for (const p of this.scorePlans.values()) p.destroy();

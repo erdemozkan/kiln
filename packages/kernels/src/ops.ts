@@ -32,6 +32,11 @@ import {
   relAttentionSpec,
   gatedTanhSpec,
   colsSpec,
+  headSlicesSpec,
+  sigmoidMulSpec,
+  causalConvSpec,
+  causalConvStateSpec,
+  gatedDeltaSpec,
   pixelShuffleSpec,
   swinAttentionSpec,
   swinV1AttentionSpec,
@@ -863,4 +868,63 @@ export function logprobRows(ctx: Ctx, logits: Tensor, targets: Buf, out: Buf): v
 /** GPU-side step advance: tokens[0] = sampled, history[step.n++] = sampled, mark seen, pos0 += lastRow + 1. */
 export function advance(ctx: Ctx, sampled: Buf, tokens: Buf, history: Buf, seen: Buf): void {
   ctx.run(advanceSpec(), [ctx.step, sampled, tokens, history, seen], [1, 1, 1]);
+}
+
+/** Block `pick` of every head of x [T, H·B·D] (each head laid out as B blocks of D): [T, H·D]. See `headSlicesSpec`. */
+export function headSlices(ctx: Ctx, x: Tensor, o: { H: number; D: number; blocks: number; pick: number }): Tensor {
+  const row = o.H * o.blocks * o.D;
+  if (lastDim(x) !== row || o.pick >= o.blocks) throw new Error(`headSlices: rows of ${lastDim(x)} are not ${o.H} heads of ${o.blocks} × ${o.D}`);
+  const T = numel(x.shape) / row;
+  const y = ctx.alloc([T, o.H * o.D]);
+  ctx.run(headSlicesSpec(), [ctx.uniform([T, o.H, o.D, o.blocks, o.pick, 0, 0, 0].map(u32)), x.buf, y.buf], grid1d(T * o.H * o.D));
+  return y;
+}
+
+/** x *= sigmoid(gate), in place. */
+export function sigmoidMul(ctx: Ctx, x: Tensor, gate: Tensor): void {
+  const n = numel(x.shape);
+  if (numel(gate.shape) !== n) throw new Error(`sigmoidMul: gate [${gate.shape}] does not match [${x.shape}]`);
+  ctx.run(sigmoidMulSpec(), [ctx.uniform([u32(n), u32(0), u32(0), u32(0)]), gate.buf, x.buf], grid1d(n));
+}
+
+/**
+ * Causal depthwise convolution over time with SiLU on x [T, C], weights w [C, K], carrying `state`
+ * ([K − 1, C]: the input rows before this call) across calls: returns y [T, C] and moves the state on.
+ */
+export function causalConv(ctx: Ctx, x: Tensor, w: Tensor, state: Buf): Tensor {
+  const C = lastDim(x);
+  const T = numel(x.shape) / C;
+  const K = numel(w.shape) / C;
+  if (!Number.isInteger(K) || K < 2) throw new Error(`causalConv: weights [${w.shape}] do not fit ${C} channels`);
+  const y = ctx.alloc([T, C]);
+  const params = ctx.uniform([u32(T), u32(C), u32(K), u32(0)]);
+  ctx.run(causalConvSpec(), [params, x.buf, w.buf, state, y.buf], grid1d(T * C));
+  ctx.run(causalConvStateSpec(), [params, x.buf, state], grid1d(C));
+  return y;
+}
+
+/** Sizes of linear attention's recurrence (see `gatedDeltaSpec`). */
+export interface GatedDeltaShape {
+  T: number;
+  keyHeads: number;
+  valueHeads: number;
+  keyDim: number;
+  valueDim: number;
+}
+
+/**
+ * Linear attention's gated delta rule over T tokens (see `gatedDeltaSpec`): qk [T, 2·Hk·Dk] holds the
+ * normalised queries then keys, conv [T, C] the convolution output whose last Hv·Dv columns are the
+ * values, a and b [T, Hv] the decay and write projections. `state` ([Hv, Dv, Dk]) is carried across
+ * calls. Returns [T, Hv·Dv].
+ */
+export function gatedDelta(ctx: Ctx, qk: Tensor, conv: Tensor, a: Tensor, b: Tensor, aLog: Tensor, dtBias: Tensor, state: Buf, s: GatedDeltaShape): Tensor {
+  const C = lastDim(conv);
+  const vOff = 2 * s.keyHeads * s.keyDim;
+  if (C !== vOff + s.valueHeads * s.valueDim || lastDim(qk) !== vOff) throw new Error(`gatedDelta: rows of ${C} and ${lastDim(qk)} do not fit the heads`);
+  if (numel(aLog.shape) !== s.valueHeads || numel(dtBias.shape) !== s.valueHeads) throw new Error("gatedDelta: one A_log and dt_bias per value head");
+  const out = ctx.alloc([s.T, s.valueHeads * s.valueDim]);
+  const params = ctx.uniform([u32(s.T), u32(s.valueHeads), u32(s.keyHeads), u32(s.keyDim), u32(s.valueDim), u32(C), u32(vOff), f32(1 / Math.sqrt(s.keyDim))]);
+  ctx.run(gatedDeltaSpec(s.keyDim), [params, qk.buf, conv.buf, a.buf, b.buf, aLog.buf, dtBias.buf, state, out.buf], [Math.ceil(s.valueDim / 64), s.valueHeads, 1]);
+  return out;
 }

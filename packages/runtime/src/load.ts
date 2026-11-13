@@ -544,9 +544,15 @@ async function openSafetensors(ref: ModelRef, endpoint?: string): Promise<{ cfg:
   if (idefics3 && !textConfig) throw new UnsupportedModelError('model_type "idefics3" without a text_config');
   const cfg = configFromHF(textConfig ?? config!, generation);
   // Gemma's RMSNorm scales by (1 + w); folding the 1 in at load keeps one norm kernel for every family.
-  const transform = cfg.family === "gemma3" ? (name: string, v: Float32Array) => (name.endsWith("norm.weight") ? addOne(v) : undefined) : undefined;
+  // Qwen 3.5's norms do the same, except the one inside linear attention, whose weight is used as it is.
+  const transform =
+    cfg.family === "gemma3"
+      ? (name: string, v: Float32Array) => (name.endsWith("norm.weight") ? addOne(v) : undefined)
+      : cfg.family === "qwen35"
+        ? (name: string, v: Float32Array) => (name.endsWith("norm.weight") && !name.includes("linear_attn") ? addOne(v) : undefined)
+        : undefined;
   // Multimodal Gemma 3 (4B and up): load the language model's weights under their text names, skip the rest.
-  const rename = config!.model_type === "gemma3" ? multimodalTextName : config!.model_type === "granitemoehybrid" ? graniteName : config!.model_type === "phi3" ? phi3Name : idefics3 ? idefics3TextName : undefined;
+  const rename = config!.model_type === "gemma3" || config!.model_type === "qwen3_5" ? multimodalTextName : config!.model_type === "granitemoehybrid" ? graniteName : config!.model_type === "phi3" ? phi3Name : idefics3 ? idefics3TextName : undefined;
   const scale = cfg.residualScale !== undefined || cfg.logitScale !== undefined ? (name: string) => weightScale(cfg, name) : undefined;
   // Shards are opened together: each open is a request (and a header to read) on a first load.
   const opened = await Promise.allSettled(names.map((name) => openParsed(ref, name, endpoint, readSafetensorsHeader)));

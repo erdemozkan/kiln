@@ -285,3 +285,117 @@ describe("partial rotary (CPU)", () => {
     expect(() => run(0, (ctx) => ops.rope(ctx, x, 1, 1, 16, upload(randn(9), [9]), false))).toThrow(/do not fit a head of 16/);
   });
 });
+
+describe("linear attention kernels (CPU)", () => {
+  const be = new CpuBackend({ simd: false });
+  const step = be.alloc(STEP_BYTES);
+  const upload = (data: Float32Array, shape: number[]): Tensor => {
+    const buf = be.alloc(Math.max(4, data.byteLength));
+    be.write(buf, 0, data);
+    return { shape, dtype: "f32", buf };
+  };
+  const read = async (buf: Tensor["buf"], n: number) => new Float32Array(await be.readback(buf, 0, n * 4));
+  const run = (build: (ctx: Ctx) => void) => {
+    be.write(step, 0, packStep({ pos0: 0, lastRow: 0, seed: 1, temperature: 0 }));
+    const ctx = new Ctx(be, step, "t");
+    build(ctx);
+    be.submit(ctx.dispatches);
+  };
+  const silu = (v: number) => v / (1 + Math.exp(-v));
+
+  it("causal convolution carries its last inputs across calls", async () => {
+    const [C, K, T] = [5, 4, 9];
+    const x = randn(T * C);
+    const w = randn(C * K);
+    // Direct: zero padding on the left, as F.conv1d(padding=K-1)[:T].
+    const want = new Float32Array(T * C);
+    for (let t = 0; t < T; t++)
+      for (let c = 0; c < C; c++) {
+        let acc = 0;
+        for (let j = 0; j < K; j++) acc += t + j - (K - 1) >= 0 ? w[c * K + j]! * x[(t + j - (K - 1)) * C + c]! : 0;
+        want[t * C + c] = silu(acc);
+      }
+    // In one call, and in calls of 1, 2, 1 and 5 rows (shorter and longer than the state).
+    for (const chunks of [[T], [1, 2, 1, 5], [1, 1, 1, 1, 1, 1, 1, 1, 1], [4, 5]]) {
+      const state = be.alloc((K - 1) * C * 4);
+      const got = new Float32Array(T * C);
+      let at = 0;
+      for (const n of chunks) {
+        let y!: Tensor;
+        run((ctx) => (y = ops.causalConv(ctx, upload(x.subarray(at * C, (at + n) * C), [n, C]), upload(w, [C, K]), state)));
+        got.set(await read(y.buf, n * C), at * C);
+        at += n;
+      }
+      expect(ref.maxAbsDiff(got, want), String(chunks)).toBeLessThan(1e-5);
+    }
+  });
+
+  it("the gated delta rule matches the reference recurrence, in one call or token by token", async () => {
+    const [T, Hk, Hv, Dk, Dv] = [7, 2, 4, 8, 12];
+    const keys = 2 * Hk * Dk;
+    const C = keys + Hv * Dv;
+    const conv = randn(T * C);
+    const [a, b, aLog, dt] = [randn(T * Hv).map((v) => v * 3), randn(T * Hv), randn(Hv), randn(Hv)];
+    // Queries and keys normalised per head, as the layer does before the recurrence.
+    const qk = new Float32Array(T * keys);
+    for (let r = 0; r < (T * keys) / Dk; r++) {
+      let ss = 0;
+      for (let i = 0; i < Dk; i++) ss += conv[Math.floor(r / (keys / Dk)) * C + (r % (keys / Dk)) * Dk + i]! ** 2;
+      for (let i = 0; i < Dk; i++) qk[r * Dk + i] = conv[Math.floor(r / (keys / Dk)) * C + (r % (keys / Dk)) * Dk + i]! / Math.sqrt(ss + 1e-6);
+    }
+    // transformers' torch_recurrent_gated_delta_rule, head by head: state [Dk, Dv].
+    const want = new Float32Array(T * Hv * Dv);
+    for (let h = 0; h < Hv; h++) {
+      const kh = Math.floor(h / (Hv / Hk));
+      const S = Array.from({ length: Dk }, () => new Float64Array(Dv));
+      for (let t = 0; t < T; t++) {
+        const q = Array.from({ length: Dk }, (_, i) => qk[t * keys + kh * Dk + i]! / Math.sqrt(Dk));
+        const k = Array.from({ length: Dk }, (_, i) => qk[t * keys + Hk * Dk + kh * Dk + i]!);
+        const v = Array.from({ length: Dv }, (_, j) => conv[t * C + keys + h * Dv + j]!);
+        const g = -Math.exp(aLog[h]!) * Math.log1p(Math.exp(a[t * Hv + h]! + dt[h]!));
+        const beta = 1 / (1 + Math.exp(-b[t * Hv + h]!));
+        for (const row of S) for (let j = 0; j < Dv; j++) row[j]! *= Math.exp(g);
+        const mem = Array.from({ length: Dv }, (_, j) => S.reduce((sum, row, i) => sum + row[j]! * k[i]!, 0));
+        const delta = v.map((x, j) => (x - mem[j]!) * beta);
+        S.forEach((row, i) => delta.forEach((d, j) => (row[j]! += k[i]! * d)));
+        for (let j = 0; j < Dv; j++) want[(t * Hv + h) * Dv + j] = S.reduce((sum, row, i) => sum + row[j]! * q[i]!, 0);
+      }
+    }
+    const shape = { keyHeads: Hk, valueHeads: Hv, keyDim: Dk, valueDim: Dv };
+    for (const chunks of [[T], [1, 1, 1, 1, 1, 1, 1], [3, 4]]) {
+      const state = be.alloc(Hv * Dv * Dk * 4);
+      const got = new Float32Array(T * Hv * Dv);
+      let at = 0;
+      for (const n of chunks) {
+        const rows = (f: Float32Array, width: number) => upload(f.subarray(at * width, (at + n) * width), [n, width]);
+        let y!: Tensor;
+        run((ctx) => (y = ops.gatedDelta(ctx, rows(qk, keys), rows(conv, C), rows(a, Hv), rows(b, Hv), upload(aLog, [Hv]), upload(dt, [Hv]), state, { T: n, ...shape })));
+        got.set(await read(y.buf, n * Hv * Dv), at * Hv * Dv);
+        at += n;
+      }
+      expect(ref.maxAbsDiff(got, want), String(chunks)).toBeLessThan(2e-5);
+    }
+  });
+
+  it("splits heads into blocks and gates in place", async () => {
+    const [T, H, D] = [2, 3, 4];
+    const x = randn(T * H * 2 * D);
+    let q!: Tensor, g!: Tensor;
+    run((ctx) => {
+      const xt = upload(x, [T, H * 2 * D]);
+      q = ops.headSlices(ctx, xt, { H, D, blocks: 2, pick: 0 });
+      g = ops.headSlices(ctx, xt, { H, D, blocks: 2, pick: 1 });
+    });
+    const [gq, gg] = [await read(q.buf, T * H * D), await read(g.buf, T * H * D)];
+    for (let r = 0; r < T * H; r++)
+      for (let i = 0; i < D; i++) {
+        expect(gq[r * D + i]).toBe(x[r * 2 * D + i]);
+        expect(gg[r * D + i]).toBe(x[r * 2 * D + D + i]);
+      }
+    const y = randn(8);
+    const gate = randn(8).map((v) => v * 4);
+    const yt = upload(y, [1, 8]);
+    run((ctx) => ops.sigmoidMul(ctx, yt, upload(gate, [1, 8])));
+    expect(ref.maxAbsDiff(await read(yt.buf, 8), y.map((v, i) => v / (1 + Math.exp(-gate[i]!))))).toBeLessThan(1e-6);
+  });
+});

@@ -45,5 +45,7 @@ export function ggufToHF(name: string, arch = "llama"): string | undefined {
 
 /** Linear and embedding matrices can be stored as q4 or q8; norms and biases stay f32. */
 export function isQuantizable(name: string, shape: readonly number[]): boolean {
+  // Linear attention's decay and write-strength projections are a few rows that steer a recurrent state: kept exact.
+  if (/\.linear_attn\.in_proj_[ab]\./.test(name)) return false;
   return shape.length === 2 && name.endsWith(".weight") && !name.includes("norm") && shape[1]! % 32 === 0;
 }

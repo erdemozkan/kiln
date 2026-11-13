@@ -3549,3 +3549,165 @@ ${kv === "f8"
   : `  if (c < qn + kn) { kc[dst] = pair.x; kc[dst + 1u] = pair.y; } else { vc[dst] = pair.x; vc[dst + 1u] = pair.y; }`}
 }`);
 }
+
+// ---- Qwen 3.5: gated attention output and linear attention (gated delta net) ----
+
+/**
+ * One block of every head: src rows are [H heads × B blocks × D], dst rows [H × D] take block `pick`
+ * of each head. Qwen 3.5's q_proj writes each head as [query | gate]: pick 0 is the queries, 1 the gates.
+ */
+export function headSlicesSpec(): KernelSpec {
+  return spec("head_slices", ["uniform", "read", "rw"], cpu.cpuHeadSlices, () => /* wgsl */ `
+struct P { T: u32, H: u32, D: u32, B: u32, pick: u32, _a: u32, _b: u32, _c: u32 }
+@group(0) @binding(0) var<uniform> p: P;
+@group(0) @binding(1) var<storage, read> src: array<f32>;
+@group(0) @binding(2) var<storage, read_write> dst: array<f32>;
+
+@compute @workgroup_size(${EW})
+fn main(${EW_ARGS}) {
+  ${FLAT}
+  if (idx >= p.T * p.H * p.D) { return; }
+  let i = idx % p.D;
+  let head = idx / p.D; // t * H + h
+  dst[idx] = src[(head * p.B + p.pick) * p.D + i];
+}`);
+}
+
+/** x[i] *= sigmoid(g[i]), in place: Qwen 3.5's gate on the attention output. */
+export function sigmoidMulSpec(): KernelSpec {
+  return spec("sigmoid_mul", ["uniform", "read", "rw"], cpu.cpuSigmoidMul, () => /* wgsl */ `
+struct P { n: u32, _a: u32, _b: u32, _c: u32 }
+@group(0) @binding(0) var<uniform> p: P;
+@group(0) @binding(1) var<storage, read> g: array<f32>;
+@group(0) @binding(2) var<storage, read_write> x: array<f32>;
+
+@compute @workgroup_size(${EW})
+fn main(${EW_ARGS}) {
+  ${FLAT}
+  if (idx >= p.n) { return; }
+  x[idx] = x[idx] / (1.0 + exp(-g[idx]));
+}`);
+}
+
+/**
+ * Causal depthwise convolution over time with SiLU: y[t, c] = silu(Σ_j w[c, j] · x[t − (K − 1) + j, c]),
+ * where rows before this call's first come from `state` [K − 1, C], the last K − 1 input rows of the
+ * calls before (zeros at the start of a sequence). `causalConvStateSpec` moves the state on afterwards.
+ */
+export function causalConvSpec(): KernelSpec {
+  return spec("causal_conv", ["uniform", "read", "read", "read", "rw"], cpu.cpuCausalConv, () => /* wgsl */ `
+struct P { T: u32, C: u32, K: u32, _a: u32 }
+@group(0) @binding(0) var<uniform> p: P;
+@group(0) @binding(1) var<storage, read> x: array<f32>;
+@group(0) @binding(2) var<storage, read> w: array<f32>;
+@group(0) @binding(3) var<storage, read> state: array<f32>;
+@group(0) @binding(4) var<storage, read_write> y: array<f32>;
+
+@compute @workgroup_size(${EW})
+fn main(${EW_ARGS}) {
+  ${FLAT}
+  if (idx >= p.T * p.C) { return; }
+  let c = idx % p.C;
+  let t = idx / p.C;
+  let back = p.K - 1u;
+  var acc = 0.0;
+  for (var j = 0u; j < p.K; j++) {
+    // Input row t − back + j: of this call when it is not negative, else from the state.
+    var v: f32;
+    if (t + j >= back) { v = x[(t + j - back) * p.C + c]; } else { v = state[(t + j) * p.C + c]; }
+    acc += w[c * p.K + j] * v;
+  }
+  y[idx] = acc / (1.0 + exp(-acc));
+}`);
+}
+
+/** The convolution state after a call over x [T, C]: the last K − 1 input rows seen so far (see `causalConvSpec`). */
+export function causalConvStateSpec(): KernelSpec {
+  return spec("causal_conv_state", ["uniform", "read", "rw"], cpu.cpuCausalConvState, () => /* wgsl */ `
+struct P { T: u32, C: u32, K: u32, _a: u32 }
+@group(0) @binding(0) var<uniform> p: P;
+@group(0) @binding(1) var<storage, read> x: array<f32>;
+@group(0) @binding(2) var<storage, read_write> state: array<f32>;
+
+@compute @workgroup_size(${EW})
+fn main(${EW_ARGS}) {
+  ${FLAT}
+  if (idx >= p.C) { return; }
+  let back = p.K - 1u;
+  // One thread per channel, rows in order: a row kept from the old state (T < K − 1) moves down from
+  // an index above the one being written, so it is read before it is overwritten.
+  for (var r = 0u; r < back; r++) {
+    if (p.T + r >= back) { state[r * p.C + idx] = x[(p.T + r - back) * p.C + idx]; }
+    else { state[r * p.C + idx] = state[(p.T + r) * p.C + idx]; }
+  }
+}`);
+}
+
+/**
+ * The gated delta rule of linear attention, token by token. Each value head h keeps a state
+ * S [Dk, Dv]; per token: S ← S · exp(g); δ = (v − Sᵀk) · β; S ← S + k δᵀ; out = Sᵀq, with
+ * g = −exp(A_log[h]) · softplus(a + dt_bias[h]) and β = sigmoid(b). The columns of S never mix, so
+ * one thread owns one column (laid out [Hv, Dv, Dk]: a thread's Dk values are contiguous) and walks
+ * the T tokens in order.
+ *   qk    [T, 2·Hk·Dk]  queries then keys, each head already L2-normalised
+ *   conv  [T, C]        the convolution's output; values start at column vOff
+ *   a, b  [T, Hv]       decay and write-strength projections
+ *   state [Hv, Dv, Dk]  read and written
+ *   out   [T, Hv·Dv]    scaled by qScale (1 / √Dk, the query's scale)
+ * A thread reads its column into registers once, walks the tokens there, four values at a time, and
+ * writes it back at the end: the per-token work is two passes over Dk / 4 vectors, the first taking
+ * Sᵀk, Sᵀq and kᵀq together (the output is decay · Sᵀq + δ · kᵀq, so the second pass only updates S).
+ */
+export function gatedDeltaSpec(Dk: number): KernelSpec {
+  if (Dk % 4 !== 0 || Dk < 4 || Dk > 256) throw new Error(`gatedDeltaSpec: key head of ${Dk} must be a multiple of 4, at most 256`);
+  const D4 = Dk / 4;
+  return spec(`gated_delta/D${Dk}`, ["uniform", "read", "read", "read", "read", "read", "read", "rw", "rw"], cpu.cpuGatedDelta, () => /* wgsl */ `
+struct P { T: u32, Hv: u32, Hk: u32, Dk: u32, Dv: u32, C: u32, vOff: u32, qScale: f32 }
+@group(0) @binding(0) var<uniform> p: P;
+@group(0) @binding(1) var<storage, read> qk: array<vec4<f32>>;
+@group(0) @binding(2) var<storage, read> conv: array<f32>;
+@group(0) @binding(3) var<storage, read> a: array<f32>;
+@group(0) @binding(4) var<storage, read> b: array<f32>;
+@group(0) @binding(5) var<storage, read> alog: array<f32>;
+@group(0) @binding(6) var<storage, read> dt: array<f32>;
+@group(0) @binding(7) var<storage, read_write> state: array<vec4<f32>>;
+@group(0) @binding(8) var<storage, read_write> out: array<f32>;
+const D4 = ${D4}u;
+
+@compute @workgroup_size(64)
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) li: u32) {
+  let col = wid.x * 64u + li;
+  let h = wid.y;
+  if (col >= p.Dv) { return; }
+  // Each key head serves Hv / Hk consecutive value heads.
+  let kh = h / (p.Hv / p.Hk);
+  let sb = (h * p.Dv + col) * D4;
+  var s: array<vec4<f32>, ${D4}>;
+  for (var i = 0u; i < D4; i++) { s[i] = state[sb + i]; }
+  let rate = -exp(alog[h]);
+  let qkRow = 2u * p.Hk * D4;
+  for (var t = 0u; t < p.T; t++) {
+    let qb = t * qkRow + kh * D4;
+    let kb = qb + p.Hk * D4;
+    let ax = a[t * p.Hv + h] + dt[h];
+    // softplus; past 20 it is its argument to f32 precision, and exp would overflow.
+    let sp = select(log(1.0 + exp(min(ax, 20.0))), ax, ax > 20.0);
+    let decay = exp(rate * sp);
+    let beta = 1.0 / (1.0 + exp(-b[t * p.Hv + h]));
+    var mem = 0.0;
+    var sq = 0.0;
+    var kq = 0.0;
+    for (var i = 0u; i < D4; i++) {
+      let k = qk[kb + i];
+      let q = qk[qb + i];
+      mem += dot(s[i], k);
+      sq += dot(s[i], q);
+      kq += dot(k, q);
+    }
+    let delta = (conv[t * p.C + p.vOff + h * p.Dv + col] - mem * decay) * beta;
+    for (var i = 0u; i < D4; i++) { s[i] = s[i] * decay + qk[kb + i] * delta; }
+    out[(t * p.Hv + h) * p.Dv + col] = (sq * decay + kq * delta) * p.qScale;
+  }
+  for (var i = 0u; i < D4; i++) { state[sb + i] = s[i]; }
+}`);
+}

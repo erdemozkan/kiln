@@ -168,7 +168,8 @@ scope.onmessage = async (e: MessageEvent<Request>) => {
         cacheName = undefined;
         engine = await createEngine(msg.model, { ...msg.opts, onProgress: (progress) => post({ id: msg.id, type: "progress", progress }) });
         // A file model's prompt cache is named by the file (name, size, time) or a hash of its URL.
-        cacheName = msg.opts.promptCache === false ? undefined : promptCacheName(modelKey(msg.model), msg.opts);
+        // The prompt cache stores keys and values; a recurrent model (Qwen 3.5) needs its state too, which it does not hold yet.
+        cacheName = msg.opts.promptCache === false || engine.model.recurrent ? undefined : promptCacheName(modelKey(msg.model), msg.opts);
         saved = undefined;
         const stored = cacheName ? await loadPromptCache(cacheName) : undefined;
         // A file that does not fit this model (another context size, say) is started over at the next save.

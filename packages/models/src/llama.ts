@@ -93,6 +93,8 @@ export const RING_SLACK = 256;
  * slots (at least ATTN_WG, which the attention kernels' key runs need), when that is smaller.
  */
 export function ringSlots(cfg: LlamaConfig, maxSeq: number, l: number): number {
+  // A linear-attention layer keeps a recurrent state, not keys and values.
+  if (cfg.linearLayers?.[l]) return 0;
   const win = cfg.slidingLayers?.[l] ? cfg.slidingWindow : undefined;
   return win ? Math.min(maxSeq, Math.max(ATTN_WG, win + RING_SLACK)) : maxSeq;
 }
@@ -140,6 +142,14 @@ export class LlamaModel {
   /** Intermediates of every plan, shared: plans run one after another on the queue. */
   readonly activations: ActivationPool;
   private readonly kv: { k: Buf; v: Buf }[] = [];
+  /**
+   * Linear-attention layers' state, by layer (Qwen 3.5): `s` the recurrent state [Hv, Dv, Dk], `conv`
+   * the convolution's last input rows [K − 1, C]. Both are what the tokens run so far left behind:
+   * unlike keys and values they cannot be cut back to an earlier position, only saved and restored whole.
+   */
+  private readonly linearState = new Map<number, { s: Buf; conv: Buf }>();
+  /** L2 normalisation of a key head as an RMSNorm weight (see `buildPlan`). */
+  private readonly l2Weight: Tensor | undefined;
   /** Cache slots per layer: maxSeq, or a ring for sliding layers (see `ringSlots`). */
   readonly slots: number[] = [];
   private readonly invFreq: Tensor;
@@ -178,10 +188,28 @@ export class LlamaModel {
     for (let l = 0; l < cfg.numLayers; l++) {
       const slots = ringSlots(cfg, this.maxSeq, l);
       this.slots.push(slots);
+      // A layer without a cache (linear attention) keeps one word, so every layer has its buffers.
       this.kv.push({
-        k: backend.alloc(slots * row * kvBytes, "storage", `kv/${l}/k`),
-        v: backend.alloc(slots * row * kvBytes, "storage", `kv/${l}/v`),
+        k: backend.alloc(Math.max(4, slots * row * kvBytes), "storage", `kv/${l}/k`),
+        v: backend.alloc(Math.max(4, slots * row * kvBytes), "storage", `kv/${l}/v`),
       });
+      if (cfg.linearLayers?.[l]) {
+        const g = cfg.linear!;
+        const channels = 2 * g.keyHeads * g.keyDim + g.valueHeads * g.valueDim;
+        this.linearState.set(l, {
+          s: backend.alloc(g.valueHeads * g.valueDim * g.keyDim * 4, "storage", `linear/${l}/state`),
+          conv: backend.alloc((g.convKernel - 1) * channels * 4, "storage", `linear/${l}/conv`),
+        });
+      }
+    }
+    if (cfg.linear) {
+      // x · rsqrt(Σx² + 1e-6) is RMSNorm with eps 1e-6 / D and a weight of 1 / √D.
+      const D = cfg.linear.keyDim;
+      const w = new Float32Array(D).fill(1 / Math.sqrt(D));
+      const buf = backend.alloc(w.byteLength, "storage", "linear/l2");
+      backend.write(buf, 0, w);
+      this.l2Weight = { shape: [D], dtype: "f32", buf };
+      this.resetState();
     }
     const freqs = (f: Float32Array, label: string): Tensor => {
       const buf = backend.alloc(f.byteLength, "storage", label);
@@ -196,7 +224,8 @@ export class LlamaModel {
     this.w("model.embed_tokens.weight");
     const fuse = typeof opts.fuse === "object" ? { qkv: true, mlp: true, ...opts.fuse } : { qkv: opts.fuse ?? true, mlp: opts.fuse ?? true };
     // Phi-3 checkpoints store qkv already stacked.
-    this.fusedQkv = weights.has("model.layers.0.self_attn.qkv.weight") || (fuse.qkv && this.fuse("self_attn", ["q_proj", "k_proj", "v_proj"], "qkv", cfg.attentionBias));
+    // Qwen 3.5's q_proj carries a gate beside each query, and not every layer has attention: its q/k/v stay apart.
+    this.fusedQkv = weights.has("model.layers.0.self_attn.qkv.weight") || (fuse.qkv && !cfg.linearLayers && this.fuse("self_attn", ["q_proj", "k_proj", "v_proj"], "qkv", cfg.attentionBias));
     // Granite 4 and Phi-3 checkpoints store gate_up already stacked.
     this.fusedMlp = weights.has("model.layers.0.mlp.gate_up.weight") || (fuse.mlp && this.fuse("mlp", ["gate_proj", "up_proj"], "gate_up", false));
   }
@@ -320,12 +349,55 @@ export class LlamaModel {
    * GPU copies of the K/V of positions 0…n-1 (per layer: K, then V, as `readKv` lays them out),
    * queued now, so they hold the cache as it stands. `restoreKv` puts them back.
    */
+  /** True when some layers carry a state that cannot be cut back to an earlier position (see `saveState`). */
+  get recurrent(): boolean {
+    return this.linearState.size > 0;
+  }
+
+  /** Bytes one `saveState` snapshot takes. */
+  get stateBytes(): number {
+    let n = 0;
+    for (const { s, conv } of this.linearState.values()) n += s.size + conv.size;
+    return n;
+  }
+
+  /** Empties the linear-attention state: the state before the first token. */
+  resetState(): void {
+    for (const { s, conv } of this.linearState.values()) {
+      this.backend.write(s, 0, new Uint8Array(s.size));
+      this.backend.write(conv, 0, new Uint8Array(conv.size));
+    }
+  }
+
+  /**
+   * GPU copies of the linear-attention state, queued now, so they hold it as the work submitted so
+   * far leaves it. `restoreState` puts a snapshot back; the caller frees the buffers.
+   */
+  saveState(): Buf[] {
+    return [...this.linearState.values()].flatMap(({ s, conv }) =>
+      [s, conv].map((src) => {
+        const dst = this.backend.alloc(src.size, "storage", "linear/saved");
+        this.backend.copy(src, 0, dst, 0, src.size);
+        return dst;
+      }),
+    );
+  }
+
+  restoreState(saved: readonly Buf[]): void {
+    let i = 0;
+    for (const { s, conv } of this.linearState.values()) {
+      this.backend.copy(saved[i++]!, 0, s, 0, s.size);
+      this.backend.copy(saved[i++]!, 0, conv, 0, conv.size);
+    }
+  }
+
   saveKv(n: number): Buf[] {
     return this.kv.flatMap(({ k, v }, l) => {
       const bytes = Math.min(n, this.slots[l]!) * this.kvRowBytes;
       return [k, v].map((src, i) => {
-        const dst = this.backend.alloc(bytes, "storage", `kv/saved/${l}/${i ? "v" : "k"}`);
-        this.backend.copy(src, 0, dst, 0, bytes);
+        // A layer without a cache (linear attention) has nothing to copy, but keeps its place in the list.
+        const dst = this.backend.alloc(Math.max(4, bytes), "storage", `kv/saved/${l}/${i ? "v" : "k"}`);
+        if (bytes) this.backend.copy(src, 0, dst, 0, bytes);
         return dst;
       });
     });
@@ -335,6 +407,7 @@ export class LlamaModel {
   restoreKv(n: number, saved: readonly Buf[]): void {
     for (const [l, { k, v }] of this.kv.entries()) {
       const bytes = Math.min(n, this.slots[l]!) * this.kvRowBytes;
+      if (!bytes) continue;
       this.backend.copy(saved[2 * l]!, 0, k, 0, bytes);
       this.backend.copy(saved[2 * l + 1]!, 0, v, 0, bytes);
     }
@@ -361,7 +434,7 @@ export class LlamaModel {
     let min = 0;
     for (let l = 0; l < this.slots.length; l++) {
       const slots = this.slots[l]!;
-      if (slots >= this.maxSeq || written <= slots) continue;
+      if (slots === 0 || slots >= this.maxSeq || written <= slots) continue;
       min = Math.max(min, written - slots + (this.cfg.slidingWindow ?? 0) - 1);
     }
     return min;
@@ -587,7 +660,10 @@ export class LlamaModel {
         slots: this.slots[l],
       };
       const inputNorm = { w: this.w(`${p}.input_layernorm.weight`), eps: c.rmsEps };
+      if (c.linearLayers?.[l]) this.linearAttention(ctx, x, l, T);
+      else {
       let q: Tensor;
+      let gate: Tensor | undefined;
       if (this.fusedQkv) {
         // RMSNorm → one qkv matmul (+bias) → RoPE fused with the cache write.
         let qkv: Tensor;
@@ -601,9 +677,10 @@ export class LlamaModel {
           ? ops.qkNormRopeKv(ctx, qkv, this.w(`${p}.self_attn.q_norm.weight`), this.w(`${p}.self_attn.k_norm.weight`), c.rmsEps, kc, vc, attnShape, invFreq, c.ropeInterleaved)
           : ops.ropeKv(ctx, qkv, kc, vc, attnShape, invFreq, c.ropeInterleaved);
       } else {
-        q = this.attentionInputs(ctx, x, l, T, invFreq, L ? delta : undefined);
+        ({ q, gate } = this.attentionInputs(ctx, x, l, T, invFreq, L ? delta : undefined));
       }
       const a = ops.attention(ctx, q, kc, vc, attnShape);
+      if (gate) ops.sigmoidMul(ctx, a, gate);
       if (c.sandwichNorms) {
         // Gemma: the attention output is normalised before the residual add.
         const o = ops.linear(ctx, a, this.w(`${p}.self_attn.o_proj.weight`));
@@ -612,6 +689,7 @@ export class LlamaModel {
       } else {
         ops.linear(ctx, a, this.w(`${p}.self_attn.o_proj.weight`), { residual: x });
         if (L) delta(a, x, `${l}.o_proj`);
+      }
       }
 
       const mlpNorm = { w: this.w(`${p}.${c.sandwichNorms ? "pre_feedforward_layernorm" : "post_attention_layernorm"}.weight`), eps: c.rmsEps };
@@ -696,6 +774,11 @@ export class LlamaModel {
     this.freeLora();
     this.backend.free(this.invFreq.buf);
     if (this.localInvFreq !== this.invFreq) this.backend.free(this.localInvFreq.buf);
+    for (const { s, conv } of this.linearState.values()) {
+      this.backend.free(s);
+      this.backend.free(conv);
+    }
+    if (this.l2Weight) this.backend.free(this.l2Weight.buf);
     this.backend.free(this.step);
     this.backend.free(this.history);
     this.backend.free(this.seen);
@@ -711,7 +794,34 @@ export class LlamaModel {
   }
 
   /** Unfused attention inputs (qk-norm models): separate q/k/v, per-head norms, RoPE, cache write. */
-  private attentionInputs(ctx: Ctx, x: Tensor, l: number, T: number, invFreq: Tensor, delta?: (xin: Tensor, y: Tensor, name: string) => void): Tensor {
+  /**
+   * A linear-attention layer (Qwen 3.5's gated delta net), added to x in place: projections of the
+   * normalised input, a causal convolution over time, L2-normalised queries and keys, the recurrence
+   * over the layer's state, a gated norm and the output projection.
+   */
+  private linearAttention(ctx: Ctx, x: Tensor, l: number, T: number): void {
+    const c = this.cfg;
+    const g = c.linear!;
+    const p = `model.layers.${l}.linear_attn`;
+    const state = this.linearState.get(l)!;
+    const keys = 2 * g.keyHeads * g.keyDim;
+    const h = ops.rmsnorm(ctx, x, this.w(`model.layers.${l}.input_layernorm.weight`), c.rmsEps);
+    const mixed = ops.linear(ctx, h, this.w(`${p}.in_proj_qkv.weight`));
+    const z = ops.linear(ctx, h, this.w(`${p}.in_proj_z.weight`));
+    const a = ops.linear(ctx, h, this.w(`${p}.in_proj_a.weight`));
+    const b = ops.linear(ctx, h, this.w(`${p}.in_proj_b.weight`));
+    const conv = ops.causalConv(ctx, mixed, this.w(`${p}.conv1d.weight`), state.conv);
+    // Queries and keys are the row's first columns: each head normalised to unit length.
+    const qk = ctx.alloc([T, keys]);
+    ops.cols(ctx, qk, conv, { n: keys });
+    const unit = ops.rmsnorm(ctx, qk, this.l2Weight!, 1e-6 / g.keyDim, g.keyDim);
+    const out = ops.gatedDelta(ctx, unit, conv, a, b, this.w(`${p}.A_log`), this.w(`${p}.dt_bias`), state.s, { T, ...g });
+    // RMSNorm per value head, gated by silu(z).
+    const normed = ops.rmsnorm(ctx, out, this.w(`${p}.norm.weight`), c.rmsEps, g.valueDim);
+    ops.linear(ctx, ops.siluMul(ctx, z, normed), this.w(`${p}.out_proj.weight`), { residual: x });
+  }
+
+  private attentionInputs(ctx: Ctx, x: Tensor, l: number, T: number, invFreq: Tensor, delta?: (xin: Tensor, y: Tensor, name: string) => void): { q: Tensor; gate?: Tensor } {
     const c = this.cfg;
     const D = c.headDim;
     const p = `model.layers.${l}`;
@@ -724,6 +834,12 @@ export class LlamaModel {
       delta(h, k, `${l}.k_proj`);
       delta(h, v, `${l}.v_proj`);
     }
+    let gate: Tensor | undefined;
+    if (c.attnOutputGate) {
+      // q_proj writes each head as [query | gate].
+      gate = ops.headSlices(ctx, q, { H: c.numHeads, D, blocks: 2, pick: 1 });
+      q = ops.headSlices(ctx, q, { H: c.numHeads, D, blocks: 2, pick: 0 });
+    }
     if (c.qkNorm) {
       const qn = ops.rmsnorm(ctx, q, this.w(`${p}.self_attn.q_norm.weight`), c.rmsEps, D);
       const kn = ops.rmsnorm(ctx, k, this.w(`${p}.self_attn.k_norm.weight`), c.rmsEps, D);
@@ -733,7 +849,7 @@ export class LlamaModel {
     ops.rope(ctx, q, T, c.numHeads, D, invFreq, c.ropeInterleaved);
     ops.rope(ctx, k, T, c.numKvHeads, D, invFreq, c.ropeInterleaved);
     ops.kvWrite(ctx, k, v, this.kv[l]!.k, this.kv[l]!.v, T, this.maxSeq, this.kvDtype, this.slots[l]);
-    return q;
+    return { q, gate };
   }
 
   private bias(name: string): Tensor | undefined {
