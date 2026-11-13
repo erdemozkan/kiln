@@ -60,8 +60,11 @@ async function saveCache(e: Engine, name: string): Promise<void> {
   // The prompt cache restores into the base model at the next load: K/V an adapter made would not fit it.
   if (e.adapterInfo.active !== undefined) return;
   try {
+    // Compared first: reading the K/V back from the GPU is the expensive part, and a call that
+    // changed nothing (a repeated prompt, a failed call) needs none of it.
+    const now = e.cacheTokens;
+    if (now.length === savedTokens.length && now.every((t, i) => t === savedTokens[i])) return;
     const snap = await e.exportCache();
-    if (snap.tokens.length === savedTokens.length && snap.tokens.every((t, i) => t === savedTokens[i])) return;
     if (await savePromptCache(name, snap)) savedTokens = snap.tokens;
   } catch {
     // Busy with the next call, or storage refused: the cache is only an optimisation.

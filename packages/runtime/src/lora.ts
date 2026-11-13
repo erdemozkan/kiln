@@ -38,7 +38,8 @@ const TENSOR = /layers\.(\d+)\.(self_attn|mlp)\.([a-z_]+)\.lora_([AB])(?:\.defau
 function patternValue(patterns: Record<string, number> | undefined, module: string): number | undefined {
   for (const [key, v] of Object.entries(patterns ?? {})) {
     // Keys come from the adapter repo: only patterns that cannot backtrack exponentially are compiled.
-    assertLinearRegex(key, "adapter_config.json pattern");
+    // Module names are short, so more open-ended repetitions in a row are affordable than on prompts.
+    assertLinearRegex(key, "adapter_config.json pattern", 6);
     if (new RegExp(`(^|\\.)(${key})$`).test(module)) return v;
   }
   return undefined;

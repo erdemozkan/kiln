@@ -4,7 +4,7 @@ import type { Backend, Tensor } from "@kiln/core";
 import { fetchBytes, fetchJSON, fetchText, fileUrl, listRepoFiles, parseModelId, readPytorchHeader, readSafetensorsHeader, toF32, weightFiles, whisperFeatures, type ByteSource, type TensorEntry } from "@kiln/loader";
 import { Seq2SeqModel, T5Model, seq2seqConfigFromHF, seq2seqName, sinusoidalTable, t5ConfigFromHF, t5Name, t5Transform, type Seq2SeqConfig, type T5Config } from "@kiln/models";
 import { byteLevelFromVocabMerges, encoderTokenizerFromJSON, marianTokenizer, type EncoderTokenizer, type EncoderTokenizerJSON } from "@kiln/tokenizers";
-import { openBackend, openParsed } from "./load";
+import { openBackend, openParsed, withBackend } from "./load";
 import { loadWeights, type LoadProgress, type WeightFile } from "./weights";
 import { PUNCTUATION_ONLY, collateWords, whisperTokenTimestamps, type WhisperWord } from "./whisper-words";
 
@@ -545,7 +545,11 @@ export function whisperLanguage(l: string): string {
 }
 
 /** Loads an encoder-decoder repo ("org/repo", safetensors) for summarization, translation and text2text. */
-export async function createSeq2Seq(modelId: string, opts: Seq2SeqLoadOptions = {}): Promise<Seq2SeqEngine> {
+export function createSeq2Seq(modelId: string, opts: Seq2SeqLoadOptions = {}): Promise<Seq2SeqEngine> {
+  return withBackend(opts, (o) => loadSeq2Seq(modelId, o));
+}
+
+async function loadSeq2Seq(modelId: string, opts: Seq2SeqLoadOptions): Promise<Seq2SeqEngine> {
   const ref = parseModelId(modelId, opts.revision);
   if (ref.gguf) throw new Error("encoder-decoder models load from safetensors repos, not GGUF files");
   const ep = opts.endpoint;

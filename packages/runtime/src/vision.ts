@@ -7,7 +7,7 @@ import type { Backend, Tensor } from "@kiln/core";
 import { fetchJSON, fileUrl, listRepoFiles, parseModelId, preprocessImage, resizeImage, readPytorchHeader, readSafetensorsHeader, toF32, weightFiles, type ByteSource, type ImageProcessorConfig, type RgbImage, type TensorEntry } from "@kiln/loader";
 import { ClipTextModel, Seq2SeqModel, visionDecoderConfigFromHF, ConvNetModel, convNetConfigFromHF, convNetConvs, convNextName, type ConvNetConfig, SWIN2SR_MEAN, Swin2srModel, swin2srBias, swin2srConfigFromHF, DETR_IN_CHANNELS, DepthAnythingModel, ISNET_IN_CHANNELS, IsNetModel, SEGFORMER_IN_CHANNELS, SegformerModel, isnetConvs, segformerConfigFromHF, segformerName, type SegformerConfig, DetrModel, VitModel, bicubicResize, convMatrix, convTransposeMatrix, depthConfigFromHF, depthName, detrConfigFromHF, detrName, dinov2Positions, foldConvBn, clipPoolIndex, clipTextConfigFromHF, clipTextName, vitConfigFromHF, vitGrid, vitName, vitPatchK, type DepthAnythingConfig, type DetrConfig, type VitConfig, type VitEmbeddings } from "@kiln/models";
 import { ClipTokenizer, encoderTokenizerFromJSON, type ClipTokenizerJSON, type EncoderTokenizer, type EncoderTokenizerJSON } from "@kiln/tokenizers";
-import { openBackend, openParsed } from "./load";
+import { openBackend, openParsed, withBackend } from "./load";
 import { loadWeights, type LoadProgress, type WeightFile } from "./weights";
 import { createFlorence, type Florence2, type FlorenceOptions } from "./florence";
 import { createOwl, type OwlDetector, type ZeroShotDetectionOptions } from "./owl";
@@ -687,7 +687,11 @@ export class VisionEngine {
 }
 
 /** Loads a ViT, DeiT, CLIP, YOLOS, DETR, OWL-ViT or OWLv2 checkpoint (safetensors or pytorch_model.bin) from the Hugging Face Hub. */
-export async function createVision(modelId: string, opts: VisionLoadOptions = {}): Promise<VisionEngine> {
+export function createVision(modelId: string, opts: VisionLoadOptions = {}): Promise<VisionEngine> {
+  return withBackend(opts, (o) => loadVision(modelId, o));
+}
+
+async function loadVision(modelId: string, opts: VisionLoadOptions): Promise<VisionEngine> {
   const ref = parseModelId(modelId, opts.revision);
   if (ref.gguf) throw new Error("vision models load from safetensors or PyTorch repos, not GGUF files");
   const ep = opts.endpoint;

@@ -36,6 +36,19 @@ variants (Phi-3.5 mini, Phi-3 128k) up to their original 4096-token context, wit
 factors and the attention factor applied. Their stacked `qkv_proj` and `gate_up_proj` are the stacked
 matmuls Kiln already runs. Phi-4 mini (rotary on part of each head) is refused with a clear message.
 
+**Hardening against hostile model repos.** Three ways a crafted repo could freeze the tab are closed.
+The check on regexes from `tokenizer.json` and adapter configs now also refuses patterns that are
+slow without a repeated group (many choices or many open-ended repetitions in a row; one such pattern
+took 41 s on 40 characters). Reading `pytorch_model.bin` walks a dict named from many places once,
+not once per path. Chat templates are charged for the work inside filters, methods, `in` and
+printing, and for the strings `replace`, `join`, `indent` and `tojson` build, not only per statement.
+Phi-3's LongRoPE values are range-checked, the PyTorch zip directory and pickle are size-capped, and
+the Pages deploy pins its actions to commits and copies only a plain file out of an npm tarball.
+
+**Failed loads free their GPU memory.** An encoder, seq2seq, audio or vision model whose load fails
+no longer leaves its device and buffers behind (the LLM loader already cleaned up). The prompt cache
+is no longer read back from the GPU after a call that left it unchanged.
+
 **A download closed just short of its end now finishes.** A GGUF whose last bytes the model does not
 read (bartowski's SmolLM2-135M Q4_K_M, for one) was never marked complete, so up to 32 MiB of it was
 downloaded again on every load. A source closed with at most 64 MiB left runs to the end first; one

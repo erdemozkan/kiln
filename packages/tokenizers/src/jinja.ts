@@ -21,9 +21,55 @@ const MAX_STRING = 32 * 2 ** 20;
 /** Statements and loop iterations one render may execute. */
 const MAX_STEPS = 2_000_000;
 
+/**
+ * Work one render may do inside expressions: list elements visited, and string characters / 32.
+ * Statements are counted by MAX_STEPS; this covers what one statement can cost (a filter over a
+ * long list, `in`, a method on a long string), so a loop of expensive calls ends too.
+ */
+const MAX_WORK = 20_000_000;
+/** Work charged for each value printed (str, tojson): a call and a string, not one comparison. */
+const PRINT_COST = 32;
+/** Longest list a filter or a method may return. */
+const MAX_LIST = 10 * MAX_RANGE;
+/** Work done by the render in progress (renders are synchronous, so one counter serves). */
+let work = 0;
+
+function charge(n: number): void {
+  if ((work += n) > MAX_WORK) throw new TemplateError("the template does too much work");
+}
+
+/** What touching `v` once costs. */
+function cost(v: unknown): number {
+  return typeof v === "string" ? 1 + (v.length >> 5) : Array.isArray(v) ? 1 + v.length : 1;
+}
+
 function bounded(s: string): string {
   if (s.length > MAX_STRING) throw new TemplateError("the template builds a string that is too long");
+  charge(1 + (s.length >> 5));
   return s;
+}
+
+/** A filter's or a method's result, refused when it is a string or a list past the limits. */
+function checked(v: unknown): unknown {
+  if (typeof v === "string") return bounded(v);
+  if (Array.isArray(v) && v.length > MAX_LIST) throw new TemplateError("the template builds a list that is too long");
+  return v;
+}
+
+/** `parts.join(sep)`, refused before the string is built when it would be too long. */
+function joinBounded(parts: string[], sep: string): string {
+  let n = sep.length * Math.max(0, parts.length - 1);
+  for (const x of parts) n += x.length;
+  if (n > MAX_STRING) throw new TemplateError("the template builds a string that is too long");
+  return parts.join(sep);
+}
+
+/** A method that charges for its receiver on every call. */
+function metered(m: Callable | undefined, receiver: unknown): Callable | undefined {
+  return m && new Callable((args, kw) => {
+    charge(cost(receiver));
+    return checked(m.fn(args, kw));
+  });
 }
 
 /** A missing variable or attribute. Renders as "", is falsy, and stays undefined when accessed. */
@@ -640,6 +686,7 @@ function str(v: unknown): string {
 }
 
 function pyRepr(v: unknown): string {
+  charge(PRINT_COST + cost(v));
   if (typeof v === "string") return `'${v.replace(/\\/g, "\\\\").replace(/'/g, "\\'").replace(/\n/g, "\\n")}'`;
   if (Array.isArray(v)) return `[${v.map(pyRepr).join(", ")}]`;
   if (v && typeof v === "object") return `{${Object.entries(v).map(([k, x]) => `${pyRepr(k)}: ${pyRepr(x)}`).join(", ")}}`;
@@ -648,7 +695,9 @@ function pyRepr(v: unknown): string {
 
 /** `json.dumps(v, ensure_ascii=False, indent=indent)`, as transformers' `tojson` filter. */
 export function pyJson(v: unknown, indent?: number, level = 0): string {
+  charge(PRINT_COST + cost(v));
   if (v === null || v === undefined || isUndef(v)) return "null";
+  if (indent !== undefined && !(indent >= 0 && indent <= 64)) throw new TemplateError("tojson: indent must be between 0 and 64");
   if (typeof v === "string") return JSON.stringify(v);
   if (typeof v === "number" || typeof v === "boolean") return JSON.stringify(v);
   const nl = indent === undefined ? "" : "\n" + " ".repeat(indent * (level + 1));
@@ -669,7 +718,10 @@ function equal(a: unknown, b: unknown): boolean {
 
 function iterate(v: unknown): unknown[] {
   if (Array.isArray(v)) return v;
-  if (typeof v === "string") return Array.from(v);
+  if (typeof v === "string") {
+    charge(v.length);
+    return Array.from(v);
+  }
   if (isUndef(v) || v === null) return [];
   if (v instanceof Namespace) return Object.keys(v.vars);
   if (typeof v === "object") return Object.keys(v as object);
@@ -679,8 +731,8 @@ function iterate(v: unknown): unknown[] {
 function getAttr(obj: unknown, name: string): unknown {
   if (isUndef(obj) || obj === null || obj === undefined) return new Undef(name);
   if (obj instanceof Namespace) return Object.prototype.hasOwnProperty.call(obj.vars, name) ? obj.vars[name] : new Undef(name);
-  if (typeof obj === "string") return strMethod(obj, name) ?? new Undef(name);
-  if (Array.isArray(obj)) return listMethod(obj, name) ?? new Undef(name);
+  if (typeof obj === "string") return metered(strMethod(obj, name), obj) ?? new Undef(name);
+  if (Array.isArray(obj)) return metered(listMethod(obj, name), obj) ?? new Undef(name);
   if (typeof obj === "object") {
     const rec = obj as Record<string, unknown>;
     if (Object.prototype.hasOwnProperty.call(rec, name)) return rec[name];
@@ -771,6 +823,7 @@ function strMethod(s: string, name: string): Callable | undefined {
           const i = rest.indexOf(from);
           if (i < 0 || from === "") break;
           out += rest.slice(0, i) + String(b);
+          if (out.length > MAX_STRING) throw new TemplateError("the template builds a string that is too long");
           rest = rest.slice(i + from.length);
         }
         return out + rest;
@@ -780,7 +833,7 @@ function strMethod(s: string, name: string): Callable | undefined {
     case "count":
       return fn(([x]) => (String(x) ? s.split(String(x)).length - 1 : s.length + 1));
     case "join":
-      return fn(([xs]) => iterate(xs).map(str).join(s));
+      return fn(([xs]) => joinBounded(iterate(xs).map(str), s));
     case "format":
       return fn((args) => {
         let i = 0;
@@ -866,6 +919,7 @@ function test(name: string, v: unknown, args: unknown[]): boolean {
 }
 
 function contains(container: unknown, x: unknown): boolean {
+  charge(cost(container));
   if (typeof container === "string") return container.includes(str(x));
   if (Array.isArray(container)) return container.some((y) => equal(x, y));
   if (container instanceof Namespace) return str(x) in container.vars;
@@ -917,6 +971,7 @@ export class Template {
     const out: string[] = [];
     this.steps = 0;
     this.written = 0;
+    work = 0;
     this.exec(this.nodes, scope, out);
     return out.join("");
   }
@@ -1057,15 +1112,16 @@ export class Template {
           const v = x && this.eval(x, scope);
           return v === undefined || v === null || isUndef(v) ? undefined : Number(v);
         };
-        return slice(this.eval(e.obj, scope), num(e.start), num(e.stop), num(e.step) ?? 1);
+        const sliced = this.eval(e.obj, scope);
+        charge(cost(sliced));
+        return slice(sliced, num(e.start), num(e.stop), num(e.step) ?? 1);
       }
       case "call": {
         const f = this.eval(e.fn, scope);
         if (!(f instanceof Callable)) throw new TemplateError(`${exprName(e.fn)} is not callable`);
-        return f.fn(
-          e.args.map((a) => this.eval(a, scope)),
-          Object.fromEntries(e.kwargs.map(([k, v]) => [k, this.eval(v, scope)])),
-        );
+        const args = e.args.map((a) => this.eval(a, scope));
+        for (const a of args) charge(cost(a));
+        return checked(f.fn(args, Object.fromEntries(e.kwargs.map(([k, v]) => [k, this.eval(v, scope)]))));
       }
       case "filter":
         return this.filter(e.name, this.eval(e.value, scope), e.args.map((a) => this.eval(a, scope)), Object.fromEntries(e.kwargs.map(([k, v]) => [k, this.eval(v, scope)])), scope);
@@ -1115,7 +1171,8 @@ export class Template {
         return bounded(str(a) + str(b));
       case "+":
         if (Array.isArray(a) && Array.isArray(b)) {
-          if (a.length + b.length > 10 * MAX_RANGE) throw new TemplateError("the template builds a list that is too long");
+          if (a.length + b.length > MAX_LIST) throw new TemplateError("the template builds a list that is too long");
+          charge(a.length + b.length);
           return [...a, ...b];
         }
         if (typeof a === "string" || typeof b === "string") {
@@ -1129,7 +1186,7 @@ export class Template {
         if (typeof a === "string") {
           const times = Math.max(0, Math.floor(Number(b)) || 0);
           if (a.length * times > MAX_STRING) throw new TemplateError("the template builds a string that is too long");
-          return a.repeat(times);
+          return bounded(a.repeat(times));
         }
         return Number(a) * Number(b);
       case "/":
@@ -1147,6 +1204,11 @@ export class Template {
   }
 
   private filter(name: string, v: unknown, args: unknown[], kw: Record<string, unknown>, scope: Scope): unknown {
+    charge(cost(v));
+    return checked(this.applyFilter(name, v, args, kw, scope));
+  }
+
+  private applyFilter(name: string, v: unknown, args: unknown[], kw: Record<string, unknown>, scope: Scope): unknown {
     switch (name) {
       case "length":
       case "count":
@@ -1190,9 +1252,10 @@ export class Template {
         return typeof v === "string" ? Array.from(v).reverse().join("") : [...iterate(v)].reverse();
       case "join": {
         const attr = kw.attribute as string | undefined;
-        return iterate(v)
-          .map((x) => str(attr ? getAttr(x, attr) : x))
-          .join(str(args[0] ?? kw.d ?? ""));
+        return joinBounded(
+          iterate(v).map((x) => str(attr ? getAttr(x, attr) : x)),
+          str(args[0] ?? kw.d ?? ""),
+        );
       }
       case "replace":
         return (strMethod(str(v), "replace")!.fn(args, {}) as string);
@@ -1200,20 +1263,26 @@ export class Template {
         return v && typeof v === "object" && !isUndef(v) ? Object.entries(v instanceof Namespace ? v.vars : v) : [];
       case "unique": {
         const seen: unknown[] = [];
-        for (const x of iterate(v)) if (!seen.some((y) => equal(x, y))) seen.push(x);
+        for (const x of iterate(v)) {
+          charge(seen.length);
+          if (!seen.some((y) => equal(x, y))) seen.push(x);
+        }
         return seen;
       }
       case "sum":
         return iterate(v).reduce((n: number, x) => n + Number(kw.attribute ? getAttr(x, String(kw.attribute)) : x), Number(kw.start ?? 0));
       case "indent": {
         const width = (kw.width ?? args[0] ?? 4) as number | string;
-        const pad = typeof width === "number" ? " ".repeat(width) : width;
+        if (typeof width === "number" && !(width >= 0 && width <= MAX_STRING)) throw new TemplateError("indent: the width is out of range");
+        const pad = typeof width === "number" ? " ".repeat(width) : str(width);
         const first = !!(kw.first ?? args[1]);
         const blank = !!(kw.blank ?? args[2]);
-        return str(v)
-          .split("\n")
-          .map((l, i) => ((i > 0 || first) && (blank || l !== "") ? pad + l : l))
-          .join("\n");
+        const lines = str(v).split("\n");
+        if (pad.length * lines.length > MAX_STRING) throw new TemplateError("the template builds a string that is too long");
+        return joinBounded(
+          lines.map((l, i) => ((i > 0 || first) && (blank || l !== "") ? pad + l : l)),
+          "\n",
+        );
       }
       case "selectattr":
       case "rejectattr": {

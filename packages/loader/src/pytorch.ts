@@ -303,13 +303,19 @@ function tensorsOf(value: unknown): Map<string, TensorRef> {
   for (const k of ["state_dict", "model"]) if (v instanceof Map && v.has(k) && v.get(k) instanceof Map) v = v.get(k);
   if (!(v instanceof Map)) throw new Error("pytorch: the checkpoint is not a state dict");
   const out = new Map<string, TensorRef>();
-  const walk = (m: Map<unknown, unknown>, prefix: string) => {
+  // A pickle can name one dict from many places (its memo), or from inside itself: each dict is
+  // walked once, so a small file cannot unfold into an endless tree of names.
+  const seen = new Set<Map<unknown, unknown>>();
+  const walk = (m: Map<unknown, unknown>, prefix: string, depth: number) => {
+    if (seen.has(m)) return;
+    seen.add(m);
+    if (depth > 16) throw new Error("pytorch: the state dict is nested too deep");
     for (const [k, t] of m) {
-      if (t instanceof Map) walk(t, `${prefix}${String(k)}.`);
+      if (t instanceof Map) walk(t, `${prefix}${String(k)}.`, depth + 1);
       else if (t && (t as TensorRef).kind === "tensor") out.set(prefix + String(k), t as TensorRef);
     }
   };
-  walk(v, "");
+  walk(v, "", 0);
   return out;
 }
 
@@ -371,6 +377,7 @@ async function zipEntries(src: ByteSource): Promise<Map<string, { at: number; si
   }
   // The directory must lie inside the file, with no more entries than its bytes can hold (46 each).
   if (![count, cdSize, cdAt].every(Number.isSafeInteger) || cdAt + cdSize > total || count * 46 > cdSize) throw new Error("pytorch: bad zip directory");
+  if (cdSize > MAX_HEADER_BYTES) throw new Error(`${src.name}: zip directory larger than ${MAX_HEADER_BYTES / 2 ** 20} MB`);
   const cd = await src.read(cdAt, cdSize);
   const cv = new DataView(cd.buffer, cd.byteOffset, cd.byteLength);
   const td = new TextDecoder();
@@ -435,6 +442,7 @@ async function readPytorchTensors(src: ByteSource): Promise<{ tensors: TensorEnt
     if (!pkl) throw new Error("pytorch: data.pkl not found in the archive");
     const root = pkl.slice(0, pkl.length - "data.pkl".length);
     const { at, size } = files.get(pkl)!;
+    if (size > MAX_HEADER_BYTES) throw new Error(`${src.name}: pickle header larger than ${MAX_HEADER_BYTES / 2 ** 20} MB`);
     const { value } = unpickle(await src.read(at, size), 0, storageRef);
     return {
       tensors: entries(tensorsOf(value), (s) => {

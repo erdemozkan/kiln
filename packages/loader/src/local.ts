@@ -2,7 +2,8 @@
  * Models on the user's own disk: a picked folder (config, tokenizer and weights, laid out as a Hub
  * repo is) or a single .gguf. The files are registered under an id of the form "@local/<name>", which
  * loads wherever a Hub id does; "@" cannot start a Hub organisation, so the two never collide. Files
- * are read in place from their Blobs: nothing is uploaded, and nothing is copied into the cache.
+ * are read in place from their Blobs: nothing is uploaded, and the files themselves are not copied
+ * into the cache (the weights converted from them are, as for a Hub model, so the next load is fast).
  */
 const PREFIX = "@local/";
 const SCHEME = "kiln-local://";

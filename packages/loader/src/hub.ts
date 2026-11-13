@@ -101,7 +101,12 @@ async function download(url: string): Promise<HubFile> {
   return res.ok ? { status: 200, bytes: new Uint8Array(await res.arrayBuffer()) } : { status: res.status };
 }
 
-const sameBytes = (a?: Uint8Array, b?: Uint8Array) => a?.length === b?.length && (!a || !b || a.every((v, i) => v === b[i]));
+function sameBytes(a?: Uint8Array, b?: Uint8Array): boolean {
+  if (a?.length !== b?.length) return false;
+  if (!a || !b) return true;
+  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+  return true;
+}
 
 /** Entries already compared with the server in this session. */
 const checked = new Set<string>();

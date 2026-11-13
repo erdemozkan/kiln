@@ -6,7 +6,7 @@ import type { Backend } from "@kiln/core";
 import { fetchJSON, fetchText, fileUrl, listRepoFiles, parseModelId, readPytorchHeader, readSafetensorsHeader, toF32, weightFiles, type ByteSource, type TensorEntry } from "@kiln/loader";
 import { EncoderModel, encoderConfigFromHF, encoderName, type EncoderConfig } from "@kiln/models";
 import { encoderTokenizerFromJSON, wordPieceFromVocab, type EncoderTokenizer, type EncoderTokenizerJSON, type Encoding } from "@kiln/tokenizers";
-import { openBackend, openParsed } from "./load";
+import { openBackend, openParsed, withBackend } from "./load";
 import { loadWeights, type LoadProgress, type WeightFile } from "./weights";
 
 export interface EncoderLoadOptions {
@@ -430,7 +430,11 @@ export class EncoderEngine {
 }
 
 /** Loads an encoder repo ("org/repo", safetensors) for the text tasks. */
-export async function createEncoder(modelId: string, opts: EncoderLoadOptions = {}): Promise<EncoderEngine> {
+export function createEncoder(modelId: string, opts: EncoderLoadOptions = {}): Promise<EncoderEngine> {
+  return withBackend(opts, (o) => loadEncoder(modelId, o));
+}
+
+async function loadEncoder(modelId: string, opts: EncoderLoadOptions): Promise<EncoderEngine> {
   const ref = parseModelId(modelId, opts.revision);
   if (ref.gguf) throw new Error("encoder models load from safetensors repos, not GGUF files");
   const ep = opts.endpoint;

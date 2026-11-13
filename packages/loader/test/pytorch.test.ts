@@ -28,3 +28,51 @@ describe.each([["zip", ZIP], ["legacy", LEGACY]])("pytorch_model.bin (%s)", (_, 
     expect(byName.get("tied")!.offset).toBe(byName.get("a.weight")!.offset);
   });
 });
+
+/** A zip holding one stored entry, archive/data.pkl. */
+function zipOf(pkl: Uint8Array): Uint8Array {
+  const name = new TextEncoder().encode("archive/data.pkl");
+  const local = new Uint8Array(30 + name.length);
+  const lv = new DataView(local.buffer);
+  lv.setUint32(0, 0x04034b50, true);
+  lv.setUint32(18, pkl.length, true);
+  lv.setUint32(22, pkl.length, true);
+  lv.setUint16(26, name.length, true);
+  local.set(name, 30);
+  const central = new Uint8Array(46 + name.length);
+  const cv = new DataView(central.buffer);
+  cv.setUint32(0, 0x02014b50, true);
+  cv.setUint32(20, pkl.length, true);
+  cv.setUint32(24, pkl.length, true);
+  cv.setUint16(28, name.length, true);
+  central.set(name, 46);
+  const end = new Uint8Array(22);
+  const ev = new DataView(end.buffer);
+  ev.setUint32(0, 0x06054b50, true);
+  ev.setUint16(8, 1, true);
+  ev.setUint16(10, 1, true);
+  ev.setUint32(12, central.length, true);
+  ev.setUint32(16, local.length + pkl.length, true);
+  const out = new Uint8Array(local.length + pkl.length + central.length + end.length);
+  out.set(local, 0);
+  out.set(pkl, local.length);
+  out.set(central, local.length + pkl.length);
+  out.set(end, local.length + pkl.length + central.length);
+  return out;
+}
+
+describe("hostile pytorch_model.bin", () => {
+  it("walks a dict named from many places once, not once per path", async () => {
+    // d0 = {}; d1 = {"a": d0, "b": d0}; … d40 = {"a": d39, "b": d39}: 300 bytes, 2^40 paths.
+    const ops: number[] = [0x80, 2, 0x7d, 0x71, 0];
+    for (let i = 1; i <= 40; i++) {
+      ops.push(0x7d, 0x71, i);
+      for (const key of ["a", "b"]) ops.push(0x58, 1, 0, 0, 0, key.charCodeAt(0), 0x68, i - 1, 0x73);
+    }
+    ops.push(0x2e);
+    const t0 = performance.now();
+    const header = await readPytorchHeader(new MemorySource(zipOf(Uint8Array.from(ops)))).catch((e: unknown) => e);
+    expect(performance.now() - t0).toBeLessThan(1000);
+    expect(header instanceof Error ? [] : (header as { tensors: unknown[] }).tensors).toEqual([]);
+  });
+});

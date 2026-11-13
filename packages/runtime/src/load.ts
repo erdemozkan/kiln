@@ -457,6 +457,26 @@ export async function openBackend(device: "auto" | "gpu" | "cpu", cpuThreads?: n
   }
 }
 
+/**
+ * Runs a loader on the caller's backend, or on one opened here. A backend opened here is destroyed
+ * if the load fails, which frees every buffer the load had made on it: the worker may load another
+ * model next, and a failed load must not keep a model's worth of GPU memory.
+ */
+export async function withBackend<O extends { backend?: Backend; device?: "auto" | "gpu" | "cpu"; cpuThreads?: number }, T>(opts: O, load: (opts: O) => Promise<T>): Promise<T> {
+  if (opts.backend) return load(opts);
+  const backend = await openBackend(opts.device ?? "auto", opts.cpuThreads);
+  try {
+    return await load({ ...opts, backend });
+  } catch (err) {
+    try {
+      backend.destroy();
+    } catch {
+      // The original error is the one to report.
+    }
+    throw err;
+  }
+}
+
 /** Where `mmproj` points: a full id as it is, a bare file name inside the model's own repo. */
 function mmprojRef(mmproj: string, ref: ModelRef | undefined, revision?: string): ModelRef {
   if (mmproj.split("/").length >= 3) return parseModelId(mmproj, revision);
@@ -591,6 +611,8 @@ async function ggufModel(file: string, source: ByteSource, gguf: Awaited<ReturnT
   try {
     // Phi-3's LongRoPE factors are a small tensor, not metadata: the config needs its values.
     const factors = gguf.tensors.find((t) => t.name === PHI3_ROPE_SHORT);
+    // One value per rotated pair of a head: a few KB. Anything larger is not this tensor.
+    if (factors && factors.byteLength > 65536) throw new UnsupportedModelError(`${file}: ${PHI3_ROPE_SHORT} is ${factors.byteLength} bytes, too large for LongRoPE factors`);
     const ropeShort = factors && toF32(factors.type as Parameters<typeof toF32>[0], await source.read(factors.offset, factors.byteLength), factors.shape.reduce((a, b) => a * b, 1));
     const cfg = configFromGGUF(gguf.metadata, gguf.tensors.map((t) => t.name), ropeShort);
     const scale = cfg.residualScale !== undefined || cfg.logitScale !== undefined ? (name: string) => weightScale(cfg, name) : undefined;

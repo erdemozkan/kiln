@@ -216,9 +216,13 @@ function phi3(c: HFConfig, base: LlamaConfig): LlamaConfig {
 /** Applies LongRoPE's short factors and its attention factor (√(1 + ln(scale) / ln(original)) unless the checkpoint states one). */
 function longRope(base: LlamaConfig, short: unknown, original: number, trained: number, attnFactor?: number): LlamaConfig {
   const half = base.headDim / 2;
-  if (!Array.isArray(short) || short.length !== half || short.some((v) => typeof v !== "number" || !(v > 0))) {
+  if (!Array.isArray(short) || short.length !== half || short.some((v) => typeof v !== "number" || !(v > 0) || !Number.isFinite(v))) {
     throw new UnsupportedModelError(`LongRoPE needs ${half} positive short factors`);
   }
+  // These come from the repo and set the context size and a scale on every attention input.
+  if (!Number.isInteger(original) || original < 2 || original > 2 ** 20) throw new UnsupportedModelError(`LongRoPE: an original context of ${original} tokens is out of range`);
+  if (!(trained >= 1 && trained <= 2 ** 24)) throw new UnsupportedModelError(`LongRoPE: a context of ${trained} tokens is out of range`);
+  if (attnFactor !== undefined && !(attnFactor > 0 && attnFactor <= 16)) throw new UnsupportedModelError(`LongRoPE: an attention factor of ${attnFactor} is out of range`);
   const scale = trained / original;
   const factor = attnFactor ?? (scale <= 1 ? 1 : Math.sqrt(1 + Math.log(scale) / Math.log(original)));
   // cos and sin are both multiplied by the factor, so q·k grows by its square.

@@ -48,6 +48,14 @@ describe("Phi-3", () => {
     expect(() => configFromHF({ ...mini4k, partial_rotary_factor: 0.75 })).toThrow(UnsupportedModelError);
     expect(() => configFromHF({ ...mini4k, rope_scaling: { type: "longrope", short_factor: [1, 2, 3] } })).toThrow("48 positive short factors");
     expect(() => configFromHF({ ...mini4k, rope_scaling: { type: "yarn" } })).toThrow(UnsupportedModelError);
+    // Values that would give a zero or endless context, or a scale that is not a number.
+    const long = (over: object, scaling: object = {}) => () => configFromHF({ ...mini4k, max_position_embeddings: 131072, ...over, rope_scaling: { type: "longrope", short_factor: short, ...scaling } });
+    for (const original of [0, 1, -4096, 4096.5, 2 ** 30]) expect(long({ original_max_position_embeddings: original }), String(original)).toThrow(UnsupportedModelError);
+    // A factor that is not positive is ignored, and the computed one applies.
+    expect(long({}, { attention_factor: -1 })).not.toThrow();
+    expect(long({}, { attention_factor: 1e9 })).toThrow(/attention factor/);
+    expect(long({}, { short_factor: short.map((v, i) => (i === 5 ? Infinity : v)) })).toThrow("48 positive short factors");
+    expect(long({})).not.toThrow();
   });
 
   it("names the stacked projections as Kiln's stacked matmuls", () => {

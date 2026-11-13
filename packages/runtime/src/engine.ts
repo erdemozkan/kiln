@@ -908,6 +908,11 @@ export class Engine {
    * The K/V of the tokens currently cached (the last call's prompt and reply), to restore with
    * `importCache` in a later session so a shared prefix is not prefilled again.
    */
+  /** The tokens whose K/V `exportCache` would return, without reading anything back from the GPU. */
+  get cacheTokens(): readonly number[] {
+    return this.cached;
+  }
+
   async exportCache(): Promise<CacheSnapshot> {
     if (this.busy) throw new Error("exportCache: the engine is generating");
     const tokens = [...this.cached];

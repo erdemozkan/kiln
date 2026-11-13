@@ -4,7 +4,7 @@ import type { Backend, Tensor } from "@kiln/core";
 import { fetchJSON, fileUrl, normalizeAudio, listRepoFiles, parseModelId, readPytorchHeader, readSafetensorsHeader, toF32, weightFiles, type ByteSource, type TensorEntry } from "@kiln/loader";
 import { Wav2Vec2Model, wav2vec2ConfigFromHF, wav2vec2Name, type Wav2Vec2Config } from "@kiln/models";
 import { ctcTokenizer, type CtcTokenizer } from "@kiln/tokenizers";
-import { openBackend, openParsed } from "./load";
+import { openBackend, openParsed, withBackend } from "./load";
 import { loadWeights, type LoadProgress, type WeightFile } from "./weights";
 import { createSpeechT5, createTts, type SpeechT5LoadOptions, type TtsEngine } from "./tts";
 import { createKokoro, isKokoroConfig } from "./kokoro";
@@ -146,7 +146,11 @@ export function convRows(shape: readonly number[], raw: Float32Array): { data: F
 }
 
 /** Loads a wav2vec2 / HuBERT model with a CTC or sequence-classification head. */
-export async function createAudio(modelId: string, opts: AudioLoadOptions & Pick<SpeechT5LoadOptions, "vocoder" | "maxSteps"> = {}): Promise<AudioEngine | TtsEngine> {
+export function createAudio(modelId: string, opts: AudioLoadOptions & Pick<SpeechT5LoadOptions, "vocoder" | "maxSteps"> = {}): Promise<AudioEngine | TtsEngine> {
+  return withBackend(opts, (o) => loadAudio(modelId, o));
+}
+
+async function loadAudio(modelId: string, opts: AudioLoadOptions & Pick<SpeechT5LoadOptions, "vocoder" | "maxSteps">): Promise<AudioEngine | TtsEngine> {
   const ref = parseModelId(modelId, opts.revision);
   if (ref.gguf) throw new Error("speech models load from safetensors or PyTorch repos, not GGUF files");
   const ep = opts.endpoint;
