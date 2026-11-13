@@ -81,6 +81,12 @@ private ones load. The token is sent to `https://huggingface.co` only: not to a 
 memory, handed to the workers, and never written to the cache. A refusal by the Hub now says what
 to do (set a token, or accept the model's terms).
 
+**Whisper's log-mel features about five times faster.** A 30-second window took about 430 ms on
+the CPU and now takes 75 to 100 ms: the transform of each frame uses half-length complex FFTs of the
+real samples, with the radix-2, 4 and 5 butterflies written out and nothing allocated per frame. The
+features are the same to rounding. (llama.cpp moved this step into its compute graph; here the CPU
+version is fast enough that a GPU kernel would save little.)
+
 **Fewer requests on a first download.** The request that downloads a weight file also tells its
 size, so the separate one-byte request that asked for it is gone, and the shards of a split
 safetensors model are opened together instead of one after another.

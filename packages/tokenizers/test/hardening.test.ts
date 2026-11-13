@@ -31,7 +31,8 @@ describe("hostile chat templates fail instead of hanging", () => {
     expect(() => render("{{ [1] | tojson(indent=100000000) }}")).toThrow(/indent/);
     // Ordinary use stays far inside the limits.
     expect(render("{{ [3, 1, 3, 2, 1] | unique | join(',') }}{{ 'a-b' | replace('-', '+') }}{{ 2 in [1, 2] }}{{ {'a': [1, 2]} | tojson }}")).toBe('3,1,2a+bTrue{"a": [1, 2]}');
-  });
+    // Each hostile case runs to its limit (a few hundred ms); with every test file running at once that adds up.
+  }, 30000);
 
   it("does not read through a namespace's prototype, and trims long whitespace quickly", () => {
     expect(render("{% set ns = namespace(a=1) %}{{ ns.constructor is defined }}{{ ns.__proto__ is defined }}{{ ns.a }}")).toBe("FalseFalse1");

@@ -1,6 +1,12 @@
 // Audio front end for speech models: Whisper's log-mel features (as transformers'
 // WhisperFeatureExtractor computes them), a mixed-radix FFT, and WAV decoding.
 
+// cos and sin of 2π/5 and 4π/5, for the radix-5 butterfly.
+const C1 = Math.cos((2 * Math.PI) / 5);
+const C2 = Math.cos((4 * Math.PI) / 5);
+const S1 = Math.sin((2 * Math.PI) / 5);
+const S2 = Math.sin((4 * Math.PI) / 5);
+
 /** In-place complex FFT of any length whose factors are 2, 3, 4 and 5 (re, im split arrays). */
 export class FFT {
   private readonly factors: number[] = [];
@@ -30,47 +36,176 @@ export class FFT {
 
   /** Forward transform of (re, im), in place. */
   transform(re: Float64Array, im: Float64Array): void {
+    if (this.n === 1) return;
     this.rec(re, im, 0, 1, this.n, 0, this.tmpRe, this.tmpIm);
     re.set(this.tmpRe);
     im.set(this.tmpIm);
   }
 
+  /** The sub-transform outputs of one butterfly, for factors without a written-out butterfly. */
+  private readonly yr = new Float64Array(5);
+  private readonly yi = new Float64Array(5);
+
   /**
    * Decimation in time: the input of length `len`, read from `off` with `stride`, transforms into
-   * out[outOff…outOff + len). Each factor f splits it into f interleaved sub-sequences.
+   * out[outOff…outOff + len). Each factor f splits it into f interleaved sub-sequences. Factors 2
+   * and 4, most of any length used here, have their butterflies written out (W_4 is -i, so a
+   * radix-4 step needs three twiddle multiplications and no others); 3 and 5 take the general sum.
    */
   private rec(re: Float64Array, im: Float64Array, off: number, stride: number, len: number, depth: number, outRe: Float64Array, outIm: Float64Array, outOff = 0): void {
-    if (len === 1) {
-      outRe[outOff] = re[off]!;
-      outIm[outOff] = im[off]!;
-      return;
-    }
     const f = this.factors[depth]!;
     const m = len / f;
-    // Sub-transforms into consecutive blocks of the output.
-    for (let j = 0; j < f; j++) this.rec(re, im, off + j * stride, stride * f, m, depth + 1, outRe, outIm, outOff + j * m);
-    // Butterflies: X[k + q·m] = Σ_j W_len^{j(k + q·m)} · Y_j[k].
+    // Sub-transforms into consecutive blocks of the output (of one sample each at the last factor).
+    if (m === 1) {
+      for (let j = 0; j < f; j++) {
+        outRe[outOff + j] = re[off + j * stride]!;
+        outIm[outOff + j] = im[off + j * stride]!;
+      }
+    } else {
+      for (let j = 0; j < f; j++) this.rec(re, im, off + j * stride, stride * f, m, depth + 1, outRe, outIm, outOff + j * m);
+    }
+    // Butterflies: X[k + q·m] = Σ_j W_len^{j(k + q·m)} · Y_j[k]; W_len^x is table entry x·step.
     const step = this.n / len;
-    const yr = new Float64Array(f);
-    const yi = new Float64Array(f);
+    const { cos, sin, n } = this;
+    if (f === 2) {
+      for (let k = 0, a = outOff, b = outOff + m; k < m; k++, a++, b++) {
+        const c = cos[k * step]!;
+        const sn = sin[k * step]!;
+        const br = outRe[b]! * c - outIm[b]! * sn;
+        const bi = outRe[b]! * sn + outIm[b]! * c;
+        const ar = outRe[a]!;
+        const ai = outIm[a]!;
+        outRe[a] = ar + br;
+        outIm[a] = ai + bi;
+        outRe[b] = ar - br;
+        outIm[b] = ai - bi;
+      }
+      return;
+    }
+    if (f === 4) {
+      for (let k = 0; k < m; k++) {
+        const [i0, i1, i2, i3] = [outOff + k, outOff + m + k, outOff + 2 * m + k, outOff + 3 * m + k];
+        const t = k * step;
+        const br = outRe[i1]! * cos[t]! - outIm[i1]! * sin[t]!;
+        const bi = outRe[i1]! * sin[t]! + outIm[i1]! * cos[t]!;
+        const cr = outRe[i2]! * cos[2 * t]! - outIm[i2]! * sin[2 * t]!;
+        const ci = outRe[i2]! * sin[2 * t]! + outIm[i2]! * cos[2 * t]!;
+        const dr = outRe[i3]! * cos[3 * t]! - outIm[i3]! * sin[3 * t]!;
+        const di = outRe[i3]! * sin[3 * t]! + outIm[i3]! * cos[3 * t]!;
+        const ar = outRe[i0]!;
+        const ai = outIm[i0]!;
+        // q = 0…3 weigh b, c, d by (-i)^q, (-1)^q and i^q.
+        outRe[i0] = ar + br + cr + dr;
+        outIm[i0] = ai + bi + ci + di;
+        outRe[i1] = ar + bi - cr - di;
+        outIm[i1] = ai - br - ci + dr;
+        outRe[i2] = ar - br + cr - dr;
+        outIm[i2] = ai - bi + ci - di;
+        outRe[i3] = ar - bi - cr + di;
+        outIm[i3] = ai + br - ci - dr;
+      }
+      return;
+    }
+    if (f === 5) {
+      // The inputs are turned by their twiddles, then a 5-point transform whose roots pair up:
+      // ω and ω⁴ share a cosine and differ in the sign of the sine, as do ω² and ω³.
+      for (let k = 0; k < m; k++) {
+        const o = outOff + k;
+        const t = k * step;
+        const y0r = outRe[o]!, y0i = outIm[o]!;
+        const y1r = outRe[o + m]! * cos[t]! - outIm[o + m]! * sin[t]!, y1i = outRe[o + m]! * sin[t]! + outIm[o + m]! * cos[t]!;
+        const y2r = outRe[o + 2 * m]! * cos[2 * t]! - outIm[o + 2 * m]! * sin[2 * t]!, y2i = outRe[o + 2 * m]! * sin[2 * t]! + outIm[o + 2 * m]! * cos[2 * t]!;
+        const y3r = outRe[o + 3 * m]! * cos[3 * t]! - outIm[o + 3 * m]! * sin[3 * t]!, y3i = outRe[o + 3 * m]! * sin[3 * t]! + outIm[o + 3 * m]! * cos[3 * t]!;
+        const y4r = outRe[o + 4 * m]! * cos[4 * t]! - outIm[o + 4 * m]! * sin[4 * t]!, y4i = outRe[o + 4 * m]! * sin[4 * t]! + outIm[o + 4 * m]! * cos[4 * t]!;
+        const t1r = y1r + y4r, t1i = y1i + y4i, t2r = y2r + y3r, t2i = y2i + y3i;
+        const t3r = y1r - y4r, t3i = y1i - y4i, t4r = y2r - y3r, t4i = y2i - y3i;
+        const p1r = y0r + C1 * t1r + C2 * t2r, p1i = y0i + C1 * t1i + C2 * t2i;
+        const p2r = y0r + C2 * t1r + C1 * t2r, p2i = y0i + C2 * t1i + C1 * t2i;
+        const ar = S1 * t3r + S2 * t4r, ai = S1 * t3i + S2 * t4i;
+        const br = S2 * t3r - S1 * t4r, bi = S2 * t3i - S1 * t4i;
+        outRe[o] = y0r + t1r + t2r;
+        outIm[o] = y0i + t1i + t2i;
+        // X1 = p1 - i·a, X4 = p1 + i·a, X2 = p2 - i·b, X3 = p2 + i·b.
+        outRe[o + m] = p1r + ai;
+        outIm[o + m] = p1i - ar;
+        outRe[o + 2 * m] = p2r + bi;
+        outIm[o + 2 * m] = p2i - br;
+        outRe[o + 3 * m] = p2r - bi;
+        outIm[o + 3 * m] = p2i + br;
+        outRe[o + 4 * m] = p1r - ai;
+        outIm[o + 4 * m] = p1i + ar;
+      }
+      return;
+    }
+    const { yr, yi } = this;
     for (let k = 0; k < m; k++) {
       for (let j = 0; j < f; j++) {
         yr[j] = outRe[outOff + j * m + k]!;
         yi[j] = outIm[outOff + j * m + k]!;
       }
       for (let q = 0; q < f; q++) {
+        // The table index of W_len^{j(k + q·m)} grows by the same amount with each j, modulo n.
+        const base = ((k + q * m) * step) % n;
         let sr = 0;
         let si = 0;
-        for (let j = 0; j < f; j++) {
-          const t = ((j * (k + q * m)) % len) * step;
-          const c = this.cos[t]!;
-          const s = this.sin[t]!;
-          sr += yr[j]! * c - yi[j]! * s;
-          si += yr[j]! * s + yi[j]! * c;
+        for (let j = 0, t = 0; j < f; j++) {
+          const c = cos[t]!;
+          const sn = sin[t]!;
+          sr += yr[j]! * c - yi[j]! * sn;
+          si += yr[j]! * sn + yi[j]! * c;
+          t += base;
+          if (t >= n) t -= n;
         }
         outRe[outOff + q * m + k] = sr;
         outIm[outOff + q * m + k] = si;
       }
+    }
+  }
+}
+
+/**
+ * |DFT|² of real frames of an even length n, bins 0…n/2, from a complex FFT of half the length:
+ * z[j] = x[2j] + i·x[2j + 1] transforms to Z, from which the transforms of the even and the odd
+ * samples follow (E = (Z[k] + Z*[h - k]) / 2, O = (Z[k] - Z*[h - k]) / 2i), and X[k] = E + W_n^k · O.
+ */
+export class RealPowerSpectrum {
+  private readonly fft: FFT;
+  private readonly re: Float64Array;
+  private readonly im: Float64Array;
+  private readonly cos: Float64Array;
+  private readonly sin: Float64Array;
+
+  constructor(readonly n: number) {
+    if (n % 2 !== 0) throw new Error(`RealPowerSpectrum: length ${n} is not even`);
+    const h = n / 2;
+    this.fft = new FFT(h);
+    this.re = new Float64Array(h);
+    this.im = new Float64Array(h);
+    this.cos = Float64Array.from({ length: h + 1 }, (_, k) => Math.cos((-2 * Math.PI * k) / n));
+    this.sin = Float64Array.from({ length: h + 1 }, (_, k) => Math.sin((-2 * Math.PI * k) / n));
+  }
+
+  /** Writes |X[k]|², k = 0…n/2, of the n real samples in `x` to `power`. */
+  run(x: Float64Array, power: Float64Array): void {
+    const h = this.n / 2;
+    const { re, im, cos, sin } = this;
+    for (let j = 0; j < h; j++) {
+      re[j] = x[2 * j]!;
+      im[j] = x[2 * j + 1]!;
+    }
+    this.fft.transform(re, im);
+    for (let k = 0; k <= h; k++) {
+      const a = k === h ? 0 : k;
+      const b = k === 0 ? 0 : h - k;
+      // Z[a] and the conjugate of Z[b].
+      const er = (re[a]! + re[b]!) / 2;
+      const ei = (im[a]! - im[b]!) / 2;
+      // (Z[a] - Z*[b]) / 2i.
+      const or = (im[a]! + im[b]!) / 2;
+      const oi = (re[b]! - re[a]!) / 2;
+      const xr = er + or * cos[k]! - oi * sin[k]!;
+      const xi = ei + or * sin[k]! + oi * cos[k]!;
+      power[k] = xr * xr + xi * xi;
     }
   }
 }
@@ -106,7 +241,7 @@ export interface WhisperFeatureConfig {
   chunkSeconds?: number;
 }
 
-const fftCache = new Map<number, FFT>();
+const fftCache = new Map<number, RealPowerSpectrum>();
 const filterCache = new Map<string, Float64Array>();
 const spanCache = new Map<string, Int32Array>();
 
@@ -129,26 +264,23 @@ export function whisperFeatures(samples: Float32Array, cfg: WhisperFeatureConfig
   const frames = Math.floor(total / hop); // 3001 frames from center padding, minus the last one
   const bins = half + 1;
   let fft = fftCache.get(nFft);
-  if (!fft) fftCache.set(nFft, (fft = new FFT(nFft)));
+  if (!fft) fftCache.set(nFft, (fft = new RealPowerSpectrum(nFft)));
   const key = `${bins}/${mels}/${sr}`;
   let filters = filterCache.get(key);
   if (!filters) filterCache.set(key, (filters = melFilters(bins, mels, sr)));
   let spans = spanCache.get(key);
   if (!spans) spanCache.set(key, (spans = filterSpans(filters, bins, mels)));
   const window = Float64Array.from({ length: nFft }, (_, i) => 0.5 - 0.5 * Math.cos((2 * Math.PI * i) / nFft));
-  const re = new Float64Array(nFft);
-  const im = new Float64Array(nFft);
+  const frame = new Float64Array(nFft);
   const power = new Float64Array(bins);
   const out = new Float32Array(frames * mels);
   let max = -Infinity;
   for (let t = 0; t < frames; t++) {
     const start = t * hop - half;
-    for (let i = 0; i < nFft; i++) {
-      re[i] = at(start + i) * window[i]!;
-      im[i] = 0;
-    }
-    fft.transform(re, im);
-    for (let b = 0; b < bins; b++) power[b] = re[b]! * re[b]! + im[b]! * im[b]!;
+    // Only the first and the last frames reach past the samples and need the reflection.
+    if (start >= 0 && start + nFft <= total) for (let i = 0; i < nFft; i++) frame[i] = x[start + i]! * window[i]!;
+    else for (let i = 0; i < nFft; i++) frame[i] = at(start + i) * window[i]!;
+    fft.run(frame, power);
     for (let m = 0; m < mels; m++) {
       let s = 0;
       // Each triangle covers a few bins; the zeros outside it add nothing (the sum is the same bits).

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { FFT, melFilters, readAudio, readWav, resample, whisperFeatures } from "../src";
+import { FFT, RealPowerSpectrum, melFilters, readAudio, readWav, resample, whisperFeatures } from "../src";
 
 function dft(x: Float64Array): [Float64Array, Float64Array] {
   const n = x.length;
@@ -57,6 +57,31 @@ describe("FFT", () => {
 
   it("rejects lengths with other prime factors", () => {
     expect(() => new FFT(14)).toThrow(/prime factors/);
+  });
+});
+
+describe("power spectrum of real frames", () => {
+  it("matches the direct transform for lengths with every supported factor", () => {
+    let seed = 5;
+    const rnd = () => ((seed = (seed * 1103515245 + 12345) >>> 0) / 2 ** 32) * 2 - 1;
+    for (const n of [2, 4, 6, 8, 10, 12, 16, 20, 30, 50, 64, 100, 240, 400, 512, 600, 1024]) {
+      const x = Float64Array.from({ length: n }, rnd);
+      const got = new Float64Array(n / 2 + 1);
+      new RealPowerSpectrum(n).run(x, got);
+      let scale = 0;
+      for (let k = 0; k <= n / 2; k++) {
+        let re = 0;
+        let im = 0;
+        for (let j = 0; j < n; j++) {
+          re += x[j]! * Math.cos((-2 * Math.PI * j * k) / n);
+          im += x[j]! * Math.sin((-2 * Math.PI * j * k) / n);
+        }
+        const want = re * re + im * im;
+        scale = Math.max(scale, want);
+        expect(Math.abs(got[k]! - want), `n=${n} k=${k}`).toBeLessThan(1e-9 * (1 + scale));
+      }
+    }
+    expect(() => new RealPowerSpectrum(7)).toThrow(/even/);
   });
 });
 
