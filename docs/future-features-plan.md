@@ -18,8 +18,10 @@ family itself. Pick the next families by what people ask for.
 Phi-3, 3.5 and Phi-4 mini are done (unreleased); Phi-4 mini needed rope on part of each head, which
 the rope kernels now take. Qwen 3.5's text model is done too (unreleased), from safetensors: its
 linear-attention layers (a gated delta net) run in their own kernels, and the engine snapshots their
-recurrent state. Open for it: GGUF files (name mapping, and whether the converter folds the 1 into
-the norms), images, a prompt cache file that holds the state, speculative decoding, and the chunked
+recurrent state; GGUF files and the prompt cache across reloads work too. Open for it: images,
+GGUF files whose projections are merged, speculative decoding (a rejected draft would have to be
+undone by restoring a state snapshot), adapters (they would have to cover the linear-attention
+projections), and the chunked
 form of the recurrence if prefill of the linear layers ever dominates (it is 14% now). Gemma 4 uses
 the same partial rotary but needs K/V shared between layers, per-layer input embeddings and two
 head sizes. Open in the Phi family: LongRoPE past the original 4096 tokens (the long
