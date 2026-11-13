@@ -548,17 +548,18 @@ async function openSafetensors(ref: ModelRef, endpoint?: string): Promise<{ cfg:
   // Multimodal Gemma 3 (4B and up): load the language model's weights under their text names, skip the rest.
   const rename = config!.model_type === "gemma3" ? multimodalTextName : config!.model_type === "granitemoehybrid" ? graniteName : config!.model_type === "phi3" ? phi3Name : idefics3 ? idefics3TextName : undefined;
   const scale = cfg.residualScale !== undefined || cfg.logitScale !== undefined ? (name: string) => weightScale(cfg, name) : undefined;
-  const files: WeightFile[] = [];
-  try {
-    for (const name of names) {
-      const { source, header } = await openParsed(ref, name, endpoint, readSafetensorsHeader);
-      files.push({ name, source, tensors: header.tensors, transform, rename, scale });
-    }
-  } catch (err) {
-    // Otherwise the shards already open keep their OPFS locks (and downloads) until the worker dies.
-    for (const f of files) f.source.close?.();
-    throw err;
+  // Shards are opened together: each open is a request (and a header to read) on a first load.
+  const opened = await Promise.allSettled(names.map((name) => openParsed(ref, name, endpoint, readSafetensorsHeader)));
+  const failed = opened.find((r) => r.status === "rejected");
+  if (failed) {
+    // Otherwise the shards that did open keep their OPFS locks (and downloads) until the worker dies.
+    for (const r of opened) if (r.status === "fulfilled") r.value.source.close?.();
+    throw (failed as PromiseRejectedResult).reason;
   }
+  const files: WeightFile[] = opened.map((r, i) => {
+    const { source, header } = (r as PromiseFulfilledResult<Awaited<ReturnType<typeof openParsed<Awaited<ReturnType<typeof readSafetensorsHeader>>>>>>).value;
+    return { name: names[i]!, source, tensors: header.tensors, transform, rename, scale };
+  });
   const tokenizer = Tokenizer.fromJSON(tokJson!);
   tokenizer.chatTemplate = chatTemplate(tokConfig, templateFile ?? templateJson?.chat_template);
   // Gemma 3 4B and up: the SigLIP tower and projector sit in the same files.

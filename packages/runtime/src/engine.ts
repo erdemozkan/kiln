@@ -108,6 +108,14 @@ export interface CacheSnapshot {
   data: Uint8Array;
 }
 
+/** The layout of a model's K/V cache: its number type, layers, bytes per row, and slots per layer (rings have fewer). */
+export interface CacheShape {
+  kvDtype: string;
+  layers: number;
+  rowBytes: number;
+  slots: number[];
+}
+
 export interface TextDelta {
   text: string;
   tokenId: number;
@@ -911,6 +919,22 @@ export class Engine {
   /** The tokens whose K/V `exportCache` would return, without reading anything back from the GPU. */
   get cacheTokens(): readonly number[] {
     return this.cached;
+  }
+
+  /** What decides how cached K/V is laid out: a prompt cache file made for another shape does not fit. */
+  get cacheShape(): CacheShape {
+    const m = this.model;
+    return { kvDtype: m.kvDtype, layers: m.cfg.numLayers, rowBytes: m.kvRowBytes, slots: [...m.slots] };
+  }
+
+  /**
+   * The cached tokens and the K/V of those from position `from` on (see `LlamaModel.readKvRange`),
+   * for a prompt cache that already holds the ones before.
+   */
+  async exportCacheFrom(from: number): Promise<{ tokens: number[]; parts: Uint8Array[] }> {
+    if (this.busy) throw new Error("exportCache: the engine is generating");
+    const tokens = [...this.cached];
+    return { tokens, parts: await this.model.readKvRange(from, tokens.length) };
   }
 
   async exportCache(): Promise<CacheSnapshot> {

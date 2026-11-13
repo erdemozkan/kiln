@@ -277,6 +277,38 @@ export class LlamaModel {
     return out;
   }
 
+  /** Positions of from…to-1 that layer l still holds once `to` are written: all, or a ring's last `slots`. */
+  private kvRangeStart(l: number, from: number, to: number): number {
+    return Math.max(from, to - this.slots[l]!);
+  }
+
+  /** Bytes `readKvRange(from, to)` returns in all. */
+  kvRangeBytes(from: number, to: number): number {
+    return this.slots.reduce((t, _, l) => t + 2 * (to - this.kvRangeStart(l, from, to)) * this.kvRowBytes, 0);
+  }
+
+  /**
+   * Copies the K/V of positions from…to-1 out of every layer's cache, as parts in order: layer 0's K
+   * rows by position, then its V rows, then layer 1's. A ring layer gives only the positions it
+   * still holds (its last `slots` up to `to`). Like `readKv`, the copies are queued at once. What a
+   * prompt cache appends after a call: the rows of the new tokens, not the whole cache again.
+   */
+  async readKvRange(from: number, to: number): Promise<Uint8Array[]> {
+    if (!(from >= 0 && from <= to && to <= this.maxSeq)) throw new Error(`readKvRange: ${from}…${to} is not inside the cache`);
+    const row = this.kvRowBytes;
+    const parts = this.kv.flatMap(({ k, v }, l) => {
+      const slots = this.slots[l]!;
+      const start = this.kvRangeStart(l, from, to);
+      const count = to - start;
+      // Position p sits in slot p % slots, so a range may run off the ring's end and go on at slot 0.
+      const first = start % slots;
+      const head = Math.min(count, slots - first);
+      const runs = (buf: typeof k) => [this.backend.readback(buf, first * row, head * row), ...(count > head ? [this.backend.readback(buf, 0, (count - head) * row)] : [])];
+      return [...runs(k), ...runs(v)];
+    });
+    return (await Promise.all(parts)).map((p) => new Uint8Array(p));
+  }
+
   /**
    * GPU copies of the K/V of positions 0…n-1 (per layer: K, then V, as `readKv` lays them out),
    * queued now, so they hold the cache as it stands. `restoreKv` puts them back.

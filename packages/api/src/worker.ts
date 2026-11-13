@@ -1,5 +1,5 @@
 import { adoptLocalModel, readImage, type ImageInput } from "@kiln/loader";
-import { createAudio, createVision, TtsEngine, type VisionEngine, createEncoder, createEngine, modelKey, modelName, createSeq2Seq, type AudioEngine, loadPromptCache, promptCacheName, savePromptCache, type EncoderEngine, type Engine, type Seq2SeqEngine, type Seq2SeqGenerateOptions, type TextDelta } from "@kiln/runtime";
+import { createAudio, createVision, TtsEngine, type VisionEngine, createEncoder, createEngine, modelKey, modelName, createSeq2Seq, type AudioEngine, loadPromptCache, promptCacheName, savePromptCache, type PromptCacheState, type EncoderEngine, type Engine, type Seq2SeqEngine, type Seq2SeqGenerateOptions, type TextDelta } from "@kiln/runtime";
 import type { AudioTask, VisionTask, EncoderTask, RawOutputs, Request, Response, Seq2SeqTask } from "./protocol";
 
 /** The slice of DedicatedWorkerGlobalScope we use (lib.webworker conflicts with lib.dom in one program). */
@@ -50,9 +50,9 @@ function runTask(e: EncoderEngine, task: EncoderTask, args: unknown[]): Promise<
   }
 }
 const aborts = new Map<number, AbortController>();
-/** Prompt cache file of the loaded model (undefined when off), and the tokens last written to it. */
+/** Prompt cache file of the loaded model (undefined when off), and what it holds (undefined: unknown, so the next save starts it over). */
 let cacheName: string | undefined;
-let savedTokens: readonly number[] = [];
+let saved: PromptCacheState | undefined;
 let saving: Promise<void> = Promise.resolve();
 
 /** Writes the engine's cached K/V unless a call has started since or nothing changed. */
@@ -60,14 +60,13 @@ async function saveCache(e: Engine, name: string): Promise<void> {
   // The prompt cache restores into the base model at the next load: K/V an adapter made would not fit it.
   if (e.adapterInfo.active !== undefined) return;
   try {
-    // Compared first: reading the K/V back from the GPU is the expensive part, and a call that
-    // changed nothing (a repeated prompt, a failed call) needs none of it.
-    const now = e.cacheTokens;
-    if (now.length === savedTokens.length && now.every((t, i) => t === savedTokens[i])) return;
-    const snap = await e.exportCache();
-    if (await savePromptCache(name, snap)) savedTokens = snap.tokens;
+    // Only what the call added is read back from the GPU and appended (nothing, if nothing changed).
+    const before = saved;
+    saved = undefined;
+    saved = await savePromptCache(name, e, before);
   } catch {
-    // Busy with the next call, or storage refused: the cache is only an optimisation.
+    // Busy with the next call, or storage refused: the cache is only an optimisation. What the file
+    // holds is unknown now, so the next save writes it whole.
   }
 }
 
@@ -167,9 +166,10 @@ scope.onmessage = async (e: MessageEvent<Request>) => {
         engine = await createEngine(msg.model, { ...msg.opts, onProgress: (progress) => post({ id: msg.id, type: "progress", progress }) });
         // A file model's prompt cache is named by the file (name, size, time) or a hash of its URL.
         cacheName = msg.opts.promptCache === false ? undefined : promptCacheName(modelKey(msg.model), msg.opts);
-        savedTokens = [];
-        const snap = cacheName ? await loadPromptCache(cacheName) : undefined;
-        if (snap && engine.importCache(snap)) savedTokens = snap.tokens;
+        saved = undefined;
+        const stored = cacheName ? await loadPromptCache(cacheName) : undefined;
+        // A file that does not fit this model (another context size, say) is started over at the next save.
+        if (stored && engine.importCache(stored.snapshot)) saved = stored.state;
         const cfg = engine.model.cfg;
         post({
           id: msg.id,
@@ -187,7 +187,7 @@ scope.onmessage = async (e: MessageEvent<Request>) => {
             contextLength: cfg.contextLength,
             chatFormat: engine.chatFormat?.name,
             backendFeatures: [...engine.backend.limits.features],
-            restoredTokens: savedTokens.length,
+            restoredTokens: saved?.tokens.length ?? 0,
           },
         });
         break;

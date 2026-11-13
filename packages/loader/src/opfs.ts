@@ -1,5 +1,5 @@
 import { isLocalUrl, localBlob } from "./local";
-import { BlobSource, HttpSource, parseContentRangeTotal, type ByteSource, checkRange } from "./source";
+import { BlobSource, HttpSource, check, parseContentRangeTotal, withRetries, type ByteSource, checkRange } from "./source";
 
 /** Minimal typing for the worker-only OPFS sync handle (not in lib.dom). */
 interface SyncHandle {
@@ -120,6 +120,8 @@ export class CachedHttpSource implements ByteSource {
   private ahead: HttpSource | undefined;
   private url = "";
   private readAhead = READ_AHEAD;
+  /** The response `open` learned the size from: the download starts with it. */
+  private first: Response | undefined;
 
   private constructor(
     readonly name: string,
@@ -154,15 +156,24 @@ export class CachedHttpSource implements ByteSource {
     const dir = await root.getDirectoryHandle(DIR, { create: true });
     const fileName = encodeURIComponent(key);
     const meta = fresh ? undefined : await readMeta(dir, fileName);
-    const total = meta?.size ?? (await new HttpSource(url).size());
+    // A file not seen before: the request that downloads it also tells its size, so no separate
+    // request asks for it first.
+    const first = meta ? undefined : await withRetries(key, retryMs, async () => {
+      const res = await fetch(url, { headers: { Range: "bytes=0-" } });
+      check(url, res);
+      return res;
+    });
+    const total = meta?.size ?? parseContentRangeTotal(first!.headers.get("Content-Range")) ?? Number(first!.headers.get("Content-Length"));
     const parts: SyncHandle[] = [];
     try {
+      if (!Number.isSafeInteger(total) || total < 0) throw new Error(`${url}: the server did not say how large the file is`);
       for (let i = 0; i < Math.max(1, Math.ceil(total / segment)); i++) {
         const file = (await dir.getFileHandle(partName(fileName, i), { create: true })) as SyncFileHandle;
         parts.push(await file.createSyncAccessHandle());
       }
     } catch (err) {
       for (const p of parts) p.close();
+      void first?.body?.cancel().catch(() => undefined);
       if ((err as { name?: string }).name === "NoModificationAllowedError") {
         throw new Error(`${key} is already open in another tab or worker; close it and try again`);
       }
@@ -187,6 +198,7 @@ export class CachedHttpSource implements ByteSource {
       src.readAhead = readAhead;
       src.finishOnClose = finishOnClose;
       src.downloading = true;
+      src.first = first;
       void src.download(url).finally(() => {
         src.downloading = false;
         if (src.finishing) src.shut();
@@ -301,7 +313,9 @@ export class CachedHttpSource implements ByteSource {
 
   /** One request for the bytes after `have`. Returns once the file is complete or caching stopped. */
   private async fetchRest(url: string): Promise<"done" | "retry"> {
-    const res = await fetch(url, { headers: { Range: `bytes=${this.have}-` } });
+    const opened = this.have === 0 ? this.first : undefined;
+    this.first = undefined;
+    const res = opened ?? (await fetch(url, { headers: { Range: `bytes=${this.have}-` } }));
     if (res.status === 200 && this.have > 0) this.have = 0; // server ignored Range: restart
     else if (res.status >= 500 || res.status === 429) throw new RetryableError(`${url}: HTTP ${res.status}`);
     else if (res.status !== 206 && res.status !== 200) throw new Error(`${url}: HTTP ${res.status}`);
@@ -441,29 +455,41 @@ export async function readCacheFile(name: string): Promise<Uint8Array | undefine
   }
 }
 
+/** A cache file as a Blob, to read in slices (a large file need not be in memory whole); undefined if missing. */
+export async function readCacheBlob(name: string): Promise<Blob | undefined> {
+  try {
+    const dir = await (await navigator.storage.getDirectory()).getDirectoryHandle(DIR);
+    return await (await dir.getFileHandle(name)).getFile();
+  } catch {
+    return undefined;
+  }
+}
+
 /**
- * Writes a file to the cache directory from parts, replacing it; returns false on failure (a full
- * store, say), which a cache can ignore. In a worker it uses a sync handle, and a short write leaves
- * the file empty rather than truncated, so readers never see half of it. Elsewhere it uses a writable
- * stream where the browser has one (the file is swapped in whole on close).
+ * Writes a file to the cache directory from parts; returns false on failure (a full store, say),
+ * which a cache can ignore. The file is cut at `at` and the parts follow from there: 0 replaces it,
+ * a larger offset keeps what lies before and appends. In a worker it uses a sync handle, and a short
+ * write cuts the file back to `at` (empty, when replacing), so readers never see half of what was
+ * being written. Elsewhere it uses a writable stream where the browser has one (the file is swapped
+ * in whole on close).
  */
-export async function writeCacheFile(name: string, parts: readonly Uint8Array[]): Promise<boolean> {
-  if (!opfsAvailable()) return writeCacheStream(name, parts);
+export async function writeCacheFile(name: string, parts: readonly Uint8Array[], at = 0): Promise<boolean> {
+  if (!opfsAvailable()) return writeCacheStream(name, parts, at);
   let h: SyncHandle | undefined;
   try {
     const dir = await (await navigator.storage.getDirectory()).getDirectoryHandle(DIR, { create: true });
     h = await ((await dir.getFileHandle(name, { create: true })) as SyncFileHandle).createSyncAccessHandle();
-    h.truncate(0);
-    let at = 0;
+    h.truncate(at);
+    let to = at;
     for (const p of parts) {
-      if (h.write(p, { at }) !== p.length) throw new Error("short write");
-      at += p.length;
+      if (h.write(p, { at: to }) !== p.length) throw new Error("short write");
+      to += p.length;
     }
     h.flush();
     return true;
   } catch {
     try {
-      h?.truncate(0);
+      h?.truncate(at);
     } catch {
       // Nothing more to do; the reader rejects what does not parse.
     }
@@ -474,19 +500,31 @@ export async function writeCacheFile(name: string, parts: readonly Uint8Array[])
 }
 
 interface Writable {
-  write(data: Uint8Array): Promise<void>;
+  write(data: Uint8Array | { type: "write"; position: number; data: Uint8Array }): Promise<void>;
+  truncate?(size: number): Promise<void>;
   close(): Promise<void>;
   abort(): Promise<void>;
 }
 
-async function writeCacheStream(name: string, parts: readonly Uint8Array[]): Promise<boolean> {
+async function writeCacheStream(name: string, parts: readonly Uint8Array[], at: number): Promise<boolean> {
   let w: Writable | undefined;
   try {
     const dir = await (await navigator.storage.getDirectory()).getDirectoryHandle(DIR, { create: true });
-    const file = (await dir.getFileHandle(name, { create: true })) as FileSystemFileHandle & { createWritable?: () => Promise<Writable> };
+    const file = (await dir.getFileHandle(name, { create: true })) as FileSystemFileHandle & { createWritable?: (o?: { keepExistingData?: boolean }) => Promise<Writable> };
     if (!file.createWritable) return false;
-    w = await file.createWritable();
-    for (const p of parts) await w.write(p);
+    if (at === 0) {
+      w = await file.createWritable();
+      for (const p of parts) await w.write(p);
+    } else {
+      w = await file.createWritable({ keepExistingData: true });
+      if (!w.truncate) throw new Error("the stream cannot truncate");
+      await w.truncate(at);
+      let to = at;
+      for (const p of parts) {
+        await w.write({ type: "write", position: to, data: p });
+        to += p.length;
+      }
+    }
     await w.close();
     return true;
   } catch {

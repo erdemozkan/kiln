@@ -83,7 +83,7 @@ export class HttpSource implements ByteSource {
 /** A failure worth retrying: the network (fetch's TypeError), a server error, or a short body. */
 class TransientError extends Error {}
 
-function check(url: string, res: Response): void {
+export function check(url: string, res: Response): void {
   if (res.status >= 500 || res.status === 429) throw new TransientError(`${url}: HTTP ${res.status}`);
   if (res.status !== 206 && res.status !== 200) throw new Error(`${url}: HTTP ${res.status}`);
 }

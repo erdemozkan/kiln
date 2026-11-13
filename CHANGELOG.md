@@ -49,6 +49,17 @@ the Pages deploy pins its actions to commits and copies only a plain file out of
 no longer leaves its device and buffers behind (the LLM loader already cleaned up). The prompt cache
 is no longer read back from the GPU after a call that left it unchanged.
 
+**The prompt cache is appended to, not rewritten.** Its file is now a log of segments, one per save:
+after a chat turn only the new tokens' K/V is read back from the GPU and added, where the whole
+conversation's was read and written again each turn. When the tokens part ways with what is saved
+(an edited message), the file is cut at the last segment both share and continues from there. A
+write cut short costs that segment, not the file. Loading reads one segment at a time. Files of the
+old layout are ignored and replaced.
+
+**Fewer requests on a first download.** The request that downloads a weight file also tells its
+size, so the separate one-byte request that asked for it is gone, and the shards of a split
+safetensors model are opened together instead of one after another.
+
 **A download closed just short of its end now finishes.** A GGUF whose last bytes the model does not
 read (bartowski's SmolLM2-135M Q4_K_M, for one) was never marked complete, so up to 32 MiB of it was
 downloaded again on every load. A source closed with at most 64 MiB left runs to the end first; one

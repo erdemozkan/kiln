@@ -175,7 +175,7 @@ describe("CachedHttpSource", () => {
     const src = await CachedHttpSource.open("u", KEY);
     expect(await src.read(200, 50)).toEqual(BODY.subarray(200, 250));
     expect(await src.read(0, 64)).toEqual(BODY.subarray(0, 64)); // cached part, no request
-    expect(requests).toEqual(["bytes=0-0", "bytes=0-", "bytes=200-249"]); // size probe, download, network read
+    expect(requests).toEqual(["bytes=0-", "bytes=200-249"]); // download (which also tells the size), network read
     expect(await src.read(0, BODY.length)).toEqual(BODY);
     expect(warn).toHaveBeenCalledWith(expect.stringMatching(/cache write of 64 bytes at 128 returned 0/));
     src.close?.();
@@ -240,8 +240,8 @@ describe("CachedHttpSource", () => {
     vi.stubGlobal("fetch", async (url: string, init?: { headers?: Record<string, string> }) => {
       calls++;
       const res = await fakeFetch(url, init);
-      if (calls === 3) return { ...res, status: 503 };
-      if (calls !== 2) return res;
+      if (calls === 2) return { ...res, status: 503 };
+      if (calls !== 1) return res;
       // The first download request dies after two chunks, the way a dropped connection does.
       const reader = res.body.getReader();
       let n = 0;
@@ -252,7 +252,7 @@ describe("CachedHttpSource", () => {
     });
     const src = await CachedHttpSource.open("u", KEY, { retryMs: 1 });
     expect(await readAll(src)).toEqual(BODY);
-    expect(requests).toEqual(["bytes=0-0", "bytes=0-", "bytes=128-", "bytes=128-"]);
+    expect(requests).toEqual(["bytes=0-", "bytes=128-", "bytes=128-"]);
     expect(getMeta()).toMatchObject({ complete: true });
     warn.mockRestore();
   });
@@ -261,11 +261,13 @@ describe("CachedHttpSource", () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
     vi.stubGlobal("fetch", async (url: string, init?: { headers?: Record<string, string> }) => {
       const res = await fakeFetch(url, init);
-      return init?.headers?.Range === "bytes=0-0" ? res : { ...res, status: 502 };
+      // The request that opens the file answers, then its body dies; every later one is refused.
+      if (requests.length > 1) return { ...res, status: 502 };
+      return { ...res, body: { getReader: () => ({ read: async () => Promise.reject(new TypeError("network error")), cancel: async () => undefined }) } };
     });
     const src = await CachedHttpSource.open("u", KEY, { retryMs: 1 });
     await expect(src.read(0, 8)).rejects.toThrow(/HTTP 502/);
-    expect(requests.length).toBe(1 + 6);
+    expect(requests.length).toBe(6);
     src.close?.();
     warn.mockRestore();
   });
