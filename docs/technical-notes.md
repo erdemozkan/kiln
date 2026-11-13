@@ -386,6 +386,10 @@ How it got there, each step measured in one session with identical greedy output
   bytes (an estimate; not built), at the price of a second layout in every attention kernel. The rounding also makes the
   GPU and CPU backends drift apart by as much as either drifts from f32 (their inputs differ in the
   fifth digit, which flips codes), where with f16 they agree to 0.01 nats. 60 kernel checks cover it.
+  A wider check, eight reading questions with four answer choices each (32 scores per model, against
+  f32): SmolLM2-135M mean |Δ| 0.48 nats, largest 1.49, the same first choice in 7 of 8; Qwen3-0.6B
+  mean 1.21, largest 4.57, the same first choice in 7 of 8. f16 on the same: mean 0.003 and 0.009,
+  the same first choice in 8 of 8.
 - **Memory planner:** liveness-based placement in one pool shared by all plans, plus online-softmax
   prefill attention instead of a [T, heads, maxSeq] f32 score buffer (9 MiB at T = 128 for this model,
   and it grows with context and heads). Intermediates 19.3 → 1.8 MiB. The new attention is also faster:

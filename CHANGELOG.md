@@ -105,8 +105,10 @@ E4M3, four to a word, the format llama.cpp 1.0 added), half the memory of the de
 same 512 MiB budget Qwen3-0.6B's default context goes from 4,608 to 8,192 tokens, and the prompt
 cache file halves. It costs some fidelity: log-probabilities of 10 to 15 token answers moved by 0.3
 to 2.7 nats (1 to 5%) on Qwen3-0.6B, SmolLM2-135M and Phi-3.5-mini, where f16 moves them by 0.02;
-greedy answers to a 470-token question were unchanged on all three. Decode speed is within 10% of f16. The default stays
-f16. On the CPU backend an f8 cache takes the TypeScript attention path, not the WASM one.
+greedy answers to a 470-token question were unchanged on all three. On eight reading questions with four answer
+choices each, it changed which answer ranked first in 1 of 8 on both SmolLM2-135M and Qwen3-0.6B
+(scores moved by 0.5 and 1.2 nats on average), where f16 changed none: use it where memory matters
+more than close calls. Decode speed is within 10% of f16. The default stays f16. On the CPU backend an f8 cache takes the TypeScript attention path, not the WASM one.
 
 **Access tokens for gated and private models.** `setAccessToken(token)` makes requests for repo
 files carry a Hugging Face access token, so gated repos (the original Llama and Gemma ones) and
