@@ -26,6 +26,11 @@ what `localModel` does (a .gguf `File`, a folder input's files, a file or direct
 "text-generation" the URL of one .gguf; `load` accepts a folder's files and handles as well as a
 .gguf `File`. A task that needs a repo says so when given the URL of one file.
 
+**Released versions on the Pages site.** A deploy now also publishes every released version at its
+own address (`…/kiln/0.2.0/kiln-webgpu.js`, listed in `…/kiln/versions.json`), fetched from npm and
+checked against the registry's checksum, so a page that imports the library from the site can pin a
+version instead of following `main`.
+
 **A download closed just short of its end now finishes.** A GGUF whose last bytes the model does not
 read (bartowski's SmolLM2-135M Q4_K_M, for one) was never marked complete, so up to 32 MiB of it was
 downloaded again on every load. A source closed with at most 64 MiB left runs to the end first; one

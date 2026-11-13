@@ -5,10 +5,8 @@ Ideas that are not built yet. Each entry says what it is, why it is worth doing,
 ## After 0.2.0
 
 Version 0.2.0 is published on npm (`kiln-webgpu`), the repository is public, and the docs site and
-playground are live on GitHub Pages. Left over from that release:
-
-1. **Versioned copies on the Pages site.** It serves only the latest build of `main`
-   (`kiln-webgpu.js`); npm and jsDelivr are the versioned route.
+playground are live on GitHub Pages. Versioned copies on the Pages site are scripted
+(`scripts/pages-versions.mjs`, run by the deploy workflow) and take effect with the next deploy.
 
 ## Later
 

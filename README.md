@@ -66,7 +66,7 @@ Or import it with no install and no bundler:
 </script>
 ```
 
-The latest build from `main` is also served from this repository's site, at `https://erdemozkan.github.io/kiln/kiln-webgpu.js`.
+This repository's site serves the library too: each release at its own address (`https://erdemozkan.github.io/kiln/0.2.0/kiln-webgpu.js`), and the latest build from `main` at `https://erdemozkan.github.io/kiln/kiln-webgpu.js`.
 
 Chat with a model, using the transformers.js-style pipeline:
 
