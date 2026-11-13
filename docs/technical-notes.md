@@ -377,7 +377,10 @@ How it got there, each step measured in one session with identical greedy output
   per thread (rope + cache) let the thread of a word's first pair compute the second too. Half of
   f16's memory. Measured against f32 on a 470-token prompt: answer log-probabilities move by 0.3 to
   2.7 nats per 10 to 15 token answer (Qwen3-0.6B Q4_K_M, SmolLM2-135M), f16 by 0.02; greedy answers
-  unchanged; decode 16.8 to 17.8 against 18.7 tokens/s (Qwen3-0.6B), level on SmolLM2-135M. The
+  unchanged; decode 16.8 to 17.8 against 18.7 tokens/s (Qwen3-0.6B), level on SmolLM2-135M. On
+  Phi-3.5-mini (3.8B, Q4_K_M) the same prompt: scores move by 0.6 to 2.6 nats on answers of -48 to
+  -68 (1 to 5%), f16 by 0.02; the same greedy answer; 4.0 against 4.1 tokens/s; and the default
+  context is 2,560 tokens in 503 MiB where f16's 2,048 take 805 MiB. The
   error is relative (about 1.8% rms per value, whatever its size), so large values carry most of
   it; 8-bit integers with a scale per head row should be about 2.5 times more exact for the same
   bytes (an estimate; not built), at the price of a second layout in every attention kernel. The rounding also makes the
