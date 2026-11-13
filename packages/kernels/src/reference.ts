@@ -27,7 +27,8 @@ export function rmsnormRef(x: Float32Array, w: Float32Array, D: number, eps: num
 
 export function ropeRef(x: Float32Array, T: number, H: number, D: number, pos0: number, invFreq: Float32Array, interleaved: boolean): Float32Array {
   const y = x.slice();
-  const half = D / 2;
+  // One frequency per rotated pair: D / 2 of them, or fewer when only the head's first part is rotated.
+  const half = invFreq.length;
   for (let t = 0; t < T; t++)
     for (let h = 0; h < H; h++)
       for (let i = 0; i < half; i++) {

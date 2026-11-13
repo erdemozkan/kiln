@@ -233,3 +233,55 @@ describe("FP8 E4M3 codes", () => {
     expect(F8[toF8(0.0005)]).toBe(0);
   });
 });
+
+describe("partial rotary (CPU)", () => {
+  const be = new CpuBackend({ simd: false });
+  const step = be.alloc(STEP_BYTES);
+  const upload = (data: Float32Array, shape: number[]): Tensor => {
+    const buf = be.alloc(data.byteLength);
+    be.write(buf, 0, data);
+    return { shape, dtype: "f32", buf };
+  };
+  const read = async (t: { buf: Tensor["buf"] }, n: number) => new Float32Array(await be.readback(t.buf, 0, n * 4));
+  const run = (pos0: number, build: (ctx: Ctx) => void) => {
+    be.write(step, 0, packStep({ pos0, lastRow: 0, seed: 1, temperature: 0 }));
+    const ctx = new Ctx(be, step, "t");
+    build(ctx);
+    be.submit(ctx.dispatches);
+  };
+
+  it.each([[false, 12], [true, 12], [false, 16], [false, 4]] as const)("rotates the first part of each head and leaves the rest (interleaved %s, %i of 16)", async (interleaved, R) => {
+    const [T, H, Hkv, D, pos0, maxSeq] = [3, 4, 2, 16, 5, 12];
+    const inv = Float32Array.from({ length: R / 2 }, (_, i) => 1 / 10000 ** ((2 * i) / R));
+    // In place.
+    const x = randn(T * H * D);
+    const xt = upload(x, [T, H * D]);
+    run(pos0, (ctx) => ops.rope(ctx, xt, T, H, D, upload(inv, [R / 2]), interleaved));
+    const want = ref.ropeRef(x, T, H, D, pos0, inv, interleaved);
+    const got = await read(xt, x.length);
+    expect(ref.maxAbsDiff(got, want)).toBeLessThan(1e-5);
+    // What lies past the rotated part is bit for bit the input.
+    for (let r = 0; r < T * H; r++) for (let i = R; i < D; i++) expect(got[r * D + i]).toBe(x[r * D + i]);
+    // Fused with the cache write: q out, k into the cache, v copied.
+    const W = (H + 2 * Hkv) * D;
+    const qkv = randn(T * W);
+    const part = (from: number, n: number) => {
+      const out = new Float32Array(T * n);
+      for (let t = 0; t < T; t++) out.set(qkv.subarray(t * W + from, t * W + from + n), t * n);
+      return out;
+    };
+    const kc = upload(new Float32Array(maxSeq * Hkv * D), [0]);
+    const vc = upload(new Float32Array(maxSeq * Hkv * D), [0]);
+    let qo!: Tensor;
+    run(pos0, (ctx) => (qo = ops.ropeKv(ctx, upload(qkv, [T, W]), kc.buf, vc.buf, { T, H, Hkv, D, maxSeq }, upload(inv, [R / 2]), interleaved)));
+    expect(ref.maxAbsDiff(await read(qo, T * H * D), ref.ropeRef(part(0, H * D), T, H, D, pos0, inv, interleaved))).toBeLessThan(1e-5);
+    const wantK = ref.ropeRef(part(H * D, Hkv * D), T, Hkv, D, pos0, inv, interleaved);
+    expect(ref.maxAbsDiff((await read(kc, maxSeq * Hkv * D)).subarray(pos0 * Hkv * D, (pos0 + T) * Hkv * D), wantK)).toBeLessThan(1e-5);
+    expect((await read(vc, maxSeq * Hkv * D)).subarray(pos0 * Hkv * D, (pos0 + T) * Hkv * D)).toEqual(part((H + Hkv) * D, Hkv * D));
+  });
+
+  it("refuses frequencies that do not fit the head", () => {
+    const x = upload(randn(16), [1, 16]);
+    expect(() => run(0, (ctx) => ops.rope(ctx, x, 1, 1, 16, upload(randn(9), [9]), false))).toThrow(/do not fit a head of 16/);
+  });
+});

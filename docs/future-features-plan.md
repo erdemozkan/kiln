@@ -15,8 +15,11 @@ playground are live on GitHub Pages. Versioned copies on the Pages site are scri
 The largest gap against transformers.js, which runs any ONNX graph while Kiln implements each model
 family itself. Pick the next families by what people ask for.
 
-Phi-3 and 3.5 are done (unreleased). Open in that family: Phi-4 mini, which rotates only three quarters
-of each head and needs a rope kernel for that; LongRoPE past the original 4096 tokens (the long
+Phi-3, 3.5 and Phi-4 mini are done (unreleased); Phi-4 mini needed rope on part of each head, which
+the rope kernels now take. Qwen 3.5 and Gemma 4 use the same partial rotary on their full-attention
+layers, but each also needs new layers: Qwen 3.5 a recurrent "linear attention" layer (gated delta
+net) in three layers of four, Gemma 4 K/V shared between layers, per-layer input embeddings and two
+head sizes. Open in the Phi family: LongRoPE past the original 4096 tokens (the long
 factors); and a run of the safetensors checkpoints, whose name mapping is unit-tested but which were
 not loaded here (7.6 GB each).
 

@@ -21,6 +21,11 @@ export interface LlamaConfig {
    * checkpoint's short factors, which hold up to `maxPositions` tokens.
    */
   ropeFactors?: number[];
+  /**
+   * Partial rotary (Phi-4 mini): RoPE turns only the first `rotaryDims` elements of each head (pairs
+   * i and i + rotaryDims / 2); the rest carry no position. Unset: the whole head.
+   */
+  rotaryDims?: number;
   /** The longest context this config is valid for; a longer `maxSeq` is refused (LongRoPE's short factors). */
   maxPositions?: number;
   /** GGUF llama checkpoints have Q/K permuted for interleaved (GPT-J style) rotary pairs. */
@@ -198,12 +203,12 @@ export function configFromHF(c: HFConfig, generation?: HFConfig): LlamaConfig {
  * gate/up as one `gate_up_proj` (see `phi3Name`), which is how Kiln runs them anyway. The 128k
  * variants use LongRoPE: per-frequency factors, a short set up to the original context and a long set
  * past it, and attention inputs scaled by a constant. Kiln applies the short set, so those models run
- * up to their original context (4096 tokens). Phi-4 mini rotates only part of each head and is refused.
+ * up to their original context (4096 tokens). Phi-4 mini rotates only part of each head (`rotaryDims`).
  */
-function phi3(c: HFConfig, base: LlamaConfig): LlamaConfig {
-  if (typeof c.partial_rotary_factor === "number" && c.partial_rotary_factor !== 1) {
-    throw new UnsupportedModelError(`phi3 with partial_rotary_factor ${c.partial_rotary_factor} (Phi-4 mini) is not supported yet`);
-  }
+function phi3(c: HFConfig, plain: LlamaConfig): LlamaConfig {
+  // Phi-4 mini rotates the first 3/4 of each head (int(head_dim × factor), as transformers computes it).
+  const factor = c.partial_rotary_factor;
+  const base = typeof factor === "number" && factor !== 1 ? { ...plain, rotaryDims: partialRotary(plain.headDim, Math.floor(plain.headDim * factor)) } : plain;
   const s = c.rope_scaling as HFConfig | null | undefined;
   if (!s) return base;
   const type = s.rope_type ?? s.type;
@@ -213,9 +218,15 @@ function phi3(c: HFConfig, base: LlamaConfig): LlamaConfig {
   return longRope(base, s.short_factor, original, base.contextLength ?? original, optNum(s.attention_factor));
 }
 
+/** Checks a partial rotary size: an even number of a head's elements, at least one pair, at most all. */
+function partialRotary(headDim: number, dims: number): number {
+  if (!Number.isInteger(dims) || dims < 2 || dims > headDim || dims % 2 !== 0) throw new UnsupportedModelError(`rotary embedding on ${dims} of ${headDim} head dimensions is not supported`);
+  return dims;
+}
+
 /** Applies LongRoPE's short factors and its attention factor (√(1 + ln(scale) / ln(original)) unless the checkpoint states one). */
 function longRope(base: LlamaConfig, short: unknown, original: number, trained: number, attnFactor?: number): LlamaConfig {
-  const half = base.headDim / 2;
+  const half = (base.rotaryDims ?? base.headDim) / 2;
   if (!Array.isArray(short) || short.length !== half || short.some((v) => typeof v !== "number" || !(v > 0) || !Number.isFinite(v))) {
     throw new UnsupportedModelError(`LongRoPE needs ${half} positive short factors`);
   }
@@ -389,12 +400,13 @@ export function configFromGGUF(meta: Map<string, unknown>, tensorNames: readonly
     contextLength: optNum(meta.get(`${arch}.context_length`)),
   };
   if (arch === "phi3") {
+    // Phi-4 mini: fewer rotated dimensions than the head has.
     const rotary = get("rope.dimension_count", base.headDim);
-    if (rotary !== base.headDim) throw new UnsupportedModelError(`phi3 rotating ${rotary} of ${base.headDim} head dimensions (Phi-4 mini) is not supported yet`);
-    if (!tensorNames.includes(PHI3_ROPE_SHORT)) return base;
+    const phi = rotary !== base.headDim ? { ...base, rotaryDims: partialRotary(base.headDim, rotary) } : base;
+    if (!tensorNames.includes(PHI3_ROPE_SHORT)) return phi;
     if (!ropeShort) throw new UnsupportedModelError(`phi3 with LongRoPE: the values of ${PHI3_ROPE_SHORT} are needed`);
     const original = get("rope.scaling.original_context_length");
-    return longRope(base, Array.from(ropeShort), original, base.contextLength ?? original, optNum(meta.get("phi3.rope.scaling.attn_factor")));
+    return longRope(phi, Array.from(ropeShort), original, phi.contextLength ?? original, optNum(meta.get("phi3.rope.scaling.attn_factor")));
   }
   if (arch !== "granite") return base;
   const logitScale = 1 / get("logit_scale", 1);
@@ -463,12 +475,14 @@ function gemma3FromGGUF(meta: Map<string, unknown>, tensorNames: readonly string
 }
 
 /** RoPE inverse frequencies, with Llama 3 long-context scaling applied when configured. */
-export function ropeInvFreq(cfg: Pick<LlamaConfig, "headDim" | "ropeTheta" | "ropeScaling" | "ropeLinear" | "ropeFactors">): Float32Array {
-  const half = cfg.headDim / 2;
+export function ropeInvFreq(cfg: Pick<LlamaConfig, "headDim" | "ropeTheta" | "ropeScaling" | "ropeLinear" | "ropeFactors" | "rotaryDims">): Float32Array {
+  // One frequency per rotated pair, spread over the rotated part of the head.
+  const dims = cfg.rotaryDims ?? cfg.headDim;
+  const half = dims / 2;
   const out = new Float32Array(half);
   const s = cfg.ropeScaling;
   for (let i = 0; i < half; i++) {
-    let f = 1 / cfg.ropeTheta ** ((2 * i) / cfg.headDim);
+    let f = 1 / cfg.ropeTheta ** ((2 * i) / dims);
     if (cfg.ropeLinear) f /= cfg.ropeLinear;
     if (cfg.ropeFactors) f /= cfg.ropeFactors[i]!;
     if (s) {

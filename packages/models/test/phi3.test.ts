@@ -44,8 +44,22 @@ describe("Phi-3", () => {
     for (const i of [0, 7, 47]) expect(scaled[i]).toBeCloseTo(plain[i]! / short[i]!, 6);
   });
 
+  it("rotates part of each head for Phi-4 mini", () => {
+    // Phi-4-mini-instruct's shape: heads of 128, three quarters rotated, 48 LongRoPE factors (one per rotated pair).
+    const phi4 = { ...mini4k, num_attention_heads: 24, num_key_value_heads: 8, vocab_size: 200064, tie_word_embeddings: true, partial_rotary_factor: 0.75, max_position_embeddings: 131072 };
+    const c = configFromHF({ ...phi4, rope_scaling: { type: "longrope", short_factor: new Array(48).fill(1), long_factor: short } });
+    expect(c).toMatchObject({ headDim: 128, numKvHeads: 8, rotaryDims: 96, tieEmbeddings: true, maxPositions: 4096 });
+    const f = ropeInvFreq(c);
+    expect(f.length).toBe(48);
+    // Frequencies spread over the rotated part: 10000^(-2i / 96).
+    for (const i of [0, 1, 47]) expect(f[i]).toBeCloseTo(10000 ** ((-2 * i) / 96), 6);
+    expect(() => configFromHF({ ...phi4, rope_scaling: { type: "longrope", short_factor: new Array(64).fill(1) } })).toThrow("48 positive short factors");
+    expect(configFromHF(mini4k).rotaryDims).toBeUndefined();
+  });
+
   it("refuses what it cannot run", () => {
-    expect(() => configFromHF({ ...mini4k, partial_rotary_factor: 0.75 })).toThrow(UnsupportedModelError);
+    expect(() => configFromHF({ ...mini4k, partial_rotary_factor: 0.01 })).toThrow(/rotary embedding on 0 of 96/);
+    expect(() => configFromHF({ ...mini4k, partial_rotary_factor: 1.5 })).toThrow(UnsupportedModelError);
     expect(() => configFromHF({ ...mini4k, rope_scaling: { type: "longrope", short_factor: [1, 2, 3] } })).toThrow("48 positive short factors");
     expect(() => configFromHF({ ...mini4k, rope_scaling: { type: "yarn" } })).toThrow(UnsupportedModelError);
     // Values that would give a zero or endless context, or a scale that is not a number.
@@ -94,6 +108,11 @@ describe("Phi-3", () => {
     expect(l.ropeFactors!.length).toBe(48);
     expect(l.attnScale).toBeCloseTo(1.19 ** 2 / Math.sqrt(96), 10);
     expect(l.maxPositions).toBe(4096);
-    expect(() => configFromGGUF(new Map([...meta, ["phi3.rope.dimension_count", 72]]), names)).toThrow("Phi-4 mini");
+    // Phi-4 mini files: fewer rotated dimensions than the head has.
+    const partial = configFromGGUF(new Map([...meta, ["phi3.rope.dimension_count", 72]]), names);
+    expect(partial.rotaryDims).toBe(72);
+    expect(ropeInvFreq(partial).length).toBe(36);
+    expect(() => configFromGGUF(new Map([...meta, ["phi3.rope.dimension_count", 73]]), names)).toThrow(/73 of 96/);
+    expect(() => configFromGGUF(new Map([...meta, ["phi3.rope.dimension_count", 128]]), names)).toThrow(/128 of 96/);
   });
 });

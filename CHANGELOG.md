@@ -34,7 +34,14 @@ version instead of following `main`.
 **Phi-3.** The `phi3` family loads from safetensors and GGUF: Phi-3 mini and medium, and the LongRoPE
 variants (Phi-3.5 mini, Phi-3 128k) up to their original 4096-token context, with the short rotary
 factors and the attention factor applied. Their stacked `qkv_proj` and `gate_up_proj` are the stacked
-matmuls Kiln already runs. Phi-4 mini (rotary on part of each head) is refused with a clear message.
+matmuls Kiln already runs.
+
+**Phi-4 mini, and rotary embedding on part of a head.** Phi-4 mini rotates the first three quarters
+of each attention head and leaves the rest without position. The rope kernels (plain, fused with the
+cache write, and fused with q/k norm) now take the number of rotated elements, from the number of
+frequencies they are given, so Phi-4 mini loads from GGUF and safetensors (GGUF Q4_K_M checked: 4.3
+tokens/s, facts recalled from a 442-token prompt). Qwen 3.5 and Gemma 4 use the same scheme on their
+full-attention layers; they are not supported yet, as each also needs new kinds of layers.
 
 **Hardening against hostile model repos.** Three ways a crafted repo could freeze the tab are closed.
 The check on regexes from `tokenizer.json` and adapter configs now also refuses patterns that are

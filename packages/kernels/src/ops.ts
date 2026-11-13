@@ -234,9 +234,20 @@ export function rmsnorm(ctx: Ctx, x: Tensor, w: Tensor, eps: number, dim = lastD
   return y;
 }
 
-/** In-place RoPE on x [T, H * D]. `invFreq` has D / 2 entries (scaling already applied). */
+/**
+ * Elements of each head that RoPE rotates: two per frequency. All D of them, or with partial rotary
+ * (Phi-4 mini) the first 2 × invFreq.length, the rest of the head passing through unchanged.
+ */
+function rotaryDims(invFreq: Tensor, D: number): number {
+  const R = 2 * numel(invFreq.shape);
+  if (R < 2 || R > D || R % 2 !== 0) throw new Error(`rope: ${numel(invFreq.shape)} frequencies do not fit a head of ${D}`);
+  return R;
+}
+
+/** In-place RoPE on x [T, H * D]. `invFreq` has one entry per rotated pair: D / 2, or fewer for partial rotary (scaling already applied). */
 export function rope(ctx: Ctx, x: Tensor, T: number, H: number, D: number, invFreq: Tensor, interleaved: boolean): void {
-  ctx.run(ropeSpec(interleaved), [ctx.uniform([u32(T), u32(H), u32(D), u32(0)]), ctx.step, invFreq.buf, x.buf], grid1d((T * H * D) / 2));
+  const R = rotaryDims(invFreq, D);
+  ctx.run(ropeSpec(interleaved), [ctx.uniform([u32(T), u32(H), u32(D), u32(R)]), ctx.step, invFreq.buf, x.buf], grid1d((T * H * R) / 2));
 }
 
 /**
@@ -246,7 +257,7 @@ export function rope(ctx: Ctx, x: Tensor, T: number, H: number, D: number, invFr
 export function ropeKv(ctx: Ctx, qkv: Tensor, kc: Buf, vc: Buf, s: AttentionShape, invFreq: Tensor, interleaved: boolean): Tensor {
   const q = ctx.alloc([s.T, s.H * s.D]);
   const W = (s.H + 2 * s.Hkv) * s.D;
-  const params = ctx.uniform([u32(s.T), u32(s.H), u32(s.Hkv), u32(s.D), u32(s.maxSeq), u32(cacheSlots(s)), u32(0), u32(0)]);
+  const params = ctx.uniform([u32(s.T), u32(s.H), u32(s.Hkv), u32(s.D), u32(s.maxSeq), u32(cacheSlots(s)), u32(rotaryDims(invFreq, s.D)), u32(0)]);
   ctx.run(ropeKvSpec(interleaved, s.kv), [params, ctx.step, invFreq.buf, qkv.buf, q.buf, kc, vc], grid1d((s.T * W) / 2));
   return q;
 }
@@ -258,7 +269,7 @@ export function ropeKv(ctx: Ctx, qkv: Tensor, kc: Buf, vc: Buf, s: AttentionShap
 export function qkNormRopeKv(ctx: Ctx, qkv: Tensor, qNorm: Tensor, kNorm: Tensor, eps: number, kc: Buf, vc: Buf, s: AttentionShape, invFreq: Tensor, interleaved: boolean): Tensor {
   if (s.D > 256 || s.D % 4 !== 0) throw new Error(`qkNormRopeKv: head dim ${s.D} must be a multiple of 4 and at most 256`);
   const q = ctx.alloc([s.T, s.H * s.D]);
-  const params = ctx.uniform([u32(s.T), u32(s.H), u32(s.Hkv), u32(s.D), u32(s.maxSeq), u32(cacheSlots(s)), f32(eps), u32(0)]);
+  const params = ctx.uniform([u32(s.T), u32(s.H), u32(s.Hkv), u32(s.D), u32(s.maxSeq), u32(cacheSlots(s)), f32(eps), u32(rotaryDims(invFreq, s.D))]);
   ctx.run(qkNormRopeKvSpec(interleaved, s.kv), [params, ctx.step, invFreq.buf, qkv.buf, qNorm.buf, kNorm.buf, q.buf, kc, vc], [s.H + 2 * s.Hkv, s.T, 1]);
   return q;
 }

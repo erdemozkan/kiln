@@ -329,9 +329,13 @@ function angles(pos: number, f: Float32Array, half: number, cs: Float64Array, sn
   }
 }
 
-/** Rotates head `src[base…base+D)` by the angles in cs/sn into out[o…o+D) (src and out may be one array). */
-function rotateHead(src: Float32Array, base: number, D: number, cs: Float64Array, sn: Float64Array, interleaved: boolean, out: Float32Array, o: number): void {
-  const half = D >>> 1;
+/**
+ * Rotates head `src[base…base+D)` by the angles in cs/sn into out[o…o+D) (src and out may be one
+ * array). The first R elements are rotated (R = D, or less with partial rotary); the rest are copied.
+ */
+function rotateHead(src: Float32Array, base: number, D: number, cs: Float64Array, sn: Float64Array, interleaved: boolean, out: Float32Array, o: number, R = D): void {
+  const half = R >>> 1;
+  if (R < D && (src !== out || base !== o)) for (let i = R; i < D; i++) out[o + i] = src[base + i]!;
   for (let j = 0; j < half; j++) {
     const i0 = interleaved ? 2 * j : j;
     const i1 = interleaved ? 2 * j + 1 : j + half;
@@ -343,14 +347,14 @@ function rotateHead(src: Float32Array, base: number, D: number, cs: Float64Array
 
 export function cpuRope(interleaved: boolean): CpuKernel {
   return (b) => {
-    const [T, H, D] = [b[0]!.u32[0]!, b[0]!.u32[1]!, b[0]!.u32[2]!];
+    const [T, H, D, R] = [b[0]!.u32[0]!, b[0]!.u32[1]!, b[0]!.u32[2]!, b[0]!.u32[3]!];
     const { pos0 } = step(b[1]!);
     const f = b[2]!.f32;
     const x = b[3]!.f32;
-    const cs = new Float64Array(D >>> 1), sn = new Float64Array(D >>> 1);
+    const cs = new Float64Array(R >>> 1), sn = new Float64Array(R >>> 1);
     for (let t = 0; t < T; t++) {
-      angles(pos0 + t, f, D >>> 1, cs, sn);
-      for (let h = 0; h < H; h++) rotateHead(x, (t * H + h) * D, D, cs, sn, interleaved, x, (t * H + h) * D);
+      angles(pos0 + t, f, R >>> 1, cs, sn);
+      for (let h = 0; h < H; h++) rotateHead(x, (t * H + h) * D, D, cs, sn, interleaved, x, (t * H + h) * D, R);
     }
   };
 }
@@ -384,6 +388,8 @@ function qkvToCache(
   qo: Float32Array,
   kcView: CpuView,
   vcView: CpuView,
+  /** Rotated elements per head (see `rotateHead`). */
+  R: number,
 ): void {
   const u = b[0]!.u32;
   const [T, H, Hkv, D, maxSeq, cap] = [u[0]!, u[1]!, u[2]!, u[3]!, u[4]!, u[5]!];
@@ -393,12 +399,12 @@ function qkvToCache(
   const kn = Hkv * D;
   const tmp = new Float32Array(D);
   const normed = new Float32Array(D);
-  const cs = new Float64Array(D >>> 1), sn = new Float64Array(D >>> 1);
+  const cs = new Float64Array(R >>> 1), sn = new Float64Array(R >>> 1);
   for (let t = 0; t < T; t++) {
     const pos = pos0 + t;
     const live = pos < maxSeq;
     const slot = (pos % cap) * kn;
-    angles(pos, f, D >>> 1, cs, sn);
+    angles(pos, f, R >>> 1, cs, sn);
     for (let hh = 0; hh < H + 2 * Hkv; hh++) {
       const base = (t * (H + 2 * Hkv) + hh) * D;
       if (hh >= H + Hkv) {
@@ -407,13 +413,13 @@ function qkvToCache(
       }
       if (hh < H) {
         // q straight into its output row.
-        if (norm) rotateHead(norm(hh, base, normed), 0, D, cs, sn, interleaved, qo, (t * H + hh) * D);
-        else rotateHead(qkv, base, D, cs, sn, interleaved, qo, (t * H + hh) * D);
+        if (norm) rotateHead(norm(hh, base, normed), 0, D, cs, sn, interleaved, qo, (t * H + hh) * D, R);
+        else rotateHead(qkv, base, D, cs, sn, interleaved, qo, (t * H + hh) * D, R);
         continue;
       }
       if (!live) continue;
-      if (norm) rotateHead(norm(hh, base, normed), 0, D, cs, sn, interleaved, tmp, 0);
-      else rotateHead(qkv, base, D, cs, sn, interleaved, tmp, 0);
+      if (norm) rotateHead(norm(hh, base, normed), 0, D, cs, sn, interleaved, tmp, 0, R);
+      else rotateHead(qkv, base, D, cs, sn, interleaved, tmp, 0, R);
       for (let i = 0; i < D; i += 2) kc(slot + (hh - H) * D + i, tmp[i]!, tmp[i + 1]!);
     }
   }
@@ -421,7 +427,7 @@ function qkvToCache(
 
 export function cpuRopeKv(interleaved: boolean, f16: Kv): CpuKernel {
   return (b) => {
-    qkvToCache(b, f16, b[2]!.f32, interleaved, undefined, b[4]!.f32, b[5]!, b[6]!);
+    qkvToCache(b, f16, b[2]!.f32, interleaved, undefined, b[4]!.f32, b[5]!, b[6]!, b[0]!.u32[6]!);
   };
 }
 
@@ -449,6 +455,7 @@ export function cpuQkNormRopeKv(interleaved: boolean, f16: Kv): CpuKernel {
       b[6]!.f32,
       b[7]!,
       b[8]!,
+      u[7]!,
     );
   };
 }

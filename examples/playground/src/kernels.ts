@@ -293,11 +293,12 @@ async function main() {
     }
   }
 
-  for (const interleaved of [false, true]) {
+  // R: the leading elements of each head that are rotated; fewer than D is partial rotary (Phi-4 mini).
+  for (const [interleaved, R] of [[false, 16], [true, 16], [false, 12], [true, 12], [false, 8]] as const) {
     const [T, H, Hkv, D, pos0, maxSeq] = [3, 4, 2, 16, 5, 12];
     const W = (H + 2 * Hkv) * D;
     const qkv = randn(T * W);
-    const inv = Float32Array.from({ length: D / 2 }, (_, i) => 1 / 10000 ** ((2 * i) / D));
+    const inv = Float32Array.from({ length: R / 2 }, (_, i) => 1 / 10000 ** ((2 * i) / R));
     const q = new Float32Array(T * H * D);
     const k = new Float32Array(T * Hkv * D);
     const v = new Float32Array(T * Hkv * D);
@@ -314,20 +315,20 @@ async function main() {
     const kc = upload(new Float32Array(maxSeq * Hkv * D), [0]);
     const vc = upload(new Float32Array(maxSeq * Hkv * D), [0]);
     let qo!: Tensor;
-    await run({ ...S0, pos0 }, (ctx) => (qo = ops.ropeKv(ctx, upload(qkv, [T, W]), kc.buf, vc.buf, { T, H, Hkv, D, maxSeq }, upload(inv, [D / 2]), interleaved)));
-    const tag = interleaved ? "interleaved" : "rotate-half";
+    await run({ ...S0, pos0 }, (ctx) => (qo = ops.ropeKv(ctx, upload(qkv, [T, W]), kc.buf, vc.buf, { T, H, Hkv, D, maxSeq }, upload(inv, [inv.length]), interleaved)));
+    const tag = `${interleaved ? "interleaved" : "rotate-half"}${R < D ? ` rotary ${R} of ${D}` : ""}`;
     check("rope_kv", `q ${tag}`, await download(qo.buf, q.length), wantQ, 1e-4);
     check("rope_kv", `k cache ${tag}`, await download(kc.buf, wantK.length), wantK, 1e-4);
     check("rope_kv", `v cache ${tag}`, await download(vc.buf, wantV.length), wantV, 0);
     const kc16 = upload(new Uint32Array((maxSeq * Hkv * D) / 2), [0]);
     const vc16 = upload(new Uint32Array((maxSeq * Hkv * D) / 2), [0]);
-    await run({ ...S0, pos0 }, (ctx) => ops.ropeKv(ctx, upload(qkv, [T, W]), kc16.buf, vc16.buf, { T, H, Hkv, D, maxSeq, kv: "f16" }, upload(inv, [D / 2]), interleaved));
+    await run({ ...S0, pos0 }, (ctx) => ops.ropeKv(ctx, upload(qkv, [T, W]), kc16.buf, vc16.buf, { T, H, Hkv, D, maxSeq, kv: "f16" }, upload(inv, [inv.length]), interleaved));
     const words = async (b: Buf, n: number) => new Uint32Array(await be.readback(b, 0, n * 4));
     check("rope_kv/f16", `k cache ${tag}`, unpackHalf(await words(kc16.buf, wantK.length / 2)), wantK, 2e-3);
     check("rope_kv/f16", `v cache ${tag}`, unpackHalf(await words(vc16.buf, wantV.length / 2)), wantV, 2e-3);
     const kc8 = upload(new Uint32Array((maxSeq * Hkv * D) / 4), [0]);
     const vc8 = upload(new Uint32Array((maxSeq * Hkv * D) / 4), [0]);
-    await run({ ...S0, pos0 }, (ctx) => ops.ropeKv(ctx, upload(qkv, [T, W]), kc8.buf, vc8.buf, { T, H, Hkv, D, maxSeq, kv: "f8" }, upload(inv, [D / 2]), interleaved));
+    await run({ ...S0, pos0 }, (ctx) => ops.ropeKv(ctx, upload(qkv, [T, W]), kc8.buf, vc8.buf, { T, H, Hkv, D, maxSeq, kv: "f8" }, upload(inv, [inv.length]), interleaved));
     const gotK8 = unpackF8(await words(kc8.buf, wantK.length / 4));
     check("rope_kv/f8", `k cache ${tag}`, f8Error(gotK8, wantK), new Float32Array(wantK.length), F8_STEP);
     // v is copied, so its codes are exactly the values' codes.
@@ -342,7 +343,9 @@ async function main() {
     const qw = Float32Array.from(randn(D), (x) => 1 + x);
     const kw = Float32Array.from(randn(D), (x) => 1 + x);
     const eps = 1e-6;
-    const inv = Float32Array.from({ length: D / 2 }, (_, i) => 1 / 10000 ** ((2 * i) / D));
+    // One case with partial rotary: the first three quarters of each head rotated.
+    const R = pos0 === 9 ? (D * 3) / 4 : D;
+    const inv = Float32Array.from({ length: R / 2 }, (_, i) => 1 / 10000 ** ((2 * i) / R));
     const q = new Float32Array(T * H * D);
     const k = new Float32Array(T * Hkv * D);
     const v = new Float32Array(T * Hkv * D);
@@ -360,14 +363,14 @@ async function main() {
       wantK.set(kr.subarray(t * row, (t + 1) * row), ((pos0 + t) % slots) * row);
       wantV.set(v.subarray(t * row, (t + 1) * row), ((pos0 + t) % slots) * row);
     }
-    const tag = `T${T} H${H}/${Hkv} D${D} pos${pos0} slots${slots} ${interleaved ? "interleaved" : "rotate-half"}`;
+    const tag = `T${T} H${H}/${Hkv} D${D} pos${pos0} slots${slots} ${interleaved ? "interleaved" : "rotate-half"}${R < D ? ` rotary ${R}` : ""}`;
     const shape = { T, H, Hkv, D, maxSeq, slots };
     for (const kv of ["f32", "f16", "f8"] as const) {
       const empty = () => (kv === "f8" ? new Uint32Array((slots * row) / 4) : kv === "f16" ? new Uint32Array((slots * row) / 2) : new Float32Array(slots * row));
       const kc = upload(empty(), [0]);
       const vc = upload(empty(), [0]);
       let qo!: Tensor;
-      await run({ ...S0, pos0 }, (ctx) => (qo = ops.qkNormRopeKv(ctx, upload(qkv, [T, W]), upload(qw, [D]), upload(kw, [D]), eps, kc.buf, vc.buf, { ...shape, kv }, upload(inv, [D / 2]), interleaved)));
+      await run({ ...S0, pos0 }, (ctx) => (qo = ops.qkNormRopeKv(ctx, upload(qkv, [T, W]), upload(qw, [D]), upload(kw, [D]), eps, kc.buf, vc.buf, { ...shape, kv }, upload(inv, [inv.length]), interleaved)));
       const cache = async (b: Buf) => (kv === "f8" ? unpackF8(new Uint32Array(await be.readback(b, 0, slots * row))) : kv === "f16" ? unpackHalf(new Uint32Array(await be.readback(b, 0, slots * row * 2))) : await download(b, slots * row));
       // Normalised values reach about 10 (weights 1 + N(0, 1)), so f32 rounding alone is ~1e-4.
       const tol = kv === "f16" ? 2e-2 : 5e-4;
@@ -391,13 +394,13 @@ async function main() {
     check("rmsnorm", `R${R} D${D}`, await download(y.buf, R * D), ref.rmsnormRef(x, w, D, 1e-6), 1e-4);
   }
 
-  for (const interleaved of [false, true]) {
+  for (const [interleaved, R] of [[false, 16], [true, 16], [false, 12], [true, 4]] as const) {
     const [T, H, D, pos0] = [3, 2, 16, 37];
     const x = randn(T * H * D);
-    const inv = Float32Array.from({ length: D / 2 }, (_, i) => 1 / 10000 ** ((2 * i) / D));
+    const inv = Float32Array.from({ length: R / 2 }, (_, i) => 1 / 10000 ** ((2 * i) / R));
     const xt = upload(x, [T, H * D]);
-    await run({ ...S0, pos0 }, (ctx) => ops.rope(ctx, xt, T, H, D, upload(inv, [D / 2]), interleaved));
-    check("rope", interleaved ? "interleaved" : "rotate-half", await download(xt.buf, x.length), ref.ropeRef(x, T, H, D, pos0, inv, interleaved), 1e-4);
+    await run({ ...S0, pos0 }, (ctx) => ops.rope(ctx, xt, T, H, D, upload(inv, [inv.length]), interleaved));
+    check("rope", `${interleaved ? "interleaved" : "rotate-half"}${R < D ? ` rotary ${R} of ${D}` : ""}`, await download(xt.buf, x.length), ref.ropeRef(x, T, H, D, pos0, inv, interleaved), 1e-4);
   }
 
   // Prefill (T > 1) cases run both kernels: tiled (default) and one workgroup per query row.
