@@ -93,6 +93,12 @@ export function opfsAvailable(): boolean {
  */
 /** How far past the downloaded bytes a read must start to be fetched on its own instead of awaited. */
 const READ_AHEAD = 64 * 2 ** 20;
+/**
+ * A source closed with at most this much left to download finishes the download first. A model need
+ * not read a file to its last byte (a GGUF's final tensor can be one it skips), and a download cut
+ * off just short of the end would be resumed, and cut off again, on every load.
+ */
+const FINISH_ON_CLOSE = 64 * 2 ** 20;
 /** Reads up to this size are fetched on their own once they start this far past the download. */
 const SMALL_READ = 2 ** 20;
 
@@ -102,6 +108,11 @@ export class CachedHttpSource implements ByteSource {
   private failure: Error | undefined;
   private waiters: (() => void)[] = [];
   private closed = false;
+  /** The download is still running. */
+  private downloading = false;
+  /** Closed by the caller with little left to download: the handle closes when the download ends. */
+  private finishing = false;
+  private finishOnClose = FINISH_ON_CLOSE;
   /** Set once the cache stopped taking bytes: reads past `have` then go straight to the network. */
   private spill: HttpSource | undefined;
   /** Range reads of bytes far past the download (a zip's directory at the end of pytorch_model.bin). */
@@ -124,7 +135,13 @@ export class CachedHttpSource implements ByteSource {
   static async open(
     url: string,
     key: string,
-    { fresh = false, segment = SEGMENT, retryMs = 1000, readAhead = READ_AHEAD }: { fresh?: boolean; segment?: number; retryMs?: number; readAhead?: number } = {},
+    {
+      fresh = false,
+      segment = SEGMENT,
+      retryMs = 1000,
+      readAhead = READ_AHEAD,
+      finishOnClose = FINISH_ON_CLOSE,
+    }: { fresh?: boolean; segment?: number; retryMs?: number; readAhead?: number; finishOnClose?: number } = {},
   ): Promise<ByteSource> {
     if (!opfsAvailable()) return new HttpSource(url);
     const root = await navigator.storage.getDirectory();
@@ -162,7 +179,12 @@ export class CachedHttpSource implements ByteSource {
       await writeMeta(dir, fileName, { size: total, complete: false, flushed: src.have });
       src.url = url;
       src.readAhead = readAhead;
-      void src.download(url);
+      src.finishOnClose = finishOnClose;
+      src.downloading = true;
+      void src.download(url).finally(() => {
+        src.downloading = false;
+        if (src.finishing) src.shut();
+      });
     }
     return src;
   }
@@ -205,10 +227,28 @@ export class CachedHttpSource implements ByteSource {
     return out;
   }
 
+  /**
+   * Done reading. A download with little left runs to its end first (the file is the cache, and is
+   * then complete for the next load); one with more left stops, and the next open resumes from here.
+   */
   close(): void {
+    if (this.closed || this.finishing) return;
+    if (this.downloading && !this.failure && !this.spill && this.total - this.have <= this.finishOnClose) {
+      this.finishing = true;
+      return;
+    }
+    this.shut();
+  }
+
+  private shut(): void {
     if (this.closed) return;
     this.closed = true;
     this.handle.flush();
+    // Everything written is durable now, so an unfinished download resumes from its last byte, not
+    // from the last periodic watermark. (A slower, older watermark landing after this one is still safe.)
+    if (!this.complete && !this.spill && !this.failure && this.downloading) {
+      void this.saveMeta({ size: this.total, complete: false, flushed: this.have }).catch(() => undefined);
+    }
     this.handle.close();
   }
 

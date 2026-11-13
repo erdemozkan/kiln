@@ -270,6 +270,34 @@ describe("CachedHttpSource", () => {
     warn.mockRestore();
   });
 
+  it("finishes a download that is closed with little left, so the next load needs no network", async () => {
+    // A model that never reads the file's last bytes (a GGUF whose final tensor it skips).
+    const src = await CachedHttpSource.open("u", KEY);
+    expect(await src.read(0, 100)).toEqual(BODY.subarray(0, 100));
+    src.close?.();
+    src.close?.();
+    await new Promise((r) => setTimeout(r, 10));
+    expect(getMeta()).toMatchObject({ complete: true, flushed: BODY.length });
+    expect(files.get(NAME)!.bytes).toEqual(BODY);
+    requests.length = 0;
+    expect(await readAll(await CachedHttpSource.open("u", KEY))).toEqual(BODY);
+    expect(requests).toEqual([]);
+  });
+
+  it("stops a download that is closed with much left, and resumes from the last byte written", async () => {
+    const src = await CachedHttpSource.open("u", KEY, { finishOnClose: 50 });
+    await src.read(0, 100);
+    src.close?.();
+    await new Promise((r) => setTimeout(r, 10));
+    const { complete, flushed } = getMeta();
+    expect(complete).toBe(false);
+    expect(flushed).toBeGreaterThanOrEqual(100);
+    expect(flushed).toBeLessThan(BODY.length);
+    requests.length = 0;
+    expect(await readAll(await CachedHttpSource.open("u", KEY))).toEqual(BODY);
+    expect(requests).toEqual([`bytes=${flushed}-`]);
+  });
+
   it("closing twice is harmless", async () => {
     const src = await CachedHttpSource.open("u", KEY);
     await readAll(src);
