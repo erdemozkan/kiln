@@ -120,7 +120,7 @@ export class KilnModel extends WorkerChannel {
     super(worker);
   }
 
-  static async load(model: string, opts: LoadOptions = {}): Promise<KilnModel> {
+  static async load(model: string | Blob, opts: LoadOptions = {}): Promise<KilnModel> {
     const worker = opts.worker ?? createWorker();
     const m = new KilnModel(worker, undefined as unknown as ModelInfo);
     const { onProgress, worker: _w, persist = true, ...wire } = opts;

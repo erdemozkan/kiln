@@ -1,6 +1,7 @@
 import type { Backend, Tensor } from "@kiln/core";
 import { createWebGPUBackend } from "@kiln/backend-webgpu";
 import {
+  BlobSource,
   CachedHttpSource,
   UnsupportedTensorError,
   MemorySource,
@@ -124,11 +125,67 @@ export interface LoadOptions {
 }
 
 /**
- * Loads a model from the Hub: "org/repo" for safetensors or "org/repo/file.gguf" for GGUF.
- * Weights stream into the GPU while downloading; in a worker they are cached in OPFS as they arrive.
+ * A model to load: a Hub id ("org/repo", or "org/repo/file.gguf"), the URL of one .gguf file on any
+ * server, or a .gguf file the user picked (a `File` or `Blob`). A GGUF file carries its own config and
+ * tokenizer, which is why one file is enough.
  */
-export async function createEngine(modelId: string, opts: LoadOptions = {}): Promise<Engine> {
-  const ref = parseModelId(modelId, opts.revision);
+export type ModelSource = string | Blob;
+
+const DIRECT_URL = /^https?:\/\//i;
+
+/** True for a model that is one file (a picked file or a direct URL), not a repo on a Hub. */
+export function isFileModel(model: ModelSource): boolean {
+  return typeof model !== "string" || DIRECT_URL.test(model);
+}
+
+/** FNV-1a over a string, twice with different offsets: a short stable name for a long URL. */
+function hash64(text: string): string {
+  let a = 0x811c9dc5;
+  let b = 0x01000193;
+  for (let i = 0; i < text.length; i++) {
+    a = Math.imul(a ^ text.charCodeAt(i), 0x01000193);
+    b = Math.imul(b ^ text.charCodeAt(i), 0x85ebca6b);
+  }
+  return (a >>> 0).toString(16).padStart(8, "0") + (b >>> 0).toString(16).padStart(8, "0");
+}
+
+/** The file name a file model goes by: the picked file's, or the last segment of the URL. */
+function fileModelName(model: ModelSource): string {
+  if (typeof model !== "string") return (model as Blob & { name?: string }).name || "model.gguf";
+  const path = new URL(model).pathname;
+  let name = path.slice(path.lastIndexOf("/") + 1);
+  try {
+    name = decodeURIComponent(name);
+  } catch {
+    // Kept as written.
+  }
+  return name || "model.gguf";
+}
+
+/** How a model is shown (`info.model`): the id or URL as given, or a picked file's name. */
+export function modelName(model: ModelSource): string {
+  return typeof model === "string" ? model : fileModelName(model);
+}
+
+/**
+ * What a model's caches are named by. A Hub id is its own key (callers add revision and server). A
+ * URL is keyed by a hash of itself, a picked file by its name, size and modification time: the same
+ * file picked again finds its caches, and an edited one does not.
+ */
+export function modelKey(model: ModelSource): string {
+  if (!isFileModel(model)) return model as string;
+  const name = fileModelName(model).slice(0, 80);
+  if (typeof model === "string") return `url|${hash64(model)}|${name}`;
+  return `file|${name}|${model.size}|${(model as Blob & { lastModified?: number }).lastModified ?? 0}`;
+}
+
+/**
+ * Loads a model: from the Hub ("org/repo" for safetensors, "org/repo/file.gguf" for GGUF), from the
+ * URL of one .gguf file, or from a .gguf `File`. Weights stream into the GPU while downloading; in a
+ * worker, downloads are cached in OPFS as they arrive. A picked file is read in place, never copied.
+ */
+export async function createEngine(from: ModelSource, opts: LoadOptions = {}): Promise<Engine> {
+  const ref = isFileModel(from) ? undefined : parseModelId(from as string, opts.revision);
   const backend = opts.backend ?? (await openBackend(opts.device ?? "auto", opts.cpuThreads));
   const quant = opts.quant ?? "auto";
   ops.setMatmulF16(!!opts.f16Math && backend.limits.features.has("shader-f16"));
@@ -139,7 +196,7 @@ export async function createEngine(modelId: string, opts: LoadOptions = {}): Pro
   let model: LlamaModel | undefined;
   let files: Awaited<ReturnType<typeof openSafetensors>>["files"] = [];
   try {
-    const opened = ref.gguf ? await openGGUF(ref, opts.endpoint) : await openSafetensors(ref, opts.endpoint);
+    const opened = !ref ? await openGGUFFile(from) : ref.gguf ? await openGGUF(ref, opts.endpoint) : await openSafetensors(ref, opts.endpoint);
     const { cfg, tokenizer, idefics3, gemma3 } = opened;
     files = opened.files;
     const tuning =
@@ -149,13 +206,14 @@ export async function createEngine(modelId: string, opts: LoadOptions = {}): Pro
             () => undefined,
             (err: unknown) => console.warn("[kiln] matmul tuning failed; using defaults:", err),
           );
-    // Converted weights are cached per repo, revision and server; the vision tower's under the same key.
-    const converted = opts.weightCache === false ? undefined : cacheKey(ref, ref.gguf ?? "weights", opts.endpoint);
+    // Converted weights are cached per repo, revision and server (per file, for a file model); the
+    // vision tower's under the same key.
+    const converted = opts.weightCache === false ? undefined : ref ? cacheKey(ref, ref.gguf ?? "weights", opts.endpoint) : modelKey(from);
     weights = await loadWeights(backend, files, quant, opts.onProgress, converted ? { key: converted } : undefined);
     vision = idefics3
       ? await openIdefics3Vision(backend, files, idefics3, opts, converted)
       : opts.mmproj
-        ? await openVision(backend, opts.mmproj.split("/").length >= 3 ? parseModelId(opts.mmproj, opts.revision) : { ...ref, gguf: opts.mmproj }, opts)
+        ? await openVision(backend, mmprojRef(opts.mmproj, ref, opts.revision), opts)
         : gemma3 && opts.vision !== false
           ? await openGemma3Vision(backend, files, gemma3, opts, converted)
           : undefined;
@@ -392,6 +450,13 @@ export async function openBackend(device: "auto" | "gpu" | "cpu", cpuThreads?: n
   }
 }
 
+/** Where `mmproj` points: a full id as it is, a bare file name inside the model's own repo. */
+function mmprojRef(mmproj: string, ref: ModelRef | undefined, revision?: string): ModelRef {
+  if (mmproj.split("/").length >= 3) return parseModelId(mmproj, revision);
+  if (!ref) throw new Error(`mmproj "${mmproj}": a model loaded from a file or URL has no repo to look in; give the full id (org/repo/${mmproj})`);
+  return { ...ref, gguf: mmproj };
+}
+
 async function open(ref: ModelRef, file: string, endpoint?: string, fresh = false) {
   return CachedHttpSource.open(fileUrl(ref, file, endpoint), cacheKey(ref, file, endpoint), { fresh });
 }
@@ -402,17 +467,25 @@ async function open(ref: ModelRef, file: string, endpoint?: string, fresh = fals
  * downloaded once more over the same file. Network failures are not retried.
  */
 export async function openParsed<H>(ref: ModelRef, file: string, endpoint: string | undefined, parse: (s: ByteSource) => Promise<H>): Promise<{ source: ByteSource; header: H }> {
-  const source = await open(ref, file, endpoint);
+  return openParsedWith(file, (fresh) => open(ref, file, endpoint, fresh), parse);
+}
+
+/** `openParsed` for any way of opening the file: `opener(true)` must discard a cached copy. */
+async function openParsedWith<H>(file: string, opener: (fresh: boolean) => Promise<ByteSource>, parse: (s: ByteSource) => Promise<H>): Promise<{ source: ByteSource; header: H }> {
+  const source = await opener(false);
   try {
     return { source, header: await parse(source) };
   } catch (err) {
     // A format Kiln does not support is not damage: downloading it again would only fail the same way.
-    if (!(source instanceof CachedHttpSource) || source.failed || err instanceof UnsupportedTensorError) throw err;
+    if (!(source instanceof CachedHttpSource) || source.failed || err instanceof UnsupportedTensorError) {
+      source.close?.();
+      throw err;
+    }
     console.warn(`[kiln] cached ${file} looks corrupt (${String(err)}); downloading it again`);
     source.close();
     // Overwritten in place rather than evicted: removing the file fails quietly while anything still
     // holds it, and the next open would then trust the same bad bytes again.
-    const fresh = await open(ref, file, endpoint, true);
+    const fresh = await opener(true);
     try {
       return { source: fresh, header: await parse(fresh) };
     } catch (err2) {
@@ -486,15 +559,39 @@ function chatTemplate(cfg: TokenizerConfig | undefined, file: string | undefined
   return { source, bosToken: token(cfg?.bos_token), eosToken: token(cfg?.eos_token) };
 }
 
-async function openGGUF(ref: ModelRef, endpoint?: string): Promise<{ cfg: LlamaConfig; tokenizer: Tokenizer; files: WeightFile[]; idefics3?: undefined; gemma3?: undefined }> {
+type OpenedGGUF = { cfg: LlamaConfig; tokenizer: Tokenizer; files: WeightFile[]; idefics3?: undefined; gemma3?: undefined };
+
+async function openGGUF(ref: ModelRef, endpoint?: string): Promise<OpenedGGUF> {
   const file = ref.gguf!;
-  const { source, header: gguf } = await openParsed(ref, file, endpoint, readGGUFHeader);
-  const cfg = configFromGGUF(gguf.metadata, gguf.tensors.map((t) => t.name));
-  const scale = cfg.residualScale !== undefined || cfg.logitScale !== undefined ? (name: string) => weightScale(cfg, name) : undefined;
-  return {
-    cfg,
-    tokenizer: Tokenizer.fromGGUF(gguf.metadata),
-    // Norms in gemma3 files already hold 1 + w, so unlike safetensors there is nothing to transform.
-    files: [{ name: file, source, tensors: gguf.tensors, rename: (n) => ggufToHF(n, cfg.family), scale }],
-  };
+  const { source, header } = await openParsed(ref, file, endpoint, readGGUFHeader);
+  return ggufModel(file, source, header);
+}
+
+/** One .gguf file from a URL (downloaded into the cache like a Hub file) or as picked by the user (read in place). */
+async function openGGUFFile(model: ModelSource): Promise<OpenedGGUF> {
+  const file = fileModelName(model);
+  if (typeof model === "string" && !/\.gguf$/i.test(file)) {
+    throw new Error(`"${model}": only a .gguf file can be loaded from a URL; other models need their whole repo (config, tokenizer and weights), given as org/repo with \`endpoint\` for your own server`);
+  }
+  const opener = typeof model === "string" ? (fresh: boolean) => CachedHttpSource.open(model, modelKey(model), { fresh }) : async () => new BlobSource(model, file) as ByteSource;
+  const { source, header } = await openParsedWith(file, opener, readGGUFHeader).catch((err: unknown) => {
+    throw new Error(`${file}: ${err instanceof Error ? err.message : String(err)}${typeof model === "string" ? "" : " (only .gguf files can be loaded from a file)"}`);
+  });
+  return ggufModel(file, source, header);
+}
+
+function ggufModel(file: string, source: ByteSource, gguf: Awaited<ReturnType<typeof readGGUFHeader>>): OpenedGGUF {
+  try {
+    const cfg = configFromGGUF(gguf.metadata, gguf.tensors.map((t) => t.name));
+    const scale = cfg.residualScale !== undefined || cfg.logitScale !== undefined ? (name: string) => weightScale(cfg, name) : undefined;
+    return {
+      cfg,
+      tokenizer: Tokenizer.fromGGUF(gguf.metadata),
+      // Norms in gemma3 files already hold 1 + w, so unlike safetensors there is nothing to transform.
+      files: [{ name: file, source, tensors: gguf.tensors, rename: (n) => ggufToHF(n, cfg.family), scale }],
+    };
+  } catch (err) {
+    source.close?.();
+    throw err;
+  }
 }

@@ -6,6 +6,9 @@ const modelInput = $<HTMLInputElement>("model");
 const quant = $<HTMLSelectElement>("quant");
 const device = $<HTMLSelectElement>("device");
 const loadBtn = $<HTMLButtonElement>("load");
+const fileInput = $<HTMLInputElement>("file");
+// Typing a model id means the id is wanted, not the file picked earlier.
+modelInput.addEventListener("input", () => (fileInput.value = ""));
 const progress = $<HTMLProgressElement>("progress");
 const status = $("status");
 const log = $("log");
@@ -81,7 +84,7 @@ loadBtn.onclick = async () => {
   const t0 = performance.now();
   try {
     await model?.unload();
-    model = await load(modelInput.value.trim(), {
+    model = await load(fileInput.files?.[0] ?? modelInput.value.trim(), {
       quant: quant.value as "auto" | "q4" | "q8" | "f32",
       device: device.value as "auto" | "gpu" | "cpu",
       onProgress: (p) => {

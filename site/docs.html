@@ -34,6 +34,7 @@ const llm = await load("Qwen/Qwen2.5-0.5B-Instruct", {
 llm.info; // { family, backend: "webgpu" | "cpu", layers, maxSeq, contextLength, ... }</code></pre>
         <ul>
           <li>A model id is <code>org/repo</code> (safetensors or pytorch_model.bin) or <code>org/repo/file.gguf</code> for one GGUF file.</li>
+          <li><code>load</code> also takes a single GGUF from anywhere: the URL of a <code>.gguf</code> on any server, or a <code>File</code> the user picked (<code>load(input.files[0])</code>), which is read in place and never uploaded.</li>
           <li><code>quant: "auto"</code> stores float weights as q4 and keeps a GGUF's tensors at their own precision. Small models (Gemma 3 270M, Granite 4 350M) need <code>"q8"</code> or <code>"f32"</code>.</li>
           <li>Files are cached in the browser (OPFS) as they download; interrupted downloads resume. <code>listCache()</code> and <code>clearCache()</code> manage the cache.</li>
           <li>Float weights loaded as q4 or q8 are also cached as converted (about a third to a half of the download on top), which roughly halves later loads; <code>weightCache: false</code> keeps only the download.</li>

@@ -372,6 +372,14 @@ to the model's own, up to 8192 tokens and 512 MiB of KV cache; `load(id, { maxSe
 `llm.info.contextLength` says how long the model was trained for. A model id is
 `org/repo` for safetensors or `org/repo/file.gguf` for one GGUF file.
 
+A single GGUF also loads from outside a repo: the URL of a `.gguf` on any server, or a file the user
+picked, which is read in place and never uploaded:
+
+```js
+const llm = await load("https://example.com/models/my-model-Q4_K_M.gguf");
+fileInput.onchange = async () => { const local = await load(fileInput.files[0]); };
+```
+
 Several conversations can share one model: each call reuses the cached K/V of whichever earlier
 prompt shares the most tokens with it (kept on the GPU up to `load(id, { prefixCacheBytes })`, 256 MiB
 by default), and calls that overlap run one after another.

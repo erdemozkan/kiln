@@ -1,5 +1,20 @@
 # Changelog
 
+## Unreleased
+
+**GGUF from a file or a URL.** `load` takes a `.gguf` `File` (or `Blob`) the user picked, read in
+place, and the URL of one `.gguf` on any server, downloaded into the cache like a Hub file. The
+prompt cache works for both (a file is keyed by its name, size and modification time, a URL by a hash
+of itself). The playground has a file picker. Other formats still need their repo layout.
+
+**A download closed just short of its end now finishes.** A GGUF whose last bytes the model does not
+read (bartowski's SmolLM2-135M Q4_K_M, for one) was never marked complete, so up to 32 MiB of it was
+downloaded again on every load. A source closed with at most 64 MiB left runs to the end first; one
+with more left records exactly how far it got. Cached loads of that file went from 2.7 s to 1.8 s.
+
+**Cached loading against transformers.js, re-measured.** Now about even: 1.6 s against 1.7 s to
+ready, 1.9 s against 2.5 s to the first tokens (SmolLM2-135M, q4, one session).
+
 ## 0.2.0 (2026-11-12)
 
 **Converted-weight cache.** Float weights loaded as q4 or q8 are written to OPFS as converted (read

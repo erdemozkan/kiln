@@ -1,5 +1,5 @@
 import { readImage, type ImageInput } from "@kiln/loader";
-import { createAudio, createVision, TtsEngine, type VisionEngine, createEncoder, createEngine, createSeq2Seq, type AudioEngine, loadPromptCache, promptCacheName, savePromptCache, type EncoderEngine, type Engine, type Seq2SeqEngine, type Seq2SeqGenerateOptions, type TextDelta } from "@kiln/runtime";
+import { createAudio, createVision, TtsEngine, type VisionEngine, createEncoder, createEngine, modelKey, modelName, createSeq2Seq, type AudioEngine, loadPromptCache, promptCacheName, savePromptCache, type EncoderEngine, type Engine, type Seq2SeqEngine, type Seq2SeqGenerateOptions, type TextDelta } from "@kiln/runtime";
 import type { AudioTask, VisionTask, EncoderTask, RawOutputs, Request, Response, Seq2SeqTask } from "./protocol";
 
 /** The slice of DedicatedWorkerGlobalScope we use (lib.webworker conflicts with lib.dom in one program). */
@@ -159,7 +159,8 @@ scope.onmessage = async (e: MessageEvent<Request>) => {
         engine = undefined;
         cacheName = undefined;
         engine = await createEngine(msg.model, { ...msg.opts, onProgress: (progress) => post({ id: msg.id, type: "progress", progress }) });
-        cacheName = msg.opts.promptCache === false ? undefined : promptCacheName(msg.model, msg.opts);
+        // A file model's prompt cache is named by the file (name, size, time) or a hash of its URL.
+        cacheName = msg.opts.promptCache === false ? undefined : promptCacheName(modelKey(msg.model), msg.opts);
         savedTokens = [];
         const snap = cacheName ? await loadPromptCache(cacheName) : undefined;
         if (snap && engine.importCache(snap)) savedTokens = snap.tokens;
@@ -168,7 +169,7 @@ scope.onmessage = async (e: MessageEvent<Request>) => {
           id: msg.id,
           type: "loaded",
           info: {
-            model: msg.model,
+            model: modelName(msg.model),
             family: cfg.family,
             backend: engine.backend.name,
             cpuThreads: engine.backend.name === "cpu" ? (engine.backend as { threads?: number }).threads : undefined,

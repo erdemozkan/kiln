@@ -27,6 +27,10 @@
         </select>
         <button id="load">Load</button>
       </div>
+      <div class="row status">
+        <label for="file">or open a .gguf file from this computer (it is read in place, nothing is uploaded):</label>
+        <input id="file" type="file" accept=".gguf" />
+      </div>
       <progress id="progress" max="1" value="0"></progress>
       <div id="status" class="status">Not loaded.</div>
       <div class="row status cache">
