@@ -1,11 +1,11 @@
 {
   "name": "kiln-webgpu",
   "version": "0.2.0",
-  "description": "Kiln.js: run LLMs in the browser on WebGPU (CPU fallback), straight from Hugging Face safetensors or GGUF files, with a transformers.js-style pipeline API",
+  "description": "Kiln.js: run AI models in the browser on WebGPU (CPU fallback), straight from their original safetensors or GGUF files, with a transformers.js-style pipeline API",
   "license": "MIT",
   "author": "Erdem Ozkan",
   "repository": { "type": "git", "url": "git+https://github.com/erdemozkan/kiln.git" },
-  "homepage": "https://github.com/erdemozkan/kiln#readme",
+  "homepage": "https://erdemozkan.github.io/kiln/",
   "bugs": { "url": "https://github.com/erdemozkan/kiln/issues" },
   "keywords": ["webgpu", "llm", "inference", "gguf", "safetensors", "browser", "transformer", "transformers.js", "pipeline", "text-generation", "wasm"],
   "type": "module",

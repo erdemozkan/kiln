@@ -1,7 +1,9 @@
 # Kiln.js (`kiln-webgpu`)
 
-Run LLMs in the browser on WebGPU, straight from Hugging Face safetensors or GGUF files: no ONNX
-export, no compile step, no server. Without WebGPU it runs on the CPU (WASM SIMD).
+Run AI models in the browser on WebGPU, straight from their original weights. Kiln reads a model's
+own files (safetensors, `pytorch_model.bin` or GGUF) from the Hugging Face Hub or from your own
+server: no ONNX export, no compile step, no inference server. Without WebGPU it runs on the CPU
+(WASM SIMD). Docs, examples and benchmarks: <https://erdemozkan.github.io/kiln/>.
 
 ```bash
 npm install kiln-webgpu
