@@ -118,7 +118,7 @@ Kiln against transformers.js in the same browser on the same machine, on the sam
 
 Measured on an Intel Mac with integrated graphics (Iris Plus 650) in Chrome; times are the median of three warm calls. On an Apple M3, Kiln decodes SmolLM2-135M at about 307 tokens per second.
 
-Where Kiln is slower: loading a model that is already cached, download size for 4-bit models (transformers.js's ONNX repos ship pre-quantized files), and full masked-LM logits through `AutoModelForMaskedLM`. Outputs were checked against transformers.js or Python on every model; the [technical notes](docs/technical-notes.md) have each comparison.
+Where Kiln is behind: download size for 4-bit models (transformers.js's ONNX repos ship pre-quantized files) and full masked-LM logits through `AutoModelForMaskedLM`. Loading an already cached model takes about the same time in both (1.6 s against 1.7 s for SmolLM2-135M). Outputs were checked against transformers.js or Python on every model; the [technical notes](docs/technical-notes.md) have each comparison.
 
 ## The story behind Kiln
 

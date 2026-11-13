@@ -113,7 +113,7 @@ const { logits } = await model(tokenizer(["I love it", "I hate it"], { padding: 
           <li>Prompt-prefix caching across calls and reloads; draft tokens for faster decoding.</li>
           <li><a href="docs.html#lora">LoRA adapters</a>, <a href="docs.html#rag">retrieval</a> and <a href="docs.html#tasks">LLM tasks</a> with your own labels.</li>
           <li>GGUF files and models without an ONNX export.</li>
-          <li>On the same GPU, faster end to end on every pipeline measured so far. The <a href="benchmarks.html">benchmarks</a> also list where it is slower: loading from the cache, and AutoModel masked-LM logits.</li>
+          <li>On the same GPU, faster end to end on every pipeline measured so far. The <a href="benchmarks.html">benchmarks</a> also list where it is behind: download size for 4-bit models, and AutoModel masked-LM logits.</li>
         </ul>
 
         <h2 id="missing">What is missing</h2>

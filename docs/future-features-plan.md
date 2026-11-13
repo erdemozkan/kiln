@@ -7,12 +7,7 @@ Ideas that are not built yet. Each entry says what it is, why it is worth doing,
 Version 0.2.0 is published on npm (`kiln-webgpu`), the repository is public, and the docs site and
 playground are live on GitHub Pages. Left over from that release:
 
-1. **Re-measure cached loading against transformers.js.** The benchmarks page still lists it under
-   "where Kiln is slower", with numbers from two different sessions (1.8 s against 0.9 s, then Kiln
-   alone at 1.0–1.9 s). One session with both libraries settles whether that line stays.
-2. **Bring the other entry pages in line with the README.** The package README (the page npm shows)
-   and the docs site still open with Hub-first wording.
-3. **Versioned copies on the Pages site.** It serves only the latest build of `main`
+1. **Versioned copies on the Pages site.** It serves only the latest build of `main`
    (`kiln-webgpu.js`); npm and jsDelivr are the versioned route.
 
 ## Later

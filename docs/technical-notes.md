@@ -329,9 +329,13 @@ unless noted.
 LLM outputs differ in q4 (the two 4-bit schemes round differently) and agree in f32. Two of these
 rows came out of this comparison: feature extraction was 400 ms (each sentence's forward pass
 waited on the previous one's readback; now they are queued back to back and read once), and
-fill-mask was 851 ms (the 30k-word output layer ran in TypeScript; now on the GPU). transformers.js
-loads faster from its cache (0.9 s against 1.8 s for SmolLM2 when measured; Kiln has since started
-caching its converted weights, which about halves its time, and the pair has not been re-measured) and
+fill-mask was 851 ms (the 30k-word output layer ran in TypeScript; now on the GPU). Loading from the
+cache is now about even: with both libraries imported from the same CDN and loaded in turn in one
+session (SmolLM2-135M, q4, six loads each, medians), Kiln 0.2.0 was ready in 1.6 s against 1.7 s
+(1.24–1.69 s against 1.51–3.43 s), and had the first four tokens of a reply after 1.9 s against 2.5 s,
+since transformers.js leaves more work to the first call. Kiln's unbundled dev build is slower to
+start (2.1 s to ready, 2.4 s to the first tokens, in the same session). Before the converted-weight
+cache the pair measured 1.8 s against 0.9 s. transformers.js
 downloads less (its files are pre-quantized), and its runtime adds 6.7 MB (gzipped) of WASM to
 Kiln's 241 KB (the whole package, its worker included).
 
