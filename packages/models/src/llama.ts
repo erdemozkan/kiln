@@ -22,7 +22,7 @@ export interface ForwardPlan {
 }
 
 /** The projections a LoRA adapter may update (PEFT's target_modules names). */
-export const LORA_MODULES = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"] as const;
+export const LORA_MODULES = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj", "in_proj_qkv", "in_proj_z", "in_proj_a", "in_proj_b", "out_proj"] as const;
 export type LoraModule = (typeof LORA_MODULES)[number];
 
 /** One projection's low-rank update with its scale folded in: ΔW = B · A, A [rank, in], B [out, rank]. */
@@ -529,9 +529,22 @@ export class LlamaModel {
     for (let l = 0; l < c.numLayers; l++) {
       const p = `model.layers.${l}`;
       const I = this.fusedMlp ? this.w(`${p}.mlp.gate_up.weight`).shape[0]! / 2 : this.w(`${p}.mlp.gate_proj.weight`).shape[0]!;
-      if (this.fusedQkv) add(`${l}.qkv`, ["q_proj", "k_proj", "v_proj"], H, [q, kv, kv]);
-      else for (const [m, n] of [["q_proj", q], ["k_proj", kv], ["v_proj", kv]] as const) add(`${l}.${m}`, [m], H, [n]);
-      add(`${l}.o_proj`, ["o_proj"], q, [H]);
+      if (c.linearLayers?.[l]) {
+        // Linear attention's five projections (Qwen 3.5), in the order the layer runs them.
+        const g = c.linear!;
+        const values = g.valueHeads * g.valueDim;
+        add(`${l}.in_proj_qkv`, ["in_proj_qkv"], H, [2 * g.keyHeads * g.keyDim + values]);
+        add(`${l}.in_proj_z`, ["in_proj_z"], H, [values]);
+        add(`${l}.in_proj_a`, ["in_proj_a"], H, [g.valueHeads]);
+        add(`${l}.in_proj_b`, ["in_proj_b"], H, [g.valueHeads]);
+        add(`${l}.out_proj`, ["out_proj"], values, [H]);
+      } else {
+        // With an output gate, q_proj also writes the gates: twice the rows.
+        const qRows = c.attnOutputGate ? 2 * q : q;
+        if (this.fusedQkv) add(`${l}.qkv`, ["q_proj", "k_proj", "v_proj"], H, [qRows, kv, kv]);
+        else for (const [m, n] of [["q_proj", qRows], ["k_proj", kv], ["v_proj", kv]] as const) add(`${l}.${m}`, [m], H, [n]);
+        add(`${l}.o_proj`, ["o_proj"], q, [H]);
+      }
       if (this.fusedMlp) add(`${l}.gate_up`, ["gate_proj", "up_proj"], H, [I, I]);
       else for (const m of ["gate_proj", "up_proj"] as const) add(`${l}.${m}`, [m], H, [I]);
       add(`${l}.down_proj`, ["down_proj"], I, [H]);
@@ -689,7 +702,7 @@ export class LlamaModel {
         slots: this.slots[l],
       };
       const inputNorm = { w: this.w(`${p}.input_layernorm.weight`), eps: c.rmsEps };
-      if (c.linearLayers?.[l]) this.linearAttention(ctx, x, l, T);
+      if (c.linearLayers?.[l]) this.linearAttention(ctx, x, l, T, L ? delta : undefined);
       else {
       let q: Tensor;
       let gate: Tensor | undefined;
@@ -828,7 +841,7 @@ export class LlamaModel {
    * normalised input, a causal convolution over time, L2-normalised queries and keys, the recurrence
    * over the layer's state, a gated norm and the output projection.
    */
-  private linearAttention(ctx: Ctx, x: Tensor, l: number, T: number): void {
+  private linearAttention(ctx: Ctx, x: Tensor, l: number, T: number, delta?: (xin: Tensor, y: Tensor, name: string) => void): void {
     const c = this.cfg;
     const g = c.linear!;
     const p = `model.layers.${l}.linear_attn`;
@@ -839,6 +852,12 @@ export class LlamaModel {
     const z = ops.linear(ctx, h, this.w(`${p}.in_proj_z.weight`));
     const a = ops.linear(ctx, h, this.w(`${p}.in_proj_a.weight`));
     const b = ops.linear(ctx, h, this.w(`${p}.in_proj_b.weight`));
+    if (delta) {
+      delta(h, mixed, `${l}.in_proj_qkv`);
+      delta(h, z, `${l}.in_proj_z`);
+      delta(h, a, `${l}.in_proj_a`);
+      delta(h, b, `${l}.in_proj_b`);
+    }
     const conv = ops.causalConv(ctx, mixed, this.w(`${p}.conv1d.weight`), state.conv);
     // Queries and keys are the row's first columns: each head normalised to unit length.
     const qk = ctx.alloc([T, keys]);
@@ -847,7 +866,9 @@ export class LlamaModel {
     const out = ops.gatedDelta(ctx, unit, conv, a, b, this.w(`${p}.A_log`), this.w(`${p}.dt_bias`), state.s, { T, ...g });
     // RMSNorm per value head, gated by silu(z).
     const normed = ops.rmsnorm(ctx, out, this.w(`${p}.norm.weight`), c.rmsEps, g.valueDim);
-    ops.linear(ctx, ops.siluMul(ctx, z, normed), this.w(`${p}.out_proj.weight`), { residual: x });
+    const gated = ops.siluMul(ctx, z, normed);
+    ops.linear(ctx, gated, this.w(`${p}.out_proj.weight`), { residual: x });
+    if (delta) delta(gated, x, `${l}.out_proj`);
   }
 
   private attentionInputs(ctx: Ctx, x: Tensor, l: number, T: number, invFreq: Tensor, delta?: (xin: Tensor, y: Tensor, name: string) => void): { q: Tensor; gate?: Tensor } {

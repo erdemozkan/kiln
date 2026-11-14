@@ -30,6 +30,9 @@ function rand(n: number, seed: number, scale: number): Float32Array {
   });
 }
 
+/** The projections of an attention layer and its MLP (the rest of LORA_MODULES are linear attention's). */
+const ATTENTION_MODULES = LORA_MODULES.filter((m) => !m.includes("in_proj") && m !== "out_proj");
+
 const SHAPES = (c: LlamaConfig): Record<string, [number, number]> => ({
   q_proj: [c.numHeads * c.headDim, c.hiddenSize],
   k_proj: [c.numKvHeads * c.headDim, c.hiddenSize],
@@ -45,7 +48,7 @@ function adapter(c: LlamaConfig, r: number, seed: number): LoraWeights {
   const out = new Map<string, { rank: number; A: Float32Array; B: Float32Array }>();
   let k = seed;
   for (let l = 0; l < c.numLayers; l++)
-    for (const m of LORA_MODULES) {
+    for (const m of ATTENTION_MODULES) {
       const [n, kin] = SHAPES(c)[m]!;
       out.set(`${l}.${m}`, { rank: r, A: rand(r * kin, k++, 0.2), B: rand(n * r, k++, 0.2) });
     }
@@ -67,7 +70,7 @@ function weights(be: CpuBackend, c: LlamaConfig, merged?: LoraWeights): Map<stri
     const p = `model.layers.${l}`;
     add(`${p}.input_layernorm.weight`, [c.hiddenSize], rand(c.hiddenSize, seed++, 0.5).map((v) => 1 + v));
     add(`${p}.post_attention_layernorm.weight`, [c.hiddenSize], rand(c.hiddenSize, seed++, 0.5).map((v) => 1 + v));
-    for (const m of LORA_MODULES) {
+    for (const m of ATTENTION_MODULES) {
       const [n, k] = SHAPES(c)[m]!;
       const data = rand(n * k, seed++, 0.15);
       const u = merged?.get(`${l}.${m}`);

@@ -32,7 +32,7 @@ export interface LoraAdapter {
   base?: string;
 }
 
-const TENSOR = /layers\.(\d+)\.(self_attn|mlp)\.([a-z_]+)\.lora_([AB])(?:\.default)?\.weight$/;
+const TENSOR = /layers\.(\d+)\.(self_attn|mlp|linear_attn)\.([a-z_]+)\.lora_([AB])(?:\.default)?\.weight$/;
 
 /** PEFT's pattern lookup: a key applies to a module whose name is the key or ends in ".key" (keys may be regexes). */
 function patternValue(patterns: Record<string, number> | undefined, module: string): number | undefined {

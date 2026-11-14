@@ -1089,7 +1089,6 @@ export class Engine {
    * `adapter` picks it). Its projections must match this model's shapes.
    */
   async loadAdapter(name: string, id: string, opts: { revision?: string; endpoint?: string } = {}): Promise<{ name: string; id: string; rank: number; modules: string[]; base?: string }> {
-    if (this.model.recurrent) throw new Error("adapters are not supported for models with linear-attention layers yet");
     const a = await loadLoraAdapter(id, opts);
     const c = this.model.cfg;
     for (const key of a.weights.keys()) if (Number(key.split(".")[0]) >= c.numLayers) throw new Error(`${id} adapts layer ${key.split(".")[0]}, but this model has ${c.numLayers} layers (another base model?)`);
@@ -1179,6 +1178,8 @@ export class Engine {
   resetCache(): void {
     this.cached = [];
     this.prefixes.clear();
+    // Recurrent snapshots were made by the weights then in use (another adapter's, say).
+    while (this.states.length) this.dropState(0);
   }
 
   /** Saves the live cache's K/V (GPU to GPU) unless it is short or already saved. */

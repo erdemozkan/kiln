@@ -20,7 +20,7 @@ vi.mock("../src/speculate", async (original) => {
 });
 import { physical, type Tensor } from "@kiln/core";
 import { CpuBackend } from "@kiln/kernels";
-import { LlamaModel, configFromHF, type LlamaConfig } from "@kiln/models";
+import { LlamaModel, configFromHF, type LlamaConfig, type LoraWeights } from "@kiln/models";
 import { Tokenizer } from "@kiln/tokenizers";
 import { Engine } from "../src/engine";
 
@@ -59,12 +59,46 @@ function rand(n: number, seed: number, scale: number): Float32Array {
   });
 }
 
-function weights(be: CpuBackend): Map<string, Tensor> {
+/** Rows and columns of every projection an adapter may update, by layer. */
+function projections(l: number): [string, string, number, number][] {
+  const c = CFG;
+  const g = c.linear!;
+  const keys = 2 * g.keyHeads * g.keyDim;
+  const values = g.valueHeads * g.valueDim;
+  const mlp: [string, string, number, number][] = [
+    ["mlp", "gate_proj", c.intermediateSize, c.hiddenSize],
+    ["mlp", "up_proj", c.intermediateSize, c.hiddenSize],
+    ["mlp", "down_proj", c.hiddenSize, c.intermediateSize],
+  ];
+  if (c.linearLayers![l]) {
+    return [...mlp, ["linear_attn", "in_proj_qkv", keys + values, c.hiddenSize], ["linear_attn", "in_proj_z", values, c.hiddenSize], ["linear_attn", "in_proj_a", g.valueHeads, c.hiddenSize], ["linear_attn", "in_proj_b", g.valueHeads, c.hiddenSize], ["linear_attn", "out_proj", c.hiddenSize, values]];
+  }
+  const q = c.numHeads * c.headDim;
+  const kv = c.numKvHeads * c.headDim;
+  return [...mlp, ["self_attn", "q_proj", 2 * q, c.hiddenSize], ["self_attn", "k_proj", kv, c.hiddenSize], ["self_attn", "v_proj", kv, c.hiddenSize], ["self_attn", "o_proj", c.hiddenSize, q]];
+}
+
+/** A rank-`r` update for every projection of every layer. */
+function adapter(r: number, seed: number): LoraWeights {
+  const out = new Map<string, { rank: number; A: Float32Array; B: Float32Array }>();
+  let k = seed;
+  for (let l = 0; l < CFG.numLayers; l++) for (const [, m, n, cols] of projections(l)) out.set(`${l}.${m}`, { rank: r, A: rand(r * cols, k++, 0.2), B: rand(n * r, k++, 0.2) });
+  return out;
+}
+
+function weights(be: CpuBackend, merged?: LoraWeights): Map<string, Tensor> {
   const c = CFG;
   const g = c.linear!;
   const w = new Map<string, Tensor>();
   let seed = 11;
   const add = (name: string, shape: number[], data: Float32Array) => {
+    // W + B·A for a projection the adapter updates: what the slots must match.
+    const at = /^model\.layers\.(\d+)\.(?:self_attn|mlp|linear_attn)\.(\w+)\.weight$/.exec(name);
+    const u = at && merged?.get(`${at[1]}.${at[2]}`);
+    if (u) {
+      const [n, cols] = shape as [number, number];
+      for (let i = 0; i < n; i++) for (let j = 0; j < cols; j++) for (let t = 0; t < u.rank; t++) data[i * cols + j]! += u.B[i * u.rank + t]! * u.A[t * cols + j]!;
+    }
     const buf = be.alloc(data.byteLength, "storage", name);
     be.write(buf, 0, data);
     w.set(name, { shape, dtype: "f32", buf });
@@ -265,5 +299,42 @@ describe("Qwen 3.5 (linear attention)", () => {
     const after = await run(e, next, { draftTokens: 7 });
     expect(e.lastStats!.cachedTokens).toBe(prompt.length);
     expect(after.out).toEqual((await run(fresh(), next, { draftTokens: 0 })).out);
+  });
+
+  it("applies an adapter to every projection, the linear attention ones included, as merged weights would", async () => {
+    const be = new CpuBackend({ threads: 1 });
+    const ids = [5, 17, 33, 41, 8, 90, 12, 3, 77, 21];
+    const logits = async (m: LlamaModel) => {
+      const out: Float32Array[] = [];
+      const read = async (t: Tensor) => new Float32Array(await be.readback(physical(t.buf), 0, t.shape[0]! * t.shape[1]! * 4));
+      m.resetState();
+      const pre = m.buildPlan(ids.length);
+      be.write(pre.tokens, 0, Uint32Array.from(ids));
+      m.setStep({ pos0: 0, lastRow: ids.length - 1, seed: 0, temperature: 0 });
+      be.submit(pre.dispatches);
+      out.push(await read(pre.logits));
+      const dec = m.buildPlan(1);
+      be.write(dec.tokens, 0, Uint32Array.of(7));
+      m.setStep({ pos0: ids.length, lastRow: 0, seed: 0, temperature: 0 });
+      be.submit(dec.dispatches);
+      out.push(await read(dec.logits));
+      pre.destroy();
+      dec.destroy();
+      return out;
+    };
+    const diff = (a: Float32Array, b: Float32Array) => a.reduce((m, v, i) => Math.max(m, Math.abs(v - b[i]!)), 0);
+    const lora = adapter(4, 900);
+    const base = await logits(new LlamaModel(be, CFG, weights(be), { maxSeq: 64, kvDtype: "f32" }));
+    const merged = await logits(new LlamaModel(be, CFG, weights(be, lora), { maxSeq: 64, kvDtype: "f32" }));
+    const slots = new LlamaModel(be, CFG, weights(be), { maxSeq: 64, kvDtype: "f32" });
+    slots.enableLora(4);
+    slots.setLora(lora);
+    const adapted = await logits(slots);
+    expect(diff(merged[0]!, base[0]!)).toBeGreaterThan(0.05);
+    expect(diff(adapted[0]!, merged[0]!)).toBeLessThan(2e-4);
+    expect(diff(adapted[1]!, merged[1]!)).toBeLessThan(2e-4);
+    // Cleared slots give the base model back.
+    slots.setLora(undefined);
+    expect(diff((await logits(slots))[0]!, base[0]!)).toBeLessThan(1e-5);
   });
 });
