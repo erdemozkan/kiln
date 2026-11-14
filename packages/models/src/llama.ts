@@ -716,7 +716,7 @@ export class LlamaModel {
     let kvEnd: number | undefined;
     for (let l = 0; l < c.numLayers; l++) {
       const p = `model.layers.${l}`;
-      if (l === firstShared) kvEnd = ctx.dispatches.length;
+      if (l === firstShared) kvEnd = ctx.size;
       const D = headDimOf(c, l);
       // A layer without keys and values of its own (Gemma 4) reads the cache of an earlier one of its kind.
       const src = c.kvFrom?.[l] ?? l;
