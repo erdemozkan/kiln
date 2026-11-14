@@ -68,7 +68,9 @@ as 33).
 and 6 to 7.5 tokens/s): its tensor names for linear attention, the sizes from the `ssm.*` metadata,
 the decay rates it stores as −exp(A_log), the `qwen35` pre-tokenizer, and value heads in the tiled
 order its converter writes when there are more of them than key heads. Files whose converter merged
-the layer's projections into one tensor are refused by name.
+linear attention's projections into `attn_qkv_gate` and `ssm_beta_alpha` load too: each half is a
+byte range of the merged tensor, listed under its usual name (covered by tests on made-up tensor
+lists; no published file with the merge was found to try).
 
 **Prompt cache for Qwen 3.5.** The cache file holds the attention layers' keys and values as for
 any model; a small file beside it (`….kv.state`) holds the two newest recurrent snapshots, rewritten

@@ -491,9 +491,10 @@ export function configFromGGUF(meta: Map<string, unknown>, tensorNames: readonly
     const interval = get("full_attention_interval", 4);
     const linearLayers = Array.from({ length: base.numLayers }, (_, l) => (Array.isArray(listed) ? Boolean(listed[l]) : (l + 1) % interval !== 0));
     const first = linearLayers.indexOf(true);
-    // Newer conversions merge the q/k/v and gate projections (and the two small ones) into one tensor each.
-    if (first >= 0 && !tensorNames.includes(`blk.${first}.attn_gate.weight`)) {
-      throw new UnsupportedModelError("this Qwen 3.5 GGUF stores linear attention's projections merged, which is not supported yet (files with blk.N.attn_gate are)");
+    // Some conversions merge the q/k/v and gate projections (and the two small ones) into one tensor
+    // each; the loader lists their halves under the usual names (see `splitQwen35Merged`).
+    if (first >= 0 && !tensorNames.includes(`blk.${first}.attn_gate.weight`) && !tensorNames.includes(`blk.${first}.attn_qkv_gate.weight`)) {
+      throw new UnsupportedModelError(`this Qwen 3.5 GGUF has neither blk.${first}.attn_gate nor blk.${first}.attn_qkv_gate: linear attention's projections are missing`);
     }
     const valueHeads = get("ssm.time_step_rank");
     const keyHeads = get("ssm.group_count");

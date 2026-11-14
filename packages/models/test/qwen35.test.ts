@@ -43,7 +43,9 @@ describe("Qwen 3.5 from GGUF", () => {
   });
 
   it("refuses layouts it cannot run", () => {
-    expect(() => configFromGGUF(meta(), names.filter((n) => n !== "blk.0.attn_gate.weight"))).toThrow(/merged/);
+    // Merged projections are accepted (the loader splits them); a file with neither form is refused.
+    expect(configFromGGUF(meta(), names.map((n) => (n === "blk.0.attn_gate.weight" ? "blk.0.attn_qkv_gate.weight" : n))).linear).toBeDefined();
+    expect(() => configFromGGUF(meta(), names.filter((n) => n !== "blk.0.attn_gate.weight"))).toThrow(/projections are missing/);
     expect(() => configFromGGUF(meta([["qwen35.ssm.inner_size", 2050]]), names)).toThrow(UnsupportedModelError);
     expect(() => configFromGGUF(meta([["qwen35.ssm.time_step_rank", 24], ["qwen35.ssm.inner_size", 3072]]), names)).toThrow(UnsupportedModelError);
     expect(() => configFromGGUF(meta([["qwen35.rope.dimension_count", 63]]), names)).toThrow(/63 of 256/);

@@ -20,8 +20,7 @@ the rope kernels now take. Qwen 3.5's text model is done too (unreleased), from 
 linear-attention layers (a gated delta net) run in their own kernels, and the engine snapshots their
 recurrent state; GGUF files, the prompt cache across reloads, speculative decoding and adapters
 work too, and so do images (its vision tower, and rotary positions on three axes in the language
-model: a token's position is then no longer its index). Open for it: video, GGUF files whose
-projections are merged, and the chunked
+model: a token's position is then no longer its index). Open for it: video, and the chunked
 form of the recurrence if prefill of the linear layers ever dominates (it is 14% now). Gemma 4 uses
 the same partial rotary but needs K/V shared between layers, per-layer input embeddings and two
 head sizes. Open in the Phi family: LongRoPE past the original 4096 tokens (the long

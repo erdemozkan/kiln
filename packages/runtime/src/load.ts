@@ -56,6 +56,7 @@ import {
 } from "@kiln/models";
 import { Tokenizer, type ChatTemplate, type TokenizerJSON } from "@kiln/tokenizers";
 import { Engine } from "./engine";
+import { splitQwen35Merged } from "./qwen35-gguf";
 import { llamaMatmulShapes, tuneMatmuls } from "./tune";
 import { freeWeights, loadWeights, type LoadProgress, type Quant, type WeightFile } from "./weights";
 
@@ -712,7 +713,7 @@ async function ggufModel(file: string, source: ByteSource, gguf: Awaited<ReturnT
       cfg,
       tokenizer: Tokenizer.fromGGUF(gguf.metadata),
       // Norms in gemma3 files already hold 1 + w, so unlike safetensors there is nothing to transform.
-      files: [{ name: file, source, tensors: gguf.tensors, rename: (n) => ggufToHF(n, cfg.family), scale, ...(cfg.family === "qwen35" ? { transform: qwen35GgufValues } : {}) }],
+      files: [{ name: file, source, tensors: cfg.linear ? splitQwen35Merged(gguf.tensors, cfg.linear.valueHeads * cfg.linear.valueDim) : gguf.tensors, rename: (n) => ggufToHF(n, cfg.family), scale, ...(cfg.family === "qwen35" ? { transform: qwen35GgufValues } : {}) }],
     };
   } catch (err) {
     source.close?.();
