@@ -374,6 +374,40 @@ async function loadTensor(
   gpu?: GpuConverter,
   factor?: number,
 ): Promise<Tensor> {
+  const w = tensorWriter(backend, e.type, name, layout, transform, gpu, factor);
+  try {
+    for (let r = 0; r < layout.rows; r += w.rowsPerChunk) {
+      const n = Math.min(w.rowsPerChunk, layout.rows - r);
+      w.put(r, n, await src.read(e.offset + r * w.srcRow, n * w.srcRow));
+      onBytes(n * w.srcRow);
+    }
+    w.finish();
+  } catch (err) {
+    freeTensor(backend, w.tensor);
+    throw err;
+  }
+  return w.tensor;
+}
+
+function freeTensor(backend: Backend, t: Tensor): void {
+  backend.free(t.buf);
+  if (t.scales) backend.free(t.scales);
+  if (t.mins) backend.free(t.mins);
+}
+
+/**
+ * A tensor's GPU buffers and the conversion of its rows: `put(r, n, bytes)` takes rows r … r + n − 1
+ * as stored (at most `rowsPerChunk` of them, `srcRow` bytes each), `finish()` follows the last.
+ */
+function tensorWriter(
+  backend: Backend,
+  type: TensorEntry["type"],
+  name: string,
+  layout: Layout,
+  transform?: (name: string, values: Float32Array) => void,
+  gpu?: GpuConverter,
+  factor?: number,
+): { tensor: Tensor; srcRow: number; rowsPerChunk: number; put(r: number, n: number, bytes: Uint8Array): void; finish(): void } {
   const scaleAll = (v: Float32Array | undefined) => {
     if (!v) return;
     // An f32 factor, as the GPU uses: the product of two f32 is exact in a double, so one rounding.
@@ -382,7 +416,7 @@ async function loadTensor(
   };
   const { shape, rows, cols, dtype, isExact, affine } = layout;
 
-  const srcRow = rowBytes(e.type, cols);
+  const srcRow = rowBytes(type, cols);
   const rowsPerChunk = Math.max(1, Math.floor(CHUNK / srcRow));
 
   if (dtype !== "f32") {
@@ -391,30 +425,26 @@ async function loadTensor(
     const scales = backend.alloc(q4ScaleBytes(shape), "storage", `${name}/scales`);
     const mins = affine ? backend.alloc(q4ScaleBytes(shape), "storage", `${name}/mins`) : undefined;
     const fits = grid1d((rowsPerChunk * cols) / 32)[1] <= MAX_X;
-    const exactOnGpu = gpu && isExact && GPU_EXACT_TYPES.has(e.type) && fits;
-    const onGpu = gpu && (!isExact || e.type === "Q4_0") && gpuConverts(e.type, dtype) && fits;
-    for (let r = 0; r < rows; r += rowsPerChunk) {
-      const n = Math.min(rowsPerChunk, rows - r);
-      const bytes = await src.read(e.offset + r * srcRow, n * srcRow);
+    const exactOnGpu = gpu && isExact && GPU_EXACT_TYPES.has(type) && fits;
+    const onGpu = gpu && (!isExact || type === "Q4_0") && gpuConverts(type, dtype) && fits;
+    const put = (r: number, n: number, bytes: Uint8Array) => {
       if (exactOnGpu) {
-        gpu.exact(e.type as GpuExactType, bytes, (n * cols) / 32, (r * cols) / 32, buf, scales, mins);
-        onBytes(n * srcRow);
-        continue;
+        gpu.exact(type as GpuExactType, bytes, (n * cols) / 32, (r * cols) / 32, buf, scales, mins);
+        return;
       }
       if (onGpu) {
-        gpu.convert(e.type as GpuConvertType, dtype, bytes, (n * cols) / 32, (r * cols) / 32, buf, scales);
-        onBytes(n * srcRow);
-        continue;
+        gpu.convert(type as GpuConvertType, dtype, bytes, (n * cols) / 32, (r * cols) / 32, buf, scales);
+        return;
       }
       let planes: { data: Uint32Array; scales: Float32Array; mins?: Float32Array };
-      const asF32 = () => toF32(e.type as Exclude<typeof e.type, "Q4_0">, bytes, n * cols);
+      const asF32 = () => toF32(type as Exclude<typeof type, "Q4_0">, bytes, n * cols);
       if (dtype === "q4") {
         const p =
-          e.type === "Q4_0" ? repackQ4_0(bytes, n * cols) : isExact ? exactQ4(e.type as "Q4_1" | "Q4_K", bytes, n * cols) : quantizeQ4(asF32());
+          type === "Q4_0" ? repackQ4_0(bytes, n * cols) : isExact ? exactQ4(type as "Q4_1" | "Q4_K", bytes, n * cols) : quantizeQ4(asF32());
         planes = { data: p.nibbles, scales: p.scales, mins: p.mins };
       } else {
         const p =
-          e.type === "Q8_0" ? repackQ8_0(bytes, n * cols) : isExact ? exactQ8(e.type as "Q5_0" | "Q5_1" | "Q5_K", bytes, n * cols) : quantizeQ8(asF32());
+          type === "Q8_0" ? repackQ8_0(bytes, n * cols) : isExact ? exactQ8(type as "Q5_0" | "Q5_1" | "Q5_K", bytes, n * cols) : quantizeQ8(asF32());
         planes = { data: p.bytes, scales: p.scales, mins: p.mins };
       }
       scaleAll(planes.scales);
@@ -422,25 +452,77 @@ async function loadTensor(
       backend.write(buf, r * perRow, planes.data);
       backend.write(scales, (r * cols) / 8, planes.scales);
       if (mins && planes.mins) backend.write(mins, (r * cols) / 8, planes.mins);
-      onBytes(n * srcRow);
-    }
-    // GPU-converted scales get the factor once every chunk is in; CPU ones got it per chunk.
-    if ((onGpu || exactOnGpu) && factor !== undefined && factor !== 1) {
-      gpu.scale(scales, (rows * cols) / 32, factor);
-      if (mins) gpu.scale(mins, (rows * cols) / 32, factor);
-    }
-    return { shape, dtype, buf, scales, mins };
+    };
+    const finish = () => {
+      // GPU-converted scales get the factor once every chunk is in; CPU ones got it per chunk.
+      if ((onGpu || exactOnGpu) && factor !== undefined && factor !== 1) {
+        gpu.scale(scales, (rows * cols) / 32, factor);
+        if (mins) gpu.scale(mins, (rows * cols) / 32, factor);
+      }
+    };
+    return { tensor: { shape, dtype, buf, scales, mins }, srcRow, rowsPerChunk, put, finish };
   }
 
   const buf = backend.alloc(rows * cols * 4, "storage", name);
-  for (let r = 0; r < rows; r += rowsPerChunk) {
-    const n = Math.min(rowsPerChunk, rows - r);
-    const bytes = await src.read(e.offset + r * srcRow, n * srcRow);
-    const values = toF32(e.type as Exclude<typeof e.type, "Q4_0">, bytes, n * cols);
+  const put = (r: number, n: number, bytes: Uint8Array) => {
+    const values = toF32(type as Exclude<typeof type, "Q4_0">, bytes, n * cols);
     transform?.(name, values);
     scaleAll(values);
     backend.write(buf, r * cols * 4, values);
-    onBytes(n * srcRow);
+  };
+  return { tensor: { shape, dtype: "f32", buf }, srcRow, rowsPerChunk, put, finish: () => undefined };
+}
+
+/**
+ * Loads a matrix [rows, groups · cols] as one tensor per group of columns, [rows, cols] each, under
+ * `names`: Gemma 4's per-layer embedding table, whose 2.3 billion values are too many for one GPU
+ * buffer and of which each layer reads only its own columns. The file is read once, front to back;
+ * each chunk of rows is cut into the groups' column ranges (whole quantization blocks, so byte
+ * ranges of each stored row) and converted as `loadWeights` converts a tensor of that size.
+ */
+export async function loadColumnGroups(
+  backend: Backend,
+  src: ByteSource,
+  e: TensorEntry,
+  names: readonly string[],
+  quant: Quant,
+  onProgress?: (p: LoadProgress) => void,
+  file = e.name,
+): Promise<Map<string, Tensor>> {
+  const out = new Map<string, Tensor>();
+  if (e.shape.length !== 2 || e.transposed) throw new Error(`${e.name}: a [rows, columns] matrix is expected, got [${e.shape}]`);
+  const [rows, all] = e.shape as [number, number];
+  const cols = all / names.length;
+  if (!Number.isInteger(cols) || cols % 32) throw new Error(`${e.name}: ${all} columns do not split into ${names.length} groups of whole blocks`);
+  const part = rowBytes(e.type, cols);
+  const whole = rowBytes(e.type, all);
+  if (part * names.length !== whole || whole * rows !== e.byteLength) throw new Error(`${e.name}: ${e.type} rows of ${all} values do not split into ${names.length} equal parts`);
+  const gpu = gpuConvert && backend.name !== "cpu" ? new GpuConverter(backend) : undefined;
+  try {
+    const writers = names.map((name) => {
+      const w = tensorWriter(backend, e.type, name, layoutOf({ ...e, name, shape: [rows, cols], byteLength: rows * part }, name, quant), undefined, gpu);
+      // In the map at once, so a failure part-way frees it with the rest.
+      out.set(name, w.tensor);
+      return w;
+    });
+    const rowsPerChunk = Math.max(1, Math.min(writers[0]!.rowsPerChunk, Math.floor(CHUNK / whole)));
+    onProgress?.({ file, loaded: 0, total: e.byteLength });
+    for (let r = 0; r < rows; r += rowsPerChunk) {
+      const n = Math.min(rowsPerChunk, rows - r);
+      const bytes = await src.read(e.offset + r * whole, n * whole);
+      for (const [g, w] of writers.entries()) {
+        const slice = new Uint8Array(n * part);
+        for (let i = 0; i < n; i++) slice.set(bytes.subarray(i * whole + g * part, i * whole + (g + 1) * part), i * part);
+        w.put(r, n, slice);
+      }
+      onProgress?.({ file, loaded: (r + n) * whole, total: e.byteLength });
+    }
+    for (const w of writers) w.finish();
+  } catch (err) {
+    freeWeights(backend, out);
+    throw err;
+  } finally {
+    gpu?.destroy();
   }
-  return { shape, dtype: "f32", buf };
+  return out;
 }
