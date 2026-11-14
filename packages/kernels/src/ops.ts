@@ -255,9 +255,9 @@ function rotaryDims(invFreq: Tensor, D: number): number {
 }
 
 /** In-place RoPE on x [T, H * D]. `invFreq` has one entry per rotated pair: D / 2, or fewer for partial rotary (scaling already applied). */
-export function rope(ctx: Ctx, x: Tensor, T: number, H: number, D: number, invFreq: Tensor, interleaved: boolean): void {
+export function rope(ctx: Ctx, x: Tensor, T: number, H: number, D: number, invFreq: Tensor, interleaved: boolean, step: Buf = ctx.step): void {
   const R = rotaryDims(invFreq, D);
-  ctx.run(ropeSpec(interleaved), [ctx.uniform([u32(T), u32(H), u32(D), u32(R)]), ctx.step, invFreq.buf, x.buf], grid1d((T * H * R) / 2));
+  ctx.run(ropeSpec(interleaved), [ctx.uniform([u32(T), u32(H), u32(D), u32(R)]), step, invFreq.buf, x.buf], grid1d((T * H * R) / 2));
 }
 
 /** In-place rotary embedding of x [T, H · D] by per-row angles [T, D / 2], rotate-half pairs (see ropeTableSpec). */

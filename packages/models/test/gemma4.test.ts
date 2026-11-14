@@ -281,6 +281,14 @@ describe("Gemma 4", () => {
       expect(Math.max(...want.map(Math.abs))).toBeLessThan(30);
       expect(Math.max(...want) - Math.min(...want)).toBeGreaterThan(1);
 
+      // The layers that share a cache run on the sampled row alone, whichever row that is: the
+      // rows after it are padding that later tokens overwrite.
+      step(0, 8);
+      be.submit(whole.dispatches);
+      expect(maxDiff(await read(whole.logits), reference(cfg, w, TOKENS.slice(0, 9)))).toBeLessThan(2e-3);
+      // One copy takes that row out of the residual stream, one more per shared layer out of its input.
+      expect(whole.dispatches.filter((d) => d.label === "copy_row").length).toBe(3);
+
       // In chunks: the first stops after the last layer that writes a cache, the second runs everything.
       const [a, b] = [m.buildPlan(11), m.buildPlan(TOKENS.length - 11)];
       expect(a.kvBody!.length).toBeLessThan(a.body.length);

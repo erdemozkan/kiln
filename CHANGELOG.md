@@ -81,7 +81,8 @@ transformers checkpoints. Beyond Gemma 3 they have: heads of 512 in the full-att
 256 in the sliding ones (a new attention kernel, since the others stop at 256), with rotary on a
 quarter of those heads; values normalised like queries and keys; the last 20 of 35 layers reading
 the keys and values of an earlier layer instead of making their own, so only 15 layers hold a cache
-and a prompt chunk whose output is not needed stops after them; a second embedding table that gives
+a prompt chunk whose output is not needed stops after them, and the last chunk runs the layers
+after them on its final token alone; a second embedding table that gives
 every layer its own 256 values per token; a scalar on each layer's output; and logits capped with
 tanh before sampling. The second table has 2.3 billion values (1.6 GB of the 3 GB file), too many
 for one GPU buffer: it is read once and stored as one table per layer, and each layer looks its rows
@@ -90,7 +91,7 @@ transformers forward pass within 2e-3 (a prompt at once, in chunks, and token by
 kernel passes its checks on the GPU. On unsloth's gemma-4-E2B-it Q4_0 file (Intel Iris GPU): sums
 and capitals right, four facts recalled from a 302-token prompt, a number recalled from the start
 of an 839-token prompt (past the 512-token sliding window), the next turn reusing 334 of 352 tokens;
-5 to 6 tokens/s, 8 s to prefill 839 tokens, and about 50 s of the load for the per-layer table
+5 to 6 tokens/s, 6.5 s to prefill 839 tokens (3.0 s for 302), and about 50 s of the load for the per-layer table
 (it is kept at its 5-bit precision as 8-bit planes, so the model takes roughly 4 GB on the GPU by
 its sizes; not measured). Not done: its images and audio, the mixture-of-experts size (26B-A4B), LoRA adapters, the
 i8 cache (heads past 256), and a run of the safetensors checkpoint (10 GB), whose loading shares

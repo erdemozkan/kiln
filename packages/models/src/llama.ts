@@ -16,7 +16,8 @@ export interface ForwardPlan {
   /**
    * Gemma 4: the dispatches up to the last layer that writes keys and values. The layers after it
    * read an earlier layer's cache and leave nothing a later token needs, so a prefill chunk whose
-   * logits nobody reads stops here.
+   * logits nobody reads stops here. A chunk whose logits are read runs those layers on one row only,
+   * `step.lastRow`: the others' outputs there would feed nothing.
    */
   readonly kvBody?: readonly Dispatch[];
   /** u32 [T] token ids, written before each replay. */
@@ -144,6 +145,8 @@ export class LlamaModel {
   readonly maxSeq: number;
   readonly kvDtype: KvDtype;
   readonly step: Buf;
+  /** Gemma 4: the step as the layers that run on row `lastRow` alone see it (that row's position, row 0). */
+  private readonly tailStep?: Buf;
   /** u32 [maxSeq] sampled ids, appended by `advance` dispatches (slot = step.n). */
   readonly history: Buf;
   /** u32 bitmask [ceil(vocab / 32)] of ids the repetition penalty applies to; set per call, updated by `advance`. */
@@ -192,6 +195,7 @@ export class LlamaModel {
       throw new Error(`maxSeq ${this.maxSeq} is past the ${cfg.maxPositions} tokens this model's rotary factors are loaded for`);
     }
     this.step = backend.alloc(STEP_BYTES, "storage", "step");
+    if (cfg.kvFrom) this.tailStep = backend.alloc(STEP_BYTES, "storage", "step/tail");
     this.history = backend.alloc(this.maxSeq * 4, "storage", "history");
     this.seen = backend.alloc(Math.ceil(cfg.vocabSize / 32) * 4, "storage", "seen");
     this.allowed = backend.alloc((1 + Math.ceil(cfg.vocabSize / 32)) * 4, "storage", "allowed");
@@ -683,6 +687,8 @@ export class LlamaModel {
 
   setStep(s: StepParams): void {
     this.backend.write(this.step, 0, packStep(s));
+    // The same step as the one-row layers see it: their only row is row `lastRow`.
+    if (this.tailStep) this.backend.write(this.tailStep, 0, packStep({ ...s, pos0: s.pos0 + s.lastRow, lastRow: 0 }));
   }
 
   /**
@@ -706,17 +712,29 @@ export class LlamaModel {
       ops.linear(ctx, ops.linear(ctx, xin, s.A), s.B, { residual: y });
     };
     const features = this.imageFeatures && { buf: this.imageFeatures, vocab: c.vocabSize };
-    const x = ops.embed(ctx, this.w("model.embed_tokens.weight"), tokens, T, c.embedScale ?? 1, features);
+    const x0 = ops.embed(ctx, this.w("model.embed_tokens.weight"), tokens, T, c.embedScale ?? 1, features);
     // Gemma 4's per-layer input, the part every layer shares: a projection of the token embeddings
     // to layers × P values, normalised per layer. The model scales the projection by 1 / √hidden
     // first, which RMSNorm undoes but for eps: the same as eps · hidden without the scaling.
     const P = c.perLayerInput;
-    const perLayer = P ? ops.rmsnorm(ctx, ops.linear(ctx, x, this.w("model.per_layer_model_projection.weight")), this.w("model.per_layer_projection_norm.weight"), c.rmsEps * c.hiddenSize, P) : undefined;
+    const perLayer = P ? ops.rmsnorm(ctx, ops.linear(ctx, x0, this.w("model.per_layer_model_projection.weight")), this.w("model.per_layer_projection_norm.weight"), c.rmsEps * c.hiddenSize, P) : undefined;
     const firstShared = c.kvFrom ? c.kvFrom.findIndex((from) => from !== undefined) : -1;
     let kvEnd: number | undefined;
+    // Past the last layer that writes a cache (Gemma 4) only the sampled row matters: the layers
+    // from there on run on that row alone, at its position, which the tail step carries.
+    let x = x0;
+    let rows = T;
+    let step = this.step;
     for (let l = 0; l < c.numLayers; l++) {
       const p = `model.layers.${l}`;
-      if (l === firstShared) kvEnd = ctx.size;
+      if (l === firstShared) {
+        kvEnd = ctx.size;
+        if (!verify && T > 1) {
+          x = ops.copyRow(ctx, view(x, [T, c.hiddenSize]));
+          rows = 1;
+          step = this.tailStep!;
+        }
+      }
       const D = headDimOf(c, l);
       // A layer without keys and values of its own (Gemma 4) reads the cache of an earlier one of its kind.
       const src = c.kvFrom?.[l] ?? l;
@@ -724,7 +742,8 @@ export class LlamaModel {
       const sliding = !!c.slidingLayers?.[l];
       const invFreq = sliding ? this.localInvFreq : this.invFreq;
       const attnShape = {
-        T,
+        T: rows,
+        step,
         H: c.numHeads,
         Hkv: c.numKvHeads,
         D,
@@ -735,7 +754,7 @@ export class LlamaModel {
         slots: this.slots[src],
       };
       const inputNorm = { w: this.w(`${p}.input_layernorm.weight`), eps: c.rmsEps };
-      if (c.linearLayers?.[l]) this.linearAttention(ctx, x, l, T, L ? delta : undefined);
+      if (c.linearLayers?.[l]) this.linearAttention(ctx, x, l, rows, L ? delta : undefined);
       else {
       let q: Tensor;
       let gate: Tensor | undefined;
@@ -752,7 +771,7 @@ export class LlamaModel {
           ? ops.qkNormRopeKv(ctx, qkv, this.w(`${p}.self_attn.q_norm.weight`), this.w(`${p}.self_attn.k_norm.weight`), c.rmsEps, kc, vc, attnShape, invFreq, c.ropeInterleaved)
           : ops.ropeKv(ctx, qkv, kc, vc, attnShape, invFreq, c.ropeInterleaved);
       } else {
-        ({ q, gate } = this.attentionInputs(ctx, x, l, T, invFreq, L ? delta : undefined));
+        ({ q, gate } = this.attentionInputs(ctx, x, l, rows, invFreq, L ? delta : undefined, step));
       }
       const a = ops.attention(ctx, q, kc, vc, attnShape);
       if (gate) ops.sigmoidMul(ctx, a, gate);
@@ -803,8 +822,9 @@ export class LlamaModel {
         // slice of the shared projection. The layer's output gates it, a projection brings it back
         // to the model's width, and its norm goes onto the residual. The model halves the sum's
         // square (× 1 / √2) before the gate; the norm after undoes that but for eps, hence 2 · eps.
-        const e = ops.embed(ctx, this.w(gemma4PerLayerTable(l)), tokens, T, Math.sqrt(P));
-        ops.cols(ctx, e, perLayer, { n: P, srcStart: l * P, accumulate: true });
+        const all = ops.embed(ctx, this.w(gemma4PerLayerTable(l)), tokens, T, Math.sqrt(P));
+        ops.cols(ctx, all, perLayer, { n: P, srcStart: l * P, accumulate: true });
+        const e = rows === T ? all : ops.copyRow(ctx, all);
         const g = ops.linear(ctx, x, this.w(`${p}.per_layer_input_gate.weight`));
         const back = ops.linear(ctx, ops.siluMul(ctx, g, e, "gelu"), this.w(`${p}.per_layer_projection.weight`));
         ops.addInPlace(ctx, x, ops.rmsnorm(ctx, back, this.w(`${p}.post_per_layer_input_norm.weight`), 2 * c.rmsEps));
@@ -812,17 +832,19 @@ export class LlamaModel {
       const scalar = c.layerScalars?.[l];
       if (scalar !== undefined && scalar !== 1) ops.scaleInPlace(ctx, x, scalar);
     }
-    const rows = verify ? view(x, [T, c.hiddenSize]) : ops.copyRow(ctx, view(x, [T, c.hiddenSize]));
+    const last = verify || rows < T ? view(x, [rows, c.hiddenSize]) : ops.copyRow(ctx, view(x, [T, c.hiddenSize]));
     const head = this.weights.get("lm_head.weight") ?? this.w("model.embed_tokens.weight");
-    const logits = ops.linear(ctx, rows, head, { norm: { w: this.w("model.norm.weight"), eps: c.rmsEps } });
+    const logits = ops.linear(ctx, last, head, { norm: { w: this.w("model.norm.weight"), eps: c.rmsEps } });
     if (c.logitSoftcap) ops.softcap(ctx, logits, c.logitSoftcap);
     if (verify) ops.sampleRows(ctx, logits, out, this.seen, this.allowedRows);
     else ops.sample(ctx, logits, out, this.seen, this.allowed);
 
     const dispatches = ctx.dispatches;
-    // Non-verify plans end copy_row → head matmul (→ soft cap) → sample.
-    const body = verify ? dispatches : dispatches.slice(0, dispatches.length - (c.logitSoftcap ? 4 : 3));
-    if (!verify && dispatches[body.length]!.label !== "copy_row") throw new Error("buildPlan: unexpected head layout");
+    // Non-verify plans end (copy_row →) head matmul (→ soft cap) → sample; a plan whose last layers
+    // ran on one row has no copy there.
+    const copied = rows === T;
+    const body = verify ? dispatches : dispatches.slice(0, dispatches.length - 2 - (copied ? 1 : 0) - (c.logitSoftcap ? 1 : 0));
+    if (!verify && copied && dispatches[body.length]!.label !== "copy_row") throw new Error("buildPlan: unexpected head layout");
     return { T, dispatches, body, ...(kvEnd !== undefined && !verify ? { kvBody: dispatches.slice(0, kvEnd) } : {}), tokens, out, logits, destroy: () => ctx.destroy() };
   }
 
@@ -870,6 +892,7 @@ export class LlamaModel {
     }
     if (this.l2Weight) this.backend.free(this.l2Weight.buf);
     this.backend.free(this.step);
+    if (this.tailStep) this.backend.free(this.tailStep);
     this.backend.free(this.history);
     this.backend.free(this.seen);
     this.backend.free(this.allowed);
@@ -919,7 +942,7 @@ export class LlamaModel {
     if (delta) delta(gated, x, `${l}.out_proj`);
   }
 
-  private attentionInputs(ctx: Ctx, x: Tensor, l: number, T: number, invFreq: Tensor, delta?: (xin: Tensor, y: Tensor, name: string) => void): { q: Tensor; gate?: Tensor } {
+  private attentionInputs(ctx: Ctx, x: Tensor, l: number, T: number, invFreq: Tensor, delta?: (xin: Tensor, y: Tensor, name: string) => void, step: Buf = this.step): { q: Tensor; gate?: Tensor } {
     const c = this.cfg;
     const D = headDimOf(c, l);
     const p = `model.layers.${l}`;
@@ -928,7 +951,7 @@ export class LlamaModel {
     if (c.kvFrom?.[l] !== undefined) {
       // Only a query: the keys and values are another layer's (Gemma 4), written earlier in this pass.
       if (c.qkNorm) q = ops.rmsnorm(ctx, q, this.w(`${p}.self_attn.q_norm.weight`), c.rmsEps, D);
-      ops.rope(ctx, q, T, c.numHeads, D, invFreq, c.ropeInterleaved);
+      ops.rope(ctx, q, T, c.numHeads, D, invFreq, c.ropeInterleaved, step);
       return { q };
     }
     let k = ops.linear(ctx, h, this.w(`${p}.self_attn.k_proj.weight`), this.bias(`${p}.self_attn.k_proj.bias`));
