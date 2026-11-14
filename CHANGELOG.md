@@ -64,7 +64,7 @@ language model's rotary kernels. With Kiln's own 4-bit conversion of the safeten
 0.8B model makes slips it does not make with `quant: "q8"` or from a Q4_K_M GGUF (17 + 26 came out
 as 33).
 
-**Qwen 3.5 from GGUF.** llama.cpp's files load as well (unsloth's 0.8B and 2B Q4_K_M checked: 15
+**Qwen 3.5 from GGUF.** llama.cpp's files load as well (unsloth's 0.8B, 2B and 9B Q4_K_M checked: 15
 and 6 to 7.5 tokens/s): its tensor names for linear attention, the sizes from the `ssm.*` metadata,
 the decay rates it stores as −exp(A_log), the `qwen35` pre-tokenizer, and value heads in the tiled
 order its converter writes when there are more of them than key heads. Files whose converter merged
@@ -167,8 +167,8 @@ speed. Evenly spaced bytes were tried first and were worse than f8 on Qwen3 (2.3
 have a few very large values, which use up an even scale. Of the two, i8 is the one to pick.
 
 **Phi-4 mini from safetensors.** A tiny random Phi-4 mini checkpoint in that layout loads and gives
-the same scores on the GPU and the CPU backend. The full model's 7.7 GB safetensors were not run
-(its GGUF was).
+the same scores on the GPU and the CPU backend. The real checkpoint (microsoft/Phi-4-mini-instruct, 7.7 GB) loads too: facts recalled from a
+232-token prompt at about 5 tokens/s on the Intel GPU, the next turn reusing 284 of 296 tokens.
 
 **Fewer requests on a first download.** The request that downloads a weight file also tells its
 size, so the separate one-byte request that asked for it is gone, and the shards of a split

@@ -548,10 +548,12 @@ Models run end to end (greedy answers to fixed questions checked by hand; tool c
 | `phi3` | Phi-3-mini-4k-instruct (3.8B; recalls a code word 1,700 tokens back) | GGUF q4 (2.3 GB) | 4.1 tok/s |
 | `phi3` | Phi-3.5-mini-instruct (LongRoPE short factors, context capped at 4096; same recall) | GGUF Q4_K_M (2.3 GB) | 4.4 tok/s |
 | `phi3` | Phi-4-mini-instruct (rope on 96 of each head's 128 dimensions; four facts recalled from a 442-token prompt) | GGUF Q4_K_M (2.5 GB) | 4.3 tok/s |
+| `phi3` | Phi-4-mini-instruct (three facts recalled, the next turn reuses 284 of 296 tokens) | safetensors (7.7 GB, loaded as q4) | 4.8 to 5.8 tok/s |
 | `qwen35` | Qwen3.5-0.8B (18 linear-attention layers, 6 gated attention layers; four facts recalled from a 458-token prompt; three chat turns) | safetensors bf16 → q4 (1.75 GB) | 20 to 23 tok/s |
 | `qwen35` | Qwen3.5-0.8B (same recall; a reload restores 450 tokens and the next turn reuses 425 of 463) | GGUF Q4_K_M (0.53 GB) | 15 tok/s |
 | `qwen35` | Qwen3.5-2B (same recall) | GGUF Q4_K_M (1.28 GB) | 6 to 7.5 tok/s |
 | `qwen35` | Qwen3.5-4B (32 value heads on 16 key heads, tiled; same recall) | GGUF Q4_K_M (2.73 GB) | 3 tok/s |
+| `qwen35` | Qwen3.5-9B (same recall; the next turn reuses 232 of 306 tokens) | GGUF Q4_K_M (5.7 GB) | 0.6 to 0.7 tok/s |
 | `qwen35` | Qwen3.5-0.8B and 2B with images (a photo described, text on a sign and three lines of small text read, two images told apart) | GGUF Q4_K_M + mmproj-F16 (0.2 and 0.67 GB); safetensors (the tower in the same file) | a 640 × 416 picture (260 tokens) prefills in 3 s on 0.8B, 5 s on 2B |
 | `gemma3` | Gemma 3 4B-it (recalls a fact 1,100 and 3,000 tokens back; images) | GGUF Q4_0 (2.4 GB) + mmproj-F16; safetensors (8.6 GB, the vision tower in the same files) | 177–180 ms GPU per step (about 5.5 tok/s); 24.6 tok/s on an M3 |
 | `idefics3` | SmolVLM-256M-Instruct, SmolVLM-500M-Instruct (images in chat) | safetensors | a 640 × 480 photo in about 17 s (13 tiles), 2–4 s without splitting |

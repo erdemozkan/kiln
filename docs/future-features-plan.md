@@ -24,8 +24,7 @@ model: a token's position is then no longer its index). Open for it: video, and 
 form of the recurrence if prefill of the linear layers ever dominates (it is 14% now). Gemma 4 uses
 the same partial rotary but needs K/V shared between layers, per-layer input embeddings and two
 head sizes. Open in the Phi family: LongRoPE past the original 4096 tokens (the long
-factors); and a run of the safetensors checkpoints, whose name mapping is unit-tested but which were
-not loaded here (7.6 GB each).
+factors). Phi-4 mini's safetensors checkpoint (7.7 GB) was loaded and answers as the GGUF does.
 
 ### More ways to load local models
 
