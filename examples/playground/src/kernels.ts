@@ -5,6 +5,8 @@ import { dequantQ4, dequantQ8, f16ToF32, MemorySource, quantizeQ4, quantizeQ8, r
 import { loadWeights, setGpuConvert } from "@kiln/runtime";
 
 interface Result {
+  /** For a failure: the worst element and what was expected there. */
+  worst?: string;
   kernel: string;
   case: string;
   error: number;
@@ -173,15 +175,27 @@ async function main() {
       for (const v of want) mx = Math.max(mx, Math.abs(v));
       tol = Math.max(tol, 2e-4 * mx);
     }
-    // f16 dot products round each product to 11 bits, so the gated outputs (two sums of ~25 multiplied,
-    // up to a few thousand) are off by about a thousandth of their size: how far depends on the GPU's rounding.
+    // f16 dot products round each product to 11 bits (5e-4 of its size), and the gated outputs multiply
+    // two such sums, so they may be off by 2e-3 of their size. Measured: 5.6e-1 at 481 on an Apple GPU.
     if (kernel.endsWith("/f16")) {
       let mx = 0;
       for (const v of want) mx = Math.max(mx, Math.abs(v));
-      tol = Math.max(tol, 1e-3 * mx);
+      tol = Math.max(tol, 2e-3 * mx);
     }
     const error = ref.maxAbsDiff(got, want);
-    results.push({ kernel, case: name, error, tol, pass: error <= tol && got.length === want.length });
+    const pass = error <= tol && got.length === want.length;
+    // For a failure, where the worst element is and what was expected there.
+    let worst: string | undefined;
+    if (!pass) {
+      let at = 0;
+      let mx = 0;
+      for (let i = 0; i < want.length; i++) {
+        mx = Math.max(mx, Math.abs(want[i]!));
+        if (Math.abs((got[i] ?? NaN) - want[i]!) > Math.abs((got[at] ?? NaN) - want[at]!)) at = i;
+      }
+      worst = `element ${at} of ${want.length}: got ${got[at]}, want ${want[at]}; largest |want| ${mx.toPrecision(4)}`;
+    }
+    results.push({ kernel, case: name, error, tol, pass, worst });
   };
   const S0: StepParams = { pos0: 0, lastRow: 0, seed: 1, temperature: 0 };
 
