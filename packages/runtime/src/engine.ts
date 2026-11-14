@@ -590,7 +590,8 @@ export class Engine {
         tokens.set(prefix.slice(pos, pos + k));
         this.backend.write(plan.tokens, 0, tokens);
         this.model.setStep({ pos0: pos, lastRow: k - 1, ...step });
-        this.submit(plan.body, T);
+        // Only this chunk's keys and values are needed: Gemma 4 stops after the last layer that writes them.
+        this.submit(plan.kvBody ?? plan.body, T);
         pos += k;
       }
       // Each continuation's per-token log-probabilities are computed on the GPU and copied into one
@@ -769,7 +770,7 @@ export class Engine {
         this.backend.write(plan.tokens, 0, tokens);
         this.model.setStep({ pos0: pos, lastRow: n - 1, seed, temperature, ...sampling, ...bidi, ...this.ropeAt(promptIds, pos) });
         // Only the last chunk's logits are read; earlier chunks skip the output head.
-        prefillUnits += this.submit(pos + n < promptIds.length ? plan.body : plan.dispatches, T);
+        prefillUnits += this.submit(pos + n < promptIds.length ? (plan.kvBody ?? plan.body) : plan.dispatches, T);
         pos += n;
         out = plan.out;
       }

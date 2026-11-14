@@ -76,6 +76,26 @@ lists; no published file with the merge was found to try).
 any model; a small file beside it (`….kv.state`) holds the two newest recurrent snapshots, rewritten
 when they change, and both are restored at load, so a conversation resumes after a reload.
 
+**Gemma 4 (text).** The E2B and E4B sizes load, from llama.cpp's GGUF files and from the
+transformers checkpoints. Beyond Gemma 3 they have: heads of 512 in the full-attention layers beside
+256 in the sliding ones (a new attention kernel, since the others stop at 256), with rotary on a
+quarter of those heads; values normalised like queries and keys; the last 20 of 35 layers reading
+the keys and values of an earlier layer instead of making their own, so only 15 layers hold a cache
+and a prompt chunk whose output is not needed stops after them; a second embedding table that gives
+every layer its own 256 values per token; a scalar on each layer's output; and logits capped with
+tanh before sampling. The second table has 2.3 billion values (1.6 GB of the 3 GB file), too many
+for one GPU buffer: it is read once and stored as one table per layer, and each layer looks its rows
+up on the GPU, so decode steps still chain there. The model code matches a float64 reference of the
+transformers forward pass within 2e-3 (a prompt at once, in chunks, and token by token), and the new
+kernel passes its checks on the GPU. On unsloth's gemma-4-E2B-it Q4_0 file (Intel Iris GPU): sums
+and capitals right, four facts recalled from a 302-token prompt, a number recalled from the start
+of an 839-token prompt (past the 512-token sliding window), the next turn reusing 334 of 352 tokens;
+5 to 6 tokens/s, 8 s to prefill 839 tokens, and about 50 s of the load for the per-layer table
+(it is kept at its 5-bit precision as 8-bit planes, so the model takes roughly 4 GB on the GPU by
+its sizes; not measured). Not done: its images and audio, the mixture-of-experts size (26B-A4B), LoRA adapters, the
+i8 cache (heads past 256), and a run of the safetensors checkpoint (10 GB), whose loading shares
+the GGUF path's code but was not tried.
+
 **Images for Qwen 3.5.** Chat messages may hold images: from the transformers checkpoint, whose
 files hold the vision tower (`vision: false` leaves it out), or from a GGUF with its mmproj file
 (`mmproj: "mmproj-F16.gguf"`). The tower takes each image at its own shape, resized to whole tokens

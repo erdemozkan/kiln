@@ -21,15 +21,11 @@ linear-attention layers (a gated delta net) run in their own kernels, and the en
 recurrent state; GGUF files, the prompt cache across reloads, speculative decoding and adapters
 work too, and so do images (its vision tower, and rotary positions on three axes in the language
 model: a token's position is then no longer its index). Open for it: video, and the chunked
-form of the recurrence if prefill of the linear layers ever dominates (it is 14% now). Gemma 4 is
-not started. Read from its transformers code and the E2B config (35 layers, 1536 wide), it needs:
-attention heads of 512 on the full-attention layers beside 256 on the sliding ones (the attention
-kernels stop at 256); the last 20 layers reading the keys and values of an earlier layer of their
-kind instead of making their own, with an MLP twice as wide; values normalised as well as queries
-and keys; "proportional" rotary on a quarter of the full layers' heads; a second embedding table of
-35 × 256 values per token (2.3 billion values for E2B, too large for one GPU buffer, so rows would
-be read from the file per token, which rules out decode steps chained on the GPU); a scalar per
-layer; and logits soft-capped before sampling. Its images and audio are separate towers on top. Open in the Phi family: LongRoPE past the original 4096 tokens (the long
+form of the recurrence if prefill of the linear layers ever dominates (it is 14% now). Gemma 4's
+text model is done too (E2B from GGUF, run; see the changelog). Open for it: its image and audio
+towers, the mixture-of-experts size, adapters, the safetensors checkpoint (10 GB, not run), and
+running only the last prompt token through the 20 layers that write no keys and values (today every
+row of the last chunk goes through them; the earlier chunks already skip them). Open in the Phi family: LongRoPE past the original 4096 tokens (the long
 factors). Phi-4 mini's safetensors checkpoint (7.7 GB) was loaded and answers as the GGUF does.
 
 ### More ways to load local models

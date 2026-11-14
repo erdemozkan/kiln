@@ -626,6 +626,34 @@ async function main() {
     ops.setPrefillAttention("tiled");
   }
 
+  // Heads wider than a workgroup (Gemma 4's full-attention layers: 512, and scores as they are):
+  // decode steps and prefill rows, blocks of keys that end mid-block, each cache format but i8.
+  for (const [T, H, Hkv, D, pos0, maxSeq] of [[1, 8, 1, 512, 700, 1024], [1, 2, 1, 512, 0, 16], [5, 4, 2, 512, 250, 512], [3, 2, 1, 384, 40, 64], [1, 2, 2, 260, 300, 512]] as const) {
+    const q = randn(T * H * D).map((v) => v * 0.2);
+    const kc = randn(maxSeq * Hkv * D);
+    const vc = randn(maxSeq * Hkv * D);
+    const scale = 1;
+    const tag = `T${T} H${H}/${Hkv} D${D} pos${pos0}`;
+    let o!: Tensor;
+    await run({ ...S0, pos0 }, (ctx) => (o = ops.attention(ctx, upload(q, [T, H * D]), upload(kc, [0]).buf, upload(vc, [0]).buf, { T, H, Hkv, D, maxSeq, scale })));
+    check("attention/wide", tag, await download(o.buf, q.length), ref.attentionRef(q, kc, vc, { T, H, Hkv, D, pos0, scale }), 2e-4);
+    await run({ ...S0, pos0 }, (ctx) => (o = ops.attention(ctx, upload(q, [T, H * D]), upload(packHalf(kc), [0]).buf, upload(packHalf(vc), [0]).buf, { T, H, Hkv, D, maxSeq, kv: "f16", scale })));
+    check("attention/wide/f16", tag, await download(o.buf, q.length), ref.attentionRef(q, unpackHalf(packHalf(kc)), unpackHalf(packHalf(vc)), { T, H, Hkv, D, pos0, scale }), 2e-4);
+    await run({ ...S0, pos0 }, (ctx) => (o = ops.attention(ctx, upload(q, [T, H * D]), upload(packF8(kc), [0]).buf, upload(packF8(vc), [0]).buf, { T, H, Hkv, D, maxSeq, kv: "f8", scale })));
+    check("attention/wide/f8", tag, await download(o.buf, q.length), ref.attentionRef(q, asF8(kc), asF8(vc), { T, H, Hkv, D, pos0, scale }), 2e-4);
+  }
+
+  // Logits squashed to ±cap, and a tensor scaled in place.
+  {
+    const x = Float32Array.from(randn(4000), (v, i) => v * (i % 7 === 0 ? 400 : 20));
+    const xt = upload(x, [1, x.length]);
+    await run(S0, (ctx) => ops.softcap(ctx, xt, 30));
+    check("softcap", "cap 30", await download(xt.buf, x.length), x.map((v) => 30 * Math.tanh(v / 30)), 1e-4);
+    const yt = upload(x, [1, x.length]);
+    await run(S0, (ctx) => ops.scaleInPlace(ctx, yt, 0.0178));
+    check("scale", "x 0.0178", await download(yt.buf, x.length), x.map((v) => Math.fround(Math.fround(0.0178) * v)), 1e-5);
+  }
+
   // Sliding-window attention with an explicit score scale (Gemma 3: window 512, scale 1/16, D 256).
   // Windows that start mid-split and mid-tile, are longer than the context, and decode far past them.
   for (const [T, H, Hkv, D, pos0, maxSeq, window] of [[1, 4, 1, 256, 700, 1024, 512], [1, 4, 1, 256, 100, 1024, 512], [1, 9, 3, 64, 300, 512, 37], [5, 4, 1, 256, 600, 1024, 512], [33, 8, 2, 128, 300, 512, 64], [17, 6, 2, 96, 40, 128, 9], [64, 9, 3, 64, 1000, 2048, 100]] as const) {
