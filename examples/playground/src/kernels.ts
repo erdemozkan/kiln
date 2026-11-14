@@ -47,6 +47,38 @@ const unpackF8 = (w: Uint32Array) => Float32Array.from(new Uint8Array(w.buffer, 
 const asF8 = (a: Float32Array) => unpackF8(packF8(a));
 /** Error of each stored value relative to what was to be stored (to its size, or to the smallest normal step near zero). */
 const f8Error = (got: Float32Array, want: Float32Array) => got.map((g, i) => Math.abs(g - want[i]!) / Math.max(Math.abs(want[i]!), 2 ** -6));
+/** What an i8 cache holds for rows of heads of D values: bytes scaled to ±127 of each head's largest, times the scale. */
+const asI8 = (a: Float32Array, D: number) => {
+  const out = new Float32Array(a.length);
+  for (let h = 0; h < a.length / D; h++) {
+    let max = 0;
+    for (let i = 0; i < D; i++) max = Math.max(max, Math.abs(a[h * D + i]!));
+    const inv = max > 0 ? Math.fround(127 / max) : 0;
+    for (let i = 0; i < D; i++) out[h * D + i] = Math.round(Math.fround(a[h * D + i]! * inv)) * Math.fround(max / 127);
+  }
+  return out;
+};
+/** The same as an i8 cache stores it: per head D / 4 words of bytes, then the scale. */
+const packI8 = (a: Float32Array, D: number) => {
+  const HW = D / 4 + 1;
+  const out = new Uint32Array((a.length / D) * HW);
+  const f = new Float32Array(out.buffer);
+  for (let h = 0; h < a.length / D; h++) {
+    let max = 0;
+    for (let i = 0; i < D; i++) max = Math.max(max, Math.abs(a[h * D + i]!));
+    const inv = max > 0 ? Math.fround(127 / max) : 0;
+    for (let i = 0; i < D; i++) out[h * HW + (i >> 2)]! |= ((Math.round(Math.fround(a[h * D + i]! * inv)) & 255) << (8 * (i & 3))) >>> 0;
+    f[h * HW + D / 4] = max / 127;
+  }
+  return out;
+};
+const unpackI8 = (w: Uint32Array, D: number) => {
+  const HW = D / 4 + 1;
+  const f = new Float32Array(w.buffer, w.byteOffset, w.length);
+  const out = new Float32Array((w.length / HW) * D);
+  for (let h = 0; h < w.length / HW; h++) for (let i = 0; i < D; i++) out[h * D + i] = ((w[h * HW + (i >> 2)]! << (24 - 8 * (i & 3))) >> 24) * f[h * HW + D / 4]!;
+  return out;
+};
 /** A stored value is at most half a step from the value: 1 part in 16 just above a power of two. */
 const F8_STEP = 1 / 16 + 1e-3;
 
@@ -333,6 +365,15 @@ async function main() {
     check("rope_kv/f8", `k cache ${tag}`, f8Error(gotK8, wantK), new Float32Array(wantK.length), F8_STEP);
     // v is copied, so its codes are exactly the values' codes.
     check("rope_kv/f8", `v cache ${tag}`, unpackF8(await words(vc8.buf, wantV.length / 4)), asF8(wantV), 0);
+    const i8Words = maxSeq * Hkv * (D / 4 + 1);
+    const kcI = upload(new Uint32Array(i8Words), [0]);
+    const vcI = upload(new Uint32Array(i8Words), [0]);
+    let qI!: Tensor;
+    await run({ ...S0, pos0 }, (ctx) => (qI = ops.ropeKv(ctx, upload(qkv, [T, W]), kcI.buf, vcI.buf, { T, H, Hkv, D, maxSeq, kv: "i8" }, upload(inv, [inv.length]), interleaved)));
+    check("rope_kv/i8", `q ${tag}`, await download(qI.buf, q.length), wantQ, 1e-4);
+    // Half a byte step of each head's largest value (about 1 here) is 0.004.
+    check("rope_kv/i8", `k cache ${tag}`, unpackI8(await words(kcI.buf, i8Words), D), wantK, 1e-2);
+    check("rope_kv/i8", `v cache ${tag}`, unpackI8(await words(vcI.buf, i8Words), D), asI8(wantV, D), 1e-6);
   }
 
   // Qwen 3.5's linear attention: the convolution and the recurrence, in one call and split across
@@ -447,6 +488,18 @@ async function main() {
       check(`qknorm_rope_kv/${kv}`, `k cache ${tag}`, await cache(kc.buf), wantK, tol);
       check(`qknorm_rope_kv/${kv}`, `v cache ${tag}`, await cache(vc.buf), wantV, kv === "f16" ? 2e-3 : 0);
     }
+    {
+      const n = slots * Hkv * (D / 4 + 1);
+      const kcI = upload(new Uint32Array(n), [0]);
+      const vcI = upload(new Uint32Array(n), [0]);
+      let qo!: Tensor;
+      await run({ ...S0, pos0 }, (ctx) => (qo = ops.qkNormRopeKv(ctx, upload(qkv, [T, W]), upload(qw, [D]), upload(kw, [D]), eps, kcI.buf, vcI.buf, { ...shape, kv: "i8" }, upload(inv, [inv.length]), interleaved)));
+      const read = async (b: Buf) => unpackI8(new Uint32Array(await be.readback(b, 0, n * 4)), D);
+      check("qknorm_rope_kv/i8", `q ${tag}`, await download(qo.buf, q.length), wantQ, 5e-4);
+      // Normalised keys reach about 10: half a byte step of that is 0.04.
+      check("qknorm_rope_kv/i8", `k cache ${tag}`, await read(kcI.buf), wantK, 8e-2);
+      check("qknorm_rope_kv/i8", `v cache ${tag}`, await read(vcI.buf), asI8(wantV, D), 1e-6);
+    }
   }
 
   {
@@ -486,6 +539,8 @@ async function main() {
       check("attention/f16", tag, await download(o.buf, q.length), wantH, 1e-4);
       await run({ ...S0, pos0 }, (ctx) => (o = ops.attention(ctx, upload(q, [T, H * D]), upload(packF8(kc), [0]).buf, upload(packF8(vc), [0]).buf, { T, H, Hkv, D, maxSeq, kv: "f8" })));
       check("attention/f8", tag, await download(o.buf, q.length), ref.attentionRef(q, asF8(kc), asF8(vc), { T, H, Hkv, D, pos0 }), 1e-4);
+      await run({ ...S0, pos0 }, (ctx) => (o = ops.attention(ctx, upload(q, [T, H * D]), upload(packI8(kc, D), [0]).buf, upload(packI8(vc, D), [0]).buf, { T, H, Hkv, D, maxSeq, kv: "i8" })));
+      check("attention/i8", tag, await download(o.buf, q.length), ref.attentionRef(q, asI8(kc, D), asI8(vc, D), { T, H, Hkv, D, pos0 }), 2e-4);
     }
     ops.setPrefillAttention("tiled");
   }
@@ -509,6 +564,8 @@ async function main() {
       check("attention/window/f16", tag, await download(o.buf, q.length), wantH, 1e-4);
       await run({ ...S0, pos0 }, (ctx) => (o = ops.attention(ctx, upload(q, [T, H * D]), upload(packF8(kc), [0]).buf, upload(packF8(vc), [0]).buf, { T, H, Hkv, D, maxSeq, kv: "f8", scale, window })));
       check("attention/window/f8", tag, await download(o.buf, q.length), ref.attentionRef(q, asF8(kc), asF8(vc), { T, H, Hkv, D, pos0, scale, window }), 1e-4);
+      await run({ ...S0, pos0 }, (ctx) => (o = ops.attention(ctx, upload(q, [T, H * D]), upload(packI8(kc, D), [0]).buf, upload(packI8(vc, D), [0]).buf, { T, H, Hkv, D, maxSeq, kv: "i8", scale, window })));
+      check("attention/window/i8", tag, await download(o.buf, q.length), ref.attentionRef(q, asI8(kc, D), asI8(vc, D), { T, H, Hkv, D, pos0, scale, window }), 2e-4);
     }
     ops.setPrefillAttention("tiled");
   }
@@ -587,6 +644,8 @@ async function main() {
       check("attention/ring/f16", tag, await download(o.buf, q.length), wantH, 1e-4);
       await run({ ...S0, pos0 }, (ctx) => (o = ops.attention(ctx, upload(q, [T, H * D]), upload(packF8(ring(kc)), [0]).buf, upload(packF8(ring(vc)), [0]).buf, { ...shape, kv: "f8" })));
       check("attention/ring/f8", tag, await download(o.buf, q.length), ref.attentionRef(q, asF8(kc), asF8(vc), { T, H, Hkv, D, pos0, scale, window }), 1e-4);
+      await run({ ...S0, pos0 }, (ctx) => (o = ops.attention(ctx, upload(q, [T, H * D]), upload(packI8(ring(kc), D), [0]).buf, upload(packI8(ring(vc), D), [0]).buf, { ...shape, kv: "i8" })));
+      check("attention/ring/i8", tag, await download(o.buf, q.length), ref.attentionRef(q, asI8(kc, D), asI8(vc, D), { T, H, Hkv, D, pos0, scale, window }), 2e-4);
     }
     ops.setPrefillAttention("tiled");
   }
@@ -641,6 +700,22 @@ async function main() {
     };
     check("kv_write/f8", "k", unpackF8(await words(kc8.buf, wantK.length / 4)), placed(k8), 0);
     check("kv_write/f8", "v", unpackF8(await words(vc8.buf, wantV.length / 4)), placed(v8), 0);
+    {
+      // i8: heads of 4 values here (row 8 as two heads), one of them all zeros.
+      const [heads, hd] = [2, 4];
+      const kz = k8.map((x, i) => (i % row < hd && Math.floor(i / row) === 1 ? 0 : x));
+      const n = maxSeq * heads * (hd / 4 + 1);
+      const kcI = upload(new Uint32Array(n), [0]);
+      const vcI = upload(new Uint32Array(n), [0]);
+      await run({ ...S0, pos0 }, (ctx) => ops.kvWrite(ctx, upload(kz, [T, row]), upload(v8, [T, row]), kcI.buf, vcI.buf, T, maxSeq, "i8", maxSeq, heads));
+      const placedI8 = (a: Float32Array) => {
+        const out = new Float32Array(maxSeq * row);
+        out.set(asI8(a, hd), pos0 * row);
+        return out;
+      };
+      check("kv_write/i8", "k", unpackI8(await words(kcI.buf, n), hd), placedI8(kz), 1e-6);
+      check("kv_write/i8", "v", unpackI8(await words(vcI.buf, n), hd), placedI8(v8), 1e-6);
+    }
   }
 
   {

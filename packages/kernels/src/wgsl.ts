@@ -22,25 +22,66 @@ const EW_ARGS = /* wgsl */ `@builtin(global_invocation_id) gid: vec3<u32>, @buil
  * or f8, four 8-bit floats per u32 (OCP FP8 E4M3: a sign, 4 exponent bits, 3 mantissa bits; ±448,
  * about 1 part in 16 between neighbours), a quarter of f32's memory.
  */
-export type KvDtype = "f32" | "f16" | "f8";
+export type KvDtype = "f32" | "f16" | "f8" | "i8";
 
 /** Element type of a cache buffer the kernels write: packed formats are words. */
 const kvStore = (kv: KvDtype): string => (kv === "f32" ? "f32" : "u32");
 
+/**
+ * "i8": every head of every position is its values as signed bytes, four to a word, followed by one
+ * f32 scale word: value = byte · scale, the scale being the head's largest magnitude / 127. A
+ * quarter of f32's memory plus a word per head, and several times f8's accuracy on the large values
+ * that carry a dot product, since its error is a fixed 1/254 of the head's range instead of 1/16 of
+ * each value. A head is D / 4 + 1 words, so heads are (D + 4) elements apart in the index sums below.
+ */
+
 /** WGSL for reading the cache: kc as 4-element groups, vc element-wise. */
-function kvRead(kv: KvDtype): { kDecl: string; vDecl: string; k4: (i: string) => string; v1: (i: string) => string } {
+interface KvRead {
+  kDecl: string;
+  vDecl: string;
+  /** Elements from one head of a position to the next: D, or D + 4 where a scale word follows the head. */
+  head: string;
+  /** Four key values at word index i of a head (unscaled for i8: see `kScale`). */
+  k4: (i: string) => string;
+  /** A statement scaling `d`, a sum of dot products with the head whose first word is `kb`; empty unless i8. */
+  kScale: (kb: string) => string;
+  /** Value element i of the head starting at element index `base`. */
+  v1: (base: string, i: string) => string;
+}
+
+function kvRead(kv: KvDtype): KvRead {
+  if (kv === "i8") {
+    return {
+      kDecl: "array<u32>",
+      vDecl: "array<u32>",
+      head: "(p.D + 4u)",
+      k4: (i) => `i8x4(kc[${i}])`,
+      kScale: (kb) => `d *= bitcast<f32>(kc[${kb} + p.D / 4u]);`,
+      v1: (base, i) => `(i8x4(vc[(${base}) / 4u + (${i}) / 4u])[(${i}) % 4u] * bitcast<f32>(vc[(${base}) / 4u + p.D / 4u]))`,
+    };
+  }
   if (kv === "f8") {
-    return { kDecl: "array<u32>", vDecl: "array<u32>", k4: (i) => `fp8x4(kc[${i}])`, v1: (i) => `fp8x4(vc[(${i}) / 4u])[(${i}) % 4u]` };
+    return { kDecl: "array<u32>", vDecl: "array<u32>", head: "p.D", k4: (i) => `fp8x4(kc[${i}])`, kScale: () => "", v1: (base, i) => `fp8x4(vc[(${base} + ${i}) / 4u])[(${base} + ${i}) % 4u]` };
   }
   return kv === "f16"
     ? {
         kDecl: "array<vec2<u32>>",
         vDecl: "array<u32>",
+        head: "p.D",
         k4: (i) => `kv4(kc[${i}])`,
-        v1: (i) => `unpack2x16float(vc[(${i}) / 2u])[(${i}) % 2u]`,
+        kScale: () => "",
+        v1: (base, i) => `unpack2x16float(vc[(${base} + ${i}) / 2u])[(${base} + ${i}) % 2u]`,
       }
-    : { kDecl: "array<vec4<f32>>", vDecl: "array<f32>", k4: (i) => `kc[${i}]`, v1: (i) => `vc[${i}]` };
+    : { kDecl: "array<vec4<f32>>", vDecl: "array<f32>", head: "p.D", k4: (i) => `kc[${i}]`, kScale: () => "", v1: (base, i) => `vc[${base} + ${i}]` };
 }
+/** Four signed bytes of a word as floats, and four floats (already divided by the scale) as signed bytes. */
+const I8_FN = /* wgsl */ `fn i8x4(w: u32) -> vec4<f32> {
+  return vec4<f32>(vec4<i32>(bitcast<i32>(w << 24u), bitcast<i32>(w << 16u), bitcast<i32>(w << 8u), bitcast<i32>(w)) >> vec4<u32>(24u));
+}
+fn i8pack(v: vec4<f32>) -> u32 {
+  let c = bitcast<vec4<u32>>(vec4<i32>(clamp(round(v), vec4<f32>(-127.0), vec4<f32>(127.0)))) & vec4<u32>(255u);
+  return c.x | (c.y << 8u) | (c.z << 16u) | (c.w << 24u);
+}`;
 const KV4_FN = /* wgsl */ `fn kv4(w: vec2<u32>) -> vec4<f32> { return vec4<f32>(unpack2x16float(w.x), unpack2x16float(w.y)); }`;
 /**
  * FP8 E4M3, four codes per word, lowest byte first. A code is sign (bit 7), exponent e (bits 6-3,
@@ -69,7 +110,7 @@ fn fp8pack(v: vec4<f32>) -> u32 {
   return c.x | (c.y << 8u) | (c.z << 16u) | (c.w << 24u);
 }`;
 /** The helper functions a kernel reading or writing a `kv` cache needs. */
-const kvFns = (kv: KvDtype): string => (kv === "f16" ? KV4_FN : kv === "f8" ? FP8_FN : "");
+const kvFns = (kv: KvDtype): string => (kv === "f16" ? KV4_FN : kv === "f8" ? FP8_FN : kv === "i8" ? I8_FN : "");
 
 /** A number as a WGSL f32 literal. */
 const f32Lit = (x: number): string => (Number.isInteger(x) ? `${x}.0` : String(x));
@@ -755,6 +796,62 @@ ${kv === "f8"
 }`);
 }
 
+/**
+ * Writes k/v rows [T, Hkv·D] into "i8" caches (see KvDtype): one workgroup per (head, token) finds
+ * the head's largest magnitude in k and in v, then stores each as bytes scaled to ±127 and the
+ * scale after them. A head of zeros gets scale 0.
+ */
+export function kvWriteI8Spec(): KernelSpec {
+  return spec("kv_write/i8", ["uniform", "read", "read", "read", "rw", "rw"], cpu.cpuKvWriteI8, () => /* wgsl */ `
+${STEP_WGSL}
+${I8_FN}
+struct P { T: u32, Hkv: u32, D: u32, maxSeq: u32, cap: u32, _a: u32, _b: u32, _c: u32 }
+@group(0) @binding(0) var<uniform> p: P;
+@group(0) @binding(1) var<storage, read> st: Step;
+@group(0) @binding(2) var<storage, read> k: array<f32>;
+@group(0) @binding(3) var<storage, read> v: array<f32>;
+@group(0) @binding(4) var<storage, read_write> kc: array<u32>;
+@group(0) @binding(5) var<storage, read_write> vc: array<u32>;
+var<workgroup> red: array<f32, 256>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) li: u32) {
+  let h = wid.x;
+  let t = wid.y;
+  let pos = st.pos0 + t;
+  // Writes are guarded rather than returned from: pos comes from storage, and barriers follow.
+  let live = pos < p.maxSeq;
+  let src = (t * p.Hkv + h) * p.D;
+  let d4 = p.D / 4u;
+  let base = ((pos % p.cap) * p.Hkv + h) * (d4 + 1u);
+  let at = src + min(li, p.D - 1u);
+  red[li] = select(0.0, abs(k[at]), li < p.D);
+  workgroupBarrier();
+  for (var s = 128u; s > 0u; s >>= 1u) {
+    if (li < s) { red[li] = max(red[li], red[li + s]); }
+    workgroupBarrier();
+  }
+  let kMax = red[0];
+  workgroupBarrier();
+  red[li] = select(0.0, abs(v[at]), li < p.D);
+  workgroupBarrier();
+  for (var s = 128u; s > 0u; s >>= 1u) {
+    if (li < s) { red[li] = max(red[li], red[li + s]); }
+    workgroupBarrier();
+  }
+  let vMax = red[0];
+  if (live && li < d4) {
+    let e = src + li * 4u;
+    kc[base + li] = i8pack(vec4<f32>(k[e], k[e + 1u], k[e + 2u], k[e + 3u]) * select(0.0, 127.0 / kMax, kMax > 0.0));
+    vc[base + li] = i8pack(vec4<f32>(v[e], v[e + 1u], v[e + 2u], v[e + 3u]) * select(0.0, 127.0 / vMax, vMax > 0.0));
+  }
+  if (live && li == 0u) {
+    kc[base + d4] = bitcast<u32>(kMax / 127.0);
+    vc[base + d4] = bitcast<u32>(vMax / 127.0);
+  }
+}`);
+}
+
 /** Threads per attention workgroup; head dims up to this size are supported. */
 export const ATTN_WG = 256;
 
@@ -826,8 +923,8 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
   let kvh = h / (p.H / p.Hkv);
   let n = keys(st.pos0 + t);
   let qo = (t * p.H + h) * p.D;
-  let stride = p.Hkv * p.D;
-  let ko = kvh * p.D;
+  let stride = p.Hkv * ${r.head};
+  let ko = kvh * ${r.head};
   let d4 = p.D / 4u;
   if (li < d4) {
     let qb = qo + li * 4u;
@@ -853,6 +950,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
       if (jj < bn) {
         let kb = (wrap(sb + jj) * stride + ko) / 4u;
         for (var c = lane; c < d4; c += 8u) { d += dot(qs[c], ${r.k4("kb + c")}); }
+        ${r.kScale("kb")}
       }
       red[li] = d;
       workgroupBarrier();
@@ -886,7 +984,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
     m = mNew;
     acc *= corr;
     if (g < groups) {
-      for (var jj = g; jj < bn; jj += groups) { acc += ss[jj] * ${r.v1("wrap(sb + jj) * stride + ko + i")}; }
+      for (var jj = g; jj < bn; jj += groups) { acc += ss[jj] * ${r.v1("wrap(sb + jj) * stride + ko", "i")}; }
     }
     workgroupBarrier();
   }
@@ -1162,12 +1260,16 @@ export function attentionTiledSpec(kv: KvDtype, D: number, tile: AttentionTile =
   const D4 = D / 4;
   const KP = D4 + 1; // padded row stride (vec4) of the key/value tile, so rows start in different banks
   const TPR = Math.floor(256 / R);
+  // Words per head in the cache: its D / 4 vectors, and for i8 the scale after them.
+  const HW = kv === "i8" ? D4 + 1 : D4;
   const load =
-    kv === "f8"
-      ? { kDecl: "array<u32>", vDecl: "array<u32>", k: "fp8x4(kc[i])", v: "fp8x4(vc[i])" }
+    kv === "i8"
+      ? { kDecl: "array<u32>", vDecl: "array<u32>", k: "i8x4(kc[i + c]) * bitcast<f32>(kc[i + D4])", v: "i8x4(vc[i + c]) * bitcast<f32>(vc[i + D4])" }
+      : kv === "f8"
+      ? { kDecl: "array<u32>", vDecl: "array<u32>", k: "fp8x4(kc[i + c])", v: "fp8x4(vc[i + c])" }
       : kv === "f16"
-        ? { kDecl: "array<vec2<u32>>", vDecl: "array<vec2<u32>>", k: "kv4(kc[i])", v: "kv4(vc[i])" }
-        : { kDecl: "array<vec4<f32>>", vDecl: "array<vec4<f32>>", k: "kc[i]", v: "vc[i]" };
+        ? { kDecl: "array<vec2<u32>>", vDecl: "array<vec2<u32>>", k: "kv4(kc[i + c])", v: "kv4(vc[i + c])" }
+        : { kDecl: "array<vec4<f32>>", vDecl: "array<vec4<f32>>", k: "kc[i + c]", v: "vc[i + c]" };
   return spec(`attention/tiled/${kv}/D${D}/R${R}/BK${BK}`, ["uniform", "read", "read", "read", "read", "rw"], cpu.cpuAttention(kv), () => /* wgsl */ `
 ${STEP_WGSL}
 ${kvFns(kv)}
@@ -1191,8 +1293,9 @@ var<workgroup> sc: array<f32, ${R * BK}>;
 ${split ? `var<workgroup> part: array<f32, 256>;
 const TPP = ${TPP_}u;` : ""}
 
-fn K4(i: u32) -> vec4<f32> { return ${load.k}; }
-fn V4(i: u32) -> vec4<f32> { return ${load.v}; }
+// Vector c of the head whose first word is i.
+fn K4(i: u32, c: u32) -> vec4<f32> { return ${load.k}; }
+fn V4(i: u32, c: u32) -> vec4<f32> { return ${load.v}; }
 
 @compute @workgroup_size(256)
 fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) li: u32) {
@@ -1200,8 +1303,8 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
   let G = p.H / p.Hkv;
   let rows = p.T * G;
   let r0 = wid.y * R;
-  let stride4 = p.Hkv * D4;
-  let ko4 = kvh * D4;
+  let stride4 = p.Hkv * ${HW}u;
+  let ko4 = kvh * ${HW}u;
   for (var e = li; e < R * D4; e += 256u) {
     let rho = r0 + e / D4;
     var v = vec4<f32>(0.0);
@@ -1233,7 +1336,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
     for (var e = li; e < BK * D4; e += 256u) {
       let j = b0 + e / D4;
       var v = vec4<f32>(0.0);
-      if (j < nMax) { v = K4(wrap(sb + e / D4) * stride4 + ko4 + e % D4); }
+      if (j < nMax) { v = K4(wrap(sb + e / D4) * stride4 + ko4, e % D4); }
       tile[(e / D4) * KP + e % D4] = v;
     }
     workgroupBarrier();
@@ -1275,7 +1378,7 @@ ${split
     for (var e = li; e < BK * D4; e += 256u) {
       let j = b0 + e / D4;
       var v = vec4<f32>(0.0);
-      if (j < nMax) { v = V4(wrap(sb + e / D4) * stride4 + ko4 + e % D4); }
+      if (j < nMax) { v = V4(wrap(sb + e / D4) * stride4 + ko4, e % D4); }
       tile[(e / D4) * KP + e % D4] = v;
     }
     workgroupBarrier();
@@ -1346,7 +1449,7 @@ var<workgroup> qs: array<vec4<f32>, ${ATTN_WG / 4}>;
 var<workgroup> part: array<f32, 64>;
 var<workgroup> sc: array<f32, ${ATTN_CHUNK}>;
 var<workgroup> red: array<f32, 64>;
-${kv === "f16" ? "var<workgroup> vpart: array<vec2<f32>, 64>;" : kv === "f8" ? "var<workgroup> vpart: array<vec4<f32>, 64>;" : ""}
+${kv === "f16" ? "var<workgroup> vpart: array<vec2<f32>, 64>;" : kv === "f8" || kv === "i8" ? "var<workgroup> vpart: array<vec4<f32>, 64>;" : ""}
 
 @compute @workgroup_size(64)
 fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) li: u32) {
@@ -1364,8 +1467,8 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
   let cnt = min(j0s + CH, n) - j0;
   let sb = j0 % p.cap;
   let qo = (t * p.H + h) * p.D;
-  let stride = p.Hkv * p.D;
-  let ko = kvh * p.D;
+  let stride = p.Hkv * ${r.head};
+  let ko = kvh * ${r.head};
   let d4 = p.D / 4u;
   for (var c = li; c < d4; c += 64u) {
     let qb = qo + c * 4u;
@@ -1382,6 +1485,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
     if (j < cnt) {
       let kb = (wrap(sb + j) * stride + ko) / 4u;
       for (var c = lane; c < d4; c += 8u) { d += dot(qs[c], ${r.k4("kb + c")}); }
+      ${r.kScale("kb")}
     }
     part[li] = d;
     workgroupBarrier();
@@ -1414,7 +1518,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
     ml[row * 2u] = m;
     ml[row * 2u + 1u] = red[0];
   }
-${kv === "f8"
+${kv === "f8" || kv === "i8"
   ? `  // V: one word of four codes per thread; when D / 4 < 64, groups of threads split the keys and are summed.
   let quads = p.D / 4u;
   let groups = max(1u, 64u / quads);
@@ -1424,7 +1528,10 @@ ${kv === "f8"
   for (var pi = li % quads; pi < quads; pi += 64u) {
     var acc = vec4<f32>(0.0);
     if (g < groups) {
-      for (var j = g; j < cnt; j += groups) { acc += sc[j] * fp8x4(vc[vo + wrap(sb + j) * vs + pi]); }
+      for (var j = g; j < cnt; j += groups) {
+        let hb = vo + wrap(sb + j) * vs;
+        acc += ${kv === "i8" ? "(sc[j] * bitcast<f32>(vc[hb + quads])) * i8x4(vc[hb + pi])" : "sc[j] * fp8x4(vc[hb + pi])"};
+      }
     }
     if (quads < 64u) {
       vpart[li] = acc;
@@ -1474,7 +1581,7 @@ ${kv === "f8"
   }`
   : `  for (var i = li; i < p.D; i += 64u) {
     var acc = 0.0;
-    for (var j = 0u; j < cnt; j++) { acc += sc[j] * ${r.v1("wrap(sb + j) * stride + ko + i")}; }
+    for (var j = 0u; j < cnt; j++) { acc += sc[j] * ${r.v1("wrap(sb + j) * stride + ko", "i")}; }
     po[row * p.D + i] = acc;
   }`}
 }`);
@@ -3400,9 +3507,11 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
   let base = (t * (p.H + 2u * p.Hkv) + hh) * D;
   let pos = st.pos0 + t;
   let kn = p.Hkv * D;
-  let slot = (pos % p.cap) * kn;
+  // cap 0: k and v go to row t of plain [T, Hkv·D] buffers, not into a cache (see ops.qkNormRopeKv).
+  let local = p.cap == 0u;
+  let slot = select((pos % max(p.cap, 1u)) * kn, t * kn, local);
   // Writes are guarded rather than returned from: pos comes from storage, and a barrier follows.
-  let live = pos < p.maxSeq;
+  let live = local || pos < p.maxSeq;
   let x = select(0.0, qkv[base + min(i, D - 1u)], i < D);
   if (hh >= p.H + p.Hkv) {
     // v: copied into the cache as is.
@@ -3529,8 +3638,10 @@ fn main(${EW_ARGS}) {
     qo[t * qn + c + 1u] = pair.y;
     return;
   }
-  if (pos >= p.maxSeq) { return; }
-  let dst = (pos % p.cap) * kn + (c - qn) % kn;
+  // cap 0: k and v go to row t of plain [T, Hkv·D] buffers, not into a cache (see ops.ropeKv).
+  let local = p.cap == 0u;
+  if (!local && pos >= p.maxSeq) { return; }
+  let dst = select((pos % max(p.cap, 1u)) * kn, t * kn, local) + (c - qn) % kn;
 ${kv === "f8"
   ? `  // A word holds two pairs: the thread of the first one computes the second as well and writes both.
   if (dst % 4u != 0u) { return; }

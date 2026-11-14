@@ -32,6 +32,7 @@ import {
   relAttentionSpec,
   gatedTanhSpec,
   colsSpec,
+  kvWriteI8Spec,
   headSlicesSpec,
   sigmoidMulSpec,
   causalConvSpec,
@@ -262,6 +263,14 @@ export function rope(ctx: Ctx, x: Tensor, T: number, H: number, D: number, invFr
 export function ropeKv(ctx: Ctx, qkv: Tensor, kc: Buf, vc: Buf, s: AttentionShape, invFreq: Tensor, interleaved: boolean): Tensor {
   const q = ctx.alloc([s.T, s.H * s.D]);
   const W = (s.H + 2 * s.Hkv) * s.D;
+  if (s.kv === "i8") {
+    // An i8 head is stored relative to its largest value: k and v come out as plain rows first.
+    const [k, v] = [ctx.alloc([s.T, s.Hkv * s.D]), ctx.alloc([s.T, s.Hkv * s.D])];
+    const local = ctx.uniform([u32(s.T), u32(s.H), u32(s.Hkv), u32(s.D), u32(s.maxSeq), u32(0), u32(rotaryDims(invFreq, s.D)), u32(0)]);
+    ctx.run(ropeKvSpec(interleaved, "f32"), [local, ctx.step, invFreq.buf, qkv.buf, q.buf, k.buf, v.buf], grid1d((s.T * W) / 2));
+    kvWrite(ctx, k, v, kc, vc, s.T, s.maxSeq, "i8", cacheSlots(s), s.Hkv);
+    return q;
+  }
   const params = ctx.uniform([u32(s.T), u32(s.H), u32(s.Hkv), u32(s.D), u32(s.maxSeq), u32(cacheSlots(s)), u32(rotaryDims(invFreq, s.D)), u32(0)]);
   ctx.run(ropeKvSpec(interleaved, s.kv), [params, ctx.step, invFreq.buf, qkv.buf, q.buf, kc, vc], grid1d((s.T * W) / 2));
   return q;
@@ -274,14 +283,28 @@ export function ropeKv(ctx: Ctx, qkv: Tensor, kc: Buf, vc: Buf, s: AttentionShap
 export function qkNormRopeKv(ctx: Ctx, qkv: Tensor, qNorm: Tensor, kNorm: Tensor, eps: number, kc: Buf, vc: Buf, s: AttentionShape, invFreq: Tensor, interleaved: boolean): Tensor {
   if (s.D > 256 || s.D % 4 !== 0) throw new Error(`qkNormRopeKv: head dim ${s.D} must be a multiple of 4 and at most 256`);
   const q = ctx.alloc([s.T, s.H * s.D]);
+  if (s.kv === "i8") {
+    // As in `ropeKv`: plain rows, then the i8 write.
+    const [k, v] = [ctx.alloc([s.T, s.Hkv * s.D]), ctx.alloc([s.T, s.Hkv * s.D])];
+    const local = ctx.uniform([u32(s.T), u32(s.H), u32(s.Hkv), u32(s.D), u32(s.maxSeq), u32(0), f32(eps), u32(rotaryDims(invFreq, s.D))]);
+    ctx.run(qkNormRopeKvSpec(interleaved, "f32"), [local, ctx.step, invFreq.buf, qkv.buf, qNorm.buf, kNorm.buf, q.buf, k.buf, v.buf], [s.H + 2 * s.Hkv, s.T, 1]);
+    kvWrite(ctx, k, v, kc, vc, s.T, s.maxSeq, "i8", cacheSlots(s), s.Hkv);
+    return q;
+  }
   const params = ctx.uniform([u32(s.T), u32(s.H), u32(s.Hkv), u32(s.D), u32(s.maxSeq), u32(cacheSlots(s)), f32(eps), u32(rotaryDims(invFreq, s.D))]);
   ctx.run(qkNormRopeKvSpec(interleaved, s.kv), [params, ctx.step, invFreq.buf, qkv.buf, qNorm.buf, kNorm.buf, q.buf, kc, vc], [s.H + 2 * s.Hkv, s.T, 1]);
   return q;
 }
 
 /** Writes k/v into the caches at positions pos0…; `slots` < maxSeq makes the cache a ring (slot = position % slots). */
-export function kvWrite(ctx: Ctx, k: Tensor, v: Tensor, kc: Buf, vc: Buf, T: number, maxSeq: number, kv: KvDtype = "f32", slots = maxSeq): void {
+export function kvWrite(ctx: Ctx, k: Tensor, v: Tensor, kc: Buf, vc: Buf, T: number, maxSeq: number, kv: KvDtype = "f32", slots = maxSeq, heads?: number): void {
   const row = numel(k.shape) / T;
+  if (kv === "i8") {
+    // Each head is scaled on its own, so the head count says where heads end.
+    if (!heads || row % heads !== 0 || (row / heads) % 4 !== 0 || row / heads > 256) throw new Error(`kvWrite: an i8 cache needs the head count, and heads of a multiple of 4 up to 256 (row=${row}, heads=${heads})`);
+    ctx.run(kvWriteI8Spec(), [ctx.uniform([u32(T), u32(heads), u32(row / heads), u32(maxSeq), u32(slots), u32(0), u32(0), u32(0)]), ctx.step, k.buf, v.buf, kc, vc], [heads, T, 1]);
+    return;
+  }
   // Packed caches are written a word at a time: two halves, or four 8-bit codes.
   const per = kv === "f8" ? 4 : kv === "f16" ? 2 : 1;
   if (row % per !== 0) throw new Error(`kvWrite: an ${kv} cache needs a row that is a multiple of ${per} (row=${row})`);

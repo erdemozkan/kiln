@@ -75,13 +75,15 @@ export const F8 = (() => {
 })();
 
 /** How a KV cache stores its values (the kernels' KvDtype). */
-type Kv = "f32" | "f16" | "f8";
+type Kv = "f32" | "f16" | "f8" | "i8";
 
 /**
  * Writes element pairs (e, e + 1; e even) of a cache: two 8-bit codes, packed halves or two floats.
  * The view is taken once, since a heap buffer's view getter is too slow to call per element.
  */
 function cacheWriter(c: CpuView, kv: Kv): (e: number, a: number, b: number) => void {
+  // An i8 cache needs a head's largest value before any of it is stored: `cpuKvWriteI8` writes those.
+  if (kv === "i8") throw new Error("an i8 cache is written by kv_write/i8");
   if (kv === "f8") {
     const u = c.u32;
     return (e, a, b) => {
@@ -393,6 +395,8 @@ function qkvToCache(
 ): void {
   const u = b[0]!.u32;
   const [T, H, Hkv, D, maxSeq, cap] = [u[0]!, u[1]!, u[2]!, u[3]!, u[4]!, u[5]!];
+  // cap 0: k and v go to row t of plain [T, Hkv·D] buffers, not into a cache.
+  const local = cap === 0;
   const { pos0 } = step(b[1]!);
   const qkv = b[3]!.f32;
   const kc = cacheWriter(kcView, f16), vc = cacheWriter(vcView, f16);
@@ -402,8 +406,8 @@ function qkvToCache(
   const cs = new Float64Array(R >>> 1), sn = new Float64Array(R >>> 1);
   for (let t = 0; t < T; t++) {
     const pos = pos0 + t;
-    const live = pos < maxSeq;
-    const slot = (pos % cap) * kn;
+    const live = local || pos < maxSeq;
+    const slot = local ? t * kn : (pos % cap) * kn;
     angles(pos, f, R >>> 1, cs, sn);
     for (let hh = 0; hh < H + 2 * Hkv; hh++) {
       const base = (t * (H + 2 * Hkv) + hh) * D;
@@ -469,6 +473,18 @@ function kvRow(u: Uint32Array, f: Float32Array, e: number, D: number, kv: Kv, ou
     for (let i = 0; i < D; i++) out[i] = f[e + i]!;
     return;
   }
+  if (kv === "i8") {
+    // e is the head's first word: D / 4 words of signed bytes, then the scale.
+    const scale = f[e + (D >>> 2)]!;
+    for (let i = 0, w = e; i < D; i += 4, w++) {
+      const x = u[w]!;
+      out[i] = ((x << 24) >> 24) * scale;
+      out[i + 1] = ((x << 16) >> 24) * scale;
+      out[i + 2] = ((x << 8) >> 24) * scale;
+      out[i + 3] = (x >> 24) * scale;
+    }
+    return;
+  }
   if (kv === "f8") {
     // e and D are multiples of 4: whole words, four codes each.
     for (let i = 0, w = e >>> 2; i < D; i += 4, w++) {
@@ -520,8 +536,8 @@ export function cpuAttention(kv: Kv, rel = false): CpuKernel {
     const heap = (b[2] as HeapView).heap;
     // T5's position bias is added to each score in TypeScript below (the WASM path takes the max first).
     const table = rel ? b[5]!.f32 : undefined;
-    // The WASM kernels read f32 and f16 caches; an f8 cache takes the TypeScript path below.
-    if (heap && !rel && kv !== "f8" && D % (f16 ? 8 : 4) === 0) {
+    // The WASM kernels read f32 and f16 caches; f8 and i8 caches take the TypeScript path below.
+    if (heap && !rel && kv !== "f8" && kv !== "i8" && D % (f16 ? 8 : 4) === 0) {
       // The per-key work in WASM SIMD, on the caches in place, for all the query heads of a KV head at
       // once (each cache row read and widened once); masking and the softmax stay here.
       const G = H / Hkv;
@@ -561,6 +577,8 @@ export function cpuAttention(kv: Kv, rel = false): CpuKernel {
     const [ku, kf, vu, vf] = [b[3]!.u32, b[3]!.f32, b[4]!.u32, b[4]!.f32];
     const o = (rel ? b[6]! : b[5]!).f32;
     const stride = Hkv * D;
+    // Where key j's head starts: an element index, or for i8 a word index (heads are D / 4 + 1 words).
+    const headAt = kv === "i8" ? (j: number, kvh: number) => ((j % cap) * Hkv + kvh) * ((D >>> 2) + 1) : (j: number, kvh: number) => (j % cap) * stride + kvh * D;
     if (scores.length < maxSeq) scores = new Float32Array(maxSeq);
     const qs = new Float32Array(D);
     const row = new Float32Array(D);
@@ -576,7 +594,7 @@ export function cpuAttention(kv: Kv, rel = false): CpuKernel {
         for (let i = 0; i < D; i++) qs[i] = q[qo + i]! * scale;
         let mx = -Infinity;
         for (let j = first; j < n; j++) {
-          kvRow(ku, kf, (j % cap) * stride + kvh * D, D, kv, row);
+          kvRow(ku, kf, headAt(j, kvh), D, kv, row);
           let d = 0;
           for (let i = 0; i < D; i++) d += qs[i]! * row[i]!;
           if (table) d += table[t5Bucket(j - pos, bidir, buckets, maxDist) * H + h]!;
@@ -587,7 +605,7 @@ export function cpuAttention(kv: Kv, rel = false): CpuKernel {
         for (let j = first; j < n; j++) l += scores[j] = Math.exp(scores[j]! - mx);
         acc.fill(0);
         for (let j = first; j < n; j++) {
-          kvRow(vu, vf, (j % cap) * stride + kvh * D, D, kv, row);
+          kvRow(vu, vf, headAt(j, kvh), D, kv, row);
           const p = scores[j]!;
           for (let i = 0; i < D; i++) acc[i]! += p * row[i]!;
         }
@@ -1594,6 +1612,35 @@ export const cpuGatedDelta: CpuKernel = (b) => {
           o += s * qk[qb + i]!;
         }
         out[(t * Hv + h) * Dv + col] = o * qScale;
+      }
+    }
+  }
+};
+
+/** Writes k/v rows into i8 caches: per head and position, signed bytes scaled to ±127 and their scale (see `kvWriteI8Spec`). */
+export const cpuKvWriteI8: CpuKernel = (b) => {
+  const u = b[0]!.u32;
+  const [T, Hkv, D, maxSeq, cap] = [u[0]!, u[1]!, u[2]!, u[3]!, u[4]!];
+  const { pos0 } = step(b[1]!);
+  const d4 = D >>> 2;
+  for (const [src, dst] of [[b[2]!, b[4]!], [b[3]!, b[5]!]] as const) {
+    const x = src.f32;
+    const [words, floats] = [dst.u32, dst.f32];
+    for (let t = 0; t < T; t++) {
+      const pos = pos0 + t;
+      if (pos >= maxSeq) continue;
+      for (let h = 0; h < Hkv; h++) {
+        const from = (t * Hkv + h) * D;
+        const base = ((pos % cap) * Hkv + h) * (d4 + 1);
+        let max = 0;
+        for (let i = 0; i < D; i++) max = Math.max(max, Math.abs(x[from + i]!));
+        const inv = max > 0 ? Math.fround(127 / max) : 0;
+        const code = (v: number) => Math.max(-127, Math.min(127, Math.round(Math.fround(v * inv)))) & 255;
+        for (let w = 0; w < d4; w++) {
+          const e = from + w * 4;
+          words[base + w] = (code(x[e]!) | (code(x[e + 1]!) << 8) | (code(x[e + 2]!) << 16) | (code(x[e + 3]!) << 24)) >>> 0;
+        }
+        floats[base + d4] = max / 127;
       }
     }
   }

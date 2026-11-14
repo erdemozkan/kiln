@@ -127,6 +127,47 @@ describe.each([
     expect(ref.maxAbsDiff(await read(o, T * H * D), want)).toBeLessThan(1e-3);
   });
 
+  it("writes an i8 ring cache and attends over it as the reference does over the values it holds", async () => {
+    const [T, H, Hkv, D, maxSeq, slots, window] = [3, 4, 2, 16, 512, 300, 270];
+    const row = Hkv * D;
+    const HW = D / 4 + 1;
+    // Heads of very different sizes, and one of zeros: each is scaled on its own.
+    const sizes = (n: number) => randn(n).map((v, i) => v * [1, 0.01, 40, 0][Math.floor(i / D) % 4]!);
+    const kf = sizes(maxSeq * row);
+    const vf = sizes(maxSeq * row);
+    // What an i8 cache holds for a head: bytes scaled to ±127 of its largest value, times the scale back.
+    const held = (f: Float32Array) => {
+      const out = new Float32Array(f.length);
+      for (let h = 0; h < f.length / D; h++) {
+        let max = 0;
+        for (let i = 0; i < D; i++) max = Math.max(max, Math.abs(f[h * D + i]!));
+        const inv = max > 0 ? Math.fround(127 / max) : 0;
+        for (let i = 0; i < D; i++) out[h * D + i] = Math.round(Math.fround(f[h * D + i]! * inv)) * Math.fround(max / 127);
+      }
+      return out;
+    };
+    const kc = be.alloc(slots * Hkv * HW * 4);
+    const vc = be.alloc(slots * Hkv * HW * 4);
+    // Written in calls of T rows, the way prefill does, far enough for the ring to wrap.
+    const last = 400;
+    for (let pos = last - slots - T; pos < last; pos += T) {
+      const n = Math.min(T, last - pos);
+      run(pos, (ctx) => ops.kvWrite(ctx, upload(kf.slice(pos * row, (pos + n) * row), [n, row]), upload(vf.slice(pos * row, (pos + n) * row), [n, row]), kc, vc, n, maxSeq, "i8", slots, Hkv));
+    }
+    // One head's bytes and scale, read back.
+    const words = new Uint32Array(await be.readback(kc, 0, slots * Hkv * HW * 4));
+    const at = ((last - 1) % slots) * Hkv * HW;
+    const scale = new Float32Array(words.buffer)[at + D / 4]!;
+    const want0 = held(kf.slice((last - 1) * row, (last - 1) * row + D));
+    for (let i = 0; i < D; i++) expect(((words[at + (i >> 2)]! << (24 - 8 * (i & 3))) >> 24) * scale).toBeCloseTo(want0[i]!, 4);
+    const pos0 = last - T;
+    const q = randn(T * H * D);
+    let o!: Tensor;
+    run(pos0, (ctx) => (o = ops.attention(ctx, upload(q, [T, H * D]), kc, vc, { T, H, Hkv, D, maxSeq, kv: "i8", window, slots })));
+    const want = ref.attentionRef(q, held(kf), held(vf), { T, H, Hkv, D, pos0, window });
+    expect(ref.maxAbsDiff(await read(o, T * H * D), want)).toBeLessThan(2e-3);
+  });
+
   it("samples greedily and feeds the token back", async () => {
     const V = 100;
     const logits = randn(V);

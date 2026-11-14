@@ -133,3 +133,41 @@ describe("f8 KV cache", () => {
     expect(best(small.logits)).toBe(best(exact.logits));
   });
 });
+
+describe("i8 KV cache", () => {
+  it("is a quarter of f32 plus a scale per head, and much closer to it than f8", async () => {
+    const be = new CpuBackend({ threads: 1 });
+    const prompt = [5, 17, 33, 41, 8, 90, 12, 3, 77, 21, 4, 60];
+    const run = async (kvDtype: "f32" | "f8" | "i8", fuse = true) => {
+      const m = new LlamaModel(be, CFG, weights(be), { maxSeq: 64, kvDtype, fuse });
+      const plan = m.buildPlan(prompt.length);
+      be.write(plan.tokens, 0, Uint32Array.from(prompt));
+      m.setStep({ pos0: 0, lastRow: prompt.length - 1, seed: 0, temperature: 0 });
+      be.submit(plan.dispatches);
+      const first = new Float32Array(await be.readback(physical(plan.logits.buf), 0, plan.logits.shape[0]! * plan.logits.shape[1]! * 4));
+      // One decode step, which reads everything the prefill cached.
+      const dec = m.buildPlan(1);
+      be.write(dec.tokens, 0, Uint32Array.of(7));
+      m.setStep({ pos0: prompt.length, lastRow: 0, seed: 0, temperature: 0 });
+      be.submit(dec.dispatches);
+      const logits = new Float32Array(await be.readback(physical(dec.logits.buf), 0, dec.logits.shape[0]! * dec.logits.shape[1]! * 4));
+      const rowBytes = m.kvRowBytes;
+      m.destroy();
+      return { first, logits, rowBytes };
+    };
+    const diff = (a: Float32Array, b: Float32Array) => a.reduce((m, v, i) => Math.max(m, Math.abs(v - b[i]!)), 0);
+    const exact = await run("f32");
+    const bytes = await run("i8");
+    const floats = await run("f8");
+    // One kv head of 32: 32 bytes and a 4-byte scale, against 128 bytes.
+    expect(bytes.rowBytes).toBe(CFG.numKvHeads * (CFG.headDim + 4));
+    expect(exact.rowBytes).toBe(CFG.numKvHeads * CFG.headDim * 4);
+    const [errI8, errF8] = [diff(bytes.logits, exact.logits), diff(floats.logits, exact.logits)];
+    expect(errI8).toBeGreaterThan(0);
+    expect(errI8).toBeLessThan(errF8 / 2);
+    expect(diff(bytes.first, exact.first)).toBeLessThan(diff(floats.first, exact.first));
+    // The unfused graph writes the cache through kv_write directly: the same values.
+    const unfused = await run("i8", false);
+    expect(diff(unfused.logits, bytes.logits)).toBeLessThan(1e-4);
+  });
+});
