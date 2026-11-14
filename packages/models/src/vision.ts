@@ -391,7 +391,7 @@ export class VisionTower {
    * always has the next layer waiting (waiting on each layer left it idle 0.3 s of SmolVLM's 1.3 s
    * per tile on the Intel Mac).
    */
-  async encode(img: ImagePixels, dst: Buf, dstOffset: number): Promise<void> {
+  async encode(img: ImagePixels, dst: Buf, dstOffset: number): Promise<undefined> {
     this.plan ??= this.build();
     this.backend.write(this.plan.patches, 0, imagePatches(this.cfg, img));
     const d = this.plan.dispatches;
@@ -405,6 +405,7 @@ export class VisionTower {
     }
     await pending;
     this.backend.copy(physical(this.plan.features.buf), 0, dst, dstOffset, this.tokens * this.cfg.projectionDim * 4);
+    return undefined;
   }
 
   /** GPU bytes the tower's weights hold. */

@@ -363,6 +363,24 @@ export function cpuRope(interleaved: boolean): CpuKernel {
   };
 }
 
+export const cpuRopeTable: CpuKernel = (b) => {
+  const [T, H, D] = [b[0]!.u32[0]!, b[0]!.u32[1]!, b[0]!.u32[2]!];
+  const angles = b[1]!.f32;
+  const x = b[2]!.f32;
+  const hd = D >>> 1;
+  for (let t = 0; t < T; t++)
+    for (let i = 0; i < hd; i++) {
+      const a = angles[t * hd + i]!;
+      const c = Math.cos(a), s = Math.sin(a);
+      for (let h = 0; h < H; h++) {
+        const i0 = (t * H + h) * D + i;
+        const x0 = x[i0]!, x1 = x[i0 + hd]!;
+        x[i0] = x0 * c - x1 * s;
+        x[i0 + hd] = x0 * s + x1 * c;
+      }
+    }
+};
+
 export function cpuKvWrite(f16: Kv): CpuKernel {
   return (b) => {
     const [T, row, maxSeq, cap] = [b[0]!.u32[0]!, b[0]!.u32[1]!, b[0]!.u32[2]!, b[0]!.u32[3]!];

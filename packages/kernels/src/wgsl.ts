@@ -759,6 +759,37 @@ fn main(${EW_ARGS}) {
 }`);
 }
 
+/**
+ * In-place rotary embedding of x [T, H, D] by angles given per row: `angles` [T, D / 2], pairs in
+ * rotate-half layout (element j with j + D / 2). For positions that are not a token index, such as a
+ * vision tower's patch rows and columns.
+ */
+export function ropeTableSpec(): KernelSpec {
+  return spec("rope_table", ["uniform", "read", "rw"], cpu.cpuRopeTable, () => /* wgsl */ `
+struct P { T: u32, H: u32, D: u32, _a: u32 }
+@group(0) @binding(0) var<uniform> p: P;
+@group(0) @binding(1) var<storage, read> angles: array<f32>;
+@group(0) @binding(2) var<storage, read_write> x: array<f32>;
+
+@compute @workgroup_size(${EW})
+fn main(${EW_ARGS}) {
+  ${FLAT}
+  let hd = p.D / 2u;
+  if (idx >= p.T * p.H * hd) { return; }
+  let i = idx % hd;
+  let row = idx / hd;
+  let a = angles[(row / p.H) * hd + i];
+  let c = cos(a);
+  let s = sin(a);
+  let i0 = row * p.D + i;
+  let i1 = i0 + hd;
+  let x0 = x[i0];
+  let x1 = x[i1];
+  x[i0] = x0 * c - x1 * s;
+  x[i1] = x0 * s + x1 * c;
+}`);
+}
+
 /** Writes k/v rows [T, rowSize] into the caches at positions pos0..pos0+T (slot = position % cap). */
 export function kvWriteSpec(kv: KvDtype = "f32"): KernelSpec {
   const h = kv === "f16";

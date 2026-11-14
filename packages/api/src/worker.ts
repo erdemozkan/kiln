@@ -133,7 +133,8 @@ async function generate(msg: Extract<Request, { type: "chat" | "complete" }>, ac
     let messages = msg.type === "chat" ? msg.messages : [];
     // Gemma 3's tower takes the image squashed to its size; SmolVLM's processor tiles the full image.
     const vision = engine.vision;
-    const size = vision?.processing ? undefined : vision?.cfg.imageSize;
+    // Qwen 3.5's takes each image at its own shape; the engine resizes it.
+    const size = vision && !vision.processing && "imageSize" in vision.cfg ? vision.cfg.imageSize : undefined;
     if (vision && messages.some((m) => typeof m.content !== "string")) {
       messages = await Promise.all(
         messages.map(async (m) =>

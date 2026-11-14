@@ -18,15 +18,17 @@ export interface WireLoadOptions {
    */
   promptCache?: boolean;
   /**
-   * Gemma 3's vision tower, as llama.cpp's mmproj GGUF: a file in the model's repo ("mmproj-F16.gguf")
+   * Gemma 3's or Qwen 3.5's vision tower, as llama.cpp's mmproj GGUF: a file in the model's repo ("mmproj-F16.gguf")
    * or a full id. Messages may then hold `{ type: "image", image }` parts (Blob, ImageBitmap, ImageData).
    * A transformers checkpoint (4B and up) has the tower in its own files and needs none.
    */
   mmproj?: string;
-  /** Gemma 3 from a transformers checkpoint: false skips its vision tower (about 420 MB at q8) for text alone. */
+  /** Gemma 3 or Qwen 3.5 from a transformers checkpoint: false skips its vision tower (about 420 MB at q8 for Gemma 3) for text alone. */
   vision?: boolean;
   /** Images whose features stay on the GPU at once, with a vision tower (default 4). */
   imageSlots?: number;
+  /** Qwen 3.5: the most tokens an image becomes (default 576, a 768 × 768 picture); larger images are scaled down to fit. */
+  maxImageTokens?: number;
   /**
    * SmolVLM: split each image into 512 × 512 tiles plus a global view, as its processor does by
    * default, or false for one view (64 tokens; much faster, less detail).
@@ -61,7 +63,7 @@ export interface ModelInfo {
   backend: string;
   /** On the CPU backend, the threads large matmuls are split across (1 without cross-origin isolation). */
   cpuThreads?: number;
-  /** True when chat messages may hold images (Gemma 3 loaded with `mmproj`, or SmolVLM). */
+  /** True when chat messages may hold images (Gemma 3 or Qwen 3.5 with their vision tower, or SmolVLM). */
   vision: boolean;
   /** Context length this load allocated, in tokens. */
   maxSeq: number;

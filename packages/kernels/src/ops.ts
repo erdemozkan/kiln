@@ -75,6 +75,7 @@ import {
   qkNormRopeKvSpec,
   ropeKvSpec,
   ropeSpec,
+  ropeTableSpec,
   sampleSpec,
   logprobRowsSpec,
   siluMulSpec,
@@ -254,6 +255,13 @@ function rotaryDims(invFreq: Tensor, D: number): number {
 export function rope(ctx: Ctx, x: Tensor, T: number, H: number, D: number, invFreq: Tensor, interleaved: boolean): void {
   const R = rotaryDims(invFreq, D);
   ctx.run(ropeSpec(interleaved), [ctx.uniform([u32(T), u32(H), u32(D), u32(R)]), ctx.step, invFreq.buf, x.buf], grid1d((T * H * R) / 2));
+}
+
+/** In-place rotary embedding of x [T, H · D] by per-row angles [T, D / 2], rotate-half pairs (see ropeTableSpec). */
+export function ropeTable(ctx: Ctx, x: Tensor, angles: Tensor, H: number, D: number): void {
+  const T = x.shape[0]!;
+  if (angles.shape[0] !== T || angles.shape[1] !== D / 2) throw new Error(`ropeTable: angles [${angles.shape}] do not fit ${T} rows of heads of ${D}`);
+  ctx.run(ropeTableSpec(), [ctx.uniform([u32(T), u32(H), u32(D), u32(0)]), angles.buf, x.buf], grid1d((T * H * D) / 2));
 }
 
 /**

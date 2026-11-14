@@ -74,6 +74,23 @@ the layer's projections into one tensor are refused by name.
 any model; a small file beside it (`….kv.state`) holds the two newest recurrent snapshots, rewritten
 when they change, and both are restored at load, so a conversation resumes after a reload.
 
+**Images for Qwen 3.5.** Chat messages may hold images: from the transformers checkpoint, whose
+files hold the vision tower (`vision: false` leaves it out), or from a GGUF with its mmproj file
+(`mmproj: "mmproj-F16.gguf"`). The tower takes each image at its own shape, resized to whole tokens
+of 32 × 32 pixels and to at most `maxImageTokens` of them (default 576, a 768 × 768 picture): a ViT
+with position embeddings resampled to the image's patch grid, rotary positions on rows and columns,
+and a merger that joins each 2 × 2 patches into a token. In the language model an image's tokens
+share one time position and count rows and columns from it, and the text after continues past the
+image's longer side; the step block carries this to the rotary kernels, so a prefill step is all
+text or lies inside one image. Checked on the 0.8B (safetensors and GGUF) and 2B (GGUF) models on
+an Intel Iris GPU and the CPU backend, which agree: a photo described, shapes, colours and sides
+named, three lines of small text and large text on a sign read exactly, two images told apart, a
+follow-up question reusing the first turn. A 640 × 416 picture is 260 tokens and takes about 3 s to
+prefill on the 0.8B model. Large letters alone on a blank white picture are often misread, more so
+the larger the picture; the same letters on a photo are read at every size tried, so this is the
+model, not the code. Not compared number for number with another implementation. Video is not
+supported.
+
 **Hardening against hostile model repos.** Three ways a crafted repo could freeze the tab are closed.
 The check on regexes from `tokenizer.json` and adapter configs now also refuses patterns that are
 slow without a repeated group (many choices or many open-ended repetitions in a row; one such pattern

@@ -1,6 +1,8 @@
 import { type Backend, type Buf, type Dispatch, type Profile } from "@kiln/core";
 import { GrammarMatcher, TokenTrie, compileFormat, type ResponseFormat } from "@kiln/grammar";
-import { LlamaModel, MAX_VERIFY_ROWS, type ForwardPlan, type Idefics3Processing, type ImagePixels, type VisionTower } from "@kiln/models";
+import { LlamaModel, MAX_VERIFY_ROWS, QwenVisionTower, type ForwardPlan, type Idefics3Processing, type ImagePixels, type VisionTower } from "@kiln/models";
+import { resizeImage } from "@kiln/loader";
+import type { StepParams } from "@kiln/core";
 import { idefics3PromptString, idefics3Tiles } from "./idefics3";
 import { detectChatFormat, type ChatDocument, type ChatFormat, type ChatMessage, type Tokenizer, type ToolSpec } from "@kiln/tokenizers";
 import { SubmitPacer } from "./pace";
@@ -302,15 +304,15 @@ export class Engine {
   }
 
   /** Images whose features sit in `model.imageFeatures`, by slot (see `imageSlot`). */
-  private readonly imageSlots: ({ key: string; used: number } | undefined)[] = [];
+  private readonly imageSlots: ({ key: string; used: number; grid?: { rows: number; cols: number } } | undefined)[] = [];
   private imageClock = 0;
 
   constructor(
     readonly backend: Backend,
     readonly model: LlamaModel,
     readonly tokenizer: Tokenizer,
-    /** A vision tower (Gemma 3 with its mmproj file, or SmolVLM): chat messages may then hold images. */
-    readonly vision?: VisionTower,
+    /** A vision tower (Gemma 3 or Qwen 3.5, from the checkpoint or an mmproj file, or SmolVLM): chat messages may then hold images. */
+    readonly vision?: VisionTower | QwenVisionTower,
   ) {
     try {
       this.chatFormat = detectChatFormat(tokenizer);
@@ -329,7 +331,7 @@ export class Engine {
     // Only reasoning models know <think>; injecting it elsewhere derails them.
     const thinks = this.tokenizer.tokenId("<think>") !== undefined;
     const images = messages.flatMap((m) => (typeof m.content === "string" ? [] : m.content.flatMap((p) => (p.type === "image" ? [p.image as ImagePixels] : []))));
-    if (images.length && !this.vision) throw new Error("this model takes no images (load Gemma 3 with its mmproj file, or a SmolVLM model, to give it images)");
+    if (images.length && !this.vision) throw new Error("this model takes no images (load Gemma 3 or Qwen 3.5 with its mmproj file, or a SmolVLM model, to give it images)");
     const idefics3 = this.vision?.processing;
     // Templates see image parts without their pixels; Gemma's writes <start_of_image> for each,
     // SmolVLM's <image>. SmolVLM's template reads every message's content as a list of parts.
@@ -354,8 +356,70 @@ export class Engine {
       return;
     }
     const slots: number[] = [];
+    if (this.vision instanceof QwenVisionTower) {
+      // Each image at its own aspect ratio, resized to whole tokens (bicubic, as the processor does).
+      for (const img of images) {
+        const g = this.vision.grid(img.width, img.height);
+        slots.push(await this.imageSlot(resizeImage(img, g.width, g.height, 3)));
+      }
+      yield* this.decodeIds(this.withQwenImages(prompt, slots), this.forceToolCall(opts));
+      return;
+    }
     for (const img of images) slots.push(await this.imageSlot(img));
     yield* this.decodeIds(this.withImages(prompt, slots), this.forceToolCall(opts));
+  }
+
+  /**
+   * Prompt ids as Qwen's processor expands them: each <|image_pad|> the template wrote (between
+   * <|vision_start|> and <|vision_end|>) becomes the image's rows · cols soft tokens, with ids
+   * vocabSize + slot · (a slot's tokens) + i.
+   */
+  private withQwenImages(prompt: string, slots: readonly number[]): number[] {
+    const pad = this.tokenizer.tokenId("<|image_pad|>");
+    if (pad === undefined) throw new Error("the tokenizer has no <|image_pad|> token");
+    const ids = this.tokenizer.encode(prompt);
+    const marks = ids.reduce((n, id) => n + (id === pad ? 1 : 0), 0);
+    if (marks !== slots.length) throw new Error(`the chat template wrote ${marks} image markers for ${slots.length} images`);
+    const per = this.vision!.tokens;
+    const out: number[] = [];
+    let k = 0;
+    for (const id of ids) {
+      if (id !== pad) {
+        out.push(id);
+        continue;
+      }
+      const slot = slots[k++]!;
+      const g = this.imageSlots[slot]!.grid!;
+      const base = this.model.cfg.vocabSize + slot * per;
+      for (let i = 0; i < g.rows * g.cols; i++) out.push(base + i);
+    }
+    return out;
+  }
+
+  /**
+   * The rotary position fields of the step that starts at index `at` of `ids` (see `StepParams`).
+   * Only Qwen 3.5 with images differs from the index: an image's tokens share a time position and
+   * count rows and columns from it, and the text after continues past the image's longer side, so
+   * it sits `posShift` before its index. A step is all text or lies inside one image.
+   */
+  private ropeAt(ids: readonly number[], at: number): Pick<StepParams, "posShift" | "imgLo" | "imgHi" | "imgW" | "imgPos"> {
+    if (!(this.vision instanceof QwenVisionTower)) return {};
+    const vocab = this.model.cfg.vocabSize;
+    const per = this.vision.tokens;
+    let shift = 0;
+    for (let i = 0; i < ids.length && i <= at; ) {
+      if (ids[i]! < vocab) {
+        i++;
+        continue;
+      }
+      const g = this.imageSlots[Math.floor((ids[i]! - vocab) / per)]?.grid;
+      if (!g) throw new Error("an image token has no image behind it");
+      const n = g.rows * g.cols;
+      if (at < i + n) return { imgLo: i, imgHi: i + n, imgW: g.cols, imgPos: i - shift };
+      shift += n - Math.max(g.rows, g.cols);
+      i += n;
+    }
+    return { posShift: shift };
   }
 
   /**
@@ -432,7 +496,8 @@ export class Engine {
       slot = this.imageSlots.length < cap ? this.imageSlots.length : this.imageSlots.reduce((lru, s, i) => (s!.used < this.imageSlots[lru]!.used ? i : lru), 0);
       if (this.imageSlots[slot]) this.forgetImage(slot);
       this.imageSlots[slot] = { key, used: 0 };
-      await vision.encode(img, this.model.imageFeatures!, slot * vision.tokens * this.model.cfg.hiddenSize * 4);
+      const grid = await vision.encode(img, this.model.imageFeatures!, slot * vision.tokens * this.model.cfg.hiddenSize * 4);
+      if (grid) this.imageSlots[slot]!.grid = grid;
     }
     this.imageSlots[slot]!.used = ++this.imageClock;
     return slot;
@@ -446,6 +511,8 @@ export class Engine {
     const at = holds(this.cached);
     if (at >= 0) this.cached = this.cached.slice(0, at);
     this.prefixes.dropIf((tokens) => holds(tokens) >= 0);
+    // A recurrent model's saved states too: one taken after the old image would resume a prompt with the new one.
+    for (let i = this.states.length - 1; i >= 0; i--) if (holds(this.states[i]!.tokens) >= 0) this.dropState(i);
   }
 
   /** `opts` with `toolChoice` turned into a `tool_call` format. */
@@ -646,8 +713,10 @@ export class Engine {
     }
     // An image's tokens attend to each other both ways (Gemma 3), so each image is prefilled whole, in
     // one chunk. SmolVLM's are causal, like text.
-    const spans = this.vision?.bidirectional ? imageSpans(promptIds, this.model.cfg.vocabSize) : [];
-    for (const [lo, hi] of spans) if (start > lo && start < hi) start = lo;
+    // Qwen 3.5's are causal, but an image is prefilled in steps of its own: its positions differ.
+    const bidirectional = !!this.vision?.bidirectional;
+    const spans = bidirectional || this.vision instanceof QwenVisionTower ? imageSpans(promptIds, this.model.cfg.vocabSize) : [];
+    if (bidirectional) for (const [lo, hi] of spans) if (start > lo && start < hi) start = lo;
     this.cached = [];
     const stats: GenerateStats = { promptTokens: promptIds.length, cachedTokens: start, generatedTokens: 0, prefillMs: 0, decodeMs: 0, ttftMs: 0 };
     this.submits = 0;
@@ -678,10 +747,13 @@ export class Engine {
         let T: number;
         let n: number;
         let bidi: { spanLo?: number; spanHi?: number } = {};
-        if (span && pos >= span[0]) {
+        if (span && pos >= span[0] && bidirectional) {
           // One image: exactly its tokens, attending to each other in both directions.
           T = n = span[1] - pos;
           bidi = { spanLo: span[0], spanHi: span[1] };
+        } else if (span && pos >= span[0]) {
+          // Inside one image (Qwen 3.5): no padding rows, and nothing of the text after it.
+          T = n = Math.min(span[1] - pos, BUCKETS[BUCKETS.length - 1]!);
         } else {
           const remaining = (span ? span[0] : pos < early ? early : promptIds.length) - pos;
           const top = BUCKETS[BUCKETS.length - 1]!;
@@ -695,7 +767,7 @@ export class Engine {
         const tokens = new Uint32Array(T);
         tokens.set(promptIds.slice(pos, pos + n));
         this.backend.write(plan.tokens, 0, tokens);
-        this.model.setStep({ pos0: pos, lastRow: n - 1, seed, temperature, ...sampling, ...bidi });
+        this.model.setStep({ pos0: pos, lastRow: n - 1, seed, temperature, ...sampling, ...bidi, ...this.ropeAt(promptIds, pos) });
         // Only the last chunk's logits are read; earlier chunks skip the output head.
         prefillUnits += this.submit(pos + n < promptIds.length ? plan.body : plan.dispatches, T);
         pos += n;
@@ -844,7 +916,8 @@ export class Engine {
     const { stats, grammar } = o;
     const spec = (stats.speculation = { passes: 0, drafted: 0, accepted: 0 });
     const gate = new DraftGate();
-    const step = { lastRow: 0, seed: o.seed, temperature: o.temperature, ...o.sampling };
+    // The reply is text after the prompt's images: one shift for every step.
+    const step = { lastRow: 0, seed: o.seed, temperature: o.temperature, ...o.sampling, ...this.ropeAt(spoken, spoken.length) };
     const decode = this.plan(1);
     const maxSeq = this.model.maxSeq;
     let emit: number[] = [];

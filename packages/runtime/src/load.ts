@@ -46,6 +46,11 @@ import {
   patchOrder,
   visionConfigFromGGUF,
   visionConfigFromIdefics3,
+  QwenVisionTower,
+  qwenVisionConfig,
+  qwenVisionConfigFromGGUF,
+  qwenVisionName,
+  type QwenVisionConfig,
   weightScale,
   type LlamaConfig,
 } from "@kiln/models";
@@ -115,6 +120,11 @@ export interface LoadOptions {
    * SmolVLM (each image's tiles).
    */
   imageSlots?: number;
+  /**
+   * Qwen 3.5: the most tokens an image becomes (default 576, a 768 × 768 picture; an image is scaled
+   * down to fit, keeping its shape). More reads small text better and costs time and context.
+   */
+  maxImageTokens?: number;
   /**
    * SmolVLM: split each image into tiles plus a global view, as its processor does by default
    * (`do_image_splitting`), or false for one 512 × 512 view (64 tokens; much faster, less detail).
@@ -202,12 +212,12 @@ export async function createEngine(from: ModelSource, opts: LoadOptions = {}): P
   ops.setSubgroups(!!opts.subgroups);
   const ownsBackend = !opts.backend;
   let weights: Map<string, Tensor> | undefined;
-  let vision: VisionTower | undefined;
+  let vision: VisionTower | QwenVisionTower | undefined;
   let model: LlamaModel | undefined;
   let files: Awaited<ReturnType<typeof openSafetensors>>["files"] = [];
   try {
     const opened = !ref ? await openGGUFFile(from) : ref.gguf ? await openGGUF(ref, opts.endpoint) : await openSafetensors(ref, opts.endpoint);
-    const { cfg, tokenizer, idefics3, gemma3 } = opened;
+    const { cfg, tokenizer, idefics3, gemma3, qwen35 } = opened;
     files = opened.files;
     const tuning =
       opts.tune === false || backend.name === "cpu"
@@ -226,7 +236,9 @@ export async function createEngine(from: ModelSource, opts: LoadOptions = {}): P
         ? await openVision(backend, mmprojRef(opts.mmproj, ref, opts.revision), opts)
         : gemma3 && opts.vision !== false
           ? await openGemma3Vision(backend, files, gemma3, opts, converted)
-          : undefined;
+          : qwen35 && opts.vision !== false
+            ? await openQwenTower(backend, files, qwenVisionName, qwenVisionConfig(qwen35.config, qwen35.preprocessor), opts, converted)
+            : undefined;
     if (vision && vision.cfg.projectionDim !== cfg.hiddenSize) throw new Error(`mmproj projects to ${vision.cfg.projectionDim}, but the model is ${cfg.hiddenSize} wide`);
     await tuning;
     const imageTokens = vision ? (opts.imageSlots ?? 4) * vision.tokensPerImage : 0;
@@ -256,9 +268,16 @@ export async function createEngine(from: ModelSource, opts: LoadOptions = {}): P
  * and biases as f32; the patch convolution is read as a [hidden, 3·14·14] matrix padded to `patchK`
  * columns, and the projection transposed to [text width, hidden], as the matmul kernels take them.
  */
-async function openVision(backend: Backend, ref: ModelRef, opts: LoadOptions): Promise<VisionTower> {
+async function openVision(backend: Backend, ref: ModelRef, opts: LoadOptions): Promise<VisionTower | QwenVisionTower> {
   const { source, header } = await openParsed(ref, ref.gguf!, opts.endpoint, readGGUFHeader);
   try {
+    if (header.metadata.get("clip.projector_type") === "qwen3vl_merger") {
+      const pos = header.tensors.find((t) => t.name === "v.position_embd.weight");
+      if (!pos) throw new Error("mmproj: missing v.position_embd.weight");
+      const hidden = Number(header.metadata.get("clip.vision.embedding_length"));
+      const cfg = qwenVisionConfigFromGGUF(header.metadata, pos.shape.reduce((a, b) => a * b, 1) / hidden);
+      return await openQwenTower(backend, [{ name: ref.gguf!, source, tensors: header.tensors }], (n) => n, cfg, opts);
+    }
     const cfg = visionConfigFromGGUF(header.metadata);
     const linear = /^v\.blk\.\d+\.(attn_[qkv]|attn_out|ffn_up|ffn_down)\.weight$/;
     const ffn = /^v\.blk\.\d+\.ffn_(up|down)\.(weight|bias)$/;
@@ -447,6 +466,67 @@ async function openTower(
   return new VisionTower(backend, cfg, weights, processing);
 }
 
+/**
+ * Qwen 3.5's vision tower, from a transformers checkpoint's safetensors or an mmproj GGUF (`nameOf`
+ * gives a tensor's mmproj name): matmul weights as q8 (f32 with `quant: "f32"`), norms and biases
+ * f32. The patch convolution spans two video frames; a still image is both, so the two frames'
+ * weights are added into one [hidden, 3 · p · p] matrix. The position table stays on the CPU.
+ */
+async function openQwenTower(backend: Backend, files: WeightFile[], nameOf: (name: string) => string | undefined, cfg: QwenVisionConfig, opts: LoadOptions, converted?: string): Promise<QwenVisionTower> {
+  const quant = opts.quant === "f32" ? "f32" : "q8";
+  const linear = /^(v\.blk\.\d+\.(attn_qkv|attn_out|ffn_up|ffn_down)|mm\.[02])\.weight$/;
+  const manual = /^v\.(patch_embd\.weight(\.1)?|position_embd\.weight)$/;
+  const only = (keep: (n: string) => boolean) => (name: string) => {
+    const n = nameOf(name);
+    return n && !manual.test(n) && keep(n) ? n : undefined;
+  };
+  const weights = new Map<string, Tensor>();
+  const found = new Map<string, { file: WeightFile; entry: TensorEntry }>();
+  try {
+    for (const file of files) {
+      for (const entry of file.tensors) {
+        const n = nameOf(entry.name);
+        if (n) found.set(n, { file, entry });
+      }
+      const add = (m: Map<string, Tensor>) => m.forEach((t, k) => weights.set(k, t));
+      const plain = { name: file.name, source: file.source, tensors: file.tensors };
+      add(await loadWeights(backend, [{ ...plain, rename: only((n) => linear.test(n)) }], quant, opts.onProgress, converted ? { key: `${converted}|vision/linear/${file.name}` } : undefined));
+      add(await loadWeights(backend, [{ ...plain, rename: only((n) => !linear.test(n)) }], "f32"));
+    }
+    const read = async (name: string) => {
+      const f = found.get(name);
+      if (!f) throw new Error(`vision tower: the model has no ${name}`);
+      const n = f.entry.shape.reduce((a, b) => a * b, 1);
+      return toF32(f.entry.type as Parameters<typeof toF32>[0], await f.file.source.read(f.entry.offset, f.entry.byteLength), n);
+    };
+    const K = 3 * cfg.patchSize ** 2;
+    const pp = cfg.patchSize ** 2;
+    const patchW = new Float32Array(cfg.hidden * K);
+    if (found.has("v.patch_embd.weight.1")) {
+      // An mmproj file: one [hidden, 3, p, p] tensor per frame.
+      for (const name of ["v.patch_embd.weight", "v.patch_embd.weight.1"]) {
+        const w = await read(name);
+        if (w.length !== patchW.length) throw new Error(`vision tower: ${name} has ${w.length} values, not ${patchW.length}`);
+        for (let i = 0; i < w.length; i++) patchW[i] += w[i]!;
+      }
+    } else {
+      // A checkpoint: [hidden, 3, frames, p, p].
+      const w = await read("v.patch_embd.weight");
+      const frames = w.length / patchW.length;
+      if (!Number.isInteger(frames)) throw new Error(`vision tower: the patch weight has ${w.length} values, not a multiple of ${patchW.length}`);
+      for (let oc = 0; oc < cfg.hidden * 3; oc++) for (let t = 0; t < frames; t++) for (let i = 0; i < pp; i++) patchW[oc * pp + i] += w[(oc * frames + t) * pp + i]!;
+    }
+    const buf = backend.alloc(patchW.byteLength, "storage", "vision/w");
+    backend.write(buf, 0, patchW);
+    weights.set("v.patch_embd.weight", { shape: [cfg.hidden, K], dtype: "f32", buf });
+    const maxTokens = Math.max(1, Math.min(Math.floor(opts.maxImageTokens ?? 576), cfg.maxTokens));
+    return new QwenVisionTower(backend, cfg, weights, await read("v.position_embd.weight"), maxTokens);
+  } catch (err) {
+    freeWeights(backend, weights);
+    throw err;
+  }
+}
+
 /** WebGPU, or the CPU backend when asked for or (for "auto") when WebGPU is missing or has no adapter. */
 export async function openBackend(device: "auto" | "gpu" | "cpu", cpuThreads?: number): Promise<Backend> {
   const threads = cpuThreads ?? Math.min(4, globalThis.navigator?.hardwareConcurrency ?? 1);
@@ -525,7 +605,7 @@ async function openParsedWith<H>(file: string, opener: (fresh: boolean) => Promi
   }
 }
 
-async function openSafetensors(ref: ModelRef, endpoint?: string): Promise<{ cfg: LlamaConfig; tokenizer: Tokenizer; files: WeightFile[]; idefics3?: Idefics3Files; gemma3?: Idefics3Files }> {
+async function openSafetensors(ref: ModelRef, endpoint?: string): Promise<{ cfg: LlamaConfig; tokenizer: Tokenizer; files: WeightFile[]; idefics3?: Idefics3Files; gemma3?: Idefics3Files; qwen35?: Idefics3Files }> {
   // Required files start at once. Optional ones wait for the repo's file listing, so files that do
   // not exist are not requested (each would log a 404); without a listing they are probed.
   const listing = listRepoFiles(ref, endpoint);
@@ -573,8 +653,10 @@ async function openSafetensors(ref: ModelRef, endpoint?: string): Promise<{ cfg:
   tokenizer.chatTemplate = chatTemplate(tokConfig, templateFile ?? templateJson?.chat_template);
   // Gemma 3 4B and up: the SigLIP tower and projector sit in the same files.
   const gemma3 = config!.model_type === "gemma3" && !!config!.vision_config && files.some((f) => f.tensors.some((t) => gemma3VisionName(t.name) === "mm.input_projection.weight"));
-  const preprocessor = idefics3 || gemma3 ? await optionalJSON<Record<string, unknown>>("preprocessor_config.json") : undefined;
-  return { cfg, tokenizer, files, idefics3: idefics3 ? { config: config!, preprocessor } : undefined, gemma3: gemma3 ? { config: config!, preprocessor } : undefined };
+  const qwen35 = config!.model_type === "qwen3_5" && !!config!.vision_config && files.some((f) => f.tensors.some((t) => qwenVisionName(t.name) === "mm.2.weight"));
+  const preprocessor = idefics3 || gemma3 || qwen35 ? await optionalJSON<Record<string, unknown>>("preprocessor_config.json") : undefined;
+  const info = { config: config!, preprocessor };
+  return { cfg, tokenizer, files, idefics3: idefics3 ? info : undefined, gemma3: gemma3 ? info : undefined, qwen35: qwen35 ? info : undefined };
 }
 
 function addOne(v: Float32Array): void {
@@ -596,7 +678,7 @@ function chatTemplate(cfg: TokenizerConfig | undefined, file: string | undefined
   return { source, bosToken: token(cfg?.bos_token), eosToken: token(cfg?.eos_token) };
 }
 
-type OpenedGGUF = { cfg: LlamaConfig; tokenizer: Tokenizer; files: WeightFile[]; idefics3?: undefined; gemma3?: undefined };
+type OpenedGGUF = { cfg: LlamaConfig; tokenizer: Tokenizer; files: WeightFile[]; idefics3?: undefined; gemma3?: undefined; qwen35?: undefined };
 
 async function openGGUF(ref: ModelRef, endpoint?: string): Promise<OpenedGGUF> {
   const file = ref.gguf!;

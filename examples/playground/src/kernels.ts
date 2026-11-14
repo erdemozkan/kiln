@@ -553,6 +553,54 @@ async function main() {
     check("rope", `${interleaved ? "interleaved" : "rotate-half"}${R < D ? ` rotary ${R} of ${D}` : ""}`, await download(xt.buf, x.length), ref.ropeRef(x, T, H, D, pos0, inv, interleaved), 1e-4);
   }
 
+  // Positions on three axes around an image (Qwen's M-RoPE): four text tokens, an image of 2 rows by
+  // 3 columns, three text tokens, each run a step of its own; every kernel that rotates.
+  for (const interleaved of [false, true]) {
+    const [H, Hkv, D, R, maxSeq] = [2, 1, 16, 12, 16];
+    const inv = Float32Array.from({ length: R / 2 }, (_, i) => 1 / 10000 ** ((2 * i) / R));
+    const axes = ref.mropePositions([4, [2, 3], 3]);
+    const steps = [{ pos0: 0, T: 4 }, { pos0: 4, T: 6, imgLo: 4, imgHi: 10, imgW: 3, imgPos: 4 }, { pos0: 10, T: 3, posShift: 3 }];
+    for (const { T, ...st } of steps) {
+      const posOf = (t: number, i: number) => axes[i % 3]![st.pos0 + t]!;
+      const tag = `three axes ${interleaved ? "interleaved" : "rotate-half"} ${st.imgHi ? "image" : `text at ${st.pos0}`}`;
+      const x = randn(T * H * D);
+      const xt = upload(x, [T, H * D]);
+      await run({ ...S0, ...st }, (ctx) => ops.rope(ctx, xt, T, H, D, upload(inv, [inv.length]), interleaved));
+      check("rope", tag, await download(xt.buf, x.length), ref.ropeRef(x, T, H, D, 0, inv, interleaved, posOf), 1e-4);
+      const W = (H + 2 * Hkv) * D;
+      const qkv = randn(T * W);
+      const q = new Float32Array(T * H * D);
+      for (let t = 0; t < T; t++) q.set(qkv.subarray(t * W, t * W + H * D), t * H * D);
+      const caches = () => [upload(new Float32Array(maxSeq * Hkv * D), [0]), upload(new Float32Array(maxSeq * Hkv * D), [0])] as const;
+      let qo!: Tensor;
+      const [kc, vc] = caches();
+      await run({ ...S0, ...st }, (ctx) => (qo = ops.ropeKv(ctx, upload(qkv, [T, W]), kc.buf, vc.buf, { T, H, Hkv, D, maxSeq }, upload(inv, [inv.length]), interleaved)));
+      check("rope_kv/f32", `q ${tag}`, await download(qo.buf, q.length), ref.ropeRef(q, T, H, D, 0, inv, interleaved, posOf), 1e-4);
+      const ones = new Float32Array(D).fill(1);
+      const [kc2, vc2] = caches();
+      await run({ ...S0, ...st }, (ctx) => (qo = ops.qkNormRopeKv(ctx, upload(qkv, [T, W]), upload(ones, [D]), upload(ones, [D]), 1e-6, kc2.buf, vc2.buf, { T, H, Hkv, D, maxSeq }, upload(inv, [inv.length]), interleaved)));
+      check("qknorm_rope_kv/f32", `q ${tag}`, await download(qo.buf, q.length), ref.ropeRef(ref.rmsnormRef(q, ones, D, 1e-6), T, H, D, 0, inv, interleaved, posOf), 5e-4);
+    }
+  }
+
+  // Rotation by a table of angles (a vision tower's rows and columns).
+  {
+    const [T, H, D] = [5, 3, 16];
+    const x = randn(T * H * D);
+    const angles = randn(T * (D / 2));
+    const xt = upload(x, [T, H * D]);
+    await run(S0, (ctx) => ops.ropeTable(ctx, xt, upload(angles, [T, D / 2]), H, D));
+    const want = x.slice();
+    for (let r = 0; r < T * H; r++)
+      for (let i = 0; i < D / 2; i++) {
+        const a = angles[Math.floor(r / H) * (D / 2) + i]!;
+        const [x0, x1] = [x[r * D + i]!, x[r * D + i + D / 2]!];
+        want[r * D + i] = x0 * Math.cos(a) - x1 * Math.sin(a);
+        want[r * D + i + D / 2] = x0 * Math.sin(a) + x1 * Math.cos(a);
+      }
+    check("rope_table", `T${T} H${H} D${D}`, await download(xt.buf, x.length), want, 1e-4);
+  }
+
   // Prefill (T > 1) cases run both kernels: tiled (default) and one workgroup per query row.
   for (const [T, H, Hkv, D, pos0, maxSeq] of [[3, 4, 2, 16, 5, 16], [1, 9, 3, 64, 300, 512], [1, 9, 3, 64, 0, 200], [1, 8, 8, 128, 63, 128], [1, 8, 2, 64, 64, 256], [1, 4, 4, 32, 1999, 2048], [4, 4, 1, 128, 61, 128], [5, 9, 3, 64, 600, 1024], [3, 4, 2, 32, 1790, 2048], [2, 2, 2, 256, 255, 512], [64, 9, 3, 64, 1000, 2048], [17, 6, 2, 96, 40, 128], [33, 8, 2, 128, 300, 512], [9, 4, 4, 32, 70, 128]] as const) {
     const q = randn(T * H * D);
@@ -746,8 +794,9 @@ async function main() {
         out.set(asI8(a, hd), pos0 * row);
         return out;
       };
-      check("kv_write/i8", "k", unpackI8(await words(kcI.buf, n), hd), placedI8(kz), 1e-6);
-      check("kv_write/i8", "v", unpackI8(await words(vcI.buf, n), hd), placedI8(v8), 1e-6);
+      // Values reach several hundred, where f32 rounding of code · |code| · scale is a few 1e-6; codes are far coarser.
+      check("kv_write/i8", "k", unpackI8(await words(kcI.buf, n), hd), placedI8(kz), 1e-4);
+      check("kv_write/i8", "v", unpackI8(await words(vcI.buf, n), hd), placedI8(v8), 1e-4);
     }
   }
 
