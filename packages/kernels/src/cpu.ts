@@ -364,19 +364,20 @@ export function cpuRope(interleaved: boolean): CpuKernel {
 }
 
 export const cpuRopeTable: CpuKernel = (b) => {
-  const [T, H, D] = [b[0]!.u32[0]!, b[0]!.u32[1]!, b[0]!.u32[2]!];
+  const [T, H, D, G] = [b[0]!.u32[0]!, b[0]!.u32[1]!, b[0]!.u32[2]!, b[0]!.u32[3]! || 1];
   const angles = b[1]!.f32;
   const x = b[2]!.f32;
   const hd = D >>> 1;
+  const gd = hd / G;
   for (let t = 0; t < T; t++)
     for (let i = 0; i < hd; i++) {
       const a = angles[t * hd + i]!;
       const c = Math.cos(a), s = Math.sin(a);
       for (let h = 0; h < H; h++) {
-        const i0 = (t * H + h) * D + i;
-        const x0 = x[i0]!, x1 = x[i0 + hd]!;
+        const i0 = (t * H + h) * D + Math.floor(i / gd) * 2 * gd + (i % gd);
+        const x0 = x[i0]!, x1 = x[i0 + gd]!;
         x[i0] = x0 * c - x1 * s;
-        x[i0 + hd] = x0 * s + x1 * c;
+        x[i0 + gd] = x0 * s + x1 * c;
       }
     }
 };
@@ -687,7 +688,8 @@ export function cpuEmbed(wdtype: WeightDType, affine: boolean, features = false)
     const o = b[2 + nw + (features ? 1 : 0)]!.f32;
     const row = new Float32Array(D);
     for (let t = 0; t < T; t++) {
-      const id = tokens[t]!;
+      let id = tokens[t]!;
+      if (!feat && V > 0 && id >= V) id = 0;
       if (feat && id >= V) {
         o.set(feat.subarray((id - V) * D, (id - V + 1) * D), t * D);
         continue;
@@ -1213,6 +1215,14 @@ export const cpuScale: CpuKernel = (b) => {
   for (let i = 0; i < n; i++) x[i] = Math.fround(a * x[i]!);
 };
 
+export const cpuClamp: CpuKernel = (b) => {
+  const n = b[0]!.u32[0]!;
+  const [lo, hi] = [b[0]!.f32[2]!, b[0]!.f32[3]!];
+  const x = b[1]!.f32;
+  const y = b[2]!.f32;
+  for (let i = 0; i < n; i++) y[i] = Math.min(Math.max(x[i]!, lo), hi);
+};
+
 export const cpuSoftcap: CpuKernel = (b) => {
   const n = b[0]!.u32[0]!;
   const cap = b[0]!.f32[2]!;
@@ -1222,10 +1232,11 @@ export const cpuSoftcap: CpuKernel = (b) => {
 
 export const cpuAvgPool: CpuKernel = (b) => {
   const [side, k, C] = [b[0]!.u32[0]!, b[0]!.u32[1]!, b[0]!.u32[2]!];
+  const rows = b[0]!.u32[3]! || side;
   const x = b[1]!.f32;
   const y = b[2]!.f32;
   const out = side / k;
-  for (let t = 0; t < out * out; t++) {
+  for (let t = 0; t < out * (rows / k); t++) {
     const y0 = Math.floor(t / out) * k;
     const x0 = (t % out) * k;
     for (let c = 0; c < C; c++) {

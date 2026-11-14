@@ -716,7 +716,10 @@ export class LlamaModel {
     // Gemma 4's per-layer input, the part every layer shares: a projection of the token embeddings
     // to layers × P values, normalised per layer. The model scales the projection by 1 / √hidden
     // first, which RMSNorm undoes but for eps: the same as eps · hidden without the scaling.
+    // An image token's features go through the projection like any embedding; in each layer's
+    // table it counts as the padding token.
     const P = c.perLayerInput;
+    const asPad = features && { vocab: c.vocabSize };
     const perLayer = P ? ops.rmsnorm(ctx, ops.linear(ctx, x0, this.w("model.per_layer_model_projection.weight")), this.w("model.per_layer_projection_norm.weight"), c.rmsEps * c.hiddenSize, P) : undefined;
     const firstShared = c.kvFrom ? c.kvFrom.findIndex((from) => from !== undefined) : -1;
     let kvEnd: number | undefined;
@@ -822,7 +825,7 @@ export class LlamaModel {
         // slice of the shared projection. The layer's output gates it, a projection brings it back
         // to the model's width, and its norm goes onto the residual. The model halves the sum's
         // square (× 1 / √2) before the gate; the norm after undoes that but for eps, hence 2 · eps.
-        const all = ops.embed(ctx, this.w(gemma4PerLayerTable(l)), tokens, T, Math.sqrt(P));
+        const all = ops.embed(ctx, this.w(gemma4PerLayerTable(l)), tokens, T, Math.sqrt(P), asPad || undefined);
         ops.cols(ctx, all, perLayer, { n: P, srcStart: l * P, accumulate: true });
         const e = rows === T ? all : ops.copyRow(ctx, all);
         const g = ops.linear(ctx, x, this.w(`${p}.per_layer_input_gate.weight`));

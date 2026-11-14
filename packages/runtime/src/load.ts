@@ -51,6 +51,14 @@ import {
   qwenVisionConfigFromGGUF,
   qwenVisionName,
   type QwenVisionConfig,
+  GEMMA4_CLIPPED,
+  GEMMA4_IMAGE_TOKENS,
+  Gemma4VisionTower,
+  gemma4VisionConfig,
+  gemma4VisionConfigFromGGUF,
+  gemma4VisionName,
+  type Gemma4Clip,
+  type Gemma4VisionConfig,
   GEMMA4_LAYER_SCALE,
   GEMMA4_PER_LAYER_TABLE,
   gemma4PerLayerTable,
@@ -127,6 +135,7 @@ export interface LoadOptions {
   /**
    * Qwen 3.5: the most tokens an image becomes (default 576, a 768 × 768 picture; an image is scaled
    * down to fit, keeping its shape). More reads small text better and costs time and context.
+   * Gemma 4: one of 70, 140, 280 (the default), 560 or 1120; another number is rounded down to one.
    */
   maxImageTokens?: number;
   /**
@@ -216,12 +225,12 @@ export async function createEngine(from: ModelSource, opts: LoadOptions = {}): P
   ops.setSubgroups(!!opts.subgroups);
   const ownsBackend = !opts.backend;
   let weights: Map<string, Tensor> | undefined;
-  let vision: VisionTower | QwenVisionTower | undefined;
+  let vision: VisionTower | QwenVisionTower | Gemma4VisionTower | undefined;
   let model: LlamaModel | undefined;
   let files: Awaited<ReturnType<typeof openSafetensors>>["files"] = [];
   try {
     const opened = !ref ? await openGGUFFile(from) : ref.gguf ? await openGGUF(ref, opts.endpoint) : await openSafetensors(ref, opts.endpoint);
-    const { cfg, tokenizer, idefics3, gemma3, qwen35 } = opened;
+    const { cfg, tokenizer, idefics3, gemma3, qwen35, gemma4 } = opened;
     files = opened.files;
     const tuning =
       opts.tune === false || backend.name === "cpu"
@@ -243,7 +252,9 @@ export async function createEngine(from: ModelSource, opts: LoadOptions = {}): P
           ? await openGemma3Vision(backend, files, gemma3, opts, converted)
           : qwen35 && opts.vision !== false
             ? await openQwenTower(backend, files, qwenVisionName, qwenVisionConfig(qwen35.config, qwen35.preprocessor), opts, converted)
-            : undefined;
+            : gemma4 && opts.vision !== false
+              ? await openGemma4Tower(backend, files, gemma4VisionName, gemma4VisionConfig(gemma4.config, gemma4.preprocessor), opts, converted)
+              : undefined;
     if (vision && vision.cfg.projectionDim !== cfg.hiddenSize) throw new Error(`mmproj projects to ${vision.cfg.projectionDim}, but the model is ${cfg.hiddenSize} wide`);
     await tuning;
     const imageTokens = vision ? (opts.imageSlots ?? 4) * vision.tokensPerImage : 0;
@@ -322,7 +333,7 @@ async function loadGemma4Extras(backend: Backend, files: WeightFile[], cfg: Llam
  * and biases as f32; the patch convolution is read as a [hidden, 3·14·14] matrix padded to `patchK`
  * columns, and the projection transposed to [text width, hidden], as the matmul kernels take them.
  */
-async function openVision(backend: Backend, ref: ModelRef, opts: LoadOptions): Promise<VisionTower | QwenVisionTower> {
+async function openVision(backend: Backend, ref: ModelRef, opts: LoadOptions): Promise<VisionTower | QwenVisionTower | Gemma4VisionTower> {
   const { source, header } = await openParsed(ref, ref.gguf!, opts.endpoint, readGGUFHeader);
   try {
     if (header.metadata.get("clip.projector_type") === "qwen3vl_merger") {
@@ -331,6 +342,13 @@ async function openVision(backend: Backend, ref: ModelRef, opts: LoadOptions): P
       const hidden = Number(header.metadata.get("clip.vision.embedding_length"));
       const cfg = qwenVisionConfigFromGGUF(header.metadata, pos.shape.reduce((a, b) => a * b, 1) / hidden);
       return await openQwenTower(backend, [{ name: ref.gguf!, source, tensors: header.tensors }], (n) => n, cfg, opts);
+    }
+    if (header.metadata.get("clip.vision.projector_type") === "gemma4v") {
+      const pos = header.tensors.find((t) => t.name === "v.position_embd.weight");
+      if (!pos || pos.shape.length !== 3) throw new Error("mmproj: missing v.position_embd.weight");
+      // The file holds the audio tower too; only the vision tensors are read.
+      const tensors = header.tensors.filter((t) => t.name.startsWith("v.") || t.name === "mm.input_projection.weight");
+      return await openGemma4Tower(backend, [{ name: ref.gguf!, source, tensors }], (n) => n, gemma4VisionConfigFromGGUF(header.metadata, pos.shape[1]!), opts);
     }
     const cfg = visionConfigFromGGUF(header.metadata);
     const linear = /^v\.blk\.\d+\.(attn_[qkv]|attn_out|ffn_up|ffn_down)\.weight$/;
@@ -581,6 +599,75 @@ async function openQwenTower(backend: Backend, files: WeightFile[], nameOf: (nam
   }
 }
 
+/**
+ * Gemma 4's vision tower from an mmproj GGUF or from the checkpoint's own files (where `nameOf`
+ * gives a tensor's mmproj name): matmul weights as q8 (f32 with `quant: "f32"`), norms f32. Each
+ * projection's four clipping limits are read as numbers. A checkpoint's patch projection takes
+ * patches pixel by pixel (row, column, channel); it is reordered to the channel-major layout an
+ * mmproj file stores. The position table stays on the CPU.
+ */
+async function openGemma4Tower(backend: Backend, files: WeightFile[], nameOf: (name: string) => string | undefined, cfg: Gemma4VisionConfig, opts: LoadOptions, converted?: string): Promise<Gemma4VisionTower> {
+  const quant = opts.quant === "f32" ? "f32" : "q8";
+  const linear = /^(v\.blk\.\d+\.(attn_[qkv]|attn_out|ffn_gate|ffn_up|ffn_down)|mm\.input_projection)\.weight$/;
+  const limit = /\.(input|output)_(min|max)$/;
+  const manual = /^v\.(patch_embd|position_embd)\.weight$/;
+  const only = (keep: (n: string) => boolean) => (name: string) => {
+    const n = nameOf(name);
+    return n && !manual.test(n) && !limit.test(n) && keep(n) ? n : undefined;
+  };
+  const weights = new Map<string, Tensor>();
+  const found = new Map<string, { file: WeightFile; entry: TensorEntry }>();
+  try {
+    for (const file of files) {
+      for (const entry of file.tensors) {
+        const n = nameOf(entry.name);
+        if (n) found.set(n, { file, entry });
+      }
+      const add = (m: Map<string, Tensor>) => m.forEach((t, k) => weights.set(k, t));
+      const plain = { name: file.name, source: file.source, tensors: file.tensors };
+      add(await loadWeights(backend, [{ ...plain, rename: only((n) => linear.test(n)) }], quant, opts.onProgress, converted ? { key: `${converted}|vision/linear/${file.name}` } : undefined));
+      add(await loadWeights(backend, [{ ...plain, rename: only((n) => !linear.test(n)) }], "f32"));
+    }
+    const read = async (name: string) => {
+      const f = found.get(name);
+      if (!f) throw new Error(`vision tower: the model has no ${name}`);
+      const n = f.entry.shape.reduce((a, b) => a * b, 1);
+      return { values: toF32(f.entry.type as Parameters<typeof toF32>[0], await f.file.source.read(f.entry.offset, f.entry.byteLength), n), shape: f.entry.shape };
+    };
+    // Limits a file leaves out do not clip.
+    const clips = new Map<string, Gemma4Clip>();
+    for (let l = 0; l < cfg.layers; l++)
+      for (const proj of GEMMA4_CLIPPED) {
+        const at = `v.blk.${l}.${proj}`;
+        const [inMin, inMax, outMin, outMax] = await Promise.all(
+          (["input_min", "input_max", "output_min", "output_max"] as const).map(async (k, i) => (found.has(`${at}.${k}`) ? (await read(`${at}.${k}`)).values[0]! : i % 2 ? Infinity : -Infinity)),
+        );
+        clips.set(at, [inMin!, inMax!, outMin!, outMax!]);
+      }
+    const P = cfg.patchSize;
+    const K = 3 * P * P;
+    const patch = await read("v.patch_embd.weight");
+    if (patch.values.length !== cfg.hidden * K) throw new Error(`vision tower: the patch weight has ${patch.values.length} values, not ${cfg.hidden * K}`);
+    let patchW = patch.values;
+    if (patch.shape.length === 2) {
+      // A checkpoint's linear layer: column (y · p + x) · 3 + channel.
+      patchW = new Float32Array(patch.values.length);
+      for (let r = 0; r < cfg.hidden; r++)
+        for (let k = 0; k < 3; k++) for (let i = 0; i < P * P; i++) patchW[r * K + k * P * P + i] = patch.values[r * K + i * 3 + k]!;
+    }
+    const buf = backend.alloc(patchW.byteLength, "storage", "vision/w");
+    backend.write(buf, 0, patchW);
+    weights.set("v.patch_embd.weight", { shape: [cfg.hidden, K], dtype: "f32", buf });
+    // The budgets the model was trained with: the largest one within what was asked for.
+    const asked = Math.floor(opts.maxImageTokens ?? cfg.maxTokens);
+    const maxTokens = [...GEMMA4_IMAGE_TOKENS].reverse().find((n) => n <= asked) ?? GEMMA4_IMAGE_TOKENS[0];
+    return new Gemma4VisionTower(backend, cfg, weights, clips, (await read("v.position_embd.weight")).values, maxTokens);
+  } catch (err) {
+    freeWeights(backend, weights);
+    throw err;
+  }
+}
+
 /** WebGPU, or the CPU backend when asked for or (for "auto") when WebGPU is missing or has no adapter. */
 export async function openBackend(device: "auto" | "gpu" | "cpu", cpuThreads?: number): Promise<Backend> {
   const threads = cpuThreads ?? Math.min(4, globalThis.navigator?.hardwareConcurrency ?? 1);
@@ -659,7 +746,7 @@ async function openParsedWith<H>(file: string, opener: (fresh: boolean) => Promi
   }
 }
 
-async function openSafetensors(ref: ModelRef, endpoint?: string): Promise<{ cfg: LlamaConfig; tokenizer: Tokenizer; files: WeightFile[]; idefics3?: Idefics3Files; gemma3?: Idefics3Files; qwen35?: Idefics3Files }> {
+async function openSafetensors(ref: ModelRef, endpoint?: string): Promise<{ cfg: LlamaConfig; tokenizer: Tokenizer; files: WeightFile[]; idefics3?: Idefics3Files; gemma3?: Idefics3Files; qwen35?: Idefics3Files; gemma4?: Idefics3Files }> {
   // Required files start at once. Optional ones wait for the repo's file listing, so files that do
   // not exist are not requested (each would log a 404); without a listing they are probed.
   const listing = listRepoFiles(ref, endpoint);
@@ -710,7 +797,10 @@ async function openSafetensors(ref: ModelRef, endpoint?: string): Promise<{ cfg:
   const qwen35 = config!.model_type === "qwen3_5" && !!config!.vision_config && files.some((f) => f.tensors.some((t) => qwenVisionName(t.name) === "mm.2.weight"));
   const preprocessor = idefics3 || gemma3 || qwen35 ? await optionalJSON<Record<string, unknown>>("preprocessor_config.json") : undefined;
   const info = { config: config!, preprocessor };
-  return { cfg, tokenizer, files, idefics3: idefics3 ? info : undefined, gemma3: gemma3 ? info : undefined, qwen35: qwen35 ? info : undefined };
+  // Gemma 4: the tower and its projection sit in the same files; the image settings in processor_config.json.
+  const gemma4 = config!.model_type === "gemma4" && !!config!.vision_config && files.some((f) => f.tensors.some((t) => gemma4VisionName(t.name) === "mm.input_projection.weight"));
+  const processor = gemma4 ? await optionalJSON<{ image_processor?: Record<string, unknown> }>("processor_config.json") : undefined;
+  return { cfg, tokenizer, files, idefics3: idefics3 ? info : undefined, gemma3: gemma3 ? info : undefined, qwen35: qwen35 ? info : undefined, gemma4: gemma4 ? { config: config!, preprocessor: processor?.image_processor } : undefined };
 }
 
 function addOne(v: Float32Array): void {
@@ -732,7 +822,7 @@ function chatTemplate(cfg: TokenizerConfig | undefined, file: string | undefined
   return { source, bosToken: token(cfg?.bos_token), eosToken: token(cfg?.eos_token) };
 }
 
-type OpenedGGUF = { cfg: LlamaConfig; tokenizer: Tokenizer; files: WeightFile[]; idefics3?: undefined; gemma3?: undefined; qwen35?: undefined };
+type OpenedGGUF = { cfg: LlamaConfig; tokenizer: Tokenizer; files: WeightFile[]; idefics3?: undefined; gemma3?: undefined; qwen35?: undefined; gemma4?: undefined };
 
 async function openGGUF(ref: ModelRef, endpoint?: string): Promise<OpenedGGUF> {
   const file = ref.gguf!;

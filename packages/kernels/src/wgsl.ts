@@ -762,11 +762,12 @@ fn main(${EW_ARGS}) {
 /**
  * In-place rotary embedding of x [T, H, D] by angles given per row: `angles` [T, D / 2], pairs in
  * rotate-half layout (element j with j + D / 2). For positions that are not a token index, such as a
- * vision tower's patch rows and columns.
+ * vision tower's patch rows and columns. With G > 1 a head is G equal groups, each in rotate-half
+ * layout of its own (Gemma 4's tower: one group per axis), the angles group after group.
  */
 export function ropeTableSpec(): KernelSpec {
   return spec("rope_table", ["uniform", "read", "rw"], cpu.cpuRopeTable, () => /* wgsl */ `
-struct P { T: u32, H: u32, D: u32, _a: u32 }
+struct P { T: u32, H: u32, D: u32, G: u32 }
 @group(0) @binding(0) var<uniform> p: P;
 @group(0) @binding(1) var<storage, read> angles: array<f32>;
 @group(0) @binding(2) var<storage, read_write> x: array<f32>;
@@ -781,8 +782,10 @@ fn main(${EW_ARGS}) {
   let a = angles[(row / p.H) * hd + i];
   let c = cos(a);
   let s = sin(a);
-  let i0 = row * p.D + i;
-  let i1 = i0 + hd;
+  // Pairs per group, and the pair's place: group g holds elements g · 2 · gd … of the head.
+  let gd = hd / max(p.G, 1u);
+  let i0 = row * p.D + (i / gd) * 2u * gd + i % gd;
+  let i1 = i0 + gd;
   let x0 = x[i0];
   let x1 = x[i1];
   x[i0] = x0 * c - x1 * s;
@@ -1880,7 +1883,9 @@ ${features
   let id = tokens[idx / p.D];
   if (id >= p.V) { o[idx] = feat[(id - p.V) * p.D + idx % p.D]; return; }`
   : ""}
-  let e = tokens[idx / p.D] * p.D + idx % p.D;
+  // Without features, ids from V on (when V is set) read row 0: image tokens as the padding token.
+  let tok = tokens[idx / p.D];
+  let e = select(tok, 0u, p.V > 0u && tok >= p.V) * p.D + idx % p.D;
 ${wdtype === "q4"
   ? aff
     ? `  let q = f32((wq[e / 8u] >> (4u * (e % 8u))) & 15u);
@@ -2029,7 +2034,8 @@ export const geluSpec = (exact = false): KernelSpec => actSpec(exact ? "gelu" : 
  */
 export function avgPoolSpec(): KernelSpec {
   return spec("avg_pool", ["uniform", "read", "rw"], cpu.cpuAvgPool, () => /* wgsl */ `
-struct P { side: u32, k: u32, C: u32, _p: u32 }
+// side is the grid's width; rows its height, or 0 for a square grid.
+struct P { side: u32, k: u32, C: u32, rows: u32 }
 @group(0) @binding(0) var<uniform> p: P;
 @group(0) @binding(1) var<storage, read> x: array<f32>;
 @group(0) @binding(2) var<storage, read_write> y: array<f32>;
@@ -2038,7 +2044,8 @@ struct P { side: u32, k: u32, C: u32, _p: u32 }
 fn main(${EW_ARGS}) {
   ${FLAT}
   let out = p.side / p.k;
-  if (idx >= out * out * p.C) { return; }
+  let outRows = select(p.rows, p.side, p.rows == 0u) / p.k;
+  if (idx >= out * outRows * p.C) { return; }
   let c = idx % p.C;
   let t = idx / p.C;
   let y0 = (t / out) * p.k;
@@ -3417,6 +3424,22 @@ fn main(${EW_ARGS}) {
   ${FLAT}
   if (idx >= p.n) { return; }
   x[idx] = p.a * x[idx];
+}`);
+}
+
+/** y = clamp(x, lo, hi), element by element (the clipped linears of Gemma 4's vision tower). */
+export function clampSpec(): KernelSpec {
+  return spec("clamp", ["uniform", "read", "rw"], cpu.cpuClamp, () => /* wgsl */ `
+struct P { n: u32, _a: u32, lo: f32, hi: f32 }
+@group(0) @binding(0) var<uniform> p: P;
+@group(0) @binding(1) var<storage, read> x: array<f32>;
+@group(0) @binding(2) var<storage, read_write> y: array<f32>;
+
+@compute @workgroup_size(${EW})
+fn main(${EW_ARGS}) {
+  ${FLAT}
+  if (idx >= p.n) { return; }
+  y[idx] = clamp(x[idx], p.lo, p.hi);
 }`);
 }
 

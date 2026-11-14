@@ -77,7 +77,7 @@ function makeWeights(c: LlamaConfig): Map<string, { shape: number[]; data: Float
  * Gemma 4's forward pass as transformers writes it, in float64 and without a cache: every position
  * is recomputed from the whole sequence. Returns the logits after the last token.
  */
-function reference(c: LlamaConfig, w: Map<string, { shape: number[]; data: Float32Array }>, tokens: number[]): Float64Array {
+function reference(c: LlamaConfig, w: Map<string, { shape: number[]; data: Float32Array }>, tokens: number[], features?: Float32Array): Float64Array {
   const W = (name: string) => w.get(name)!;
   const [h, P, L, T] = [c.hiddenSize, c.perLayerInput!, c.numLayers, tokens.length];
   const eps = c.rmsEps;
@@ -119,9 +119,14 @@ function reference(c: LlamaConfig, w: Map<string, { shape: number[]; data: Float
     return y;
   };
   const embed = W("model.embed_tokens.weight").data;
-  const xs = tokens.map((t) => Float64Array.from(embed.subarray(t * h, (t + 1) * h), (v) => v * c.embedScale!));
+  const text = (t: number) => Float64Array.from(embed.subarray(t * h, (t + 1) * h), (v) => v * c.embedScale!);
+  // An image token (an id from the vocabulary's size on) is its row of the features, unscaled; in
+  // the per-layer tables it counts as the padding token, id 0, while the projection takes its features.
+  const image = (t: number) => t >= c.vocabSize;
+  const xs = tokens.map((t) => (image(t) ? Float64Array.from(features!.subarray((t - c.vocabSize) * h, (t - c.vocabSize + 1) * h)) : text(t)));
   // Per-layer inputs: [T][L · P].
-  const per = tokens.map((t, i) => {
+  const per = tokens.map((id, i) => {
+    const t = image(id) ? 0 : id;
     const proj = rms(matvec("model.per_layer_model_projection.weight", xs[i]!).map((v) => v * h ** -0.5), P, "model.per_layer_projection_norm.weight");
     const out = new Float64Array(L * P);
     for (let l = 0; l < L; l++) {
@@ -312,6 +317,28 @@ describe("Gemma 4", () => {
       expect(m.kvSnapshotBytes(10)).toBe(2 * 10 * 4 * (32 + 64 + 32 + 64));
       m.destroy();
     }
+  });
+
+  it("takes image tokens as feature rows, and as padding in the per-layer tables", async () => {
+    const w = makeWeights(cfg);
+    const be = new CpuBackend({ threads: 1 });
+    const read = async (t: Tensor) => new Float32Array(await be.readback(physical(t.buf), 0, t.shape.reduce((a, b) => a * b, 1) * 4));
+    const m = new LlamaModel(be, cfg, upload(be, w), { maxSeq: 64, kvDtype: "f32", imageTokens: 6 });
+    const features = rand(6 * cfg.hiddenSize, 99, 2);
+    be.write(m.imageFeatures!, 0, features);
+    // Text, four image tokens (rows 1 to 4 of the features), text; sampled after the last and inside the image.
+    const V = cfg.vocabSize;
+    const ids = [3, 14, V + 1, V + 2, V + 3, V + 4, 15, 9, 26];
+    const plan = m.buildPlan(ids.length);
+    be.write(plan.tokens, 0, Uint32Array.from(ids));
+    for (const last of [ids.length - 1, 4]) {
+      m.setStep({ pos0: 0, lastRow: last, seed: 0, temperature: 0 });
+      be.submit(plan.dispatches);
+      expect(maxDiff(await read(plan.logits), reference(cfg, w, ids.slice(0, last + 1), features))).toBeLessThan(2e-3);
+    }
+    // The image changes the answer: the same prompt with padding tokens in its place gives other logits.
+    expect(maxDiff(reference(cfg, w, ids, features), reference(cfg, w, ids.map((t) => (t >= V ? 0 : t))))).toBeGreaterThan(0.1);
+    m.destroy();
   });
 
   it("refuses the i8 cache for heads past 256 and adapters", () => {

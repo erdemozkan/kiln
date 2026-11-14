@@ -77,6 +77,7 @@ import {
   ropeSpec,
   ropeTableSpec,
   softcapSpec,
+  clampSpec,
   scaleInPlaceSpec,
   attentionWideSpec,
   sampleSpec,
@@ -261,10 +262,11 @@ export function rope(ctx: Ctx, x: Tensor, T: number, H: number, D: number, invFr
 }
 
 /** In-place rotary embedding of x [T, H · D] by per-row angles [T, D / 2], rotate-half pairs (see ropeTableSpec). */
-export function ropeTable(ctx: Ctx, x: Tensor, angles: Tensor, H: number, D: number): void {
+export function ropeTable(ctx: Ctx, x: Tensor, angles: Tensor, H: number, D: number, groups = 1): void {
   const T = x.shape[0]!;
   if (angles.shape[0] !== T || angles.shape[1] !== D / 2) throw new Error(`ropeTable: angles [${angles.shape}] do not fit ${T} rows of heads of ${D}`);
-  ctx.run(ropeTableSpec(), [ctx.uniform([u32(T), u32(H), u32(D), u32(0)]), angles.buf, x.buf], grid1d((T * H * D) / 2));
+  if ((D / 2) % groups) throw new Error(`ropeTable: heads of ${D} do not split into ${groups} groups of pairs`);
+  ctx.run(ropeTableSpec(), [ctx.uniform([u32(T), u32(H), u32(D), u32(groups)]), angles.buf, x.buf], grid1d((T * H * D) / 2));
 }
 
 /**
@@ -464,14 +466,15 @@ export function mulFirstRow(ctx: Ctx, x: Tensor): Tensor {
 
 /**
  * Rows of `table` for the token ids, times `scale` (Gemma scales embeddings by sqrt(hidden)). With
- * `features`, ids from `vocab` on take row id - vocab of the features instead, unscaled (image tokens).
+ * `features`, ids from `vocab` on take row id - vocab of the features instead, unscaled (image tokens);
+ * with a `vocab` alone they take row 0 (the padding token, as Gemma 4's per-layer input reads them).
  */
-export function embed(ctx: Ctx, table: Tensor, tokens: Buf, T: number, scale = 1, features?: { buf: Buf; vocab: number }): Tensor {
+export function embed(ctx: Ctx, table: Tensor, tokens: Buf, T: number, scale = 1, features?: { buf?: Buf; vocab: number }): Tensor {
   const D = lastDim(table);
   const o = ctx.alloc([T, D]);
-  const spec = embedSpec(weightDType(table), !!table.mins, !!features);
+  const spec = embedSpec(weightDType(table), !!table.mins, !!features?.buf);
   const bufs = [ctx.uniform([u32(T), u32(D), f32(scale), u32(features?.vocab ?? 0)]), tokens, ...weightBufs(table)];
-  if (features) bufs.push(features.buf);
+  if (features?.buf) bufs.push(features.buf);
   ctx.run(spec, [...bufs, o.buf], grid1d(T * D));
   return o;
 }
@@ -862,6 +865,14 @@ export function scaleInPlace(ctx: Ctx, x: Tensor, a: number): void {
   ctx.run(scaleInPlaceSpec(), [ctx.uniform([u32(n), u32(0), f32(a), u32(0)]), x.buf], grid1d(n));
 }
 
+/** clamp(x, lo, hi) as a new tensor. */
+export function clamp(ctx: Ctx, x: Tensor, lo: number, hi: number): Tensor {
+  const n = numel(x.shape);
+  const y = ctx.alloc(x.shape);
+  ctx.run(clampSpec(), [ctx.uniform([u32(n), u32(0), f32(lo), f32(hi)]), x.buf, y.buf], grid1d(n));
+  return y;
+}
+
 /** Squashes logits to ±cap in place: cap · tanh(x / cap). */
 export function softcap(ctx: Ctx, x: Tensor, cap: number): void {
   const n = numel(x.shape);
@@ -874,12 +885,13 @@ export function scaleAdd(ctx: Ctx, y: Tensor, x: Tensor, a: number, accumulate: 
   ctx.run(scaleAddSpec(), [ctx.uniform([u32(n), u32(accumulate ? 1 : 0), f32(a), u32(0)]), x.buf, y.buf], grid1d(n));
 }
 
-export function avgPool(ctx: Ctx, x: Tensor, side: number, k: number): Tensor {
+/** Means over k × k blocks of a grid of `side` columns and `rows` rows (rows of x, row-major): [rows · side, C] → [(rows / k) · (side / k), C]. */
+export function avgPool(ctx: Ctx, x: Tensor, side: number, k: number, rows = side): Tensor {
   const C = lastDim(x);
-  if (side % k || numel(x.shape) !== side * side * C) throw new Error(`avgPool: [${x.shape}] is not a ${side}×${side} grid poolable by ${k}`);
-  const out = side / k;
-  const y = ctx.alloc([out * out, C]);
-  ctx.run(avgPoolSpec(), [ctx.uniform([u32(side), u32(k), u32(C), u32(0)]), x.buf, y.buf], grid1d(out * out * C));
+  if (side % k || rows % k || numel(x.shape) !== side * rows * C) throw new Error(`avgPool: [${x.shape}] is not a ${side}×${rows} grid poolable by ${k}`);
+  const n = (side / k) * (rows / k);
+  const y = ctx.alloc([n, C]);
+  ctx.run(avgPoolSpec(), [ctx.uniform([u32(side), u32(k), u32(C), u32(rows)]), x.buf, y.buf], grid1d(n * C));
   return y;
 }
 

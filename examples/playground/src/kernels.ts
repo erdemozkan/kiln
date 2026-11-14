@@ -601,6 +601,47 @@ async function main() {
     check("rope_table", `T${T} H${H} D${D}`, await download(xt.buf, x.length), want, 1e-4);
   }
 
+  // The same with a head in two groups, each rotate-half on its own (Gemma 4's tower: one group per axis).
+  {
+    const [T, H, D, G] = [7, 3, 16, 2];
+    const x = randn(T * H * D);
+    const angles = randn(T * (D / 2));
+    const xt = upload(x, [T, H * D]);
+    await run(S0, (ctx) => ops.ropeTable(ctx, xt, upload(angles, [T, D / 2]), H, D, G));
+    const want = x.slice();
+    const gd = D / 2 / G;
+    for (let r = 0; r < T * H; r++)
+      for (let i = 0; i < D / 2; i++) {
+        const a = angles[Math.floor(r / H) * (D / 2) + i]!;
+        const i0 = r * D + Math.floor(i / gd) * 2 * gd + (i % gd);
+        const [x0, x1] = [x[i0]!, x[i0 + gd]!];
+        want[i0] = x0 * Math.cos(a) - x1 * Math.sin(a);
+        want[i0 + gd] = x0 * Math.sin(a) + x1 * Math.cos(a);
+      }
+    check("rope_table", `T${T} H${H} D${D} groups ${G}`, await download(xt.buf, x.length), want, 1e-4);
+  }
+
+  // Values clipped to a range, an open end included; means over blocks of a grid that is not square.
+  {
+    const x = Float32Array.from(randn(3000), (v) => v * 5);
+    let y!: Tensor;
+    await run(S0, (ctx) => (y = ops.clamp(ctx, upload(x, [1, x.length]), -2.5, 3.25)));
+    check("clamp", "-2.5…3.25", await download(y.buf, x.length), x.map((v) => Math.min(Math.max(v, -2.5), 3.25)), 0);
+    await run(S0, (ctx) => (y = ops.clamp(ctx, upload(x, [1, x.length]), -Infinity, 1)));
+    check("clamp", "-inf…1", await download(y.buf, x.length), x.map((v) => Math.min(v, 1)), 0);
+    const [cols, rows, k, C] = [9, 6, 3, 40];
+    const g = randn(cols * rows * C);
+    await run(S0, (ctx) => (y = ops.avgPool(ctx, upload(g, [cols * rows, C]), cols, k, rows)));
+    const want = new Float32Array((cols / k) * (rows / k) * C);
+    for (let t = 0; t < want.length / C; t++)
+      for (let c = 0; c < C; c++) {
+        let sum = 0;
+        for (let dy = 0; dy < k; dy++) for (let dx = 0; dx < k; dx++) sum += g[((Math.floor(t / (cols / k)) * k + dy) * cols + (t % (cols / k)) * k + dx) * C + c]!;
+        want[t * C + c] = sum / (k * k);
+      }
+    check("avg_pool", `${cols}×${rows} by ${k}`, await download(y.buf, want.length), want, 1e-5);
+  }
+
   // Prefill (T > 1) cases run both kernels: tiled (default) and one workgroup per query row.
   for (const [T, H, Hkv, D, pos0, maxSeq] of [[3, 4, 2, 16, 5, 16], [1, 9, 3, 64, 300, 512], [1, 9, 3, 64, 0, 200], [1, 8, 8, 128, 63, 128], [1, 8, 2, 64, 64, 256], [1, 4, 4, 32, 1999, 2048], [4, 4, 1, 128, 61, 128], [5, 9, 3, 64, 600, 1024], [3, 4, 2, 32, 1790, 2048], [2, 2, 2, 256, 255, 512], [64, 9, 3, 64, 1000, 2048], [17, 6, 2, 96, 40, 128], [33, 8, 2, 128, 300, 512], [9, 4, 4, 32, 70, 128]] as const) {
     const q = randn(T * H * D);
@@ -891,6 +932,13 @@ async function main() {
     let o!: Tensor;
     await run(S0, (ctx) => (o = ops.embed(ctx, upload(table, [V, D]), upload(ids, [ids.length]).buf, ids.length, 2, { buf: upload(feats, [3, D]).buf, vocab: V })));
     check("embed/features", `V${V} D${D}`, await download(o.buf, want.length), want, 1e-6);
+    // Without features, ids past the vocabulary read the padding token's row (Gemma 4's per-layer input).
+    const pad = new Float32Array(ids.length * D);
+    ids.forEach((id, t) => pad.set(table.subarray((id >= V ? 0 : id) * D, ((id >= V ? 0 : id) + 1) * D).map((v) => v * 2), t * D));
+    await run(S0, (ctx) => (o = ops.embed(ctx, upload(table, [V, D]), upload(ids, [ids.length]).buf, ids.length, 2, { vocab: V })));
+    check("embed/pad", `V${V} D${D}`, await download(o.buf, pad.length), pad, 1e-6);
+    await run(S0, (ctx) => (o = ops.embed(ctx, uploadQ8(table, [V, D]), upload(ids, [ids.length]).buf, ids.length, 2, { vocab: V })));
+    check("embed/pad/q8", `V${V} D${D}`, await download(o.buf, pad.length), pad, 0.15);
   }
 
   // Vision encoder pieces: LayerNorm with bias, GELU in place, 4 × 4 average pooling of a token grid.

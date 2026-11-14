@@ -1,6 +1,6 @@
 import { type Backend, type Buf, type Dispatch, type Profile } from "@kiln/core";
 import { GrammarMatcher, TokenTrie, compileFormat, type ResponseFormat } from "@kiln/grammar";
-import { LlamaModel, MAX_VERIFY_ROWS, QwenVisionTower, type ForwardPlan, type Idefics3Processing, type ImagePixels, type VisionTower } from "@kiln/models";
+import { Gemma4VisionTower, LlamaModel, MAX_VERIFY_ROWS, QwenVisionTower, type ForwardPlan, type Idefics3Processing, type ImagePixels, type VisionTower } from "@kiln/models";
 import { resizeImage } from "@kiln/loader";
 import type { StepParams } from "@kiln/core";
 import { idefics3PromptString, idefics3Tiles } from "./idefics3";
@@ -311,8 +311,8 @@ export class Engine {
     readonly backend: Backend,
     readonly model: LlamaModel,
     readonly tokenizer: Tokenizer,
-    /** A vision tower (Gemma 3 or Qwen 3.5, from the checkpoint or an mmproj file, or SmolVLM): chat messages may then hold images. */
-    readonly vision?: VisionTower | QwenVisionTower,
+    /** A vision tower (Gemma 3, Gemma 4 or Qwen 3.5, from the checkpoint or an mmproj file, or SmolVLM): chat messages may then hold images. */
+    readonly vision?: VisionTower | QwenVisionTower | Gemma4VisionTower,
   ) {
     try {
       this.chatFormat = detectChatFormat(tokenizer);
@@ -331,7 +331,7 @@ export class Engine {
     // Only reasoning models know <think>; injecting it elsewhere derails them.
     const thinks = this.tokenizer.tokenId("<think>") !== undefined;
     const images = messages.flatMap((m) => (typeof m.content === "string" ? [] : m.content.flatMap((p) => (p.type === "image" ? [p.image as ImagePixels] : []))));
-    if (images.length && !this.vision) throw new Error("this model takes no images (load Gemma 3 or Qwen 3.5 with its mmproj file, or a SmolVLM model, to give it images)");
+    if (images.length && !this.vision) throw new Error("this model takes no images (load Gemma 3, Gemma 4 or Qwen 3.5 with its mmproj file, or a SmolVLM model, to give it images)");
     const idefics3 = this.vision?.processing;
     // Templates see image parts without their pixels; Gemma's writes <start_of_image> for each,
     // SmolVLM's <image>. SmolVLM's template reads every message's content as a list of parts.
@@ -356,13 +356,18 @@ export class Engine {
       return;
     }
     const slots: number[] = [];
-    if (this.vision instanceof QwenVisionTower) {
-      // Each image at its own aspect ratio, resized to whole tokens (bicubic, as the processor does).
+    if (this.vision instanceof QwenVisionTower || this.vision instanceof Gemma4VisionTower) {
+      // Each image at its own aspect ratio, resized to whole tokens (bicubic, as the processors do).
       for (const img of images) {
         const g = this.vision.grid(img.width, img.height);
         slots.push(await this.imageSlot(resizeImage(img, g.width, g.height, 3)));
       }
-      yield* this.decodeIds(this.withQwenImages(prompt, slots), this.forceToolCall(opts));
+      // Gemma 4's processor also puts each image's tokens between <|image> and <image|>.
+      const ids =
+        this.vision instanceof QwenVisionTower
+          ? this.withGridImages(prompt, slots, "<|image_pad|>")
+          : this.withGridImages(prompt.split("<|image|>").join("<|image><|image|><image|>"), slots, "<|image|>");
+      yield* this.decodeIds(ids, this.forceToolCall(opts));
       return;
     }
     for (const img of images) slots.push(await this.imageSlot(img));
@@ -370,13 +375,14 @@ export class Engine {
   }
 
   /**
-   * Prompt ids as Qwen's processor expands them: each <|image_pad|> the template wrote (between
-   * <|vision_start|> and <|vision_end|>) becomes the image's rows · cols soft tokens, with ids
+   * Prompt ids as Qwen's and Gemma 4's processors expand them: each `marker` token in the prompt
+   * (Qwen's <|image_pad|>, which its template writes between <|vision_start|> and <|vision_end|>;
+   * Gemma 4's <|image|>) becomes the image's rows · cols soft tokens, with ids
    * vocabSize + slot · (a slot's tokens) + i.
    */
-  private withQwenImages(prompt: string, slots: readonly number[]): number[] {
-    const pad = this.tokenizer.tokenId("<|image_pad|>");
-    if (pad === undefined) throw new Error("the tokenizer has no <|image_pad|> token");
+  private withGridImages(prompt: string, slots: readonly number[], marker: string): number[] {
+    const pad = this.tokenizer.tokenId(marker);
+    if (pad === undefined) throw new Error(`the tokenizer has no ${marker} token`);
     const ids = this.tokenizer.encode(prompt);
     const marks = ids.reduce((n, id) => n + (id === pad ? 1 : 0), 0);
     if (marks !== slots.length) throw new Error(`the chat template wrote ${marks} image markers for ${slots.length} images`);
