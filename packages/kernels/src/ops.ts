@@ -78,6 +78,7 @@ import {
   ropeTableSpec,
   softcapSpec,
   clampSpec,
+  localRelAttentionSpec,
   scaleInPlaceSpec,
   attentionWideSpec,
   sampleSpec,
@@ -241,7 +242,7 @@ export function rmsnorm(ctx: Ctx, x: Tensor, w: Tensor, eps: number, dim = lastD
   const rows = numel(x.shape) / dim;
   if (numel(w.shape) !== dim) throw new Error(`rmsnorm: weight [${w.shape}] does not match dim ${dim}`);
   const y = ctx.alloc(x.shape);
-  ctx.run(rmsnormSpec(), [ctx.uniform([u32(rows), u32(dim), f32(eps), u32(0)]), x.buf, w.buf, y.buf], [rows, 1, 1]);
+  ctx.run(rmsnormSpec(), [ctx.uniform([u32(rows), u32(dim), f32(eps), u32(0)]), x.buf, w.buf, y.buf], [Math.min(rows, MAX_X), Math.ceil(rows / MAX_X), 1]);
   return y;
 }
 
@@ -965,6 +966,36 @@ export function causalConv(ctx: Ctx, x: Tensor, w: Tensor, state: Buf): Tensor {
   ctx.run(causalConvSpec(), [params, x.buf, w.buf, state, y.buf], grid1d(T * C));
   ctx.run(causalConvStateSpec(), [params, x.buf, state], grid1d(C));
   return y;
+}
+
+/**
+ * Causal depthwise convolution over time of a whole sequence, without an activation: x [T, C] and
+ * weights w [C, K] → y [T, C], the rows before the first read from `zeros` ([K − 1, C] of zeros).
+ */
+export function causalConvPlain(ctx: Ctx, x: Tensor, w: Tensor, zeros: Buf): Tensor {
+  const C = lastDim(x);
+  const T = numel(x.shape) / C;
+  const K = numel(w.shape) / C;
+  if (!Number.isInteger(K) || K < 2) throw new Error(`causalConvPlain: weights [${w.shape}] do not fit ${C} channels`);
+  const y = ctx.alloc([T, C]);
+  ctx.run(causalConvSpec(), [ctx.uniform([u32(T), u32(C), u32(K), u32(1)]), x.buf, w.buf, zeros, y.buf], grid1d(T * C));
+  return y;
+}
+
+/**
+ * Attention of each row over itself and the R − 1 rows before it, with a relative position term
+ * (see `localRelAttentionSpec`): q, k, v [T, H · D], rel [R, H · D], qs [D] → [T, H · D].
+ */
+export function localRelAttention(ctx: Ctx, q: Tensor, k: Tensor, v: Tensor, rel: Tensor, qs: Tensor, o: { heads: number; kscale: number; cap: number }): Tensor {
+  const row = lastDim(q);
+  const T = numel(q.shape) / row;
+  const D = row / o.heads;
+  const R = numel(rel.shape) / row;
+  if (!Number.isInteger(D) || !Number.isInteger(R) || R < 1 || R > 32 || numel(qs.shape) < D) throw new Error(`localRelAttention: q [${q.shape}], rel [${rel.shape}] and ${o.heads} heads do not fit`);
+  const out = ctx.alloc([T, row]);
+  const params = ctx.uniform([u32(T), u32(o.heads), u32(D), u32(R), f32(o.kscale), f32(o.cap), u32(0), u32(0)]);
+  ctx.run(localRelAttentionSpec(), [params, q.buf, k.buf, v.buf, rel.buf, qs.buf, out.buf], grid1d(T * o.heads));
+  return out;
 }
 
 /** Sizes of linear attention's recurrence (see `gatedDeltaSpec`). */

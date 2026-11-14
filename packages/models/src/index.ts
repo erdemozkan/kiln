@@ -4,6 +4,7 @@ export * from "./llama";
 export * from "./vision";
 export * from "./qwen-vision";
 export * from "./gemma4-vision";
+export * from "./gemma4-audio";
 export * from "./encoder";
 export * from "./seq2seq";
 export * from "./t5";

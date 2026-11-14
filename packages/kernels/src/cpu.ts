@@ -1608,8 +1608,38 @@ export const cpuSigmoidMul: CpuKernel = (b) => {
   for (let i = 0; i < n; i++) x[i] = x[i]! / (1 + Math.exp(-g[i]!));
 };
 
+export const cpuLocalRelAttention: CpuKernel = (b) => {
+  const [T, H, D, R] = [b[0]!.u32[0]!, b[0]!.u32[1]!, b[0]!.u32[2]!, b[0]!.u32[3]!];
+  const [kscale, cap] = [b[0]!.f32[4]!, b[0]!.f32[5]!];
+  const [q, k, v, rel, qs, o] = [b[1]!.f32, b[2]!.f32, b[3]!.f32, b[4]!.f32, b[5]!.f32, b[6]!.f32];
+  const row = H * D;
+  const sc = new Float64Array(R);
+  for (let t = 0; t < T; t++)
+    for (let h = 0; h < H; h++) {
+      const qb = t * row + h * D;
+      const n = Math.min(R, t + 1);
+      let best = -Infinity;
+      for (let d = 0; d < n; d++) {
+        const kb = (t - d) * row + h * D;
+        const rb = d * row + h * D;
+        let s = 0;
+        for (let i = 0; i < D; i++) s += q[qb + i]! * qs[i]! * (kscale * k[kb + i]! + rel[rb + i]!);
+        sc[d] = cap * Math.tanh(s / cap);
+        best = Math.max(best, sc[d]!);
+      }
+      let sum = 0;
+      for (let d = 0; d < n; d++) sum += sc[d] = Math.exp(sc[d]! - best);
+      for (let i = 0; i < D; i++) {
+        let acc = 0;
+        for (let d = 0; d < n; d++) acc += sc[d]! * v[(t - d) * row + h * D + i]!;
+        o[qb + i] = acc / sum;
+      }
+    }
+};
+
 export const cpuCausalConv: CpuKernel = (b) => {
   const [T, C, K] = [b[0]!.u32[0]!, b[0]!.u32[1]!, b[0]!.u32[2]!];
+  const plain = b[0]!.u32[3] === 1;
   const [x, w, state, y] = [b[1]!.f32, b[2]!.f32, b[3]!.f32, b[4]!.f32];
   const back = K - 1;
   for (let t = 0; t < T; t++)
@@ -1617,7 +1647,7 @@ export const cpuCausalConv: CpuKernel = (b) => {
       let acc = 0;
       for (let j = 0; j < K; j++) acc += w[c * K + j]! * (t + j >= back ? x[(t + j - back) * C + c]! : state[(t + j) * C + c]!);
       const s = Math.fround(acc);
-      y[t * C + c] = s / (1 + Math.exp(-s));
+      y[t * C + c] = plain ? s : s / (1 + Math.exp(-s));
     }
 };
 

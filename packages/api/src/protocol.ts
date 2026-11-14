@@ -25,6 +25,10 @@ export interface WireLoadOptions {
   mmproj?: string;
   /** Gemma 3 or Qwen 3.5 from a transformers checkpoint: false skips its vision tower (about 420 MB at q8 for Gemma 3) for text alone. */
   vision?: boolean;
+  /** Gemma 4: false skips its audio tower. Default: loaded, and messages may hold `{ type: "audio", audio }` parts (mono 16 kHz samples as a Float32Array; see `readAudio`). */
+  audio?: boolean;
+  /** Audio clips whose features stay on the GPU at once, with an audio tower (default 2). */
+  audioSlots?: number;
   /** Images whose features stay on the GPU at once, with a vision tower (default 4). */
   imageSlots?: number;
   /** Qwen 3.5: the most tokens an image becomes (default 576, a 768 × 768 picture); larger images are scaled down to fit. */

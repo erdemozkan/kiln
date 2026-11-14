@@ -1,7 +1,7 @@
 import { type Backend, type Buf, type Dispatch, type Profile } from "@kiln/core";
 import { GrammarMatcher, TokenTrie, compileFormat, type ResponseFormat } from "@kiln/grammar";
-import { Gemma4VisionTower, LlamaModel, MAX_VERIFY_ROWS, QwenVisionTower, type ForwardPlan, type Idefics3Processing, type ImagePixels, type VisionTower } from "@kiln/models";
-import { resizeImage } from "@kiln/loader";
+import { Gemma4VisionTower, LlamaModel, type Gemma4AudioTower, MAX_VERIFY_ROWS, QwenVisionTower, type ForwardPlan, type Idefics3Processing, type ImagePixels, type VisionTower } from "@kiln/models";
+import { GEMMA4_AUDIO_MAX_SAMPLES, gemma4AudioFeatures, resizeImage } from "@kiln/loader";
 import type { StepParams } from "@kiln/core";
 import { idefics3PromptString, idefics3Tiles } from "./idefics3";
 import { detectChatFormat, type ChatDocument, type ChatFormat, type ChatMessage, type Tokenizer, type ToolSpec } from "@kiln/tokenizers";
@@ -313,6 +313,11 @@ export class Engine {
     readonly tokenizer: Tokenizer,
     /** A vision tower (Gemma 3, Gemma 4 or Qwen 3.5, from the checkpoint or an mmproj file, or SmolVLM): chat messages may then hold images. */
     readonly vision?: VisionTower | QwenVisionTower | Gemma4VisionTower,
+    /**
+     * An audio tower (Gemma 4) and the clips whose features stay on the GPU at once: chat messages
+     * may then hold audio. Its rows come after the images' in `model.imageFeatures`.
+     */
+    readonly audio?: { tower: Gemma4AudioTower; slots: number },
   ) {
     try {
       this.chatFormat = detectChatFormat(tokenizer);
@@ -332,6 +337,9 @@ export class Engine {
     const thinks = this.tokenizer.tokenId("<think>") !== undefined;
     const images = messages.flatMap((m) => (typeof m.content === "string" ? [] : m.content.flatMap((p) => (p.type === "image" ? [p.image as ImagePixels] : []))));
     if (images.length && !this.vision) throw new Error("this model takes no images (load Gemma 3, Gemma 4 or Qwen 3.5 with its mmproj file, or a SmolVLM model, to give it images)");
+    const clips = messages.flatMap((m) => (typeof m.content === "string" ? [] : m.content.flatMap((p) => (p.type === "audio" ? [p.audio] : []))));
+    if (clips.length && !this.audio) throw new Error("this model takes no audio (load Gemma 4 with its mmproj file to give it audio)");
+    if (clips.some((c) => !(c instanceof Float32Array))) throw new Error("an audio part must hold mono samples at 16 kHz as a Float32Array (see readAudio)");
     const idefics3 = this.vision?.processing;
     // Templates see image parts without their pixels; Gemma's writes <start_of_image> for each,
     // SmolVLM's <image>. SmolVLM's template reads every message's content as a list of parts.
@@ -340,14 +348,14 @@ export class Engine {
         ? idefics3
           ? { ...m, content: [{ type: "text" as const, text: m.content }] }
           : m
-        : { ...m, content: m.content.map((p) => (p.type === "image" ? { type: "image" as const, image: null } : p)) },
+        : { ...m, content: m.content.map((p) => (p.type === "image" ? { type: "image" as const, image: null } : p.type === "audio" ? { type: "audio" as const, audio: null } : p)) },
     );
     const prompt = this.chatFormat.render(shown, {
       enableThinking: thinks ? opts.enableThinking : undefined,
       tools: opts.tools,
       documents: opts.documents,
     });
-    if (!images.length) {
+    if (!images.length && !clips.length) {
       yield* this.complete(prompt, this.forceToolCall(opts));
       return;
     }
@@ -356,17 +364,24 @@ export class Engine {
       return;
     }
     const slots: number[] = [];
-    if (this.vision instanceof QwenVisionTower || this.vision instanceof Gemma4VisionTower) {
+    if (this.vision instanceof QwenVisionTower || this.vision instanceof Gemma4VisionTower || clips.length) {
+      if (images.length && !(this.vision instanceof QwenVisionTower || this.vision instanceof Gemma4VisionTower)) throw new Error("images beside audio need Gemma 4's vision tower");
       // Each image at its own aspect ratio, resized to whole tokens (bicubic, as the processors do).
       for (const img of images) {
-        const g = this.vision.grid(img.width, img.height);
+        const g = (this.vision as QwenVisionTower | Gemma4VisionTower).grid(img.width, img.height);
         slots.push(await this.imageSlot(resizeImage(img, g.width, g.height, 3)));
       }
-      // Gemma 4's processor also puts each image's tokens between <|image> and <image|>.
-      const ids =
+      // Gemma 4's processor also puts each image's tokens between <|image> and <image|>, and each
+      // clip's between <|audio> and <audio|>.
+      let ids =
         this.vision instanceof QwenVisionTower
           ? this.withGridImages(prompt, slots, "<|image_pad|>")
-          : this.withGridImages(prompt.split("<|image|>").join("<|image><|image|><image|>"), slots, "<|image|>");
+          : this.withGridImages(prompt.split("<|image|>").join("<|image><|image|><image|>").split("<|audio|>").join("<|audio><|audio|><audio|>"), slots, "<|image|>");
+      if (clips.length) {
+        const runs: { base: number; count: number }[] = [];
+        for (const c of clips) runs.push(await this.audioSlot(c as Float32Array));
+        ids = this.withAudio(ids, runs);
+      }
       yield* this.decodeIds(ids, this.forceToolCall(opts));
       return;
     }
@@ -386,6 +401,7 @@ export class Engine {
     const ids = this.tokenizer.encode(prompt);
     const marks = ids.reduce((n, id) => n + (id === pad ? 1 : 0), 0);
     if (marks !== slots.length) throw new Error(`the chat template wrote ${marks} image markers for ${slots.length} images`);
+    if (!slots.length) return ids;
     const per = this.vision!.tokens;
     const out: number[] = [];
     let k = 0;
@@ -445,7 +461,7 @@ export class Engine {
       tiles.push(...t.tiles);
       text += idefics3PromptString(t.rows, t.cols, vision.tokens) + parts[i + 1]!;
     }
-    const cap = (this.model.imageFeatures!.size / 4 / this.model.cfg.hiddenSize / vision.tokens) | 0;
+    const cap = (this.imageRows / vision.tokens) | 0;
     if (tiles.length > cap) throw new Error(`these images make ${tiles.length} tiles, but ${cap} fit; load with a larger imageSlots, or imageSplitting: false`);
     const slots: number[] = [];
     for (const tile of tiles) slots.push(await this.imageSlot(tile));
@@ -489,6 +505,58 @@ export class Engine {
     return out;
   }
 
+  /** Rows of `model.imageFeatures` that hold images; audio clips' rows come after them. */
+  private get imageRows(): number {
+    return this.model.imageFeatures!.size / 4 / this.model.cfg.hiddenSize - (this.audio ? this.audio.slots * this.audio.tower.tokens : 0);
+  }
+
+  /** Clips whose features sit in `model.imageFeatures`, by slot. */
+  private readonly audioSlots: ({ key: string; used: number; count: number } | undefined)[] = [];
+
+  /**
+   * The feature rows holding this clip (16 kHz mono samples; at most 30 s are heard), running the
+   * audio tower if they are not there yet: the first row's token id and the number of tokens. The
+   * least recently used slot is reused, and cached prefixes that heard its old clip are forgotten.
+   */
+  private async audioSlot(samples: Float32Array): Promise<{ base: number; count: number }> {
+    const { tower, slots: cap } = this.audio!;
+    const heard = samples.subarray(0, GEMMA4_AUDIO_MAX_SAMPLES);
+    const key = imageKey({ width: heard.length, height: 1, data: new Uint8Array(heard.buffer, heard.byteOffset, heard.byteLength) });
+    const first = this.model.cfg.vocabSize + this.imageRows;
+    let slot = this.audioSlots.findIndex((s) => s?.key === key);
+    if (slot < 0) {
+      slot = this.audioSlots.length < cap ? this.audioSlots.length : this.audioSlots.reduce((lru, s, i) => (s!.used < this.audioSlots[lru]!.used ? i : lru), 0);
+      if (this.audioSlots[slot]) this.forgetRows(first + slot * tower.tokens, tower.tokens);
+      this.audioSlots[slot] = undefined;
+      const { features, frames } = gemma4AudioFeatures(heard);
+      if (tower.tokensFor(frames) < 1) throw new Error("an audio part is too short: it needs at least 20 ms of sound");
+      const count = await tower.encode(features, frames, this.model.imageFeatures!, (this.imageRows + slot * tower.tokens) * this.model.cfg.hiddenSize * 4);
+      this.audioSlots[slot] = { key, used: 0, count };
+    }
+    const s = this.audioSlots[slot]!;
+    s.used = ++this.imageClock;
+    return { base: first + slot * tower.tokens, count: s.count };
+  }
+
+  /** `ids` with each <|audio|> marker replaced by its clip's soft tokens, in order. */
+  private withAudio(ids: readonly number[], runs: readonly { base: number; count: number }[]): number[] {
+    const pad = this.tokenizer.tokenId("<|audio|>");
+    if (pad === undefined) throw new Error("the tokenizer has no <|audio|> token");
+    const marks = ids.reduce((n, id) => n + (id === pad ? 1 : 0), 0);
+    if (marks !== runs.length) throw new Error(`the chat template wrote ${marks} audio markers for ${runs.length} clips`);
+    const out: number[] = [];
+    let k = 0;
+    for (const id of ids) {
+      if (id !== pad) {
+        out.push(id);
+        continue;
+      }
+      const r = runs[k++]!;
+      for (let i = 0; i < r.count; i++) out.push(r.base + i);
+    }
+    return out;
+  }
+
   /**
    * The feature slot holding this image, running the vision tower if it is not there yet (the least
    * recently used slot is reused; cached prefixes that saw its old image are forgotten).
@@ -496,7 +564,7 @@ export class Engine {
   private async imageSlot(img: ImagePixels): Promise<number> {
     const vision = this.vision!;
     const key = imageKey(img);
-    const cap = (this.model.imageFeatures!.size / 4 / this.model.cfg.hiddenSize / vision.tokens) | 0;
+    const cap = (this.imageRows / vision.tokens) | 0;
     let slot = this.imageSlots.findIndex((s) => s?.key === key);
     if (slot < 0) {
       slot = this.imageSlots.length < cap ? this.imageSlots.length : this.imageSlots.reduce((lru, s, i) => (s!.used < this.imageSlots[lru]!.used ? i : lru), 0);
@@ -512,7 +580,11 @@ export class Engine {
   /** Drops every cached prefix that holds slot's image tokens, before the slot takes another image. */
   private forgetImage(slot: number): void {
     const per = this.vision!.tokens;
-    const lo = this.model.cfg.vocabSize + slot * per;
+    this.forgetRows(this.model.cfg.vocabSize + slot * per, per);
+  }
+
+  /** Drops every cached prefix that holds one of the `per` soft-token ids from `lo` on. */
+  private forgetRows(lo: number, per: number): void {
     const holds = (ids: readonly number[]) => ids.findIndex((id) => id >= lo && id < lo + per);
     const at = holds(this.cached);
     if (at >= 0) this.cached = this.cached.slice(0, at);
@@ -1297,6 +1369,7 @@ export class Engine {
     this.scorePlans.clear();
     this.advances.clear();
     this.chains.clear();
+    this.audio?.tower.destroy();
     this.model.destroy();
   }
 

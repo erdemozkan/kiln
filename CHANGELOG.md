@@ -93,7 +93,7 @@ and capitals right, four facts recalled from a 302-token prompt, a number recall
 of an 839-token prompt (past the 512-token sliding window), the next turn reusing 334 of 352 tokens;
 5 to 6 tokens/s, 6.5 s to prefill 839 tokens (3.0 s for 302), and about 50 s of the load for the per-layer table
 (it is kept at its 5-bit precision as 8-bit planes, so the model takes roughly 4 GB on the GPU by
-its sizes; not measured). Not done: its audio, the mixture-of-experts size (26B-A4B), LoRA adapters, the
+its sizes; not measured). Not done: the mixture-of-experts size (26B-A4B), LoRA adapters, the
 i8 cache (heads past 256), and a run of the safetensors checkpoint (10 GB), whose loading shares
 the GGUF path's code but was not tried.
 
@@ -114,8 +114,33 @@ all 1026 kernel checks pass on the GPU. On unsloth's gemma-4-E2B-it Q4_0 file wi
 (Intel Iris GPU): a red circle and a blue square named with their sides, "KILN 4273" read off a
 sign, a tall picture's shapes named top to bottom, a photo of a cat described, a follow-up turn
 reusing 292 of 309 tokens, and two images in one message told apart. A 640 × 480 picture is 266
-tokens; the tower takes about 6 s and the prefill 2 s. Not run: the checkpoint's own tower (the
-10 GB safetensors), budgets other than 280, and E4B.
+tokens; the tower takes about 6 s and the prefill 2 s. The budgets of 560 and 1120 tokens work too: at each
+of the three, a 1200 × 900 page of five lines and a reference code in small print was read exactly
+(the tower takes roughly 7, 17 and 48 s for 280, 560 and 1120 tokens, from the totals). The largest
+needed RMSNorm over more rows than one dispatch dimension holds (its patches times the heads), which
+now continue in a second. Not run: the checkpoint's own tower (the 10 GB safetensors).
+
+**Audio for Gemma 4.** Chat messages may hold audio: `{ type: "audio", audio }` parts with mono
+16 kHz samples as a Float32Array (`readAudio` makes them from a file or URL), from the same mmproj
+file as the images (`audio: false` leaves the tower out; `audioSlots`, default 2, is how many clips
+stay on the GPU). A clip becomes a token per 40 ms, up to 750 for 30 s; longer audio is cut there.
+The features are the model's log-mel spectrogram (128 HTK bands of a 512-point FFT over 20 ms
+frames every 10 ms). The tower halves time twice with two strided convolutions, which run on the
+CPU, then twelve conformer layers on the GPU: two feed-forward blocks at half weight around an
+attention over the row itself and the eleven before it with a relative position term (a new
+kernel), and a causal depthwise convolution with a gated input. Like the vision tower's, its
+projections clip their input and output. The tower matches a float64 reference of the transformers
+forward pass within 2e-3 on a small configuration, and on the real weights it matches the model's
+official ONNX audio encoder (onnx-community/gemma-4-E2B-it-ONNX) on 3 s of speech: a cosine of
+1.0000 on every token at f32, 0.9999 at q8. That comparison found what reading the code had not:
+in the mmproj file a layer's `conv_norm` is the norm before the convolution module and `norm_conv`
+the one inside it, the reverse of what the names suggest; with them swapped the model still
+answered about the audio but misheard words. All 1030 kernel checks pass on the GPU. On unsloth's
+gemma-4-E2B-it Q4_0 file with mmproj-F16 (Intel Iris GPU): an 11 s clip of Kennedy and a 13 s clip
+of King transcribed word for word, a follow-up turn reusing 313 of 339 tokens, and two clips in one
+message told apart; roughly 2 s for the tower on 11 s of audio (from the totals) and 2.5 to 3.7 s of prefill. A plain
+440 Hz tone gets the answer that no audio was provided. Not done: audio longer than 30 s in chunks,
+the checkpoint's own tower (the 10 GB safetensors, whose loading is written but was not run), E4B.
 
 **Images for Qwen 3.5.** Chat messages may hold images: from the transformers checkpoint, whose
 files hold the vision tower (`vision: false` leaves it out), or from a GGUF with its mmproj file

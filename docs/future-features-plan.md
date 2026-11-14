@@ -22,8 +22,8 @@ recurrent state; GGUF files, the prompt cache across reloads, speculative decodi
 work too, and so do images (its vision tower, and rotary positions on three axes in the language
 model: a token's position is then no longer its index). Open for it: video, and the chunked
 form of the recurrence if prefill of the linear layers ever dominates (it is 14% now). Gemma 4's
-text model and its images are done too (E2B from GGUF with its mmproj file, run; see the
-changelog). Open for it: its audio tower, video, the mixture-of-experts size, adapters, and the
+text model, its images and its audio are done too (E2B from GGUF with its mmproj file, run; see the
+changelog). Open for it: video, audio past 30 s, the mixture-of-experts size, adapters, and the
 safetensors checkpoint (10 GB, not run). Open in the Phi family: LongRoPE past the original 4096 tokens (the long
 factors). Phi-4 mini's safetensors checkpoint (7.7 GB) was loaded and answers as the GGUF does.
 

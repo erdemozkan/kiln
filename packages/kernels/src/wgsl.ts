@@ -713,7 +713,10 @@ var<workgroup> red: array<f32, 256>;
 
 @compute @workgroup_size(256)
 fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) li: u32) {
-  let o = wid.x * p.D;
+  // Rows past 65535 (a large image's patches times its heads) continue in the grid's second dimension.
+  let row = wid.x + wid.y * ${MAX_X}u;
+  if (row >= p.R) { return; }
+  let o = row * p.D;
   var ss = 0.0;
   for (var i = li; i < p.D; i += 256u) { let v = x[o + i]; ss += v * v; }
   red[li] = ss;
@@ -3923,10 +3926,11 @@ fn main(${EW_ARGS}) {
  * Causal depthwise convolution over time with SiLU: y[t, c] = silu(Σ_j w[c, j] · x[t − (K − 1) + j, c]),
  * where rows before this call's first come from `state` [K − 1, C], the last K − 1 input rows of the
  * calls before (zeros at the start of a sequence). `causalConvStateSpec` moves the state on afterwards.
+ * With `plain` set the sum is written as it is, without the SiLU.
  */
 export function causalConvSpec(): KernelSpec {
   return spec("causal_conv", ["uniform", "read", "read", "read", "rw"], cpu.cpuCausalConv, () => /* wgsl */ `
-struct P { T: u32, C: u32, K: u32, _a: u32 }
+struct P { T: u32, C: u32, K: u32, plain: u32 }
 @group(0) @binding(0) var<uniform> p: P;
 @group(0) @binding(1) var<storage, read> x: array<f32>;
 @group(0) @binding(2) var<storage, read> w: array<f32>;
@@ -3947,7 +3951,59 @@ fn main(${EW_ARGS}) {
     if (t + j >= back) { v = x[(t + j - back) * p.C + c]; } else { v = state[(t + j) * p.C + c]; }
     acc += w[c * p.K + j] * v;
   }
-  y[idx] = acc / (1.0 + exp(-acc));
+  if (p.plain == 1u) { y[idx] = acc; } else { y[idx] = acc / (1.0 + exp(-acc)); }
+}`);
+}
+
+/**
+ * Attention over a short causal window with a relative position term (Gemma 4's audio tower): row t
+ * of q [T, H · D] sees keys t − R + 1 … t (those at or after row 0), and its score for the key
+ * `dist` rows back is Σ q · qs · (kscale · k + rel[dist]) over a head, with qs [D] a scale per
+ * element shared by the heads and rel [R, H · D] the projected position embeddings, squashed to
+ * ±cap with tanh. Output [T, H · D]: the softmax-weighted values. One thread per row and head.
+ */
+export function localRelAttentionSpec(): KernelSpec {
+  return spec("local_rel_attention", ["uniform", "read", "read", "read", "read", "read", "rw"], cpu.cpuLocalRelAttention, () => /* wgsl */ `
+struct P { T: u32, H: u32, D: u32, R: u32, kscale: f32, cap: f32, _a: u32, _b: u32 }
+@group(0) @binding(0) var<uniform> p: P;
+@group(0) @binding(1) var<storage, read> q: array<f32>;
+@group(0) @binding(2) var<storage, read> k: array<f32>;
+@group(0) @binding(3) var<storage, read> v: array<f32>;
+@group(0) @binding(4) var<storage, read> rel: array<f32>;
+@group(0) @binding(5) var<storage, read> qs: array<f32>;
+@group(0) @binding(6) var<storage, read_write> o: array<f32>;
+
+@compute @workgroup_size(${EW})
+fn main(${EW_ARGS}) {
+  ${FLAT}
+  if (idx >= p.T * p.H) { return; }
+  let h = idx % p.H;
+  let t = idx / p.H;
+  let row = p.H * p.D;
+  let qb = t * row + h * p.D;
+  let n = min(p.R, t + 1u);
+  var sc: array<f32, 32>;
+  var best = -3.0e38;
+  for (var d = 0u; d < n; d++) {
+    let kb = (t - d) * row + h * p.D;
+    let rb = d * row + h * p.D;
+    var s = 0.0;
+    for (var i = 0u; i < p.D; i++) { s += q[qb + i] * qs[i] * (p.kscale * k[kb + i] + rel[rb + i]); }
+    // tanh of a large argument overflows its exponentials on some GPUs: past ±15 it is ±1 in f32.
+    s = p.cap * tanh(clamp(s / p.cap, -15.0, 15.0));
+    sc[d] = s;
+    best = max(best, s);
+  }
+  var sum = 0.0;
+  for (var d = 0u; d < n; d++) {
+    sc[d] = exp(sc[d] - best);
+    sum += sc[d];
+  }
+  for (var i = 0u; i < p.D; i++) {
+    var acc = 0.0;
+    for (var d = 0u; d < n; d++) { acc += sc[d] * v[(t - d) * row + h * p.D + i]; }
+    o[qb + i] = acc / sum;
+  }
 }`);
 }
 

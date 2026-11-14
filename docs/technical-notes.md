@@ -555,7 +555,7 @@ Models run end to end (greedy answers to fixed questions checked by hand; tool c
 | `qwen35` | Qwen3.5-4B (32 value heads on 16 key heads, tiled; same recall) | GGUF Q4_K_M (2.73 GB) | 3 tok/s |
 | `qwen35` | Qwen3.5-9B (same recall; the next turn reuses 232 of 306 tokens) | GGUF Q4_K_M (5.7 GB) | 0.6 to 0.7 tok/s |
 | `qwen35` | Qwen3.5-0.8B and 2B with images (a photo described, text on a sign and three lines of small text read, two images told apart) | GGUF Q4_K_M + mmproj-F16 (0.2 and 0.67 GB); safetensors (the tower in the same file) | a 640 × 416 picture (260 tokens) prefills in 3 s on 0.8B, 5 s on 2B |
-| `gemma4` | Gemma 4 E2B-it (35 layers, 15 with a cache; four facts from a 302-token prompt, a number from the start of an 839-token one; next turn reuses 334 of 352; with mmproj-F16, shapes, a sign's text, a photo and two images in one message answered right) | GGUF Q4_0 (3.0 GB, 1.6 GB of it the per-layer embedding table) | 5 to 6 tok/s |
+| `gemma4` | Gemma 4 E2B-it (35 layers, 15 with a cache; four facts from a 302-token prompt, a number from the start of an 839-token one; next turn reuses 334 of 352; with mmproj-F16, shapes, a sign's text, a photo and two images in one message answered right, and two speech clips transcribed word for word) | GGUF Q4_0 (3.0 GB, 1.6 GB of it the per-layer embedding table) | 5 to 6 tok/s |
 | `gemma3` | Gemma 3 4B-it (recalls a fact 1,100 and 3,000 tokens back; images) | GGUF Q4_0 (2.4 GB) + mmproj-F16; safetensors (8.6 GB, the vision tower in the same files) | 177–180 ms GPU per step (about 5.5 tok/s); 24.6 tok/s on an M3 |
 | `idefics3` | SmolVLM-256M-Instruct, SmolVLM-500M-Instruct (images in chat) | safetensors | a 640 × 480 photo in about 17 s (13 tiles), 2–4 s without splitting |
 

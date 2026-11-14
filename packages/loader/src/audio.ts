@@ -294,6 +294,67 @@ export function whisperFeatures(samples: Float32Array, cfg: WhisperFeatureConfig
   return out;
 }
 
+/**
+ * HTK-style mel filters [bins, mels] without area normalisation (transformers' `mel_filter_bank`
+ * with `mel_scale: "htk"`, `norm: None`): triangles between points evenly spaced in mel
+ * (2595 · log10(1 + f / 700)) from fmin to fmax, each peaking at 1.
+ */
+export function htkMelFilters(bins: number, mels: number, sampleRate: number, fmin = 0, fmax = sampleRate / 2): Float64Array {
+  const mel = (f: number) => 2595 * Math.log10(1 + f / 700);
+  const hz = (m: number) => 700 * (10 ** (m / 2595) - 1);
+  const pts = Array.from({ length: mels + 2 }, (_, i) => hz(mel(fmin) + ((mel(fmax) - mel(fmin)) * i) / (mels + 1)));
+  const out = new Float64Array(bins * mels);
+  for (let b = 0; b < bins; b++) {
+    const f = (b * Math.floor(sampleRate / 2)) / (bins - 1);
+    for (let m = 0; m < mels; m++) {
+      const down = (f - pts[m]!) / (pts[m + 1]! - pts[m]!);
+      const up = (pts[m + 2]! - f) / (pts[m + 2]! - pts[m + 1]!);
+      out[b * mels + m] = Math.max(0, Math.min(down, up));
+    }
+  }
+  return out;
+}
+
+/** Samples Gemma 4's audio tower takes at most: 30 s at 16 kHz. */
+export const GEMMA4_AUDIO_MAX_SAMPLES = 480000;
+
+/**
+ * Gemma 4's log-mel features of 16 kHz audio (at most 30 s; the rest is dropped), time-major
+ * [frames, 128]: frames of 320 samples every 160, the first centred on the first sample (160 zeros
+ * before it), periodic Hann window, |FFT| of 512 points, HTK mel filters, log(x + 0.001). Only frames
+ * that lie wholly inside the audio are kept, as the model's mask does.
+ */
+export function gemma4AudioFeatures(samples: Float32Array): { features: Float32Array; frames: number } {
+  const [frameLen, hop, nFft, mels] = [320, 160, 512, 128];
+  const n = Math.min(samples.length, GEMMA4_AUDIO_MAX_SAMPLES);
+  // A frame is kept when the sample after its window is still audio (the extractor reads one past it).
+  const frames = Math.max(0, Math.floor((n + frameLen / 2 - (frameLen + 1)) / hop) + 1);
+  const bins = nFft / 2 + 1;
+  let fft = fftCache.get(nFft);
+  if (!fft) fftCache.set(nFft, (fft = new RealPowerSpectrum(nFft)));
+  const key = `htk/${bins}/${mels}`;
+  let filters = filterCache.get(key);
+  if (!filters) filterCache.set(key, (filters = htkMelFilters(bins, mels, 16000, 0, 8000)));
+  let spans = spanCache.get(key);
+  if (!spans) spanCache.set(key, (spans = filterSpans(filters, bins, mels)));
+  const window = Float32Array.from({ length: frameLen }, (_, i) => 0.5 - 0.5 * Math.cos((2 * Math.PI * i) / frameLen));
+  const frame = new Float64Array(nFft);
+  const power = new Float64Array(bins);
+  const out = new Float32Array(frames * mels);
+  for (let t = 0; t < frames; t++) {
+    const start = t * hop - frameLen / 2;
+    for (let i = 0; i < frameLen; i++) frame[i] = start + i < 0 ? 0 : samples[start + i]! * window[i]!;
+    fft.run(frame, power);
+    for (let b = 0; b < bins; b++) power[b] = Math.sqrt(power[b]!);
+    for (let m = 0; m < mels; m++) {
+      let sum = 0;
+      for (let b = spans[2 * m]!, end = spans[2 * m + 1]!; b < end; b++) sum += power[b]! * filters[b * mels + m]!;
+      out[t * mels + m] = Math.log(sum + 1e-3);
+    }
+  }
+  return { features: out, frames };
+}
+
 /** [first, end) of the nonzero bins of each mel filter, as pairs. */
 function filterSpans(filters: Float64Array, bins: number, mels: number): Int32Array {
   const spans = new Int32Array(2 * mels);

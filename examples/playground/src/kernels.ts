@@ -621,6 +621,54 @@ async function main() {
     check("rope_table", `T${T} H${H} D${D} groups ${G}`, await download(xt.buf, x.length), want, 1e-4);
   }
 
+  // Attention over a short causal window with a relative position term (Gemma 4's audio tower),
+  // rows near the start seeing fewer keys; and a causal depthwise convolution without its SiLU.
+  for (const [T, H, D, R, cap] of [[40, 8, 128, 13, 50], [5, 2, 32, 13, 2], [300, 3, 64, 7, 4]] as const) {
+    const row = H * D;
+    const [q, k, v] = [randn(T * row), randn(T * row), randn(T * row)];
+    const rel = randn(R * row);
+    const qs = Float32Array.from(randn(D), (x) => 0.1 + Math.abs(x) * 0.1);
+    const kscale = 1.9;
+    let o!: Tensor;
+    await run(S0, (ctx) => (o = ops.localRelAttention(ctx, upload(q, [T, row]), upload(k, [T, row]), upload(v, [T, row]), upload(rel, [R, row]), upload(qs, [D]), { heads: H, kscale, cap })));
+    const want = new Float32Array(T * row);
+    for (let t = 0; t < T; t++)
+      for (let h = 0; h < H; h++) {
+        const n = Math.min(R, t + 1);
+        const sc: number[] = [];
+        for (let d = 0; d < n; d++) {
+          let sum = 0;
+          for (let i = 0; i < D; i++) sum += q[t * row + h * D + i]! * qs[i]! * (Math.fround(kscale) * k[(t - d) * row + h * D + i]! + rel[d * row + h * D + i]!);
+          sc.push(cap * Math.tanh(sum / cap));
+        }
+        const m = Math.max(...sc);
+        const e = sc.map((x) => Math.exp(x - m));
+        const z = e.reduce((a, x) => a + x, 0);
+        for (let i = 0; i < D; i++) want[t * row + h * D + i] = e.reduce((a, x, d) => a + (x / z) * v[(t - d) * row + h * D + i]!, 0);
+      }
+    check("local_rel_attention", `T${T} H${H} D${D} R${R} cap ${cap}`, await download(o.buf, want.length), want, 2e-4);
+  }
+  {
+    const [T, C, K] = [37, 96, 5];
+    const x = randn(T * C);
+    const w = randn(C * K);
+    let y!: Tensor;
+    await run(S0, (ctx) => (y = ops.causalConvPlain(ctx, upload(x, [T, C]), upload(w, [C, K]), upload(new Float32Array((K - 1) * C), [K - 1, C]).buf)));
+    const want = new Float32Array(T * C);
+    for (let t = 0; t < T; t++) for (let c = 0; c < C; c++) for (let j = 0; j < K; j++) if (t - (K - 1) + j >= 0) want[t * C + c] += w[c * K + j]! * x[(t - (K - 1) + j) * C + c]!;
+    check("causal_conv", `plain T${T} C${C} K${K}`, await download(y.buf, want.length), want, 1e-4);
+  }
+
+  // RMSNorm over more rows than one grid dimension holds (a large image's patches times its heads).
+  {
+    const [R, D] = [70000, 32];
+    const x = randn(R * D);
+    const w = Float32Array.from(randn(D), (v) => 1 + 0.3 * v);
+    let y!: Tensor;
+    await run(S0, (ctx) => (y = ops.rmsnorm(ctx, upload(x, [R, D]), upload(w, [D]), 1e-6)));
+    check("rmsnorm", `R${R} D${D}`, await download(y.buf, x.length), ref.rmsnormRef(x, w, D, 1e-6), 1e-4);
+  }
+
   // Values clipped to a range, an open end included; means over blocks of a grid that is not square.
   {
     const x = Float32Array.from(randn(3000), (v) => v * 5);

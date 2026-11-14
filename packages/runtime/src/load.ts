@@ -59,6 +59,12 @@ import {
   gemma4VisionName,
   type Gemma4Clip,
   type Gemma4VisionConfig,
+  GEMMA4_AUDIO_CLIPPED,
+  Gemma4AudioTower,
+  gemma4AudioConfig,
+  gemma4AudioConfigFromGGUF,
+  gemma4AudioName,
+  type Gemma4AudioConfig,
   GEMMA4_LAYER_SCALE,
   GEMMA4_PER_LAYER_TABLE,
   gemma4PerLayerTable,
@@ -122,6 +128,13 @@ export interface LoadOptions {
    * files (about 420 MB at q8), for text alone. Default: loaded, so chat messages may hold images.
    */
   vision?: boolean;
+  /**
+   * Gemma 4: false skips the audio tower (in the mmproj file or the checkpoint's own files; about
+   * 300 MB at q8). Default: loaded, so chat messages may hold audio.
+   */
+  audio?: boolean;
+  /** Audio clips whose features stay on the GPU at once, with an audio tower (default 2; a clip is up to 750 tokens). */
+  audioSlots?: number;
   /**
    * Gemma 3's vision tower, as llama.cpp's mmproj GGUF: a file name in the model's repo
    * ("mmproj-F16.gguf") or a full id ("org/repo/mmproj.gguf"). Chat messages may then hold images.
@@ -226,6 +239,7 @@ export async function createEngine(from: ModelSource, opts: LoadOptions = {}): P
   const ownsBackend = !opts.backend;
   let weights: Map<string, Tensor> | undefined;
   let vision: VisionTower | QwenVisionTower | Gemma4VisionTower | undefined;
+  let audio: Gemma4AudioTower | undefined;
   let model: LlamaModel | undefined;
   let files: Awaited<ReturnType<typeof openSafetensors>>["files"] = [];
   try {
@@ -252,14 +266,24 @@ export async function createEngine(from: ModelSource, opts: LoadOptions = {}): P
           ? await openGemma3Vision(backend, files, gemma3, opts, converted)
           : qwen35 && opts.vision !== false
             ? await openQwenTower(backend, files, qwenVisionName, qwenVisionConfig(qwen35.config, qwen35.preprocessor), opts, converted)
-            : gemma4 && opts.vision !== false
+            : gemma4?.vision && opts.vision !== false
               ? await openGemma4Tower(backend, files, gemma4VisionName, gemma4VisionConfig(gemma4.config, gemma4.preprocessor), opts, converted)
               : undefined;
     if (vision && vision.cfg.projectionDim !== cfg.hiddenSize) throw new Error(`mmproj projects to ${vision.cfg.projectionDim}, but the model is ${cfg.hiddenSize} wide`);
+    if (cfg.family === "gemma4" && opts.audio !== false) {
+      audio = opts.mmproj
+        ? await openMmprojAudio(backend, mmprojRef(opts.mmproj, ref, opts.revision), opts)
+        : gemma4?.audio
+          ? await openGemma4Audio(backend, files, gemma4AudioName, gemma4AudioConfig(gemma4.config, gemma4.processor), opts, converted)
+          : undefined;
+      if (audio && audio.cfg.projectionDim !== cfg.hiddenSize) throw new Error(`the audio tower projects to ${audio.cfg.projectionDim}, but the model is ${cfg.hiddenSize} wide`);
+    }
     await tuning;
-    const imageTokens = vision ? (opts.imageSlots ?? 4) * vision.tokensPerImage : 0;
+    const audioSlots = audio ? Math.max(1, Math.floor(opts.audioSlots ?? 2)) : 0;
+    // Feature rows: the images', then the audio clips'.
+    const imageTokens = (vision ? (opts.imageSlots ?? 4) * vision.tokensPerImage : 0) + (audio ? audioSlots * audio.tokens : 0);
     model = new LlamaModel(backend, modelCfg, weights, { maxSeq: opts.maxSeq, kvDtype: opts.kvDtype, fuse: opts.fuse, imageTokens });
-    const engine = new Engine(backend, model, tokenizer, vision);
+    const engine = new Engine(backend, model, tokenizer, vision, audio && { tower: audio, slots: audioSlots });
     if (opts.maxSubmitMs !== undefined) engine.maxSubmitMs = opts.maxSubmitMs;
     if (opts.prefixCacheBytes !== undefined) engine.prefixCacheBytes = opts.prefixCacheBytes;
     return engine;
@@ -269,6 +293,7 @@ export async function createEngine(from: ModelSource, opts: LoadOptions = {}): P
       if (model) model.destroy();
       else if (weights) freeWeights(backend, weights);
       vision?.destroy();
+      if (!model) audio?.destroy();
       if (ownsBackend) backend.destroy();
     } catch {
       // The original error is the one to report.
@@ -668,6 +693,89 @@ async function openGemma4Tower(backend: Backend, files: WeightFile[], nameOf: (n
   }
 }
 
+/** Gemma 4's audio tower from an mmproj GGUF, or undefined when the file holds none. */
+async function openMmprojAudio(backend: Backend, ref: ModelRef, opts: LoadOptions): Promise<Gemma4AudioTower | undefined> {
+  const { source, header } = await openParsed(ref, ref.gguf!, opts.endpoint, readGGUFHeader);
+  try {
+    if (header.metadata.get("clip.audio.projector_type") !== "gemma4a") return undefined;
+    const tensors = header.tensors.filter((t) => t.name.startsWith("a.") || t.name === "mm.a.input_projection.weight");
+    const shape = (name: string) => {
+      const t = tensors.find((x) => x.name === name);
+      if (!t) throw new Error(`mmproj: missing ${name}`);
+      return t.shape;
+    };
+    const [c0, c1] = [shape("a.conv1d.0.weight")[0]!, shape("a.conv1d.1.weight")[0]!];
+    const cfg = gemma4AudioConfigFromGGUF(header.metadata, [c0, c1], shape("a.blk.0.conv_dw.weight")[1]!, shape("a.pre_encode.out.weight")[0]!);
+    return await openGemma4Audio(backend, [{ name: ref.gguf!, source, tensors }], (n) => n, cfg, opts);
+  } finally {
+    source.close?.();
+  }
+}
+
+/**
+ * Gemma 4's audio tower from an mmproj GGUF or from the checkpoint's own files (where `nameOf`
+ * gives a tensor's mmproj name): matmul weights as q8 (f32 with `quant: "f32"`), norms and the
+ * depthwise convolutions f32. The two subsampling convolutions stay on the CPU, where they run.
+ * A checkpoint stores the attention's per-element scale before its softplus, an mmproj file after.
+ */
+async function openGemma4Audio(backend: Backend, files: WeightFile[], nameOf: (name: string) => string | undefined, cfg: Gemma4AudioConfig, opts: LoadOptions, converted?: string): Promise<Gemma4AudioTower> {
+  const quant = opts.quant === "f32" ? "f32" : "q8";
+  const linear = /^(a\.blk\.\d+\.(ffn_up|ffn_down|ffn_up_1|ffn_down_1|attn_[qkv]|attn_out|attn_k_rel|conv_pw[12])|a\.pre_encode\.out|a\.input_projection|mm\.a\.input_projection)\.weight$/;
+  const limit = /\.(input|output)_(min|max)$/;
+  const manual = /^a\.(conv1d\.\d(\.norm)?\.weight|blk\.\d+\.(per_dim_scale|conv_dw)\.weight)$/;
+  const only = (keep: (n: string) => boolean) => (name: string) => {
+    const n = nameOf(name);
+    return n && !manual.test(n) && !limit.test(n) && keep(n) ? n : undefined;
+  };
+  const weights = new Map<string, Tensor>();
+  const found = new Map<string, { file: WeightFile; entry: TensorEntry }>();
+  try {
+    for (const file of files) {
+      for (const entry of file.tensors) {
+        const n = nameOf(entry.name);
+        if (n) found.set(n, { file, entry });
+      }
+      const add = (m: Map<string, Tensor>) => m.forEach((t, k) => weights.set(k, t));
+      const plain = { name: file.name, source: file.source, tensors: file.tensors };
+      add(await loadWeights(backend, [{ ...plain, rename: only((n) => linear.test(n)) }], quant, opts.onProgress, converted ? { key: `${converted}|audio/linear/${file.name}` } : undefined));
+      add(await loadWeights(backend, [{ ...plain, rename: only((n) => !linear.test(n)) }], "f32"));
+    }
+    const read = async (name: string) => {
+      const f = found.get(name);
+      if (!f) throw new Error(`audio tower: the model has no ${name}`);
+      const n = f.entry.shape.reduce((a, b) => a * b, 1);
+      return { values: toF32(f.entry.type as Parameters<typeof toF32>[0], await f.file.source.read(f.entry.offset, f.entry.byteLength), n), shape: f.entry.shape, checkpoint: f.entry.name !== name };
+    };
+    const upload = (name: string, values: Float32Array, shape: number[]) => {
+      const buf = backend.alloc(values.byteLength, "storage", "audio/w");
+      backend.write(buf, 0, values);
+      weights.set(name, { shape, dtype: "f32", buf });
+    };
+    const clips = new Map<string, Gemma4Clip>();
+    for (let l = 0; l < cfg.layers; l++) {
+      const p = `a.blk.${l}.`;
+      for (const proj of GEMMA4_AUDIO_CLIPPED) {
+        const [inMin, inMax, outMin, outMax] = await Promise.all(
+          (["input_min", "input_max", "output_min", "output_max"] as const).map(async (k, i) => (found.has(`${p}${proj}.${k}`) ? (await read(`${p}${proj}.${k}`)).values[0]! : i % 2 ? Infinity : -Infinity)),
+        );
+        clips.set(p + proj, [inMin!, inMax!, outMin!, outMax!]);
+      }
+      const scale = await read(p + "per_dim_scale.weight");
+      upload(p + "per_dim_scale.weight", scale.checkpoint ? scale.values.map((v) => Math.log1p(Math.exp(v))) : scale.values, [scale.values.length]);
+      // [hidden, taps], or a checkpoint's [hidden, 1, taps]: the same values in the same order.
+      const dw = await read(p + "conv_dw.weight");
+      upload(p + "conv_dw.weight", dw.values, [cfg.hidden, dw.values.length / cfg.hidden]);
+    }
+    const conv = async (i: number) => ({ w: (await read(`a.conv1d.${i}.weight`)).values, norm: (await read(`a.conv1d.${i}.norm.weight`)).values });
+    const [l0, l1] = [await conv(0), await conv(1)];
+    if (l0.w.length !== cfg.convChannels[0] * 9 || l1.w.length !== cfg.convChannels[1] * cfg.convChannels[0] * 9) throw new Error("audio tower: the subsampling convolutions do not fit the config");
+    return new Gemma4AudioTower(backend, cfg, weights, clips, { w: [l0.w, l1.w], norm: [l0.norm, l1.norm] });
+  } catch (err) {
+    freeWeights(backend, weights);
+    throw err;
+  }
+}
+
 /** WebGPU, or the CPU backend when asked for or (for "auto") when WebGPU is missing or has no adapter. */
 export async function openBackend(device: "auto" | "gpu" | "cpu", cpuThreads?: number): Promise<Backend> {
   const threads = cpuThreads ?? Math.min(4, globalThis.navigator?.hardwareConcurrency ?? 1);
@@ -746,7 +854,7 @@ async function openParsedWith<H>(file: string, opener: (fresh: boolean) => Promi
   }
 }
 
-async function openSafetensors(ref: ModelRef, endpoint?: string): Promise<{ cfg: LlamaConfig; tokenizer: Tokenizer; files: WeightFile[]; idefics3?: Idefics3Files; gemma3?: Idefics3Files; qwen35?: Idefics3Files; gemma4?: Idefics3Files }> {
+async function openSafetensors(ref: ModelRef, endpoint?: string): Promise<{ cfg: LlamaConfig; tokenizer: Tokenizer; files: WeightFile[]; idefics3?: Idefics3Files; gemma3?: Idefics3Files; qwen35?: Idefics3Files; gemma4?: Idefics3Files & { vision: boolean; audio: boolean; processor?: Record<string, unknown> } }> {
   // Required files start at once. Optional ones wait for the repo's file listing, so files that do
   // not exist are not requested (each would log a 404); without a listing they are probed.
   const listing = listRepoFiles(ref, endpoint);
@@ -799,8 +907,9 @@ async function openSafetensors(ref: ModelRef, endpoint?: string): Promise<{ cfg:
   const info = { config: config!, preprocessor };
   // Gemma 4: the tower and its projection sit in the same files; the image settings in processor_config.json.
   const gemma4 = config!.model_type === "gemma4" && !!config!.vision_config && files.some((f) => f.tensors.some((t) => gemma4VisionName(t.name) === "mm.input_projection.weight"));
-  const processor = gemma4 ? await optionalJSON<{ image_processor?: Record<string, unknown> }>("processor_config.json") : undefined;
-  return { cfg, tokenizer, files, idefics3: idefics3 ? info : undefined, gemma3: gemma3 ? info : undefined, qwen35: qwen35 ? info : undefined, gemma4: gemma4 ? { config: config!, preprocessor: processor?.image_processor } : undefined };
+  const gemma4Audio = config!.model_type === "gemma4" && !!config!.audio_config && files.some((f) => f.tensors.some((t) => gemma4AudioName(t.name) === "mm.a.input_projection.weight"));
+  const processor = gemma4 || gemma4Audio ? await optionalJSON<Record<string, unknown>>("processor_config.json") : undefined;
+  return { cfg, tokenizer, files, idefics3: idefics3 ? info : undefined, gemma3: gemma3 ? info : undefined, qwen35: qwen35 ? info : undefined, gemma4: gemma4 || gemma4Audio ? { config: config!, preprocessor: processor?.image_processor as Record<string, unknown> | undefined, audio: gemma4Audio, processor, vision: gemma4 } : undefined };
 }
 
 function addOne(v: Float32Array): void {
