@@ -51,6 +51,9 @@ import {
   qwenVisionConfigFromGGUF,
   qwenVisionName,
   type QwenVisionConfig,
+  GEMMA4_LAYER_SCALE,
+  GEMMA4_PER_LAYER_TABLE,
+  gemma4PerLayerTable,
   weightScale,
   type LlamaConfig,
 } from "@kiln/models";
@@ -58,7 +61,7 @@ import { Tokenizer, type ChatTemplate, type TokenizerJSON } from "@kiln/tokenize
 import { Engine } from "./engine";
 import { splitQwen35Merged } from "./qwen35-gguf";
 import { llamaMatmulShapes, tuneMatmuls } from "./tune";
-import { freeWeights, loadWeights, type LoadProgress, type Quant, type WeightFile } from "./weights";
+import { freeWeights, loadColumnGroups, loadWeights, type LoadProgress, type Quant, type WeightFile } from "./weights";
 
 export interface LoadOptions {
   /** Weight storage on the GPU: "auto" (default: q4, with GGUF tensors kept at their own precision), "q4", "q8" or "f32". See `Quant`. */
@@ -231,6 +234,7 @@ export async function createEngine(from: ModelSource, opts: LoadOptions = {}): P
     // vision tower's under the same key.
     const converted = opts.weightCache === false ? undefined : ref ? cacheKey(ref, ref.gguf ?? "weights", opts.endpoint) : modelKey(from);
     weights = await loadWeights(backend, files, quant, opts.onProgress, converted ? { key: converted } : undefined);
+    const modelCfg = cfg.family === "gemma4" ? await loadGemma4Extras(backend, files, cfg, weights, quant, opts.onProgress) : cfg;
     vision = idefics3
       ? await openIdefics3Vision(backend, files, idefics3, opts, converted)
       : opts.mmproj
@@ -243,7 +247,7 @@ export async function createEngine(from: ModelSource, opts: LoadOptions = {}): P
     if (vision && vision.cfg.projectionDim !== cfg.hiddenSize) throw new Error(`mmproj projects to ${vision.cfg.projectionDim}, but the model is ${cfg.hiddenSize} wide`);
     await tuning;
     const imageTokens = vision ? (opts.imageSlots ?? 4) * vision.tokensPerImage : 0;
-    model = new LlamaModel(backend, cfg, weights, { maxSeq: opts.maxSeq, kvDtype: opts.kvDtype, fuse: opts.fuse, imageTokens });
+    model = new LlamaModel(backend, modelCfg, weights, { maxSeq: opts.maxSeq, kvDtype: opts.kvDtype, fuse: opts.fuse, imageTokens });
     const engine = new Engine(backend, model, tokenizer, vision);
     if (opts.maxSubmitMs !== undefined) engine.maxSubmitMs = opts.maxSubmitMs;
     if (opts.prefixCacheBytes !== undefined) engine.prefixCacheBytes = opts.prefixCacheBytes;
@@ -262,6 +266,55 @@ export async function createEngine(from: ModelSource, opts: LoadOptions = {}): P
   } finally {
     for (const f of files) f.source.close?.();
   }
+}
+
+/** A Gemma 4 tensor's model name from its name in a file: a checkpoint's multimodal names, or a GGUF's own (kept). */
+const gemma4TextName = (name: string): string => multimodalTextName(name) ?? name;
+
+/**
+ * What `loadWeights` leaves out of a Gemma 4 model's files: the per-layer embedding table and the
+ * layers' output scalars, which `loadGemma4Extras` reads, and the key and value weights of layers
+ * that use another layer's cache (some files keep them; nothing reads them).
+ */
+function gemma4Rename(cfg: LlamaConfig, base: (name: string) => string | undefined): (name: string) => string | undefined {
+  return (name) => {
+    const text = gemma4TextName(name);
+    if (GEMMA4_PER_LAYER_TABLE.includes(text) || GEMMA4_LAYER_SCALE.test(text)) return undefined;
+    const mapped = base(name);
+    const kv = mapped && /^model\.layers\.(\d+)\.self_attn\.(k_proj|v_proj|k_norm|v_norm)\./.exec(mapped);
+    return kv && cfg.kvFrom?.[Number(kv[1])] !== undefined ? undefined : mapped;
+  };
+}
+
+/**
+ * Gemma 4's per-layer embedding table, loaded as one table per layer into `weights` (see
+ * `loadColumnGroups`), and each layer's output scalar, returned in the config.
+ */
+async function loadGemma4Extras(backend: Backend, files: WeightFile[], cfg: LlamaConfig, weights: Map<string, Tensor>, quant: Quant, onProgress?: (p: LoadProgress) => void): Promise<LlamaConfig> {
+  const scalars = new Array<number>(cfg.numLayers).fill(1);
+  let table = false;
+  for (const file of files) {
+    for (const entry of file.tensors) {
+      const text = gemma4TextName(entry.name);
+      const scale = GEMMA4_LAYER_SCALE.exec(text);
+      if (scale) {
+        const l = Number(scale[1] ?? scale[2]);
+        if (entry.byteLength > 16 || !(l < cfg.numLayers)) throw new UnsupportedModelError(`${entry.name}: not one layer's output scalar`);
+        const v = toF32(entry.type as Parameters<typeof toF32>[0], await file.source.read(entry.offset, entry.byteLength), 1)[0]!;
+        if (!Number.isFinite(v)) throw new UnsupportedModelError(`${entry.name}: the layer's output scalar is not a number`);
+        scalars[l] = v;
+      } else if (cfg.perLayerInput && GEMMA4_PER_LAYER_TABLE.includes(text)) {
+        if (entry.shape[0] !== cfg.vocabSize || entry.shape[1] !== cfg.numLayers * cfg.perLayerInput) {
+          throw new UnsupportedModelError(`${entry.name} is [${entry.shape}], not [${cfg.vocabSize}, ${cfg.numLayers} × ${cfg.perLayerInput}]`);
+        }
+        const names = Array.from({ length: cfg.numLayers }, (_, l) => gemma4PerLayerTable(l));
+        for (const [k, t] of await loadColumnGroups(backend, file.source, entry, names, quant, onProgress, `${file.name} (per-layer embeddings)`)) weights.set(k, t);
+        table = true;
+      }
+    }
+  }
+  if (cfg.perLayerInput && !table) throw new UnsupportedModelError("Gemma 4: the model's files have no per-layer embedding table");
+  return { ...cfg, layerScalars: scalars };
 }
 
 /**
@@ -636,7 +689,7 @@ async function openSafetensors(ref: ModelRef, endpoint?: string): Promise<{ cfg:
         ? (name: string, v: Float32Array) => (name.endsWith("norm.weight") && !name.includes("linear_attn") ? addOne(v) : undefined)
         : undefined;
   // Multimodal Gemma 3 (4B and up): load the language model's weights under their text names, skip the rest.
-  const rename = config!.model_type === "gemma3" || config!.model_type === "qwen3_5" ? multimodalTextName : config!.model_type === "granitemoehybrid" ? graniteName : config!.model_type === "phi3" ? phi3Name : idefics3 ? idefics3TextName : undefined;
+  const rename = cfg.family === "gemma4" ? gemma4Rename(cfg, config!.model_type === "gemma4" ? multimodalTextName : (n) => n) : config!.model_type === "gemma3" || config!.model_type === "qwen3_5" ? multimodalTextName : config!.model_type === "granitemoehybrid" ? graniteName : config!.model_type === "phi3" ? phi3Name : idefics3 ? idefics3TextName : undefined;
   const scale = cfg.residualScale !== undefined || cfg.logitScale !== undefined ? (name: string) => weightScale(cfg, name) : undefined;
   // Shards are opened together: each open is a request (and a header to read) on a first load.
   const opened = await Promise.allSettled(names.map((name) => openParsed(ref, name, endpoint, readSafetensorsHeader)));
@@ -713,7 +766,7 @@ async function ggufModel(file: string, source: ByteSource, gguf: Awaited<ReturnT
       cfg,
       tokenizer: Tokenizer.fromGGUF(gguf.metadata),
       // Norms in gemma3 files already hold 1 + w, so unlike safetensors there is nothing to transform.
-      files: [{ name: file, source, tensors: cfg.linear ? splitQwen35Merged(gguf.tensors, cfg.linear.valueHeads * cfg.linear.valueDim) : gguf.tensors, rename: (n) => ggufToHF(n, cfg.family), scale, ...(cfg.family === "qwen35" ? { transform: qwen35GgufValues } : {}) }],
+      files: [{ name: file, source, tensors: cfg.linear ? splitQwen35Merged(gguf.tensors, cfg.linear.valueHeads * cfg.linear.valueDim) : gguf.tensors, rename: cfg.family === "gemma4" ? gemma4Rename(cfg, (n) => ggufToHF(n, "gemma4")) : (n) => ggufToHF(n, cfg.family), scale, ...(cfg.family === "qwen35" ? { transform: qwen35GgufValues } : {}) }],
     };
   } catch (err) {
     source.close?.();

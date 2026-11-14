@@ -131,12 +131,13 @@ export class Tokenizer {
     return new Tokenizer(vocab, merges, added, [], { ignoreMerges: json.model.ignore_merges, scheme });
   }
 
-  /** Builds a tokenizer from GGUF `tokenizer.ggml.*` metadata: "gpt2" (byte-level BPE) or "llama" (SentencePiece). */
+  /** Builds a tokenizer from GGUF `tokenizer.ggml.*` metadata: "gpt2" (byte-level BPE), "llama" (SentencePiece) or "gemma4" (BPE over SentencePiece-style pieces). */
   static fromGGUF(meta: Map<string, unknown>): Tokenizer {
     const model = meta.get("tokenizer.ggml.model");
-    if (model !== "gpt2" && model !== "llama") throw new Error(`GGUF tokenizer model "${String(model)}" is not supported yet (gpt2 and llama only)`);
+    if (model !== "gpt2" && model !== "llama" && model !== "gemma4") throw new Error(`GGUF tokenizer model "${String(model)}" is not supported yet (gpt2, llama and gemma4 only)`);
     const tokens = meta.get("tokenizer.ggml.tokens") as string[];
     if (model === "llama") return withTemplate(Tokenizer.fromSentencePieceGGUF(meta, tokens), meta, tokens);
+    if (model === "gemma4") return withTemplate(Tokenizer.fromGemma4GGUF(meta, tokens), meta, tokens);
     const types = (meta.get("tokenizer.ggml.token_type") as number[] | undefined) ?? [];
     const merges = (meta.get("tokenizer.ggml.merges") as string[] | undefined) ?? [];
     const pre = String(meta.get("tokenizer.ggml.pre") ?? "default");
@@ -153,6 +154,24 @@ export class Tokenizer {
     const steps: PreStep[] = [(ps) => ps.flatMap((p) => splitIsolated(p, re))];
     if (pre === "smollm" || pre === "refact") steps.unshift((ps) => ps.flatMap((p) => splitIsolated(p, /\p{N}/gu)));
     return withTemplate(new Tokenizer(vocab, merges, added, steps, { ignoreMerges: pre === "llama-bpe" || pre === "llama3" }), meta, tokens);
+  }
+
+  /**
+   * GGUF "gemma4" vocabularies: pieces with ▁ for spaces and a merge list, as Gemma 4's
+   * tokenizer.json has them (a BPE model whose normalizer turns spaces into ▁, with bytes as the
+   * fallback). Control and user-defined tokens (types 3 and 4: the turn, tool and channel markers)
+   * are matched before merging and are special, as the checkpoint's added tokens are.
+   */
+  private static fromGemma4GGUF(meta: Map<string, unknown>, tokens: string[]): Tokenizer {
+    const types = (meta.get("tokenizer.ggml.token_type") as number[] | undefined) ?? [];
+    const merges = (meta.get("tokenizer.ggml.merges") as string[] | undefined) ?? [];
+    const vocab = new Map<string, number>();
+    const added: AddedToken[] = [];
+    tokens.forEach((t, id) => {
+      if (types[id] === 3 || types[id] === 4) added.push({ id, content: t, special: true });
+      else vocab.set(t, id);
+    });
+    return new Tokenizer(vocab, merges, added, [], { scheme: { kind: "metaspace", prepend: "never", split: false } });
   }
 
   /** GGUF "llama" vocabularies: SentencePiece pieces with scores; merges pick the highest-scoring piece. */
