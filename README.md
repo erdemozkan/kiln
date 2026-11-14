@@ -10,7 +10,7 @@
   <a href="https://github.com/erdemozkan/kiln/actions/workflows/ci.yml"><img alt="CI status" src="https://github.com/erdemozkan/kiln/actions/workflows/ci.yml/badge.svg"></a>
   <img alt="MIT license" src="https://img.shields.io/badge/license-MIT-green">
   <img alt="Runs on WebGPU" src="https://img.shields.io/badge/runs%20on-WebGPU-005a9c">
-  <img alt="241 KB gzipped" src="https://img.shields.io/badge/size-241%20KB%20gzipped-8a2be2">
+  <img alt="260 KB gzipped" src="https://img.shields.io/badge/size-260%20KB%20gzipped-8a2be2">
   <img alt="Written in TypeScript" src="https://img.shields.io/badge/TypeScript-3178c6?logo=typescript&logoColor=white">
 </p>
 
@@ -34,7 +34,7 @@ most existing code moves over by changing the import and the model id.
 - **More for LLMs.** Tool calls, LoRA adapters, a retrieval helper, and prompt caching across calls and reloads.
 - **Loads once.** Downloads are cached in the browser, resume if interrupted, and cached models load offline.
 - **Stays out of the way.** Models run in a worker and stream text back; the page never blocks.
-- **Small.** One 241 KB (gzipped) ES module that also works straight from a CDN, with a CPU fallback where there is no WebGPU.
+- **Small.** One 260 KB (gzipped) ES module that also works straight from a CDN, with a CPU fallback where there is no WebGPU.
 
 ## Principles
 
@@ -42,7 +42,7 @@ most existing code moves over by changing the import and the model id.
 - **Correct before fast.** Every model is checked against transformers.js or Python on the same inputs. A speed-up that changes the output isn't one.
 - **Modest hardware first.** The benchmarks are measured on a 2017 laptop with integrated graphics, because that is the kind of machine Kiln was built to put back to work.
 - **Honest numbers.** The benchmarks list where Kiln is slower, not only where it wins.
-- **Small footprint.** One 241 KB file with its worker inside, no runtime dependencies and no WASM runtime to download.
+- **Small footprint.** One 260 KB file with its worker inside, no runtime dependencies and no WASM runtime to download.
 - **Nothing leaves the browser.** Models run on the user's own device. Prompts, images and audio are never sent to a server.
 
 ## Prerequisites
