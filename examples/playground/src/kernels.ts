@@ -173,6 +173,13 @@ async function main() {
       for (const v of want) mx = Math.max(mx, Math.abs(v));
       tol = Math.max(tol, 2e-4 * mx);
     }
+    // f16 dot products round each product to 11 bits, so the gated outputs (two sums of ~25 multiplied,
+    // up to a few thousand) are off by about a thousandth of their size: how far depends on the GPU's rounding.
+    if (kernel.endsWith("/f16")) {
+      let mx = 0;
+      for (const v of want) mx = Math.max(mx, Math.abs(v));
+      tol = Math.max(tol, 1e-3 * mx);
+    }
     const error = ref.maxAbsDiff(got, want);
     results.push({ kernel, case: name, error, tol, pass: error <= tol && got.length === want.length });
   };
