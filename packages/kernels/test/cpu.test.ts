@@ -135,14 +135,18 @@ describe.each([
     const sizes = (n: number) => randn(n).map((v, i) => v * [1, 0.01, 40, 0][Math.floor(i / D) % 4]!);
     const kf = sizes(maxSeq * row);
     const vf = sizes(maxSeq * row);
-    // What an i8 cache holds for a head: bytes scaled to ±127 of its largest value, times the scale back.
+    // What an i8 cache holds for a head: codes sign · round(127·√|x / max|), each standing for c·|c|·max / 127².
     const held = (f: Float32Array) => {
       const out = new Float32Array(f.length);
       for (let h = 0; h < f.length / D; h++) {
         let max = 0;
         for (let i = 0; i < D; i++) max = Math.max(max, Math.abs(f[h * D + i]!));
-        const inv = max > 0 ? Math.fround(127 / max) : 0;
-        for (let i = 0; i < D; i++) out[h * D + i] = Math.round(Math.fround(f[h * D + i]! * inv)) * Math.fround(max / 127);
+        const inv = max > 0 ? Math.fround(1 / max) : 0;
+        for (let i = 0; i < D; i++) {
+          const x = Math.fround(f[h * D + i]! * inv);
+          const c = Math.sign(x) * Math.round(127 * Math.fround(Math.sqrt(Math.min(1, Math.abs(x)))));
+          out[h * D + i] = c * Math.abs(c) * Math.fround(max / 16129);
+        }
       }
       return out;
     };
@@ -159,7 +163,10 @@ describe.each([
     const at = ((last - 1) % slots) * Hkv * HW;
     const scale = new Float32Array(words.buffer)[at + D / 4]!;
     const want0 = held(kf.slice((last - 1) * row, (last - 1) * row + D));
-    for (let i = 0; i < D; i++) expect(((words[at + (i >> 2)]! << (24 - 8 * (i & 3))) >> 24) * scale).toBeCloseTo(want0[i]!, 4);
+    for (let i = 0; i < D; i++) {
+      const c = (words[at + (i >> 2)]! << (24 - 8 * (i & 3))) >> 24;
+      expect(c * Math.abs(c) * scale).toBeCloseTo(want0[i]!, 4);
+    }
     const pos0 = last - T;
     const q = randn(T * H * D);
     let o!: Tensor;

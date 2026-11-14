@@ -390,6 +390,16 @@ How it got there, each step measured in one session with identical greedy output
   f32): SmolLM2-135M mean |Δ| 0.48 nats, largest 1.49, the same first choice in 7 of 8; Qwen3-0.6B
   mean 1.21, largest 4.57, the same first choice in 7 of 8. f16 on the same: mean 0.003 and 0.009,
   the same first choice in 8 of 8.
+- **i8 KV cache** (`kvDtype: "i8"`, opt-in): per head and position, signed bytes and one f32 scale,
+  a byte c standing for c·|c|·scale (scale = the head's largest magnitude / 127²). Heads are
+  D / 4 + 1 words apart, so the attention kernels take a head's stride from the format and multiply
+  each key's dot product, and each value vector, by its scale. Writing needs a head's largest value
+  first: `kv_write/i8` runs one workgroup per head and position, and the fused rope kernels write
+  plain rows for it (cap 0 in their parameters) before it. On the same eight questions: SmolLM2-135M
+  mean |Δ| 0.09 nats, largest 0.43; Qwen3-0.6B 0.54 and 1.86; the same first choice in 8 of 8 on
+  both. Evenly spaced bytes (c·scale) gave 0.14 on SmolLM2 but 2.3 on Qwen3, worse than f8: after
+  its q/k norm a head has a few values far above the rest, and an even scale spends its codes on
+  the empty range between. Speed as f16. 71 kernel checks cover it.
 - **Memory planner:** liveness-based placement in one pool shared by all plans, plus online-softmax
   prefill attention instead of a [T, heads, maxSeq] f32 score buffer (9 MiB at T = 128 for this model,
   and it grows with context and heads). Intermediates 19.3 → 1.8 MiB. The new attention is also faster:

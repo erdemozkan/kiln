@@ -54,9 +54,13 @@ tokens/s and reads a prompt at 120 to 150 tokens/s; a cached load takes 5.7 s.
 A recurrent state cannot be cut back to an earlier position the way keys and values can, so the
 engine keeps snapshots of it (with the attention layers' keys and values) after each prompt and 16
 tokens before its end, up to 256 MiB of them, and a call resumes from the longest one its prompt
-starts with: a follow-up chat turn reused 425 of 463 tokens. For these models the prefix store,
-speculative decoding and LoRA adapters are off, and prefill runs in exact sizes (padding rows would
-enter the state). Not yet: images. With Kiln's own 4-bit conversion of the safetensors weights the
+starts with: a follow-up chat turn reused 425 of 463 tokens. For these models the prefix store is
+off and prefill runs in exact sizes (padding rows would enter the state). Speculative decoding
+works: the state is copied before a draft is checked, and when part of the draft is rejected it is
+put back and the accepted tokens are run again. LoRA adapters may update linear attention's
+projections (`in_proj_qkv`, `in_proj_z`, `in_proj_a`, `in_proj_b`, `out_proj`) as well as the usual
+ones. Not yet: images, which need the model's vision tower and positions on three axes in the
+language model's rotary kernels. With Kiln's own 4-bit conversion of the safetensors weights the
 0.8B model makes slips it does not make with `quant: "q8"` or from a Q4_K_M GGUF (17 + 26 came out
 as 33).
 
@@ -122,6 +126,18 @@ the CPU and now takes 75 to 100 ms: the transform of each frame uses half-length
 real samples, with the radix-2, 4 and 5 butterflies written out and nothing allocated per frame. The
 features are the same to rounding. (llama.cpp moved this step into its compute graph; here the CPU
 version is fast enough that a GPU kernel would save little.)
+
+**A second 8-bit KV cache, `kvDtype: "i8"`.** Each head of each position is stored as signed bytes
+with one scale: a byte c stands for c·|c|·scale, so codes are spaced by the square root, fine near
+zero and under 1% apart at the head's largest value. The same memory as `"f8"` plus a word per head.
+On the eight reading questions it moved scores by 0.09 nats on SmolLM2-135M and 0.54 on Qwen3-0.6B
+(f8: 0.48 and 1.21) and changed no first choice on either (f8: one of eight on each), at f16's
+speed. Evenly spaced bytes were tried first and were worse than f8 on Qwen3 (2.3 nats): its heads
+have a few very large values, which use up an even scale. Of the two, i8 is the one to pick.
+
+**Phi-4 mini from safetensors.** A tiny random Phi-4 mini checkpoint in that layout loads and gives
+the same scores on the GPU and the CPU backend. The full model's 7.7 GB safetensors were not run
+(its GGUF was).
 
 **Fewer requests on a first download.** The request that downloads a weight file also tells its
 size, so the separate one-byte request that asked for it is gone, and the shards of a split

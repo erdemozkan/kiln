@@ -29,10 +29,12 @@ const kvStore = (kv: KvDtype): string => (kv === "f32" ? "f32" : "u32");
 
 /**
  * "i8": every head of every position is its values as signed bytes, four to a word, followed by one
- * f32 scale word: value = byte · scale, the scale being the head's largest magnitude / 127. A
- * quarter of f32's memory plus a word per head, and several times f8's accuracy on the large values
- * that carry a dot product, since its error is a fixed 1/254 of the head's range instead of 1/16 of
- * each value. A head is D / 4 + 1 words, so heads are (D + 4) elements apart in the index sums below.
+ * f32 scale word. A byte c stands for c·|c|·scale, the scale being the head's largest magnitude /
+ * 127²: codes are spaced by the square root, so a value near the largest is off by under 1% of
+ * itself (f8: up to 6%), while one a hundredth of it still has a dozen codes below it. (Evenly
+ * spaced codes lose to f8 on heads with a few very large values, which Qwen3's are.) A quarter of
+ * f32's memory plus a word per head. A head is D / 4 + 1 words, so heads are (D + 4) elements apart
+ * in the index sums below.
  */
 
 /** WGSL for reading the cache: kc as 4-element groups, vc element-wise. */
@@ -74,12 +76,16 @@ function kvRead(kv: KvDtype): KvRead {
       }
     : { kDecl: "array<vec4<f32>>", vDecl: "array<f32>", head: "p.D", k4: (i) => `kc[${i}]`, kScale: () => "", v1: (base, i) => `vc[${base} + ${i}]` };
 }
-/** Four signed bytes of a word as floats, and four floats (already divided by the scale) as signed bytes. */
+/**
+ * Four signed bytes of a word as c·|c| (to be multiplied by the head's scale), and four values
+ * already divided by the head's largest magnitude as bytes: sign · round(127 · √|v|).
+ */
 const I8_FN = /* wgsl */ `fn i8x4(w: u32) -> vec4<f32> {
-  return vec4<f32>(vec4<i32>(bitcast<i32>(w << 24u), bitcast<i32>(w << 16u), bitcast<i32>(w << 8u), bitcast<i32>(w)) >> vec4<u32>(24u));
+  let c = vec4<f32>(vec4<i32>(bitcast<i32>(w << 24u), bitcast<i32>(w << 16u), bitcast<i32>(w << 8u), bitcast<i32>(w)) >> vec4<u32>(24u));
+  return c * abs(c);
 }
 fn i8pack(v: vec4<f32>) -> u32 {
-  let c = bitcast<vec4<u32>>(vec4<i32>(clamp(round(v), vec4<f32>(-127.0), vec4<f32>(127.0)))) & vec4<u32>(255u);
+  let c = bitcast<vec4<u32>>(vec4<i32>(sign(v) * round(127.0 * sqrt(min(abs(v), vec4<f32>(1.0)))))) & vec4<u32>(255u);
   return c.x | (c.y << 8u) | (c.z << 16u) | (c.w << 24u);
 }`;
 const KV4_FN = /* wgsl */ `fn kv4(w: vec2<u32>) -> vec4<f32> { return vec4<f32>(unpack2x16float(w.x), unpack2x16float(w.y)); }`;
@@ -798,8 +804,8 @@ ${kv === "f8"
 
 /**
  * Writes k/v rows [T, Hkv·D] into "i8" caches (see KvDtype): one workgroup per (head, token) finds
- * the head's largest magnitude in k and in v, then stores each as bytes scaled to ±127 and the
- * scale after them. A head of zeros gets scale 0.
+ * the head's largest magnitude in k and in v, then stores each value as its byte and the scale
+ * after them. A head of zeros gets scale 0.
  */
 export function kvWriteI8Spec(): KernelSpec {
   return spec("kv_write/i8", ["uniform", "read", "read", "read", "rw", "rw"], cpu.cpuKvWriteI8, () => /* wgsl */ `
@@ -842,12 +848,12 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
   let vMax = red[0];
   if (live && li < d4) {
     let e = src + li * 4u;
-    kc[base + li] = i8pack(vec4<f32>(k[e], k[e + 1u], k[e + 2u], k[e + 3u]) * select(0.0, 127.0 / kMax, kMax > 0.0));
-    vc[base + li] = i8pack(vec4<f32>(v[e], v[e + 1u], v[e + 2u], v[e + 3u]) * select(0.0, 127.0 / vMax, vMax > 0.0));
+    kc[base + li] = i8pack(vec4<f32>(k[e], k[e + 1u], k[e + 2u], k[e + 3u]) * select(0.0, 1.0 / kMax, kMax > 0.0));
+    vc[base + li] = i8pack(vec4<f32>(v[e], v[e + 1u], v[e + 2u], v[e + 3u]) * select(0.0, 1.0 / vMax, vMax > 0.0));
   }
   if (live && li == 0u) {
-    kc[base + d4] = bitcast<u32>(kMax / 127.0);
-    vc[base + d4] = bitcast<u32>(vMax / 127.0);
+    kc[base + d4] = bitcast<u32>(kMax / 16129.0);
+    vc[base + d4] = bitcast<u32>(vMax / 16129.0);
   }
 }`);
 }

@@ -474,14 +474,14 @@ function kvRow(u: Uint32Array, f: Float32Array, e: number, D: number, kv: Kv, ou
     return;
   }
   if (kv === "i8") {
-    // e is the head's first word: D / 4 words of signed bytes, then the scale.
+    // e is the head's first word: D / 4 words of signed bytes, then the scale. A byte c is c·|c|·scale.
     const scale = f[e + (D >>> 2)]!;
     for (let i = 0, w = e; i < D; i += 4, w++) {
       const x = u[w]!;
-      out[i] = ((x << 24) >> 24) * scale;
-      out[i + 1] = ((x << 16) >> 24) * scale;
-      out[i + 2] = ((x << 8) >> 24) * scale;
-      out[i + 3] = (x >> 24) * scale;
+      for (let b = 0; b < 4; b++) {
+        const c = (x << (24 - 8 * b)) >> 24;
+        out[i + b] = c * Math.abs(c) * scale;
+      }
     }
     return;
   }
@@ -1617,7 +1617,7 @@ export const cpuGatedDelta: CpuKernel = (b) => {
   }
 };
 
-/** Writes k/v rows into i8 caches: per head and position, signed bytes scaled to ±127 and their scale (see `kvWriteI8Spec`). */
+/** Writes k/v rows into i8 caches: per head and position, a byte per value (sign · round(127·√|x / max|)) and the scale (see `kvWriteI8Spec`). */
 export const cpuKvWriteI8: CpuKernel = (b) => {
   const u = b[0]!.u32;
   const [T, Hkv, D, maxSeq, cap] = [u[0]!, u[1]!, u[2]!, u[3]!, u[4]!];
@@ -1634,13 +1634,13 @@ export const cpuKvWriteI8: CpuKernel = (b) => {
         const base = ((pos % cap) * Hkv + h) * (d4 + 1);
         let max = 0;
         for (let i = 0; i < D; i++) max = Math.max(max, Math.abs(x[from + i]!));
-        const inv = max > 0 ? Math.fround(127 / max) : 0;
-        const code = (v: number) => Math.max(-127, Math.min(127, Math.round(Math.fround(v * inv)))) & 255;
+        const inv = max > 0 ? Math.fround(1 / max) : 0;
+        const code = (v: number) => (Math.sign(v) * Math.round(127 * Math.fround(Math.sqrt(Math.min(1, Math.abs(Math.fround(v * inv))))))) & 255;
         for (let w = 0; w < d4; w++) {
           const e = from + w * 4;
           words[base + w] = (code(x[e]!) | (code(x[e + 1]!) << 8) | (code(x[e + 2]!) << 16) | (code(x[e + 3]!) << 24)) >>> 0;
         }
-        floats[base + d4] = max / 127;
+        floats[base + d4] = max / 16129;
       }
     }
   }
