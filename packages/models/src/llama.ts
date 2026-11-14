@@ -376,10 +376,12 @@ export class LlamaModel {
    * GPU copies of the linear-attention state, queued now, so they hold it as the work submitted so
    * far leaves it. `restoreState` puts a snapshot back; the caller frees the buffers.
    */
-  saveState(): Buf[] {
+  saveState(into?: readonly Buf[]): Buf[] {
+    let i = 0;
     return [...this.linearState.values()].flatMap(({ s, conv }) =>
       [s, conv].map((src) => {
-        const dst = this.backend.alloc(src.size, "storage", "linear/saved");
+        // `into`: an earlier snapshot's buffers, overwritten (a snapshot taken again and again, as before every draft).
+        const dst = into?.[i++] ?? this.backend.alloc(src.size, "storage", "linear/saved");
         this.backend.copy(src, 0, dst, 0, src.size);
         return dst;
       }),

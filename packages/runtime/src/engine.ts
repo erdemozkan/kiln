@@ -201,6 +201,9 @@ export class Engine {
    */
   private states: { tokens: number[]; state: Buf[]; kv: Buf[]; bytes: number }[] = [];
 
+  /** The recurrent state before the draft being checked (see `decodeSpeculative`), its buffers reused. */
+  private draftState: Buf[] | undefined;
+
   /** GPU bytes the snapshots may take together; the newest is kept whatever its size. */
   private static readonly STATE_BUDGET = 256 * 2 ** 20;
 
@@ -615,9 +618,8 @@ export class Engine {
     const stop = new Set([...this.stopIds, ...(opts.stopTokenIds ?? [])]);
     const t0 = performance.now();
     const grammar = opts.format ? this.matcher(opts.format, [...stop]) : undefined;
-    // Drafts are checked by running them and discarding what was wrong, which a recurrent state cannot undo.
     const recurrent = this.model.recurrent;
-    const draftTokens = sampling.repetitionPenalty !== 1 || recurrent ? 0 : Math.min(MAX_VERIFY_ROWS - 1, Math.max(0, Math.floor(opts.draftTokens ?? (this.backend.name === "cpu" ? 0 : 7))));
+    const draftTokens = sampling.repetitionPenalty !== 1 ? 0 : Math.min(MAX_VERIFY_ROWS - 1, Math.max(0, Math.floor(opts.draftTokens ?? (this.backend.name === "cpu" ? 0 : 7))));
     this.busy = true;
     this.lastStopId = undefined;
     // Reuse the shared prefix, but always prefill at least the last prompt token to get its logits.
@@ -898,6 +900,9 @@ export class Engine {
         if (draft.length && gate.worth(draft.length)) {
           const t = performance.now();
           const plan = this.verifyPlan(1 + draft.length);
+          // A recurrent state takes in every row, the rejected ones too: it is saved first, and put
+          // back and run over the accepted rows alone when part of the draft turns out wrong.
+          if (this.model.recurrent) this.draftState = this.model.saveState(this.draftState);
           this.backend.write(plan.tokens, 0, Uint32Array.from([spoken[pos]!, ...draft]));
           this.model.setStep({ pos0: pos, ...step });
           // The forward pass runs while the CPU computes the row masks; sampling is submitted after.
@@ -916,6 +921,13 @@ export class Engine {
           const sampled = new Uint32Array(await this.backend.readback(plan.out, 0, (1 + draft.length) * 4));
           firstRead(performance.now());
           const n = acceptedLength(draft, sampled);
+          if (this.model.recurrent && n < draft.length) {
+            this.model.restoreState(this.draftState!);
+            const redo = this.plan(n + 1);
+            this.backend.write(redo.tokens, 0, Uint32Array.from([spoken[pos]!, ...draft.slice(0, n)]));
+            this.model.setStep({ pos0: pos, ...step, lastRow: n });
+            this.submit(redo.body, n + 1);
+          }
           emit = Array.from(sampled.subarray(0, n + 1));
           gate.verified(performance.now() - t, draft.length, n);
           if (!grammar) this.pace.rows.observe(performance.now() - t, units);
@@ -1194,6 +1206,7 @@ export class Engine {
     this.prepared.clear();
     this.prefixes.clear();
     while (this.states.length) this.dropState(0);
+    for (const b of this.draftState ?? []) this.backend.free(b);
     for (const p of this.plans.values()) p.destroy();
     for (const p of this.verifyPlans.values()) p.destroy();
     for (const p of this.scorePlans.values()) p.destroy();

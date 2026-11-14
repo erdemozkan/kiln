@@ -1,4 +1,23 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
+
+// Drafts as the engine looks them up, except that while `spoilDrafts` is on every other one has a
+// token changed (at its first, second or third place in turn), so that part of it must be undone.
+// This small random model repeats itself, and would otherwise agree with every draft.
+const spoil = globalThis as unknown as { spoilDrafts?: boolean; draftCalls?: number };
+vi.mock("../src/speculate", async (original) => {
+  const real = await original<typeof import("../src/speculate")>();
+  return {
+    ...real,
+    lookupDraft: (...args: Parameters<typeof real.lookupDraft>) => {
+      const d = real.lookupDraft(...args);
+      const g = globalThis as unknown as { spoilDrafts?: boolean; draftCalls?: number };
+      const call = (g.draftCalls = (g.draftCalls ?? 0) + 1);
+      if (!g.spoilDrafts || call % 2 === 0 || !d.length) return d;
+      const at = Math.min(d.length - 1, (call >> 1) % 3);
+      return d.map((t, i) => (i === at ? (t + 1) % 96 : t));
+    },
+  };
+});
 import { physical, type Tensor } from "@kiln/core";
 import { CpuBackend } from "@kiln/kernels";
 import { LlamaModel, configFromHF, type LlamaConfig } from "@kiln/models";
@@ -203,5 +222,48 @@ describe("Qwen 3.5 (linear attention)", () => {
     const cold = await run(c, next, 5);
     expect(cold.cached).toBe(0);
     expect(cold.out).toEqual(resumed.out);
+  });
+
+  it("checks drafts and undoes the wrong ones: the same tokens as plain decoding", async () => {
+    const be = new CpuBackend({ threads: 1 });
+    const fresh = () => new Engine(be, new LlamaModel(be, CFG, weights(be), { maxSeq: 96, kvDtype: "f32" }), tok());
+    const run = async (e: Engine, prompt: number[], opts: object) => {
+      const inner = e as unknown as { decodeIds(ids: number[], o: object): AsyncGenerator<unknown>; cached: number[] };
+      for await (const _ of inner.decodeIds(prompt, { maxTokens: 24, temperature: 0, ...opts })) void _;
+      return { out: inner.cached.slice(prompt.length), spec: e.lastStats!.speculation };
+    };
+    // Prompts that repeat themselves, so that looking back for the last tokens finds drafts to propose.
+    const prompts = [3, 5, 7, 11, 13].map((k) => {
+      const unit = Array.from({ length: 8 }, (_, i) => 10 + ((i * k + k) % 80));
+      return [...unit, ...unit, ...unit, unit[0]!, unit[1]!];
+    });
+    spoil.spoilDrafts = true;
+    let passes = 0;
+    let rejected = 0;
+    let accepted = 0;
+    let e = fresh();
+    let prompt = prompts[0]!;
+    let drafted = { out: [] as number[] };
+    for (const p of prompts) {
+      const plain = await run(fresh(), p, { draftTokens: 0 });
+      e = fresh();
+      prompt = p;
+      const d = await run(e, p, { draftTokens: 7 });
+      drafted = d;
+      passes += d.spec!.passes;
+      accepted += d.spec!.accepted;
+      rejected += d.spec!.drafted - d.spec!.accepted;
+      expect(d.out, String(p.slice(0, 8))).toEqual(plain.out);
+    }
+    spoil.spoilDrafts = false;
+    // Both ways a pass can end were seen: a draft kept, and one undone by restoring the state.
+    expect(passes).toBeGreaterThan(2);
+    expect(rejected).toBeGreaterThan(0);
+    expect(accepted).toBeGreaterThan(0);
+    // And the next turn resumes from the prompt's snapshot as it does without drafts.
+    const next = [...prompt, ...drafted.out, 70, 71, 72];
+    const after = await run(e, next, { draftTokens: 7 });
+    expect(e.lastStats!.cachedTokens).toBe(prompt.length);
+    expect(after.out).toEqual((await run(fresh(), next, { draftTokens: 0 })).out);
   });
 });
