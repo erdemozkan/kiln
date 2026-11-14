@@ -76,6 +76,9 @@ import {
   ropeKvSpec,
   ropeSpec,
   ropeTableSpec,
+  softcapSpec,
+  scaleInPlaceSpec,
+  attentionWideSpec,
   sampleSpec,
   logprobRowsSpec,
   siluMulSpec,
@@ -377,7 +380,8 @@ export const cacheSlots = (s: Pick<AttentionShape, "maxSeq" | "slots">): number 
  */
 export function attention(ctx: Ctx, q: Tensor, kc: Buf, vc: Buf, s: AttentionShape): Tensor {
   if (s.H % s.Hkv !== 0) throw new Error(`attention: ${s.H} heads not divisible by ${s.Hkv} kv heads`);
-  if (s.D > ATTN_WG || s.D % 4 !== 0) throw new Error(`attention: head dim ${s.D} must be a multiple of 4 and at most ${ATTN_WG}`);
+  if (s.D > 2 * ATTN_WG || s.D % 4 !== 0) throw new Error(`attention: head dim ${s.D} must be a multiple of 4 and at most ${2 * ATTN_WG}`);
+  if (s.D > ATTN_WG && (s.relBias || s.kv === "i8")) throw new Error(`attention: heads of ${s.D} are not supported with ${s.relBias ? "a relative position bias" : "the i8 cache"}`);
   const out = ctx.alloc([s.T, s.H * s.D]);
   const splits = Math.ceil(s.maxSeq / ATTN_CHUNK);
   const slots = cacheSlots(s);
@@ -396,6 +400,11 @@ export function attention(ctx: Ctx, q: Tensor, kc: Buf, vc: Buf, s: AttentionSha
   if (ctx.backend.name === "cpu") {
     // One CPU implementation serves every attention shape; the split-K pair is a GPU occupancy trick.
     ctx.run(attentionSpec(s.kv), [params, step, q.buf, kc, vc, out.buf], [s.H, s.T, 1]);
+    return out;
+  }
+  if (s.D > ATTN_WG) {
+    // Heads wider than a workgroup: one kernel for prefill rows and decode steps alike.
+    ctx.run(attentionWideSpec(s.kv), [params, step, q.buf, kc, vc, out.buf], [s.H, s.T, 1]);
     return out;
   }
   if (s.T === 1) {
@@ -845,6 +854,18 @@ function popcount(m: number): number {
   let n = 0;
   for (let v = m >>> 0; v; v &= v - 1) n++;
   return n;
+}
+
+/** x ← a · x, in place. */
+export function scaleInPlace(ctx: Ctx, x: Tensor, a: number): void {
+  const n = numel(x.shape);
+  ctx.run(scaleInPlaceSpec(), [ctx.uniform([u32(n), u32(0), f32(a), u32(0)]), x.buf], grid1d(n));
+}
+
+/** Squashes logits to ±cap in place: cap · tanh(x / cap). */
+export function softcap(ctx: Ctx, x: Tensor, cap: number): void {
+  const n = numel(x.shape);
+  ctx.run(softcapSpec(), [ctx.uniform([u32(n), u32(0), f32(cap), u32(0)]), x.buf], grid1d(n));
 }
 
 /** y = a·x, or y += a·x when accumulating (same element count). */

@@ -1,6 +1,6 @@
 /** Normalised config for every Llama-shaped decoder (Llama 2/3, Mistral, Qwen2/2.5, Qwen3, SmolLM, Granite, Gemma 3, Phi-3). */
 export interface LlamaConfig {
-  family: "llama" | "qwen2" | "qwen3" | "qwen35" | "gemma3" | "phi3";
+  family: "llama" | "qwen2" | "qwen3" | "qwen35" | "gemma3" | "gemma4" | "phi3";
   hiddenSize: number;
   intermediateSize: number;
   numLayers: number;
@@ -72,7 +72,37 @@ export interface LlamaConfig {
   logitScale?: number;
   /** Longest context the model was trained for (max_position_embeddings / GGUF context_length), if stated. */
   contextLength?: number;
+  /**
+   * Gemma 4: the head size of each layer, where layers differ (its full-attention layers use wider
+   * heads than the sliding ones, with the same number of heads). `headDim` is the sliding layers'.
+   */
+  layerHeadDims?: number[];
+  /**
+   * Gemma 4: for a layer without keys and values of its own, the layer whose cache it reads: the
+   * last earlier layer of its kind (sliding or full) that makes them. Such a layer has only a query
+   * projection, and nothing it computes is needed by a later token.
+   */
+  kvFrom?: (number | undefined)[];
+  /** Gemma 4: values are RMS-normalised (no weight) per head before they are cached. */
+  valueNorm?: boolean;
+  /**
+   * Gemma 4's "proportional" rotary on the full-attention layers: this many pairs of a head (element
+   * i with i + head / 2) turn, at theta^(−2i / head); the other pairs carry no position.
+   */
+  ropeProportional?: number;
+  /**
+   * Gemma 4 (E2B, E4B): each layer also takes a per-token input of this width, from a second
+   * embedding table and a projection of the token's embedding, gated by the layer's output.
+   */
+  perLayerInput?: number;
+  /** Gemma 4: each layer's output is multiplied by its scalar. Read from the weights by the loader. */
+  layerScalars?: number[];
+  /** Logits are squashed to ±cap with tanh before sampling (Gemma's final_logit_softcapping). */
+  logitSoftcap?: number;
 }
+
+/** The head size of layer l. */
+export const headDimOf = (cfg: Pick<LlamaConfig, "headDim" | "layerHeadDims">, l: number): number => cfg.layerHeadDims?.[l] ?? cfg.headDim;
 
 const optNum = (v: unknown): number | undefined => (typeof v === "number" && v > 0 ? v : typeof v === "bigint" && v > 0n ? Number(v) : undefined);
 
@@ -104,7 +134,7 @@ export class UnsupportedModelError extends Error {}
 /** The tensor a phi3 GGUF keeps LongRoPE's short factors in. */
 export const PHI3_ROPE_SHORT = "rope_factors_short.weight";
 
-const SUPPORTED = ["llama", "mistral", "qwen2", "qwen3", "qwen3_5_text", "granite", "granitemoehybrid", "gemma3_text", "phi3"];
+const SUPPORTED = ["llama", "mistral", "qwen2", "qwen3", "qwen3_5_text", "granite", "granitemoehybrid", "gemma3_text", "gemma4_text", "phi3"];
 
 type HFConfig = Record<string, unknown>;
 /**
@@ -120,6 +150,8 @@ const SIZE_LIMITS: Record<string, number> = {
   num_attention_heads: 1024,
   num_key_value_heads: 1024,
   head_dim: 4096,
+  global_head_dim: 4096,
+  "attention.key_length_swa": 4096,
   vocab_size: 4194304,
   sliding_window_pattern: 1024,
   embedding_length: 65536,
@@ -201,6 +233,12 @@ export function configFromHF(c: HFConfig, generation?: HFConfig): LlamaConfig {
     if (!text) throw new UnsupportedModelError('model_type "gemma3" without a text_config');
     const eos = [...ids(c.eos_token_id), ...ids(text.eos_token_id)];
     return gemma3({ ...GEMMA3_DEFAULTS, torch_dtype: c.torch_dtype, ...text, eos_token_id: eos, bos_token_id: text.bos_token_id ?? c.bos_token_id }, generation);
+  }
+  if (type === "gemma4" || type === "gemma4_text") {
+    // The multimodal checkpoint: run its language model and ignore the vision and audio towers.
+    const text = type === "gemma4" ? (c.text_config as HFConfig | undefined) : c;
+    if (!text) throw new UnsupportedModelError('model_type "gemma4" without a text_config');
+    return gemma4({ ...text, eos_token_id: [...ids(c.eos_token_id), ...ids(text.eos_token_id)], bos_token_id: text.bos_token_id ?? c.bos_token_id, torch_dtype: text.dtype ?? text.torch_dtype ?? c.dtype ?? c.torch_dtype }, generation);
   }
   if (type === "qwen3_5") {
     // The multimodal checkpoint (every Qwen 3.5 is one): run its language model, ignore the vision tower.
@@ -367,6 +405,102 @@ function bf16(x: number): number {
   return new Float32Array(u.buffer)[0]!;
 }
 
+/**
+ * Which layers of a Gemma 4 model read another layer's keys and values: the last `shared` layers,
+ * each from the last layer before them of its own kind (sliding or full).
+ */
+function gemma4KvFrom(slidingLayers: readonly boolean[], shared: number): (number | undefined)[] | undefined {
+  if (!shared) return undefined;
+  const first = slidingLayers.length - shared;
+  const producer = (sliding: boolean) => slidingLayers.lastIndexOf(sliding, first - 1);
+  if (first <= 0 || producer(true) < 0 || producer(false) < 0) throw new UnsupportedModelError(`Gemma 4: ${shared} of ${slidingLayers.length} layers share keys and values, but no earlier layer of each kind makes them`);
+  return slidingLayers.map((sliding, l) => (l < first ? undefined : producer(sliding)));
+}
+
+/** What Gemma 4 has beyond Gemma 3, from its sizes (see the fields' notes in `LlamaConfig`). */
+function gemma4Extras(o: { numLayers: number; headDim: number; globalHeadDim: number; slidingLayers: boolean[]; shared: number; perLayerInput: number; rotaryFactor: number; softcap?: number }): Partial<LlamaConfig> {
+  if (o.slidingLayers[o.numLayers - 1]) throw new UnsupportedModelError("Gemma 4: the last layer must be a full-attention layer");
+  if (o.globalHeadDim % 4 || o.headDim % 4) throw new UnsupportedModelError("Gemma 4: head sizes must be multiples of 4");
+  if (!Number.isInteger(o.shared) || o.shared < 0 || o.shared >= o.numLayers) throw new UnsupportedModelError(`Gemma 4: ${o.shared} layers sharing keys and values out of ${o.numLayers}`);
+  if (!Number.isInteger(o.perLayerInput) || o.perLayerInput < 0 || o.perLayerInput > 4096 || o.perLayerInput % 32) throw new UnsupportedModelError(`Gemma 4: a per-layer input of ${o.perLayerInput} values is not supported (a multiple of 32, at most 4096)`);
+  if (!(o.rotaryFactor > 0 && o.rotaryFactor <= 1)) throw new UnsupportedModelError(`Gemma 4: a rotary factor of ${o.rotaryFactor}`);
+  const pairs = Math.floor((o.rotaryFactor * o.globalHeadDim) / 2);
+  return {
+    ...(o.globalHeadDim !== o.headDim ? { layerHeadDims: o.slidingLayers.map((s) => (s ? o.headDim : o.globalHeadDim)) } : {}),
+    kvFrom: gemma4KvFrom(o.slidingLayers, o.shared),
+    valueNorm: true,
+    ...(pairs < o.globalHeadDim / 2 ? { ropeProportional: pairs } : {}),
+    ...(o.perLayerInput ? { perLayerInput: o.perLayerInput } : {}),
+    ...(o.softcap ? { logitSoftcap: o.softcap } : {}),
+  };
+}
+
+/**
+ * Gemma 4's language model (the E2B and E4B sizes): Gemma 3's layout with wider heads and rotary on
+ * part of each head in the full-attention layers, normalised values, later layers that read an
+ * earlier layer's keys and values, a per-layer input from a second embedding table, a scalar on each
+ * layer's output and soft-capped logits. The mixture-of-experts sizes are refused.
+ */
+function gemma4(c: HFConfig, generation?: HFConfig): LlamaConfig {
+  if (c.enable_moe_block) throw new UnsupportedModelError("Gemma 4 with mixture-of-experts blocks (26B-A4B) is not supported");
+  if (c.attention_k_eq_v) throw new UnsupportedModelError("Gemma 4 with shared key and value projections (attention_k_eq_v) is not supported");
+  if (c.use_bidirectional_attention) throw new UnsupportedModelError("Gemma with bidirectional attention (an embedding model) is not supported");
+  if (c.num_global_key_value_heads != null && c.num_global_key_value_heads !== c.num_key_value_heads) throw new UnsupportedModelError("Gemma 4 with a different number of key heads in full-attention layers is not supported");
+  const act = String(c.hidden_activation ?? "gelu_pytorch_tanh");
+  if (act !== "gelu_pytorch_tanh") throw new UnsupportedModelError(`Gemma activation "${act}" is not supported (gelu_pytorch_tanh only)`);
+  const numLayers = num(c, "num_hidden_layers");
+  const hiddenSize = num(c, "hidden_size");
+  const numHeads = num(c, "num_attention_heads");
+  const headDim = num(c, "head_dim", 256);
+  const types = Array.isArray(c.layer_types) ? (c.layer_types as string[]) : undefined;
+  if (types && types.length !== numLayers) throw new UnsupportedModelError("Gemma 4: layer_types does not list every layer");
+  const slidingLayers = Array.from({ length: numLayers }, (_, l) => (types ? types[l] === "sliding_attention" : (l + 1) % 6 !== 0));
+  const rope = (c.rope_parameters ?? {}) as Record<string, HFConfig | undefined>;
+  const full = rope.full_attention ?? { rope_type: "proportional", partial_rotary_factor: 0.25, rope_theta: 1e6 };
+  const sliding = rope.sliding_attention ?? { rope_type: "default", rope_theta: 1e4 };
+  if ((full.rope_type ?? "proportional") !== "proportional" || (sliding.rope_type ?? "default") !== "default") {
+    throw new UnsupportedModelError(`Gemma 4 with rotary types "${String(full.rope_type)}" / "${String(sliding.rope_type)}" is not supported (proportional / default)`);
+  }
+  if (c.hidden_size_per_layer_input && c.vocab_size_per_layer_input != null && c.vocab_size_per_layer_input !== c.vocab_size) throw new UnsupportedModelError("Gemma 4: the per-layer embedding table has another vocabulary size");
+  const dtype = String(c.torch_dtype ?? "bfloat16");
+  return {
+    family: "gemma4",
+    hiddenSize,
+    intermediateSize: num(c, "intermediate_size"),
+    numLayers,
+    numHeads,
+    numKvHeads: num(c, "num_key_value_heads", numHeads),
+    headDim,
+    vocabSize: num(c, "vocab_size"),
+    rmsEps: num(c, "rms_norm_eps", 1e-6),
+    ropeTheta: typeof full.rope_theta === "number" ? configNumber("rope_theta", full.rope_theta) : 1e6,
+    ropeLocalTheta: typeof sliding.rope_theta === "number" ? configNumber("rope_theta", sliding.rope_theta) : 1e4,
+    ropeInterleaved: false,
+    tieEmbeddings: Boolean(c.tie_word_embeddings ?? true),
+    attentionBias: Boolean(c.attention_bias ?? false),
+    qkNorm: true,
+    eosTokenIds: [...new Set([...ids(c.eos_token_id), ...ids(generation?.eos_token_id)])],
+    bosTokenId: typeof c.bos_token_id === "number" ? c.bos_token_id : undefined,
+    activation: "gelu",
+    embedScale: dtype === "bfloat16" ? bf16(Math.sqrt(hiddenSize)) : Math.fround(Math.sqrt(hiddenSize)),
+    sandwichNorms: true,
+    attnScale: 1,
+    slidingWindow: num(c, "sliding_window", 512),
+    slidingLayers,
+    contextLength: optNum(c.max_position_embeddings),
+    ...gemma4Extras({
+      numLayers,
+      headDim,
+      globalHeadDim: num(c, "global_head_dim", 512),
+      slidingLayers,
+      shared: num(c, "num_kv_shared_layers", 0),
+      perLayerInput: num(c, "hidden_size_per_layer_input", 0),
+      rotaryFactor: typeof full.partial_rotary_factor === "number" ? full.partial_rotary_factor : 1,
+      softcap: optNum(c.final_logit_softcapping),
+    }),
+  };
+}
+
 function gemma3(c: HFConfig, generation?: HFConfig): LlamaConfig {
   for (const k of ["attn_logit_softcapping", "final_logit_softcapping"]) {
     if (c[k] != null) throw new UnsupportedModelError(`Gemma 3 with ${k} is not supported yet`);
@@ -436,8 +570,8 @@ function ropeScalingFromHF(s: HFConfig | null | undefined): Llama3RopeScaling | 
  */
 export function configFromGGUF(meta: Map<string, unknown>, tensorNames: readonly string[], ropeShort?: ArrayLike<number>): LlamaConfig {
   const arch = String(meta.get("general.architecture"));
-  if (!["llama", "qwen2", "qwen3", "qwen35", "granite", "gemma3", "phi3"].includes(arch)) {
-    throw new UnsupportedModelError(`GGUF architecture "${arch}" is not supported yet (llama, qwen2, qwen3, qwen35, granite, gemma3, phi3)`);
+  if (!["llama", "qwen2", "qwen3", "qwen35", "granite", "gemma3", "gemma4", "phi3"].includes(arch)) {
+    throw new UnsupportedModelError(`GGUF architecture "${arch}" is not supported yet (llama, qwen2, qwen3, qwen35, granite, gemma3, gemma4, phi3)`);
   }
   const get = (k: string, fallback?: number): number => {
     let v: unknown = meta.get(`${arch}.${k}`) ?? fallback;
@@ -454,6 +588,7 @@ export function configFromGGUF(meta: Map<string, unknown>, tensorNames: readonly
   const hiddenSize = get("embedding_length");
   const tokens = meta.get("tokenizer.ggml.tokens") as unknown[] | undefined;
   if (arch === "gemma3") return gemma3FromGGUF(meta, tensorNames, get, tokens);
+  if (arch === "gemma4") return gemma4FromGGUF(meta, tensorNames, get, tokens);
   if (arch === "granite" && get("expert_count", 0)) throw new UnsupportedModelError("Granite mixture-of-experts models are not supported");
   const base: LlamaConfig = {
     family: arch as LlamaConfig["family"],
@@ -524,6 +659,64 @@ export function configFromGGUF(meta: Map<string, unknown>, tensorNames: readonly
  * applied, the sliding layers' rope base is 10k and every 6th layer is global (neither is in the
  * metadata), and attention is scaled by head_dim^-0.5, or by (hidden / heads)^-0.5 for the 62-layer 27B.
  */
+function gemma4FromGGUF(meta: Map<string, unknown>, tensorNames: readonly string[], get: (k: string, fallback?: number) => number, tokens: unknown[] | undefined): LlamaConfig {
+  if (tensorNames.some((n) => /^blk\.\d+\.(ffn_gate_inp|ffn_gate_exps)\./.test(n))) throw new UnsupportedModelError("Gemma 4 with mixture-of-experts blocks (26B-A4B) is not supported");
+  const numLayers = get("block_count");
+  const hiddenSize = get("embedding_length");
+  const numHeads = get("attention.head_count");
+  const globalHeadDim = get("attention.key_length", 512);
+  const headDim = get("attention.key_length_swa", globalHeadDim);
+  const pattern = meta.get("gemma4.attention.sliding_window_pattern");
+  if (!Array.isArray(pattern) || pattern.length !== numLayers) throw new UnsupportedModelError("Gemma 4 GGUF: attention.sliding_window_pattern does not list every layer");
+  const slidingLayers = pattern.map(Boolean);
+  // The MLP width is listed per layer: layers that share keys and values have a wider one. The weights carry the sizes.
+  const ffn = meta.get("gemma4.feed_forward_length");
+  const intermediateSize = sized("feed_forward_length", Number(Array.isArray(ffn) ? ffn[0] : ffn));
+  if (!(intermediateSize > 0)) throw new UnsupportedModelError('GGUF metadata is missing "gemma4.feed_forward_length"');
+  const eos = ids(meta.get("tokenizer.ggml.eos_token_id"));
+  // Chat turns end with <turn|>; some files name <eos> as the end-of-sequence token instead.
+  const eot = tokens?.indexOf("<turn|>") ?? -1;
+  const softcap = optNum(meta.get("gemma4.final_logit_softcapping"));
+  // The rotated share of a full-attention head is not in the metadata (the file's rope_freqs tensor
+  // holds it as factors); every published size uses a quarter.
+  return {
+    family: "gemma4",
+    hiddenSize,
+    intermediateSize,
+    numLayers,
+    numHeads,
+    numKvHeads: get("attention.head_count_kv", numHeads),
+    headDim,
+    vocabSize: get("vocab_size", tokens?.length ?? 0),
+    rmsEps: get("attention.layer_norm_rms_epsilon", 1e-6),
+    ropeTheta: get("rope.freq_base", 1e6),
+    ropeLocalTheta: get("rope.freq_base_swa", 1e4),
+    ropeInterleaved: false,
+    tieEmbeddings: !tensorNames.includes("output.weight"),
+    attentionBias: false,
+    qkNorm: true,
+    eosTokenIds: [...new Set([...eos, ...(eot >= 0 ? [eot] : [])])],
+    bosTokenId: meta.has("tokenizer.ggml.bos_token_id") ? Number(meta.get("tokenizer.ggml.bos_token_id")) : undefined,
+    activation: "gelu",
+    embedScale: bf16(Math.sqrt(hiddenSize)),
+    sandwichNorms: true,
+    attnScale: 1,
+    slidingWindow: get("attention.sliding_window", 512),
+    slidingLayers,
+    contextLength: optNum(meta.get("gemma4.context_length")),
+    ...gemma4Extras({
+      numLayers,
+      headDim,
+      globalHeadDim,
+      slidingLayers,
+      shared: get("attention.shared_kv_layers", 0),
+      perLayerInput: get("embedding_length_per_layer_input", 0),
+      rotaryFactor: 0.25,
+      softcap,
+    }),
+  };
+}
+
 function gemma3FromGGUF(meta: Map<string, unknown>, tensorNames: readonly string[], get: (k: string, fallback?: number) => number, tokens: unknown[] | undefined): LlamaConfig {
   const scaling = meta.get("gemma3.rope.scaling.type");
   if (scaling !== undefined && scaling !== "none" && scaling !== "linear") {
@@ -574,7 +767,14 @@ function gemma3FromGGUF(meta: Map<string, unknown>, tensorNames: readonly string
 }
 
 /** RoPE inverse frequencies, with Llama 3 long-context scaling applied when configured. */
-export function ropeInvFreq(cfg: Pick<LlamaConfig, "headDim" | "ropeTheta" | "ropeScaling" | "ropeLinear" | "ropeFactors" | "rotaryDims">): Float32Array {
+export function ropeInvFreq(cfg: Pick<LlamaConfig, "headDim" | "ropeTheta" | "ropeScaling" | "ropeLinear" | "ropeFactors" | "rotaryDims" | "ropeProportional">): Float32Array {
+  if (cfg.ropeProportional !== undefined) {
+    // Gemma 4: the whole head is paired (element i with i + head / 2), the first pairs turn at
+    // frequencies spread over the whole head, and the rest get a frequency of 0: no rotation.
+    const out = new Float32Array(cfg.headDim / 2);
+    for (let i = 0; i < Math.min(cfg.ropeProportional, out.length); i++) out[i] = 1 / cfg.ropeTheta ** ((2 * i) / cfg.headDim);
+    return out;
+  }
   // One frequency per rotated pair, spread over the rotated part of the head.
   const dims = cfg.rotaryDims ?? cfg.headDim;
   const half = dims / 2;

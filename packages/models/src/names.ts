@@ -27,6 +27,28 @@ const GEMMA3_BLOCK: Record<string, string> = {
   post_ffw_norm: "post_feedforward_layernorm",
 };
 
+/**
+ * Gemma 4 adds the per-layer input's gate, projection and norm. The layer's output scale and the
+ * per-layer embedding table are not listed: the loader reads them itself (see `GEMMA4_LAYER_SCALE`
+ * and `GEMMA4_PER_LAYER_TABLE`).
+ */
+const GEMMA4_BLOCK: Record<string, string> = {
+  ...GEMMA3_BLOCK,
+  inp_gate: "per_layer_input_gate",
+  proj: "per_layer_projection",
+  post_norm: "post_per_layer_input_norm",
+};
+const GEMMA4_GLOBAL: Record<string, string> = {
+  "per_layer_model_proj.weight": "model.per_layer_model_projection.weight",
+  "per_layer_proj_norm.weight": "model.per_layer_projection_norm.weight",
+};
+/** A Gemma 4 layer's output scalar: GGUF `blk.N.layer_output_scale.weight`, checkpoint `model.layers.N.layer_scalar`. Captures the layer. */
+export const GEMMA4_LAYER_SCALE = /^(?:blk\.(\d+)\.layer_output_scale\.weight|model\.layers\.(\d+)\.layer_scalar)$/;
+/** Gemma 4's per-layer embedding table [vocab, layers · width], in a GGUF file and in a checkpoint (text names). */
+export const GEMMA4_PER_LAYER_TABLE = ["per_layer_token_embd.weight", "model.embed_tokens_per_layer.weight"];
+/** The table of layer l alone, [vocab, width], as the model reads it. */
+export const gemma4PerLayerTable = (l: number): string => `model.embed_tokens_per_layer.${l}.weight`;
+
 /** Phi-3 files keep q/k/v as one tensor and gate/up as one (in `ffn_up`): the stacked weights Kiln runs. */
 const PHI3_BLOCK: Record<string, string> = {
   ...BLOCK,
@@ -58,9 +80,10 @@ export function ggufToHF(name: string, arch = "llama"): string | undefined {
     const p = name.match(/^blk\.(\d+)\.(ssm_a|ssm_dt\.bias)$/);
     if (p) return `model.layers.${p[1]}.linear_attn.${p[2] === "ssm_a" ? "A_log" : "dt_bias"}`;
   }
+  if (arch === "gemma4" && GEMMA4_GLOBAL[name]) return GEMMA4_GLOBAL[name];
   const m = name.match(/^blk\.(\d+)\.(\w+)\.(weight|bias)$/);
   if (!m) return undefined;
-  const mapped = (arch === "gemma3" ? GEMMA3_BLOCK : arch === "phi3" ? PHI3_BLOCK : arch === "qwen35" ? QWEN35_BLOCK : BLOCK)[m[2]!];
+  const mapped = (arch === "gemma3" ? GEMMA3_BLOCK : arch === "gemma4" ? GEMMA4_BLOCK : arch === "phi3" ? PHI3_BLOCK : arch === "qwen35" ? QWEN35_BLOCK : BLOCK)[m[2]!];
   return mapped ? `model.layers.${m[1]}.${mapped}.${m[3]}` : undefined;
 }
 

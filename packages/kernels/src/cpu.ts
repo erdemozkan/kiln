@@ -1206,6 +1206,20 @@ export const cpuScaleAdd: CpuKernel = (b) => {
   for (let i = 0; i < n; i++) y[i] = (accumulate ? y[i]! : 0) + a * x[i]!;
 };
 
+export const cpuScale: CpuKernel = (b) => {
+  const n = b[0]!.u32[0]!;
+  const a = b[0]!.f32[2]!;
+  const x = b[1]!.f32;
+  for (let i = 0; i < n; i++) x[i] = Math.fround(a * x[i]!);
+};
+
+export const cpuSoftcap: CpuKernel = (b) => {
+  const n = b[0]!.u32[0]!;
+  const cap = b[0]!.f32[2]!;
+  const x = b[1]!.f32;
+  for (let i = 0; i < n; i++) x[i] = cap * Math.tanh(x[i]! / cap);
+};
+
 export const cpuAvgPool: CpuKernel = (b) => {
   const [side, k, C] = [b[0]!.u32[0]!, b[0]!.u32[1]!, b[0]!.u32[2]!];
   const x = b[1]!.f32;

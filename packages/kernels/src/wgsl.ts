@@ -1037,6 +1037,131 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
 }`);
 }
 
+/**
+ * `attentionSpec` for heads wider than a workgroup has threads (up to 2 · ATTN_WG: Gemma 4's
+ * full-attention layers have heads of 512): the same online softmax over blocks of keys, with each
+ * thread summing two output elements. Prefill rows and decode steps both use it.
+ */
+export function attentionWideSpec(kv: KvDtype = "f32"): KernelSpec {
+  const rel = false;
+  const r = kvRead(kv);
+  const bindings: BindingKind[] = rel ? ["uniform", "read", "read", "read", "read", "read", "rw"] : ["uniform", "read", "read", "read", "read", "rw"];
+  return spec(`attention/wide/${kv}`, bindings, cpu.cpuAttention(kv, rel), () => /* wgsl */ `
+${STEP_WGSL}
+${kvFns(kv)}
+${ATTN_P("_a")}
+${FIRST_KEY_WGSL}
+@group(0) @binding(0) var<uniform> p: P;
+@group(0) @binding(1) var<storage, read> st: Step;
+@group(0) @binding(2) var<storage, read> q: array<f32>;
+@group(0) @binding(3) var<storage, read> kc: ${r.kDecl};
+@group(0) @binding(4) var<storage, read> vc: ${r.vDecl};
+${rel ? `@group(0) @binding(5) var<storage, read> rel: array<f32>;
+@group(0) @binding(6) var<storage, read_write> o: array<f32>;
+// T5's relative position bucket (see cpu.t5Bucket): _x buckets, _y max distance, _z bidirectional.
+fn bucket(r: i32) -> u32 {
+  var nb = p._x;
+  var ret = 0u;
+  var n: i32;
+  if (p._z != 0u) {
+    nb = nb / 2u;
+    ret = select(0u, nb, r > 0);
+    n = abs(r);
+  } else {
+    n = max(-r, 0);
+  }
+  let exact = nb / 2u;
+  if (u32(n) < exact) { return ret + u32(n); }
+  let large = exact + u32(log(f32(n) / f32(exact)) / log(f32(p._y) / f32(exact)) * f32(nb - exact));
+  return ret + min(large, nb - 1u);
+}` : `@group(0) @binding(5) var<storage, read_write> o: array<f32>;`}
+const WG = ${ATTN_WG}u;
+var<workgroup> red: array<f32, ${ATTN_WG}>;
+var<workgroup> ss: array<f32, ${ATTN_WG}>;
+var<workgroup> qs: array<vec4<f32>, ${ATTN_WG / 2}>;
+
+@compute @workgroup_size(${ATTN_WG})
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) li: u32) {
+  let h = wid.x;
+  let t = wid.y;
+  let kvh = h / (p.H / p.Hkv);
+  let n = keys(st.pos0 + t);
+  let qo = (t * p.H + h) * p.D;
+  let stride = p.Hkv * ${r.head};
+  let ko = kvh * ${r.head};
+  let d4 = p.D / 4u;
+  if (li < d4) {
+    let qb = qo + li * 4u;
+    qs[li] = vec4<f32>(q[qb], q[qb + 1u], q[qb + 2u], q[qb + 3u]) * p.scale;
+  }
+  workgroupBarrier();
+
+  let lane = li % 8u;
+  let key = li / 8u;
+  // Each thread sums output elements li and li + WG over every key of a block.
+  let two = li + WG < p.D;
+  var m = -3.0e38;
+  var l = 0.0;
+  var acc = 0.0;
+  var acc2 = 0.0;
+  for (var b0 = firstKey(n, p.win); b0 < n; b0 += WG) {
+    let bn = min(WG, n - b0);
+    let sb = b0 % p.cap;
+    // Scores: 8 lanes per key (vec4 slots lane, lane + 8, ...), 32 keys per pass, coalesced cache reads.
+    for (var k0 = 0u; k0 < bn; k0 += WG / 8u) {
+      let jj = k0 + key;
+      var d = 0.0;
+      if (jj < bn) {
+        let kb = (wrap(sb + jj) * stride + ko) / 4u;
+        for (var c = lane; c < d4; c += 8u) { d += dot(qs[c], ${r.k4("kb + c")}); }
+        ${r.kScale("kb")}
+      }
+      red[li] = d;
+      workgroupBarrier();
+      if (lane == 0u && jj < bn) {
+        var total = 0.0;
+        for (var x = 0u; x < 8u; x++) { total += red[li + x]; }
+        ss[jj] = total;
+      }
+      workgroupBarrier();
+    }
+
+    let sc = select(-3.0e38, ss[li]${rel ? " + rel[bucket(i32(b0 + li) - i32(st.pos0 + t)) * p.H + h]" : ""}, li < bn);
+    red[li] = sc;
+    workgroupBarrier();
+    for (var s = WG / 2u; s > 0u; s >>= 1u) {
+      if (li < s) { red[li] = max(red[li], red[li + s]); }
+      workgroupBarrier();
+    }
+    let mNew = max(m, red[0]);
+    workgroupBarrier();
+    let e = select(0.0, exp(sc - mNew), li < bn);
+    ss[li] = e;
+    red[li] = e;
+    workgroupBarrier();
+    for (var s = WG / 2u; s > 0u; s >>= 1u) {
+      if (li < s) { red[li] += red[li + s]; }
+      workgroupBarrier();
+    }
+    let corr = exp(m - mNew);
+    l = l * corr + red[0];
+    m = mNew;
+    acc *= corr;
+    acc2 *= corr;
+    for (var jj = 0u; jj < bn; jj++) {
+      let vb = wrap(sb + jj) * stride + ko;
+      acc += ss[jj] * ${r.v1("vb", "li")};
+      if (two) { acc2 += ss[jj] * ${r.v1("vb", "(li + WG)")}; }
+    }
+    workgroupBarrier();
+  }
+
+  o[qo + li] = acc / l;
+  if (two) { o[qo + li + WG] = acc2 / l; }
+}`);
+}
+
+
 export interface AttentionTile {
   /** Query rows per tile. */
   R: number;
@@ -3277,6 +3402,37 @@ fn main(${EW_ARGS}) {
   if (idx >= p.n) { return; }
   let v = p.a * x[idx];
   if (p.accumulate == 1u) { y[idx] += v; } else { y[idx] = v; }
+}`);
+}
+
+/** x multiplied by a constant in place. */
+export function scaleInPlaceSpec(): KernelSpec {
+  return spec("scale", ["uniform", "rw"], cpu.cpuScale, () => /* wgsl */ `
+struct P { n: u32, _a: u32, a: f32, _b: u32 }
+@group(0) @binding(0) var<uniform> p: P;
+@group(0) @binding(1) var<storage, read_write> x: array<f32>;
+
+@compute @workgroup_size(${EW})
+fn main(${EW_ARGS}) {
+  ${FLAT}
+  if (idx >= p.n) { return; }
+  x[idx] = p.a * x[idx];
+}`);
+}
+
+/** Logits squashed to ±cap in place: cap · tanh(x / cap), Gemma's final soft cap. */
+export function softcapSpec(): KernelSpec {
+  return spec("softcap", ["uniform", "rw"], cpu.cpuSoftcap, () => /* wgsl */ `
+struct P { n: u32, _a: u32, cap: f32, _b: u32 }
+@group(0) @binding(0) var<uniform> p: P;
+@group(0) @binding(1) var<storage, read_write> x: array<f32>;
+
+@compute @workgroup_size(${EW})
+fn main(${EW_ARGS}) {
+  ${FLAT}
+  if (idx >= p.n) { return; }
+  // tanh of a large argument overflows its exponentials on some GPUs: past ±15 it is ±1 in f32.
+  x[idx] = p.cap * tanh(clamp(x[idx] / p.cap, -15.0, 15.0));
 }`);
 }
 

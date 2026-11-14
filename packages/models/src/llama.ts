@@ -1,6 +1,7 @@
 import { ActivationPool, Ctx, STEP_BYTES, physical, byteSize, isBlockQuant, packStep, q4ScaleBytes, view, type Backend, type Buf, type Dispatch, type StepParams, type Tensor } from "@kiln/core";
 import { ATTN_WG, ops, type KvDtype } from "@kiln/kernels";
-import { ropeInvFreq, type LlamaConfig } from "./config";
+import { headDimOf, ropeInvFreq, type LlamaConfig } from "./config";
+import { gemma4PerLayerTable } from "./names";
 
 /** A recorded forward pass for a fixed number of tokens. */
 export interface ForwardPlan {
@@ -12,6 +13,12 @@ export interface ForwardPlan {
    * logits nobody reads (the head is a vocabulary-sized matmul). Same as `dispatches` for verify plans.
    */
   readonly body: readonly Dispatch[];
+  /**
+   * Gemma 4: the dispatches up to the last layer that writes keys and values. The layers after it
+   * read an earlier layer's cache and leave nothing a later token needs, so a prefill chunk whose
+   * logits nobody reads stops here.
+   */
+  readonly kvBody?: readonly Dispatch[];
   /** u32 [T] token ids, written before each replay. */
   readonly tokens: Buf;
   /** u32 [1] sampled token for row `step.lastRow`; u32 [T], one per row, for a verify plan. */
@@ -95,6 +102,8 @@ export const RING_SLACK = 256;
 export function ringSlots(cfg: LlamaConfig, maxSeq: number, l: number): number {
   // A linear-attention layer keeps a recurrent state, not keys and values.
   if (cfg.linearLayers?.[l]) return 0;
+  // Nor does a layer that reads another layer's keys and values (Gemma 4).
+  if (cfg.kvFrom?.[l] !== undefined) return 0;
   const win = cfg.slidingLayers?.[l] ? cfg.slidingWindow : undefined;
   return win ? Math.min(maxSeq, Math.max(ATTN_WG, win + RING_SLACK)) : maxSeq;
 }
@@ -102,17 +111,16 @@ export function ringSlots(cfg: LlamaConfig, maxSeq: number, l: number): number {
 /** Bytes one cached value takes. */
 const KV_BYTES: Record<KvDtype, number> = { f32: 4, f16: 2, f8: 1, i8: 1 };
 
-/** Bytes of one position's keys (or values) in a layer's cache: every head's values, and for i8 a scale word per head. */
-export function kvRowBytesOf(cfg: LlamaConfig, kvDtype: KvDtype): number {
-  return cfg.numKvHeads * (cfg.headDim * KV_BYTES[kvDtype] + (kvDtype === "i8" ? 4 : 0));
+/** Bytes of one position's keys (or values) in layer l's cache: every head's values, and for i8 a scale word per head. */
+export function kvRowBytesOf(cfg: LlamaConfig, kvDtype: KvDtype, l = 0): number {
+  return cfg.numKvHeads * (headDimOf(cfg, l) * KV_BYTES[kvDtype] + (kvDtype === "i8" ? 4 : 0));
 }
 
 /** KV cache bytes of a model at a context length: keys and values of every layer, rings included. */
 export function kvCacheBytes(cfg: LlamaConfig, maxSeq: number, kvDtype: KvDtype = "f16"): number {
-  const row = kvRowBytesOf(cfg, kvDtype);
-  let slots = 0;
-  for (let l = 0; l < cfg.numLayers; l++) slots += ringSlots(cfg, maxSeq, l);
-  return 2 * slots * row;
+  let bytes = 0;
+  for (let l = 0; l < cfg.numLayers; l++) bytes += ringSlots(cfg, maxSeq, l) * kvRowBytesOf(cfg, kvDtype, l);
+  return 2 * bytes;
 }
 
 /**
@@ -155,6 +163,8 @@ export class LlamaModel {
   private readonly linearState = new Map<number, { s: Buf; conv: Buf }>();
   /** L2 normalisation of a key head as an RMSNorm weight (see `buildPlan`). */
   private readonly l2Weight: Tensor | undefined;
+  /** Weights of ones by length (see `ones`). */
+  private readonly unit = new Map<number, Tensor>();
   /** Cache slots per layer: maxSeq, or a ring for sliding layers (see `ringSlots`). */
   readonly slots: number[] = [];
   private readonly invFreq: Tensor;
@@ -188,9 +198,10 @@ export class LlamaModel {
     this.allowedRows = backend.alloc(MAX_VERIFY_ROWS * (1 + Math.ceil(cfg.vocabSize / 32)) * 4, "storage", "allowed/rows");
     this.setAllowed(undefined);
     this.activations = new ActivationPool(backend);
-    const row = kvRowBytesOf(cfg, this.kvDtype);
+    if (this.kvDtype === "i8" && cfg.layerHeadDims?.some((d) => d > ATTN_WG)) throw new Error(`the i8 cache does not hold heads wider than ${ATTN_WG}; use f16 or f8 for this model`);
     for (let l = 0; l < cfg.numLayers; l++) {
       const slots = ringSlots(cfg, this.maxSeq, l);
+      const row = kvRowBytesOf(cfg, this.kvDtype, l);
       this.slots.push(slots);
       // A layer without a cache (linear attention) keeps one word, so every layer has its buffers.
       this.kv.push({
@@ -220,16 +231,18 @@ export class LlamaModel {
       backend.write(buf, 0, f);
       return { shape: [f.length], dtype: "f32", buf };
     };
-    this.invFreq = freqs(ropeInvFreq(cfg), "rope/inv_freq");
+    // With two head sizes (Gemma 4), the full-attention layers' is the one `ropeTheta` and its options describe.
+    const fullLayer = cfg.slidingLayers?.indexOf(false) ?? 0;
+    this.invFreq = freqs(ropeInvFreq({ ...cfg, headDim: headDimOf(cfg, Math.max(0, fullLayer)) }), "rope/inv_freq");
     this.localInvFreq =
-      cfg.ropeLocalTheta !== undefined && (cfg.ropeLocalTheta !== cfg.ropeTheta || cfg.ropeLinear)
+      cfg.ropeLocalTheta !== undefined && (cfg.ropeLocalTheta !== cfg.ropeTheta || cfg.ropeLinear || cfg.layerHeadDims || cfg.ropeProportional !== undefined)
         ? freqs(ropeInvFreq({ headDim: cfg.headDim, ropeTheta: cfg.ropeLocalTheta }), "rope/inv_freq/local")
         : this.invFreq;
     this.w("model.embed_tokens.weight");
     const fuse = typeof opts.fuse === "object" ? { qkv: true, mlp: true, ...opts.fuse } : { qkv: opts.fuse ?? true, mlp: opts.fuse ?? true };
     // Phi-3 checkpoints store qkv already stacked.
     // Qwen 3.5's q_proj carries a gate beside each query, and not every layer has attention: its q/k/v stay apart.
-    this.fusedQkv = weights.has("model.layers.0.self_attn.qkv.weight") || (fuse.qkv && !cfg.linearLayers && this.fuse("self_attn", ["q_proj", "k_proj", "v_proj"], "qkv", cfg.attentionBias));
+    this.fusedQkv = weights.has("model.layers.0.self_attn.qkv.weight") || (fuse.qkv && !cfg.linearLayers && !cfg.valueNorm && !cfg.kvFrom && !cfg.layerHeadDims && this.fuse("self_attn", ["q_proj", "k_proj", "v_proj"], "qkv", cfg.attentionBias));
     // Granite 4 and Phi-3 checkpoints store gate_up already stacked.
     this.fusedMlp = weights.has("model.layers.0.mlp.gate_up.weight") || (fuse.mlp && this.fuse("mlp", ["gate_proj", "up_proj"], "gate_up", false));
   }
@@ -286,14 +299,19 @@ export class LlamaModel {
     return { weights, kv, activations: this.activations.bytes };
   }
 
-  /** Bytes of one position's K (or V) in one layer's cache. */
+  /** Bytes of one position's K (or V) in the first layer's cache: with `slots`, what tells two cache layouts apart. */
   get kvRowBytes(): number {
     return kvRowBytesOf(this.cfg, this.kvDtype);
   }
 
+  /** Bytes of one position's K (or V) in layer l's cache (layers may differ in head size). */
+  private rowBytes(l: number): number {
+    return kvRowBytesOf(this.cfg, this.kvDtype, l);
+  }
+
   /** Bytes `readKv(n)` returns: each layer's first min(n, slots) K rows and as many V rows. */
   kvSnapshotBytes(n: number): number {
-    return this.slots.reduce((t, slots) => t + 2 * Math.min(n, slots) * this.kvRowBytes, 0);
+    return this.slots.reduce((t, slots, l) => t + 2 * Math.min(n, slots) * this.rowBytes(l), 0);
   }
 
   /**
@@ -305,7 +323,7 @@ export class LlamaModel {
    */
   async readKv(n: number): Promise<Uint8Array> {
     const parts = this.kv.flatMap(({ k, v }, l) => {
-      const bytes = Math.min(n, this.slots[l]!) * this.kvRowBytes;
+      const bytes = Math.min(n, this.slots[l]!) * this.rowBytes(l);
       // A layer without a cache (linear attention) has no rows.
       return bytes ? [this.backend.readback(k, 0, bytes), this.backend.readback(v, 0, bytes)] : [];
     });
@@ -325,7 +343,7 @@ export class LlamaModel {
 
   /** Bytes `readKvRange(from, to)` returns in all. */
   kvRangeBytes(from: number, to: number): number {
-    return this.slots.reduce((t, _, l) => t + 2 * (to - this.kvRangeStart(l, from, to)) * this.kvRowBytes, 0);
+    return this.slots.reduce((t, slots, l) => t + (slots ? 2 * (to - this.kvRangeStart(l, from, to)) * this.rowBytes(l) : 0), 0);
   }
 
   /**
@@ -336,8 +354,8 @@ export class LlamaModel {
    */
   async readKvRange(from: number, to: number): Promise<Uint8Array[]> {
     if (!(from >= 0 && from <= to && to <= this.maxSeq)) throw new Error(`readKvRange: ${from}…${to} is not inside the cache`);
-    const row = this.kvRowBytes;
     const parts = this.kv.flatMap(({ k, v }, l) => {
+      const row = this.rowBytes(l);
       const slots = this.slots[l]!;
       // A layer without a cache (linear attention) has no rows.
       if (!slots) return [];
@@ -425,7 +443,7 @@ export class LlamaModel {
 
   saveKv(n: number): Buf[] {
     return this.kv.flatMap(({ k, v }, l) => {
-      const bytes = Math.min(n, this.slots[l]!) * this.kvRowBytes;
+      const bytes = Math.min(n, this.slots[l]!) * this.rowBytes(l);
       return [k, v].map((src, i) => {
         // A layer without a cache (linear attention) has nothing to copy, but keeps its place in the list.
         const dst = this.backend.alloc(Math.max(4, bytes), "storage", `kv/saved/${l}/${i ? "v" : "k"}`);
@@ -438,7 +456,7 @@ export class LlamaModel {
   /** Copies `saveKv(n)`'s buffers back into the cache. */
   restoreKv(n: number, saved: readonly Buf[]): void {
     for (const [l, { k, v }] of this.kv.entries()) {
-      const bytes = Math.min(n, this.slots[l]!) * this.kvRowBytes;
+      const bytes = Math.min(n, this.slots[l]!) * this.rowBytes(l);
       if (!bytes) continue;
       this.backend.copy(saved[2 * l]!, 0, k, 0, bytes);
       this.backend.copy(saved[2 * l + 1]!, 0, v, 0, bytes);
@@ -450,7 +468,7 @@ export class LlamaModel {
     if (n > this.maxSeq || data.length !== this.kvSnapshotBytes(n)) throw new Error(`writeKv: ${data.length} bytes do not hold ${n} positions`);
     let at = 0;
     for (const [l, { k, v }] of this.kv.entries()) {
-      const bytes = Math.min(n, this.slots[l]!) * this.kvRowBytes;
+      const bytes = Math.min(n, this.slots[l]!) * this.rowBytes(l);
       if (!bytes) continue;
       this.backend.write(k, 0, data.subarray(at, at + bytes));
       this.backend.write(v, 0, data.subarray(at + bytes, at + 2 * bytes));
@@ -588,6 +606,7 @@ export class LlamaModel {
   enableLora(rank: number): void {
     this.freeLora();
     if (rank <= 0) return;
+    if (this.cfg.kvFrom) throw new Error("LoRA adapters are not supported on Gemma 4 yet");
     const R = LlamaModel.loraSlotRank(rank);
     const slots = new Map<string, LoraSlot>();
     for (const s of this.loraLayout()) {
@@ -677,7 +696,6 @@ export class LlamaModel {
     const ctx = new Ctx(this.backend, this.step, `${verify ? "V" : "T"}${T}`, this.activations);
     const tokens = ctx.buffer(T * 4, "tokens");
     const out = ctx.buffer((verify ? T : 1) * 4, "out");
-    const D = c.headDim;
     const gelu = c.activation === "gelu";
     const norm = (t: Tensor, name: string) => ops.rmsnorm(ctx, t, this.w(name), c.rmsEps);
 
@@ -689,9 +707,20 @@ export class LlamaModel {
     };
     const features = this.imageFeatures && { buf: this.imageFeatures, vocab: c.vocabSize };
     const x = ops.embed(ctx, this.w("model.embed_tokens.weight"), tokens, T, c.embedScale ?? 1, features);
+    // Gemma 4's per-layer input, the part every layer shares: a projection of the token embeddings
+    // to layers × P values, normalised per layer. The model scales the projection by 1 / √hidden
+    // first, which RMSNorm undoes but for eps: the same as eps · hidden without the scaling.
+    const P = c.perLayerInput;
+    const perLayer = P ? ops.rmsnorm(ctx, ops.linear(ctx, x, this.w("model.per_layer_model_projection.weight")), this.w("model.per_layer_projection_norm.weight"), c.rmsEps * c.hiddenSize, P) : undefined;
+    const firstShared = c.kvFrom ? c.kvFrom.findIndex((from) => from !== undefined) : -1;
+    let kvEnd: number | undefined;
     for (let l = 0; l < c.numLayers; l++) {
       const p = `model.layers.${l}`;
-      const { k: kc, v: vc } = this.kv[l]!;
+      if (l === firstShared) kvEnd = ctx.dispatches.length;
+      const D = headDimOf(c, l);
+      // A layer without keys and values of its own (Gemma 4) reads the cache of an earlier one of its kind.
+      const src = c.kvFrom?.[l] ?? l;
+      const { k: kc, v: vc } = this.kv[src]!;
       const sliding = !!c.slidingLayers?.[l];
       const invFreq = sliding ? this.localInvFreq : this.invFreq;
       const attnShape = {
@@ -703,7 +732,7 @@ export class LlamaModel {
         kv: this.kvDtype,
         scale: c.attnScale,
         window: sliding ? c.slidingWindow : undefined,
-        slots: this.slots[l],
+        slots: this.slots[src],
       };
       const inputNorm = { w: this.w(`${p}.input_layernorm.weight`), eps: c.rmsEps };
       if (c.linearLayers?.[l]) this.linearAttention(ctx, x, l, T, L ? delta : undefined);
@@ -769,18 +798,32 @@ export class LlamaModel {
         ops.linear(ctx, m, this.w(`${p}.mlp.down_proj.weight`), { residual: x });
         if (L) delta(m, x, `${l}.down_proj`);
       }
+      if (P && perLayer) {
+        // This layer's input per token: its row of the second embedding table (times √P) plus its
+        // slice of the shared projection. The layer's output gates it, a projection brings it back
+        // to the model's width, and its norm goes onto the residual. The model halves the sum's
+        // square (× 1 / √2) before the gate; the norm after undoes that but for eps, hence 2 · eps.
+        const e = ops.embed(ctx, this.w(gemma4PerLayerTable(l)), tokens, T, Math.sqrt(P));
+        ops.cols(ctx, e, perLayer, { n: P, srcStart: l * P, accumulate: true });
+        const g = ops.linear(ctx, x, this.w(`${p}.per_layer_input_gate.weight`));
+        const back = ops.linear(ctx, ops.siluMul(ctx, g, e, "gelu"), this.w(`${p}.per_layer_projection.weight`));
+        ops.addInPlace(ctx, x, ops.rmsnorm(ctx, back, this.w(`${p}.post_per_layer_input_norm.weight`), 2 * c.rmsEps));
+      }
+      const scalar = c.layerScalars?.[l];
+      if (scalar !== undefined && scalar !== 1) ops.scaleInPlace(ctx, x, scalar);
     }
     const rows = verify ? view(x, [T, c.hiddenSize]) : ops.copyRow(ctx, view(x, [T, c.hiddenSize]));
     const head = this.weights.get("lm_head.weight") ?? this.w("model.embed_tokens.weight");
     const logits = ops.linear(ctx, rows, head, { norm: { w: this.w("model.norm.weight"), eps: c.rmsEps } });
+    if (c.logitSoftcap) ops.softcap(ctx, logits, c.logitSoftcap);
     if (verify) ops.sampleRows(ctx, logits, out, this.seen, this.allowedRows);
     else ops.sample(ctx, logits, out, this.seen, this.allowed);
 
     const dispatches = ctx.dispatches;
-    // Non-verify plans end copy_row → head matmul → sample.
-    const body = verify ? dispatches : dispatches.slice(0, dispatches.length - 3);
+    // Non-verify plans end copy_row → head matmul (→ soft cap) → sample.
+    const body = verify ? dispatches : dispatches.slice(0, dispatches.length - (c.logitSoftcap ? 4 : 3));
     if (!verify && dispatches[body.length]!.label !== "copy_row") throw new Error("buildPlan: unexpected head layout");
-    return { T, dispatches, body, tokens, out, logits, destroy: () => ctx.destroy() };
+    return { T, dispatches, body, ...(kvEnd !== undefined && !verify ? { kvBody: dispatches.slice(0, kvEnd) } : {}), tokens, out, logits, destroy: () => ctx.destroy() };
   }
 
   /**
@@ -811,6 +854,7 @@ export class LlamaModel {
       this.backend.free(k);
       this.backend.free(v);
     }
+    for (const t of this.unit.values()) this.backend.free(t.buf);
     for (const t of this.weights.values()) {
       this.backend.free(t.buf);
       if (t.scales) this.backend.free(t.scales);
@@ -877,12 +921,18 @@ export class LlamaModel {
 
   private attentionInputs(ctx: Ctx, x: Tensor, l: number, T: number, invFreq: Tensor, delta?: (xin: Tensor, y: Tensor, name: string) => void): { q: Tensor; gate?: Tensor } {
     const c = this.cfg;
-    const D = c.headDim;
+    const D = headDimOf(c, l);
     const p = `model.layers.${l}`;
     const h = ops.rmsnorm(ctx, x, this.w(`${p}.input_layernorm.weight`), c.rmsEps);
     let q = ops.linear(ctx, h, this.w(`${p}.self_attn.q_proj.weight`), this.bias(`${p}.self_attn.q_proj.bias`));
+    if (c.kvFrom?.[l] !== undefined) {
+      // Only a query: the keys and values are another layer's (Gemma 4), written earlier in this pass.
+      if (c.qkNorm) q = ops.rmsnorm(ctx, q, this.w(`${p}.self_attn.q_norm.weight`), c.rmsEps, D);
+      ops.rope(ctx, q, T, c.numHeads, D, invFreq, c.ropeInterleaved);
+      return { q };
+    }
     let k = ops.linear(ctx, h, this.w(`${p}.self_attn.k_proj.weight`), this.bias(`${p}.self_attn.k_proj.bias`));
-    const v = ops.linear(ctx, h, this.w(`${p}.self_attn.v_proj.weight`), this.bias(`${p}.self_attn.v_proj.bias`));
+    let v = ops.linear(ctx, h, this.w(`${p}.self_attn.v_proj.weight`), this.bias(`${p}.self_attn.v_proj.bias`));
     if (delta) {
       delta(h, q, `${l}.q_proj`);
       delta(h, k, `${l}.k_proj`);
@@ -900,10 +950,24 @@ export class LlamaModel {
       q = qn;
       k = kn;
     }
+    // Gemma 4 normalises each value head too, with no learned weight.
+    if (c.valueNorm) v = ops.rmsnorm(ctx, v, this.ones(D), c.rmsEps, D);
     ops.rope(ctx, q, T, c.numHeads, D, invFreq, c.ropeInterleaved);
     ops.rope(ctx, k, T, c.numKvHeads, D, invFreq, c.ropeInterleaved);
     ops.kvWrite(ctx, k, v, this.kv[l]!.k, this.kv[l]!.v, T, this.maxSeq, this.kvDtype, this.slots[l], c.numKvHeads);
     return { q, gate };
+  }
+
+  /** A weight of D ones: RMSNorm without a learned scale. */
+  private ones(D: number): Tensor {
+    let t = this.unit.get(D);
+    if (!t) {
+      const buf = this.backend.alloc(D * 4, "storage", `ones/${D}`);
+      this.backend.write(buf, 0, new Float32Array(D).fill(1));
+      t = { shape: [D], dtype: "f32", buf };
+      this.unit.set(D, t);
+    }
+    return t;
   }
 
   private bias(name: string): Tensor | undefined {
