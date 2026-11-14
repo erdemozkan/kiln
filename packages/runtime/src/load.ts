@@ -21,6 +21,8 @@ import {
   type TensorEntry,
 } from "@kiln/loader";
 import { CpuBackend, ops, type KvDtype } from "@kiln/kernels";
+
+export type { KvDtype };
 import {
   LlamaModel,
   UnsupportedModelError,

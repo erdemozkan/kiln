@@ -1,5 +1,5 @@
 import type { Profile } from "@kiln/core";
-import type { GenerateOptions, GenerateStats, LoadProgress, Quant } from "@kiln/runtime";
+import type { GenerateOptions, GenerateStats, KvDtype, LoadProgress, Quant } from "@kiln/runtime";
 import type { ChatMessage } from "@kiln/tokenizers";
 
 export type WireGenerateOptions = Omit<GenerateOptions, "signal">;
@@ -10,6 +10,8 @@ export interface WireLoadOptions {
   maxSeq?: number;
   revision?: string;
   endpoint?: string;
+  /** KV cache storage: "f16" (default), "f32", or at half of f16's memory "i8" or "f8" (less exact). */
+  kvDtype?: KvDtype;
   /**
    * Keep the last prompt's K/V in OPFS and restore it on the next load (default true), so a page
    * reload does not prefill a shared prefix such as the system prompt again. A few MB per model.
