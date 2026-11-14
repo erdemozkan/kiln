@@ -93,6 +93,18 @@ the larger the picture; the same letters on a photo are read at every size tried
 model, not the code. Not compared number for number with another implementation. Video is not
 supported.
 
+**Live transcription.** `transcribeMicrophone(asr, { onUpdate })` transcribes the microphone as it
+is spoken, and `StreamingTranscriber` does the same for audio fed in pieces from anywhere
+(`feed(samples, sampleRate)`, `finish()`). Whisper hears fixed windows, so the audio since the last
+settled word is transcribed again on each pass (every `stepSeconds`, default 1) with word times, and
+a word is committed once two passes in a row agree on it; the rest is reported as tentative. Past
+`maxWindowSeconds` (default 20) the audio the committed words cover is dropped. Windows without
+sound are not transcribed, since Whisper invents words for silence. Checked with whisper-tiny.en on
+a recording fed at speaking speed, twice with a pause between: the same words as transcribing the
+file whole, settling a few seconds behind the audio on an Intel Iris GPU. Punctuation and capitals
+are those of the pass that committed a word, so they can differ from a whole-file transcript. The
+microphone capture itself (an AudioWorklet) was not run here: the test environment has no microphone.
+
 **Hardening against hostile model repos.** Three ways a crafted repo could freeze the tab are closed.
 The check on regexes from `tokenizer.json` and adapter configs now also refuses patterns that are
 slow without a repeated group (many choices or many open-ended repetitions in a row; one such pattern
