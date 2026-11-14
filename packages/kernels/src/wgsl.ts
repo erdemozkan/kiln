@@ -1,4 +1,4 @@
-import { STEP_WGSL, type BindingKind, type CpuKernel, type KernelSpec, type WeightDType } from "@kiln/core";
+import { ROPE_POS_WGSL, STEP_WGSL, type BindingKind, type CpuKernel, type KernelSpec, type WeightDType } from "@kiln/core";
 import * as cpu from "./cpu";
 
 /**
@@ -731,6 +731,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
 export function ropeSpec(interleaved: boolean): KernelSpec {
   return spec(`rope/${interleaved ? "interleaved" : "half"}`, ["uniform", "read", "read", "rw"], cpu.cpuRope(interleaved), () => /* wgsl */ `
 ${STEP_WGSL}
+${ROPE_POS_WGSL}
 // R: the leading elements of each head that are rotated (D, or fewer with partial rotary); the rest stay.
 struct P { T: u32, H: u32, D: u32, R: u32 }
 @group(0) @binding(0) var<uniform> p: P;
@@ -746,7 +747,7 @@ fn main(${EW_ARGS}) {
   let i = idx % hd;
   let row = idx / hd;
   let t = row / p.H;
-  let a = f32(st.pos0 + t) * invFreq[i];
+  let a = f32(ropePos(st.pos0 + t, i)) * invFreq[i];
   let c = cos(a);
   let s = sin(a);
   let base = row * p.D;
@@ -3491,6 +3492,7 @@ export function qkNormRopeKvSpec(interleaved: boolean, kv: KvDtype = "f32"): Ker
   const h = kv === "f16";
   return spec(`qknorm_rope_kv/${interleaved ? "interleaved" : "half"}/${kv}`, ["uniform", "read", "read", "read", "read", "read", "rw", "rw", "rw"], cpu.cpuQkNormRopeKv(interleaved, kv), () => /* wgsl */ `
 ${STEP_WGSL}
+${ROPE_POS_WGSL}
 ${kvFns(kv)}
 struct P { T: u32, H: u32, Hkv: u32, D: u32, maxSeq: u32, cap: u32, eps: f32, R: u32 }
 @group(0) @binding(0) var<uniform> p: P;
@@ -3557,7 +3559,7 @@ ${interleaved
     let a = row[j];
     let b = row[j + hd];
     let first = i < hd;`}
-    let ang = f32(pos) * invFreq[j];
+    let ang = f32(ropePos(pos, j)) * invFreq[j];
     out = select(b * cos(ang) + a * sin(ang), a * cos(ang) - b * sin(ang), first);
   }
   if (isQ) {
@@ -3589,6 +3591,7 @@ export function ropeKvSpec(interleaved: boolean, kv: KvDtype = "f32"): KernelSpe
   const h = kv === "f16";
   return spec(`rope_kv/${interleaved ? "interleaved" : "half"}/${kv}`, ["uniform", "read", "read", "read", "rw", "rw", "rw"], cpu.cpuRopeKv(interleaved, kv), () => /* wgsl */ `
 ${STEP_WGSL}
+${ROPE_POS_WGSL}
 ${kvFns(kv)}
 struct P { T: u32, H: u32, Hkv: u32, D: u32, maxSeq: u32, cap: u32, R: u32, _c: u32 }
 @group(0) @binding(0) var<uniform> p: P;
@@ -3614,7 +3617,7 @@ ${interleaved
   let a = qkv[base + j];
   let b = qkv[base + j + hd];
   let first = i < hd;`}
-  let ang = f32(pos) * invFreq[j];
+  let ang = f32(ropePos(pos, j)) * invFreq[j];
   let cs = cos(ang);
   let sn = sin(ang);
   return select(b * cs + a * sn, a * cs - b * sn, first);

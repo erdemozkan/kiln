@@ -1,4 +1,4 @@
-import type { CpuKernel, CpuView, WeightDType } from "@kiln/core";
+import { ropePos, type CpuKernel, type CpuView, type WeightDType } from "@kiln/core";
 import { GEMV_F32, GEMV_Q4, GEMV_Q8, type WasmHeap } from "./simd";
 
 /**
@@ -109,8 +109,9 @@ const act = (epi: "silu" | "gelu", x: number) => (epi === "gelu" ? geluTanh(x) :
 /** Step buffer fields (STEP_WGSL). */
 const step = (s: CpuView) => ({
   pos0: s.u32[0]!, lastRow: s.u32[1]!, seed: s.u32[2]!, temperature: s.f32[3]!, n: s.u32[4]!, topK: s.u32[5]!, topP: s.f32[6]!, rep: s.f32[7]!,
-  spanLo: s.u32[8]!, spanHi: s.u32[9]!,
+  spanLo: s.u32[8]!, spanHi: s.u32[9]!, posShift: s.u32[10]!, imgLo: s.u32[11]!, imgHi: s.u32[12]!, imgW: s.u32[13]!, imgPos: s.u32[14]!,
 });
+type Step = ReturnType<typeof step>;
 
 // ---- matmul, GEMV and GEMM: one implementation for all three ----
 
@@ -323,9 +324,10 @@ export const cpuRmsnorm: CpuKernel = (b) => {
 };
 
 /** cos and sin of each pair's angle at position pos (the angle rounded to f32, as the kernels do), into cs and sn. */
-function angles(pos: number, f: Float32Array, half: number, cs: Float64Array, sn: Float64Array): void {
+/** cos and sin of the token at index idx's angle for each frequency (its position per `ropePos`). */
+function angles(st: Step, idx: number, f: Float32Array, half: number, cs: Float64Array, sn: Float64Array): void {
   for (let j = 0; j < half; j++) {
-    const ang = Math.fround(pos * f[j]!);
+    const ang = Math.fround(ropePos(st, idx, j) * f[j]!);
     cs[j] = Math.cos(ang);
     sn[j] = Math.sin(ang);
   }
@@ -350,12 +352,12 @@ function rotateHead(src: Float32Array, base: number, D: number, cs: Float64Array
 export function cpuRope(interleaved: boolean): CpuKernel {
   return (b) => {
     const [T, H, D, R] = [b[0]!.u32[0]!, b[0]!.u32[1]!, b[0]!.u32[2]!, b[0]!.u32[3]!];
-    const { pos0 } = step(b[1]!);
+    const st = step(b[1]!);
     const f = b[2]!.f32;
     const x = b[3]!.f32;
     const cs = new Float64Array(R >>> 1), sn = new Float64Array(R >>> 1);
     for (let t = 0; t < T; t++) {
-      angles(pos0 + t, f, R >>> 1, cs, sn);
+      angles(st, st.pos0 + t, f, R >>> 1, cs, sn);
       for (let h = 0; h < H; h++) rotateHead(x, (t * H + h) * D, D, cs, sn, interleaved, x, (t * H + h) * D, R);
     }
   };
@@ -397,7 +399,8 @@ function qkvToCache(
   const [T, H, Hkv, D, maxSeq, cap] = [u[0]!, u[1]!, u[2]!, u[3]!, u[4]!, u[5]!];
   // cap 0: k and v go to row t of plain [T, Hkv·D] buffers, not into a cache.
   const local = cap === 0;
-  const { pos0 } = step(b[1]!);
+  const st = step(b[1]!);
+  const { pos0 } = st;
   const qkv = b[3]!.f32;
   const kc = cacheWriter(kcView, f16), vc = cacheWriter(vcView, f16);
   const kn = Hkv * D;
@@ -408,7 +411,7 @@ function qkvToCache(
     const pos = pos0 + t;
     const live = local || pos < maxSeq;
     const slot = local ? t * kn : (pos % cap) * kn;
-    angles(pos, f, R >>> 1, cs, sn);
+    angles(st, pos, f, R >>> 1, cs, sn);
     for (let hh = 0; hh < H + 2 * Hkv; hh++) {
       const base = (t * (H + 2 * Hkv) + hh) * D;
       if (hh >= H + Hkv) {

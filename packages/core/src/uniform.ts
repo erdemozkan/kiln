@@ -19,7 +19,7 @@ export function packUniform(fields: readonly Field[]): Uint8Array {
 
 /**
  * Per-step values shared by every kernel in a plan. Changing these between replays is how a single
- * recorded dispatch list serves every decode position. They live in a 32-byte storage buffer so the
+ * recorded dispatch list serves every decode position. They live in a small storage buffer so the
  * GPU can advance them itself between chained decode steps.
  */
 export interface StepParams {
@@ -44,16 +44,54 @@ export interface StepParams {
    */
   spanLo?: number;
   spanHi?: number;
+  /**
+   * Rotary positions on three axes (Qwen 3.5 with images): a token's position is its index minus
+   * `posShift`, and the tokens at indices [imgLo, imgHi) are one image, `imgW` tokens to a row, whose
+   * time position is `imgPos` and whose height and width positions are `imgPos` plus the token's row
+   * and column (see `ROPE_POS_WGSL`). All 0 by default: the position is the index.
+   */
+  posShift?: number;
+  imgLo?: number;
+  imgHi?: number;
+  imgW?: number;
+  imgPos?: number;
 }
 
-export const STEP_WGSL = /* wgsl */ `struct Step { pos0: u32, lastRow: u32, seed: u32, temperature: f32, n: u32, topK: u32, topP: f32, repPenalty: f32, spanLo: u32, spanHi: u32, _a: u32, _b: u32 }`;
+export const STEP_WGSL = /* wgsl */ `struct Step { pos0: u32, lastRow: u32, seed: u32, temperature: f32, n: u32, topK: u32, topP: f32, repPenalty: f32, spanLo: u32, spanHi: u32, posShift: u32, imgLo: u32, imgHi: u32, imgW: u32, imgPos: u32, _a: u32 }`;
+
+/**
+ * The rotary position of the token at index `idx` for frequency `i` (needs `st: Step`). Text: the
+ * index minus the shift, on every axis. Inside the image span, frequencies go to the axes in turn
+ * (i % 3: time, height, width), as Qwen's interleaved M-RoPE lays them out.
+ */
+export const ROPE_POS_WGSL = /* wgsl */ `fn ropePos(idx: u32, i: u32) -> u32 {
+  if (idx >= st.imgLo && idx < st.imgHi) {
+    let j = idx - st.imgLo;
+    let w = max(st.imgW, 1u);
+    let ax = i % 3u;
+    return st.imgPos + select(0u, select(j % w, j / w, ax == 1u), ax != 0u);
+  }
+  return idx - st.posShift;
+}`;
+
+/** `ROPE_POS_WGSL` on the CPU. */
+export function ropePos(s: { posShift: number; imgLo: number; imgHi: number; imgW: number; imgPos: number }, idx: number, i: number): number {
+  if (idx >= s.imgLo && idx < s.imgHi) {
+    const j = idx - s.imgLo;
+    const w = Math.max(s.imgW, 1);
+    const ax = i % 3;
+    return s.imgPos + (ax === 0 ? 0 : ax === 1 ? Math.floor(j / w) : j % w);
+  }
+  return idx - s.posShift;
+}
 
 /** Bytes of the step buffer. */
-export const STEP_BYTES = 48;
+export const STEP_BYTES = 64;
 
 export function packStep(s: StepParams): Uint8Array {
   return packUniform([
     u32(s.pos0), u32(s.lastRow), u32(s.seed), f32(s.temperature), u32(s.n ?? 0), u32(s.topK ?? 0), f32(s.topP ?? 1), f32(s.repetitionPenalty ?? 1),
-    u32(s.spanLo ?? 0), u32(s.spanHi ?? 0), u32(0), u32(0),
+    u32(s.spanLo ?? 0), u32(s.spanHi ?? 0), u32(s.posShift ?? 0), u32(s.imgLo ?? 0),
+    u32(s.imgHi ?? 0), u32(s.imgW ?? 0), u32(s.imgPos ?? 0), u32(0),
   ]);
 }

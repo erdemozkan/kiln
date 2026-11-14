@@ -25,7 +25,11 @@ export function rmsnormRef(x: Float32Array, w: Float32Array, D: number, eps: num
   return y;
 }
 
-export function ropeRef(x: Float32Array, T: number, H: number, D: number, pos0: number, invFreq: Float32Array, interleaved: boolean): Float32Array {
+/**
+ * Rotary embedding of [T, H, D]. `posOf(t, i)` gives row t's position for frequency i where positions
+ * differ by axis (see `mropePositions`); by default every frequency uses pos0 + t.
+ */
+export function ropeRef(x: Float32Array, T: number, H: number, D: number, pos0: number, invFreq: Float32Array, interleaved: boolean, posOf?: (t: number, i: number) => number): Float32Array {
   const y = x.slice();
   // One frequency per rotated pair: D / 2 of them, or fewer when only the head's first part is rotated.
   const half = invFreq.length;
@@ -34,13 +38,35 @@ export function ropeRef(x: Float32Array, T: number, H: number, D: number, pos0: 
       for (let i = 0; i < half; i++) {
         const base = (t * H + h) * D;
         const [i0, i1] = interleaved ? [base + 2 * i, base + 2 * i + 1] : [base + i, base + i + half];
-        const a = (pos0 + t) * invFreq[i]!;
+        const a = (posOf ? posOf(t, i) : pos0 + t) * invFreq[i]!;
         const x0 = x[i0]!;
         const x1 = x[i1]!;
         y[i0] = x0 * Math.cos(a) - x1 * Math.sin(a);
         y[i1] = x0 * Math.sin(a) + x1 * Math.cos(a);
       }
   return y;
+}
+
+/**
+ * Qwen's three-axis positions, as transformers' `get_rope_index` lays them out: `parts` is the
+ * sequence as runs of text (a token count) and images ([rows, cols] of tokens). Text advances all
+ * three axes together; an image's tokens share one time position, count rows on the height axis and
+ * columns on the width axis from it, and the text after continues past the longer side. Returns
+ * [time, height, width] positions per token.
+ */
+export function mropePositions(parts: readonly (number | readonly [number, number])[]): [number[], number[], number[]] {
+  const t: number[] = [], h: number[] = [], w: number[] = [];
+  let pos = 0;
+  for (const part of parts) {
+    if (typeof part === "number") {
+      for (let i = 0; i < part; i++, pos++) { t.push(pos); h.push(pos); w.push(pos); }
+    } else {
+      const [rows, cols] = part;
+      for (let r = 0; r < rows; r++) for (let c = 0; c < cols; c++) { t.push(pos); h.push(pos + r); w.push(pos + c); }
+      pos += Math.max(rows, cols);
+    }
+  }
+  return [t, h, w];
 }
 
 /** q [T, H, D]; caches [maxSeq, Hkv, D] already containing positions 0..pos0+T-1. */
