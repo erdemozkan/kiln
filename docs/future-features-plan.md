@@ -37,3 +37,17 @@ server; `localModel` registers a picked folder (any supported format) under an i
    file-system `ByteSource` and a check of what else in the engine assumes a browser.
 2. **Remembering without handles.** Safari and Firefox have no file handles to keep; copying a picked
    file into the browser's storage would cover them, at the cost of a second copy on disk.
+
+### A 4-bit KV cache: tried, not merged
+
+The local branch `q4-cache` holds a 4-bit cache after TurboQuant (arXiv:2504.19874): each head
+turned by a Hadamard rotation, then 4-bit Lloyd-Max codes with a scale per 32 values (5 bits a
+value, against 8 for i8 and 16 for f16), with GPU and CPU kernels and their checks. It keeps Gemma 4
+E2B's answers, whose keys and values are normalised, but breaks Qwen3 0.6B. Qwen3's keys have a few
+channels around a hundred times the rest and nearly the same at every position; with 4-bit keys
+most of the first layer's attention weight goes to the wrong tokens (92% of it on that model's real
+cache), and centring the keys first (free: the same vector off every key leaves the softmax alone)
+only brings that to 61%. 8-bit keys with 4-bit values keep attention as the i8 cache does, but at
+only about 17% less memory than it. What could make 4-bit keys work is quantizing them per channel
+over blocks of positions (KIVI's way), which needs a different layout and a running store; worth it
+only if long contexts become the limit.
