@@ -1,3 +1,4 @@
+import { q4Block } from "./q4";
 import { ropePos, type CpuKernel, type CpuView, type WeightDType } from "@kiln/core";
 import { GEMV_F32, GEMV_Q4, GEMV_Q8, type WasmHeap } from "./simd";
 
@@ -75,7 +76,7 @@ export const F8 = (() => {
 })();
 
 /** How a KV cache stores its values (the kernels' KvDtype). */
-type Kv = "f32" | "f16" | "f8" | "i8";
+type Kv = "f32" | "f16" | "f8" | "i8" | "q4";
 
 /**
  * Writes element pairs (e, e + 1; e even) of a cache: two 8-bit codes, packed halves or two floats.
@@ -84,6 +85,7 @@ type Kv = "f32" | "f16" | "f8" | "i8";
 function cacheWriter(c: CpuView, kv: Kv): (e: number, a: number, b: number) => void {
   // An i8 cache needs a head's largest value before any of it is stored: `cpuKvWriteI8` writes those.
   if (kv === "i8") throw new Error("an i8 cache is written by kv_write/i8");
+  if (kv === "q4") throw new Error("a q4 cache is written by kv_write/q4");
   if (kv === "f8") {
     const u = c.u32;
     return (e, a, b) => {
@@ -495,6 +497,14 @@ function kvRow(u: Uint32Array, f: Float32Array, e: number, D: number, kv: Kv, ou
     for (let i = 0; i < D; i++) out[i] = f[e + i]!;
     return;
   }
+  if (kv === "q4") {
+    // e is the head's first word: per 32 values, four words of codes and the scale (see KvDtype).
+    for (let g = 0, w = e; g < D; g += 32, w += 5) {
+      const scale = f[w + 4]!;
+      for (let j = 0; j < 32; j++) out[g + j] = Q4_LEVELS[(u[w + (j >>> 3)]! >>> ((j & 7) * 4)) & 15]! * scale;
+    }
+    return;
+  }
   if (kv === "i8") {
     // e is the head's first word: D / 4 words of signed bytes, then the scale. A byte c is c·|c|·scale.
     const scale = f[e + (D >>> 2)]!;
@@ -558,8 +568,8 @@ export function cpuAttention(kv: Kv, rel = false): CpuKernel {
     const heap = (b[2] as HeapView).heap;
     // T5's position bias is added to each score in TypeScript below (the WASM path takes the max first).
     const table = rel ? b[5]!.f32 : undefined;
-    // The WASM kernels read f32 and f16 caches; f8 and i8 caches take the TypeScript path below.
-    if (heap && !rel && kv !== "f8" && kv !== "i8" && D % (f16 ? 8 : 4) === 0) {
+    // The WASM kernels read f32 and f16 caches; f8, i8 and q4 caches take the TypeScript path below.
+    if (heap && !rel && (kv === "f32" || kv === "f16") && D % (f16 ? 8 : 4) === 0) {
       // The per-key work in WASM SIMD, on the caches in place, for all the query heads of a KV head at
       // once (each cache row read and widened once); masking and the softmax stay here.
       const G = H / Hkv;
@@ -600,7 +610,12 @@ export function cpuAttention(kv: Kv, rel = false): CpuKernel {
     const o = (rel ? b[6]! : b[5]!).f32;
     const stride = Hkv * D;
     // Where key j's head starts: an element index, or for i8 a word index (heads are D / 4 + 1 words).
-    const headAt = kv === "i8" ? (j: number, kvh: number) => ((j % cap) * Hkv + kvh) * ((D >>> 2) + 1) : (j: number, kvh: number) => (j % cap) * stride + kvh * D;
+    const headAt =
+      kv === "i8"
+        ? (j: number, kvh: number) => ((j % cap) * Hkv + kvh) * ((D >>> 2) + 1)
+        : kv === "q4"
+          ? (j: number, kvh: number) => ((j % cap) * Hkv + kvh) * (D / 32) * 5
+          : (j: number, kvh: number) => (j % cap) * stride + kvh * D;
     if (scores.length < maxSeq) scores = new Float32Array(maxSeq);
     const qs = new Float32Array(D);
     const row = new Float32Array(D);
@@ -1691,6 +1706,81 @@ export const cpuGatedDelta: CpuKernel = (b) => {
       }
     }
   }
+};
+
+/** The 16 levels of a q4 code: the Lloyd-Max quantizer of a unit normal, ascending (f32, as the kernels hold them). */
+export const Q4_LEVELS = Float32Array.from([-2.7326, -2.069, -1.6181, -1.2562, -0.9424, -0.6568, -0.3881, -0.1284, 0.1284, 0.3881, 0.6568, 0.9424, 1.2562, 1.6181, 2.069, 2.7326]);
+const Q4_EDGES = Float32Array.from({ length: 15 }, (_, k) => 0.5 * (Q4_LEVELS[k]! + Q4_LEVELS[k + 1]!));
+
+
+/** The normalized B-point Hadamard rotation of x[o … o + B − 1], in place, in f32 steps as the kernels take them (its own inverse). */
+export function hadamard(x: Float32Array, o: number, B: number): void {
+  for (let h = 1; h < B; h <<= 1)
+    for (let i = 0; i < B; i++)
+      if ((i & h) === 0) {
+        const [a, b] = [x[o + i]!, x[o + i + h]!];
+        x[o + i] = a + b;
+        x[o + i + h] = a - b;
+      }
+  const f = Math.fround(1 / Math.sqrt(B));
+  for (let i = 0; i < B; i++) x[o + i] = x[o + i]! * f;
+}
+
+/** The 32-point rotation (see `hadamard`). */
+export const hadamard32 = (x: Float32Array, o: number): void => hadamard(x, o, 32);
+
+/**
+ * One head of D values at x[o] as q4 words at out[w]: turned by the rotation of `q4Block(D)` values
+ * at a time, then each group of 32 as its codes and its scale (see `q4Group`).
+ */
+export function q4Head(x: Float32Array, o: number, D: number, out: Uint32Array, f: Float32Array, w: number): void {
+  const a = x.slice(o, o + D);
+  const B = q4Block(D);
+  for (let b = 0; b < D; b += B) hadamard(a, b, B);
+  for (let g = 0; g < D; g += 32) q4Group(a, g, out, f, w + (g / 32) * 5, false);
+}
+
+/** One group of 32 values as q4 words: (rotated by 32, unless `rotate` is false) the codes of each value over the group's root mean square, then that scale. */
+export function q4Group(x: Float32Array, o: number, out: Uint32Array, f: Float32Array, w: number, rotate = true): void {
+  const a = x.slice(o, o + 32);
+  if (rotate) hadamard32(a, 0);
+  let ss = 0;
+  for (let i = 0; i < 32; i++) ss = Math.fround(ss + Math.fround(a[i]! * a[i]!));
+  const s = Math.fround(Math.sqrt(Math.fround(ss / 32)));
+  const inv = s > 0 ? Math.fround(1 / s) : 0;
+  for (let k = 0; k < 4; k++) {
+    let word = 0;
+    for (let j = 0; j < 8; j++) {
+      const v = Math.fround(a[k * 8 + j]! * inv);
+      let c = 0;
+      for (let e = 0; e < 15; e++) if (v > Q4_EDGES[e]!) c++;
+      word |= c << (j * 4);
+    }
+    out[w + k] = word >>> 0;
+  }
+  f[w + 4] = s;
+}
+
+/** Writes k/v rows into q4 caches (see `kvWriteQ4Spec`). */
+export const cpuKvWriteQ4: CpuKernel = (b) => {
+  const u = b[0]!.u32;
+  const [T, Hkv, D, maxSeq, cap] = [u[0]!, u[1]!, u[2]!, u[3]!, u[4]!];
+  const { pos0 } = step(b[1]!);
+  const groups = D / 32;
+  for (const [src, dst] of [[b[2]!, b[4]!], [b[3]!, b[5]!]] as const) {
+    for (let t = 0; t < T; t++) {
+      const pos = pos0 + t;
+      if (pos >= maxSeq) continue;
+      for (let h = 0; h < Hkv; h++) q4Head(src.f32, (t * Hkv + h) * D, D, dst.u32, dst.f32, ((pos % cap) * Hkv + h) * groups * 5);
+    }
+  }
+};
+
+/** x turned in place by the Hadamard rotation of B values, block by block (see `hadamardSpec`). */
+export const cpuHadamard: CpuKernel = (b) => {
+  const [n, B] = [b[0]!.u32[0]!, b[0]!.u32[1]!];
+  const x = b[1]!.f32;
+  for (let o = 0; o + B <= n; o += B) hadamard(x, o, B);
 };
 
 /** Writes k/v rows into i8 caches: per head and position, a byte per value (sign · round(127·√|x / max|)) and the scale (see `kvWriteI8Spec`). */

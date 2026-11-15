@@ -1,6 +1,6 @@
 import { createWebGPUBackend } from "@kiln/backend-webgpu";
 import { Ctx, STEP_BYTES, packStep, type Backend, type Buf, type StepParams, type Tensor } from "@kiln/core";
-import { CpuBackend, F8, gpuConverts, ops, ref, t5Bucket as cpuT5Bucket, toF8 } from "@kiln/kernels";
+import { CpuBackend, F8, Q4_LEVELS, gpuConverts, hadamard, ops, q4Block, q4Head, ref, t5Bucket as cpuT5Bucket, toF8 } from "@kiln/kernels";
 import { dequantQ4, dequantQ8, f16ToF32, MemorySource, quantizeQ4, quantizeQ8, rowBytes, type SrcType } from "@kiln/loader";
 import { loadWeights, setGpuConvert } from "@kiln/runtime";
 
@@ -68,6 +68,24 @@ const asI8 = (a: Float32Array, D: number) => {
   }
   return out;
 };
+/** Rows of heads of D (a multiple of 32) as a q4 cache stores them: per head rotated, then per 32 values four words of codes and the scale. */
+const packQ4 = (a: Float32Array, D: number) => {
+  const out = new Uint32Array((a.length / 32) * 5);
+  const f = new Float32Array(out.buffer);
+  for (let h = 0; h < a.length / D; h++) q4Head(a, h * D, D, out, f, (h * D / 32) * 5);
+  return out;
+};
+/** What a q4 cache holds, turned back out of the rotation: the values attention sees. */
+const unpackQ4 = (w: Uint32Array, D: number) => {
+  const f = new Float32Array(w.buffer, w.byteOffset, w.length);
+  const out = new Float32Array((w.length / 5) * 32);
+  for (let g = 0; g < w.length / 5; g++)
+    for (let j = 0; j < 32; j++) out[g * 32 + j] = Q4_LEVELS[(w[g * 5 + (j >>> 3)]! >>> ((j & 7) * 4)) & 15]! * f[g * 5 + 4]!;
+  const B = q4Block(D);
+  for (let o = 0; o < out.length; o += B) hadamard(out, o, B);
+  return out;
+};
+const asQ4 = (a: Float32Array, D: number) => unpackQ4(packQ4(a, D), D);
 /** The same as an i8 cache stores it: per head D / 4 words of bytes, then the scale. */
 const packI8 = (a: Float32Array, D: number) => {
   const HW = D / 4 + 1;
@@ -711,6 +729,10 @@ async function main() {
       check("attention/f8", tag, await download(o.buf, q.length), ref.attentionRef(q, asF8(kc), asF8(vc), { T, H, Hkv, D, pos0 }), 1e-4);
       await run({ ...S0, pos0 }, (ctx) => (o = ops.attention(ctx, upload(q, [T, H * D]), upload(packI8(kc, D), [0]).buf, upload(packI8(vc, D), [0]).buf, { T, H, Hkv, D, maxSeq, kv: "i8" })));
       check("attention/i8", tag, await download(o.buf, q.length), ref.attentionRef(q, asI8(kc, D), asI8(vc, D), { T, H, Hkv, D, pos0 }), 2e-4);
+      if (D % 32 === 0) {
+        await run({ ...S0, pos0 }, (ctx) => (o = ops.attention(ctx, upload(q, [T, H * D]), upload(packQ4(kc, D), [0]).buf, upload(packQ4(vc, D), [0]).buf, { T, H, Hkv, D, maxSeq, kv: "q4" })));
+        check("attention/q4", tag, await download(o.buf, q.length), ref.attentionRef(q, asQ4(kc, D), asQ4(vc, D), { T, H, Hkv, D, pos0 }), 2e-4);
+      }
     }
     ops.setPrefillAttention("tiled");
   }
@@ -730,6 +752,42 @@ async function main() {
     check("attention/wide/f16", tag, await download(o.buf, q.length), ref.attentionRef(q, unpackHalf(packHalf(kc)), unpackHalf(packHalf(vc)), { T, H, Hkv, D, pos0, scale }), 2e-4);
     await run({ ...S0, pos0 }, (ctx) => (o = ops.attention(ctx, upload(q, [T, H * D]), upload(packF8(kc), [0]).buf, upload(packF8(vc), [0]).buf, { T, H, Hkv, D, maxSeq, kv: "f8", scale })));
     check("attention/wide/f8", tag, await download(o.buf, q.length), ref.attentionRef(q, asF8(kc), asF8(vc), { T, H, Hkv, D, pos0, scale }), 2e-4);
+    if (D % 32 === 0) {
+      await run({ ...S0, pos0 }, (ctx) => (o = ops.attention(ctx, upload(q, [T, H * D]), upload(packQ4(kc, D), [0]).buf, upload(packQ4(vc, D), [0]).buf, { T, H, Hkv, D, maxSeq, kv: "q4", scale })));
+      check("attention/wide/q4", tag, await download(o.buf, q.length), ref.attentionRef(q, asQ4(kc, D), asQ4(vc, D), { T, H, Hkv, D, pos0, scale }), 2e-4);
+    }
+  }
+
+  // The q4 cache's writer and the rotation: GPU codes against the CPU's, rows of heads of 32 to 512, a
+  // group of zeros among them; a rare code a step off where a value lies on a boundary is allowed.
+  for (const [T, Hkv, D] of [[3, 2, 64], [1, 1, 512], [5, 4, 128], [2, 2, 96], [4, 1, 256]] as const) {
+    const row = Hkv * D;
+    const maxSeq = 16;
+    const k = randn(T * row).map((v, i) => (Math.floor(i / 32) % 5 === 3 ? 0 : v * (1 + (i % 13))));
+    const v = randn(T * row);
+    const words = (maxSeq * row) / 32 * 5;
+    const [kcQ, vcQ] = [upload(new Uint32Array(words), [0]), upload(new Uint32Array(words), [0])];
+    const pos0 = 7;
+    await run({ ...S0, pos0 }, (ctx) => ops.kvWrite(ctx, upload(k, [T, row]), upload(v, [T, row]), kcQ.buf, vcQ.buf, T, maxSeq, "q4", maxSeq, Hkv));
+    const placed = (a: Float32Array) => {
+      const full = new Float32Array(maxSeq * row);
+      full.set(a, pos0 * row);
+      return asQ4(full, D);
+    };
+    for (const [name, buf, src] of [["k", kcQ, k], ["v", vcQ, v]] as const) {
+      const got = unpackQ4(new Uint32Array(await be.readback(buf.buf, 0, words * 4)), D);
+      const want = placed(src);
+      let off = 0;
+      for (let i = 0; i < got.length; i++) if (Math.abs(got[i]! - want[i]!) > 1e-3 * (1 + Math.abs(want[i]!))) off++;
+      check("kv_write/q4", `${name} T${T} Hkv${Hkv} D${D} (${off} values off)`, Float32Array.of(off / got.length), Float32Array.of(0), 0.01);
+    }
+    const x = randn(T * row);
+    const B = q4Block(D);
+    const xt = upload(x, [T, row]);
+    await run(S0, (ctx) => ops.hadamard(ctx, xt, B));
+    const want = x.slice();
+    for (let o = 0; o < want.length; o += B) hadamard(want, o, B);
+    check("hadamard", `${T * row} values in blocks of ${B}`, await download(xt.buf, x.length), want, 1e-5);
   }
 
   // Logits squashed to ±cap, and a tensor scaled in place.

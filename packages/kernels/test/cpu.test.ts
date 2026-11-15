@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { Ctx, STEP_BYTES, packStep, type Tensor } from "@kiln/core";
 import { dequantQ4, dequantQ8, exactQ4, exactQ8, quantizeQ4, quantizeQ8 } from "@kiln/loader";
 import { CpuBackend, ops, ref } from "../src";
-import { F8, toF16, toF8 } from "../src/cpu";
+import { F8, Q4_LEVELS, hadamard, hadamard32, q4Group, q4Head, toF16, toF8 } from "../src/cpu";
 import { WasmHeap } from "../src/simd";
 
 let seed = 99;
@@ -173,6 +173,92 @@ describe.each([
     run(pos0, (ctx) => (o = ops.attention(ctx, upload(q, [T, H * D]), kc, vc, { T, H, Hkv, D, maxSeq, kv: "i8", window, slots })));
     const want = ref.attentionRef(q, held(kf), held(vf), { T, H, Hkv, D, pos0, window });
     expect(ref.maxAbsDiff(await read(o, T * H * D), want)).toBeLessThan(2e-3);
+  });
+
+  it("writes a q4 ring cache and attends over it as the reference does over the values it holds", async () => {
+    const [T, H, Hkv, D, maxSeq, slots, window] = [3, 4, 2, 64, 512, 300, 270];
+    const row = Hkv * D;
+    const HW = (D / 32) * 5;
+    // Groups of very different sizes, one of zeros, and a value 50 times the rest in every group.
+    const kf = randn(maxSeq * row).map((v, i) => (i % 32 === 5 ? 50 * v : v) * [1, 0.01, 40, 0][Math.floor(i / 32) % 4]!);
+    const vf = randn(maxSeq * row).map((v, i) => v * [3, 0.2][Math.floor(i / 32) % 2]!);
+    // What a q4 cache holds for a head, turned back: the rotation of the whole head, the codes and scales, the rotation again.
+    const held = (f: Float32Array) => {
+      const out = new Float32Array(f.length);
+      const w = new Uint32Array((D / 32) * 5);
+      const wf = new Float32Array(w.buffer);
+      for (let h = 0; h < f.length; h += D) {
+        q4Head(f, h, D, w, wf, 0);
+        for (let g = 0; g < D / 32; g++) for (let j = 0; j < 32; j++) out[h + g * 32 + j] = Q4_LEVELS[(w[g * 5 + (j >>> 3)]! >>> ((j & 7) * 4)) & 15]! * wf[g * 5 + 4]!;
+        hadamard(out, h, D);
+      }
+      return out;
+    };
+    const kc = be.alloc(slots * Hkv * HW * 4);
+    const vc = be.alloc(slots * Hkv * HW * 4);
+    const last = 400;
+    for (let pos = last - slots - T; pos < last; pos += T) {
+      const n = Math.min(T, last - pos);
+      run(pos, (ctx) => ops.kvWrite(ctx, upload(kf.slice(pos * row, (pos + n) * row), [n, row]), upload(vf.slice(pos * row, (pos + n) * row), [n, row]), kc, vc, n, maxSeq, "q4", slots, Hkv));
+    }
+    const pos0 = last - T;
+    const q = randn(T * H * D);
+    let o!: Tensor;
+    run(pos0, (ctx) => (o = ops.attention(ctx, upload(q.slice(), [T, H * D]), kc, vc, { T, H, Hkv, D, maxSeq, kv: "q4", window, slots })));
+    const got = await read(o, T * H * D);
+    const want = ref.attentionRef(q, held(kf), held(vf), { T, H, Hkv, D, pos0, window });
+    expect(ref.maxAbsDiff(got, want)).toBeLessThan(2e-3);
+  });
+
+  it("attends over a q4 cache close to attention over the exact values", async () => {
+    // Keys and values of ordinary size with an outlier channel, scores of a few units: a model's.
+    const [T, H, Hkv, D, maxSeq] = [4, 4, 2, 128, 64];
+    const row = Hkv * D;
+    const kf = randn(maxSeq * row).map((v, i) => (i % D === 7 ? 6 * v : v));
+    const vf = randn(maxSeq * row);
+    const q = randn(T * H * D).map((v) => v * 0.5);
+    const outOf = async (kv: "q4" | "i8") => {
+      const HW = kv === "q4" ? (D / 32) * 5 : D / 4 + 1;
+      const [kc, vc] = [be.alloc(maxSeq * Hkv * HW * 4), be.alloc(maxSeq * Hkv * HW * 4)];
+      run(0, (ctx) => ops.kvWrite(ctx, upload(kf, [maxSeq, row]), upload(vf, [maxSeq, row]), kc, vc, maxSeq, maxSeq, kv, maxSeq, Hkv));
+      let o!: Tensor;
+      run(maxSeq - T, (ctx) => (o = ops.attention(ctx, upload(q.slice(), [T, H * D]), kc, vc, { T, H, Hkv, D, maxSeq, kv })));
+      return read(o, T * H * D);
+    };
+    const exact = ref.attentionRef(q, kf, vf, { T, H, Hkv, D, pos0: maxSeq - T });
+    const rel = (a: Float32Array) => Math.sqrt(a.reduce((s, v, i) => s + (v - exact[i]!) ** 2, 0) / exact.reduce((s, v) => s + v * v, 0));
+    // 4 bits a value hold a normal value to about 10% (the Lloyd-Max quantizer's bound); the keys' error adds a little.
+    const [q4, i8] = [rel(await outOf("q4")), rel(await outOf("i8"))];
+    console.log(`attention output off by ${(100 * q4).toFixed(1)}% with q4, ${(100 * i8).toFixed(1)}% with i8`);
+    expect(q4).toBeLessThan(0.15);
+    expect(i8).toBeLessThan(q4);
+  });
+
+  it("holds a q4 group to a tenth of its size, an outlier included", () => {
+    const x = randn(32 * 64).map((v, i) => (i % 97 === 0 ? 30 * v : v));
+    const w = new Uint32Array(5);
+    const wf = new Float32Array(w.buffer);
+    let err = 0;
+    let sum = 0;
+    const out = new Float32Array(32);
+    for (let g = 0; g < x.length; g += 32) {
+      q4Group(x, g, w, wf, 0);
+      for (let j = 0; j < 32; j++) out[j] = Q4_LEVELS[(w[j >>> 3]! >>> ((j & 7) * 4)) & 15]! * wf[4]!;
+      hadamard32(out, 0);
+      for (let j = 0; j < 32; j++) {
+        err += (out[j]! - x[g + j]!) ** 2;
+        sum += x[g + j]! ** 2;
+      }
+    }
+    expect(Math.sqrt(err / sum)).toBeLessThan(0.12);
+    // The rotation is its own inverse.
+    const y = randn(64);
+    const z = y.slice();
+    hadamard32(z, 0);
+    hadamard32(z, 32);
+    hadamard32(z, 0);
+    hadamard32(z, 32);
+    expect(ref.maxAbsDiff(z, y)).toBeLessThan(1e-5);
   });
 
   it("samples greedily and feeds the token back", async () => {

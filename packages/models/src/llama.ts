@@ -110,9 +110,9 @@ export function ringSlots(cfg: LlamaConfig, maxSeq: number, l: number): number {
 }
 
 /** Bytes one cached value takes. */
-const KV_BYTES: Record<KvDtype, number> = { f32: 4, f16: 2, f8: 1, i8: 1 };
+const KV_BYTES: Record<KvDtype, number> = { f32: 4, f16: 2, f8: 1, i8: 1, q4: 0.625 };
 
-/** Bytes of one position's keys (or values) in layer l's cache: every head's values, and for i8 a scale word per head. */
+/** Bytes of one position's keys (or values) in layer l's cache: every head's values, and for i8 a scale word per head (q4: 5 words per 32 values, the scales among them). */
 export function kvRowBytesOf(cfg: LlamaConfig, kvDtype: KvDtype, l = 0): number {
   return cfg.numKvHeads * (headDimOf(cfg, l) * KV_BYTES[kvDtype] + (kvDtype === "i8" ? 4 : 0));
 }
@@ -202,6 +202,7 @@ export class LlamaModel {
     this.allowedRows = backend.alloc(MAX_VERIFY_ROWS * (1 + Math.ceil(cfg.vocabSize / 32)) * 4, "storage", "allowed/rows");
     this.setAllowed(undefined);
     this.activations = new ActivationPool(backend);
+    if (this.kvDtype === "q4" && [cfg.headDim, ...(cfg.layerHeadDims ?? [])].some((d) => d % 32 !== 0)) throw new Error("the q4 cache holds heads of a multiple of 32 values; use f16, f8 or i8 for this model");
     if (this.kvDtype === "i8" && cfg.layerHeadDims?.some((d) => d > ATTN_WG)) throw new Error(`the i8 cache does not hold heads wider than ${ATTN_WG}; use f16 or f8 for this model`);
     for (let l = 0; l < cfg.numLayers; l++) {
       const slots = ringSlots(cfg, this.maxSeq, l);

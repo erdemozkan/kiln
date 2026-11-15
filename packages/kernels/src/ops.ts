@@ -1,3 +1,4 @@
+import { q4Block } from "./q4";
 import { f32, isBlockQuant, lastDim, numel, u32, type Buf, type Ctx, type Grid, type Tensor, type WeightDType } from "@kiln/core";
 import {
   ATTN_CHUNK,
@@ -78,6 +79,8 @@ import {
   ropeTableSpec,
   softcapSpec,
   clampSpec,
+  kvWriteQ4Spec,
+  hadamardSpec,
   localRelAttentionSpec,
   scaleInPlaceSpec,
   attentionWideSpec,
@@ -277,12 +280,12 @@ export function ropeTable(ctx: Ctx, x: Tensor, angles: Tensor, H: number, D: num
 export function ropeKv(ctx: Ctx, qkv: Tensor, kc: Buf, vc: Buf, s: AttentionShape, invFreq: Tensor, interleaved: boolean): Tensor {
   const q = ctx.alloc([s.T, s.H * s.D]);
   const W = (s.H + 2 * s.Hkv) * s.D;
-  if (s.kv === "i8") {
-    // An i8 head is stored relative to its largest value: k and v come out as plain rows first.
+  if (s.kv === "i8" || s.kv === "q4") {
+    // An i8 head is stored relative to its largest value, a q4 group rotated first: k and v come out as plain rows first.
     const [k, v] = [ctx.alloc([s.T, s.Hkv * s.D]), ctx.alloc([s.T, s.Hkv * s.D])];
     const local = ctx.uniform([u32(s.T), u32(s.H), u32(s.Hkv), u32(s.D), u32(s.maxSeq), u32(0), u32(rotaryDims(invFreq, s.D)), u32(0)]);
     ctx.run(ropeKvSpec(interleaved, "f32"), [local, ctx.step, invFreq.buf, qkv.buf, q.buf, k.buf, v.buf], grid1d((s.T * W) / 2));
-    kvWrite(ctx, k, v, kc, vc, s.T, s.maxSeq, "i8", cacheSlots(s), s.Hkv);
+    kvWrite(ctx, k, v, kc, vc, s.T, s.maxSeq, s.kv, cacheSlots(s), s.Hkv);
     return q;
   }
   const params = ctx.uniform([u32(s.T), u32(s.H), u32(s.Hkv), u32(s.D), u32(s.maxSeq), u32(cacheSlots(s)), u32(rotaryDims(invFreq, s.D)), u32(0)]);
@@ -297,12 +300,12 @@ export function ropeKv(ctx: Ctx, qkv: Tensor, kc: Buf, vc: Buf, s: AttentionShap
 export function qkNormRopeKv(ctx: Ctx, qkv: Tensor, qNorm: Tensor, kNorm: Tensor, eps: number, kc: Buf, vc: Buf, s: AttentionShape, invFreq: Tensor, interleaved: boolean): Tensor {
   if (s.D > 256 || s.D % 4 !== 0) throw new Error(`qkNormRopeKv: head dim ${s.D} must be a multiple of 4 and at most 256`);
   const q = ctx.alloc([s.T, s.H * s.D]);
-  if (s.kv === "i8") {
-    // As in `ropeKv`: plain rows, then the i8 write.
+  if (s.kv === "i8" || s.kv === "q4") {
+    // As in `ropeKv`: plain rows, then the i8 or q4 write.
     const [k, v] = [ctx.alloc([s.T, s.Hkv * s.D]), ctx.alloc([s.T, s.Hkv * s.D])];
     const local = ctx.uniform([u32(s.T), u32(s.H), u32(s.Hkv), u32(s.D), u32(s.maxSeq), u32(0), f32(eps), u32(rotaryDims(invFreq, s.D))]);
     ctx.run(qkNormRopeKvSpec(interleaved, "f32"), [local, ctx.step, invFreq.buf, qkv.buf, qNorm.buf, kNorm.buf, q.buf, k.buf, v.buf], [s.H + 2 * s.Hkv, s.T, 1]);
-    kvWrite(ctx, k, v, kc, vc, s.T, s.maxSeq, "i8", cacheSlots(s), s.Hkv);
+    kvWrite(ctx, k, v, kc, vc, s.T, s.maxSeq, s.kv, cacheSlots(s), s.Hkv);
     return q;
   }
   const params = ctx.uniform([u32(s.T), u32(s.H), u32(s.Hkv), u32(s.D), u32(s.maxSeq), u32(cacheSlots(s)), f32(eps), u32(rotaryDims(invFreq, s.D))]);
@@ -317,6 +320,13 @@ export function kvWrite(ctx: Ctx, k: Tensor, v: Tensor, kc: Buf, vc: Buf, T: num
     // Each head is scaled on its own, so the head count says where heads end.
     if (!heads || row % heads !== 0 || (row / heads) % 4 !== 0 || row / heads > 256) throw new Error(`kvWrite: an i8 cache needs the head count, and heads of a multiple of 4 up to 256 (row=${row}, heads=${heads})`);
     ctx.run(kvWriteI8Spec(), [ctx.uniform([u32(T), u32(heads), u32(row / heads), u32(maxSeq), u32(slots), u32(0), u32(0), u32(0)]), ctx.step, k.buf, v.buf, kc, vc], [heads, T, 1]);
+    return;
+  }
+  if (kv === "q4") {
+    // Groups of 32 of a head are rotated and scaled on their own, so the head count says where heads end.
+    const D = row / (heads ?? 1);
+    if (!heads || row % heads !== 0 || D % 32 !== 0 || D > 512) throw new Error(`kvWrite: a q4 cache needs the head count, and heads of a multiple of 32 up to 512 (row=${row}, heads=${heads})`);
+    ctx.run(kvWriteQ4Spec(), [ctx.uniform([u32(T), u32(heads), u32(D), u32(maxSeq), u32(slots), u32(q4Block(D)), u32(0), u32(0)]), ctx.step, k.buf, v.buf, kc, vc], [heads, T, 1]);
     return;
   }
   // Packed caches are written a word at a time: two halves, or four 8-bit codes.
@@ -381,7 +391,29 @@ export const cacheSlots = (s: Pick<AttentionShape, "maxSeq" | "slots">): number 
  * Decode (T = 1) uses split-K over ATTN_CHUNK-key splits so the GPU stays busy with few heads;
  * prefill tiles query rows that share a kv head, so each K/V block is read once per tile.
  */
+/** x turned in place by the normalized Hadamard rotation of B values (a power of two from 32 to 512), each B consecutive values on their own (its own inverse). */
+export function hadamard(ctx: Ctx, x: Tensor, B: number): void {
+  const n = numel(x.shape);
+  if (B < 32 || B > 512 || (B & (B - 1)) || n % B) throw new Error(`hadamard: ${n} values are not whole blocks of ${B} (a power of two from 32 to 512)`);
+  const blocks = n / B;
+  ctx.run(hadamardSpec(), [ctx.uniform([u32(n), u32(B), u32(0), u32(0)]), x.buf], [Math.min(blocks, MAX_X), Math.ceil(blocks / MAX_X), 1]);
+}
+
+/**
+ * Attention of q over the cached keys and values. With a q4 cache q is turned in place by the
+ * rotation the cache holds keys in, and the output turned back (see KvDtype).
+ */
 export function attention(ctx: Ctx, q: Tensor, kc: Buf, vc: Buf, s: AttentionShape): Tensor {
+  if (s.kv !== "q4") return attentionOver(ctx, q, kc, vc, s);
+  if (s.D % 32 !== 0 || s.relBias) throw new Error(`attention: the q4 cache needs heads of a multiple of 32${s.relBias ? " and no relative position bias" : ""} (heads of ${s.D})`);
+  const B = q4Block(s.D);
+  hadamard(ctx, q, B);
+  const out = attentionOver(ctx, q, kc, vc, s);
+  hadamard(ctx, out, B);
+  return out;
+}
+
+function attentionOver(ctx: Ctx, q: Tensor, kc: Buf, vc: Buf, s: AttentionShape): Tensor {
   if (s.H % s.Hkv !== 0) throw new Error(`attention: ${s.H} heads not divisible by ${s.Hkv} kv heads`);
   if (s.D > 2 * ATTN_WG || s.D % 4 !== 0) throw new Error(`attention: head dim ${s.D} must be a multiple of 4 and at most ${2 * ATTN_WG}`);
   if (s.D > ATTN_WG && (s.relBias || s.kv === "i8")) throw new Error(`attention: heads of ${s.D} are not supported with ${s.relBias ? "a relative position bias" : "the i8 cache"}`);
