@@ -134,7 +134,9 @@ now continue in a second. Not run: the checkpoint's own tower (the 10 GB safeten
 **Audio for Gemma 4.** Chat messages may hold audio: `{ type: "audio", audio }` parts with mono
 16 kHz samples as a Float32Array (`readAudio` makes them from a file or URL), from the same mmproj
 file as the images (`audio: false` leaves the tower out; `audioSlots`, default 2, is how many clips
-stay on the GPU). A clip becomes a token per 40 ms, up to 750 for 30 s; longer audio is cut there.
+stay on the GPU). A clip becomes a token per 40 ms, up to 750 for 30 s; longer audio goes in as
+consecutive pieces of 30 s, each a run of audio tokens of its own and a slot of its own, so a
+recording past a minute needs a larger `audioSlots` (the error says so).
 The features are the model's log-mel spectrogram (128 HTK bands of a 512-point FFT over 20 ms
 frames every 10 ms). The tower halves time twice with two strided convolutions, which run on the
 CPU, then twelve conformer layers on the GPU: two feed-forward blocks at half weight around an
@@ -150,7 +152,9 @@ answered about the audio but misheard words. All 1030 kernel checks pass on the 
 gemma-4-E2B-it Q4_0 file with mmproj-F16 (Intel Iris GPU): an 11 s clip of Kennedy and a 13 s clip
 of King transcribed word for word, a follow-up turn reusing 313 of 339 tokens, and two clips in one
 message told apart; roughly 2 s for the tower on 11 s of audio (from the totals) and 2.5 to 3.7 s of prefill. A plain
-440 Hz tone gets the answer that no audio was provided. Not done: audio longer than 30 s in chunks,
+440 Hz tone gets the answer that no audio was provided. Recordings of 35 s and 48 s (the two clips
+end to end) are transcribed through the cut at 30 s, the second reusing the first's 757 tokens;
+asked how often one sentence occurs in the 35 s, the model said once where it is twice. Not done:
 the checkpoint's own tower (the 10 GB safetensors, whose loading is written but was not run).
 
 **Images for Qwen 3.5.** Chat messages may hold images: from the transformers checkpoint, whose

@@ -133,7 +133,7 @@ export interface LoadOptions {
    * 300 MB at q8). Default: loaded, so chat messages may hold audio.
    */
   audio?: boolean;
-  /** Audio clips whose features stay on the GPU at once, with an audio tower (default 2; a clip is up to 750 tokens). */
+  /** Pieces of audio whose features stay on the GPU at once, with an audio tower (default 2). A piece is up to 30 s and 750 tokens; a longer clip is several. */
   audioSlots?: number;
   /**
    * Gemma 3's vision tower, as llama.cpp's mmproj GGUF: a file name in the model's repo

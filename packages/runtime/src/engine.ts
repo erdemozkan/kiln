@@ -135,6 +135,26 @@ export function imageSpans(ids: readonly number[], vocab: number): [number, numb
   return spans;
 }
 
+/**
+ * A clip of 16 kHz samples as the pieces Gemma 4's audio tower takes: consecutive runs of at most
+ * 30 s. A last piece too short to make a token (under about 20 ms) is left out, unless it is all there is.
+ */
+export function audioPieces(samples: Float32Array): Float32Array[] {
+  const out: Float32Array[] = [];
+  for (let at = 0; at < samples.length; at += GEMMA4_AUDIO_MAX_SAMPLES) {
+    const piece = samples.subarray(at, at + GEMMA4_AUDIO_MAX_SAMPLES);
+    // One mel frame needs 161 samples (see `gemma4AudioFeatures`).
+    if (out.length && piece.length < 161) break;
+    out.push(piece);
+  }
+  return out.length ? out : [samples];
+}
+
+/** The key of a piece of audio: the same samples get the same slot (see `imageKey`). */
+export function audioKey(samples: Float32Array): string {
+  return imageKey({ width: samples.length, height: 1, data: new Uint8Array(samples.buffer, samples.byteOffset, samples.byteLength) });
+}
+
 /** FNV-1a over an image's bytes and size: the same picture gets the same slot (and so the same ids). */
 export function imageKey(img: ImagePixels): string {
   let h1 = 0x811c9dc5;
@@ -364,6 +384,12 @@ export class Engine {
       return;
     }
     const slots: number[] = [];
+    // A clip past 30 s goes in as consecutive pieces of 30 s, each a run of audio tokens of its own.
+    const pieces = clips.map((c) => audioPieces(c as Float32Array));
+    if (clips.length) {
+      const distinct = new Set(pieces.flat().map(audioKey)).size;
+      if (distinct > this.audio!.slots) throw new Error(`this audio makes ${distinct} pieces of up to 30 s, but ${this.audio!.slots} fit; load with a larger audioSlots`);
+    }
     if (this.vision instanceof QwenVisionTower || this.vision instanceof Gemma4VisionTower || clips.length) {
       if (images.length && !(this.vision instanceof QwenVisionTower || this.vision instanceof Gemma4VisionTower)) throw new Error("images beside audio need Gemma 4's vision tower");
       // Each image at its own aspect ratio, resized to whole tokens (bicubic, as the processors do).
@@ -376,10 +402,10 @@ export class Engine {
       let ids =
         this.vision instanceof QwenVisionTower
           ? this.withGridImages(prompt, slots, "<|image_pad|>")
-          : this.withGridImages(prompt.split("<|image|>").join("<|image><|image|><image|>").split("<|audio|>").join("<|audio><|audio|><audio|>"), slots, "<|image|>");
+          : this.withGridImages(this.audioMarkers(prompt.split("<|image|>").join("<|image><|image|><image|>"), pieces), slots, "<|image|>");
       if (clips.length) {
         const runs: { base: number; count: number }[] = [];
-        for (const c of clips) runs.push(await this.audioSlot(c as Float32Array));
+        for (const piece of pieces.flat()) runs.push(await this.audioSlot(piece));
         ids = this.withAudio(ids, runs);
       }
       yield* this.decodeIds(ids, this.forceToolCall(opts));
@@ -513,6 +539,13 @@ export class Engine {
   /** Clips whose features sit in `model.imageFeatures`, by slot. */
   private readonly audioSlots: ({ key: string; used: number; count: number } | undefined)[] = [];
 
+  /** `prompt` with the k-th <|audio|> marker written once per piece of the k-th clip, each between <|audio> and <audio|>. */
+  private audioMarkers(prompt: string, pieces: readonly (readonly Float32Array[])[]): string {
+    const parts = prompt.split("<|audio|>");
+    if (parts.length - 1 !== pieces.length) throw new Error(`the chat template wrote ${parts.length - 1} audio markers for ${pieces.length} clips`);
+    return parts.reduce((text, part, i) => text + "<|audio><|audio|><audio|>".repeat(pieces[i - 1]!.length) + part);
+  }
+
   /**
    * The feature rows holding this clip (16 kHz mono samples; at most 30 s are heard), running the
    * audio tower if they are not there yet: the first row's token id and the number of tokens. The
@@ -521,7 +554,7 @@ export class Engine {
   private async audioSlot(samples: Float32Array): Promise<{ base: number; count: number }> {
     const { tower, slots: cap } = this.audio!;
     const heard = samples.subarray(0, GEMMA4_AUDIO_MAX_SAMPLES);
-    const key = imageKey({ width: heard.length, height: 1, data: new Uint8Array(heard.buffer, heard.byteOffset, heard.byteLength) });
+    const key = audioKey(heard);
     const first = this.model.cfg.vocabSize + this.imageRows;
     let slot = this.audioSlots.findIndex((s) => s?.key === key);
     if (slot < 0) {

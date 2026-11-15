@@ -27,7 +27,7 @@ export interface WireLoadOptions {
   vision?: boolean;
   /** Gemma 4: false skips its audio tower. Default: loaded, and messages may hold `{ type: "audio", audio }` parts (mono 16 kHz samples as a Float32Array; see `readAudio`). */
   audio?: boolean;
-  /** Audio clips whose features stay on the GPU at once, with an audio tower (default 2). */
+  /** Pieces of audio (up to 30 s each; a longer clip is several) whose features stay on the GPU at once, with an audio tower (default 2). */
   audioSlots?: number;
   /** Images whose features stay on the GPU at once, with a vision tower (default 4). */
   imageSlots?: number;
