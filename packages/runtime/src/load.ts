@@ -256,8 +256,16 @@ export async function createEngine(from: ModelSource, opts: LoadOptions = {}): P
     // Converted weights are cached per repo, revision and server (per file, for a file model); the
     // vision tower's under the same key.
     const converted = opts.weightCache === false ? undefined : ref ? cacheKey(ref, ref.gguf ?? "weights", opts.endpoint) : modelKey(from);
-    weights = await loadWeights(backend, files, quant, opts.onProgress, converted ? { key: converted } : undefined);
-    const modelCfg = cfg.family === "gemma4" ? await loadGemma4Extras(backend, files, cfg, weights, quant, opts.onProgress) : cfg;
+    // Gemma 4's per-layer table comes first in its file (a GGUF's second tensor) and is half of it:
+    // loaded first, the file is read once, front to back. Loaded after the rest, the rest would be
+    // fetched by range requests ahead of the download and then downloaded a second time.
+    const tableFirst = cfg.family === "gemma4" && gemma4TableLeads(files);
+    if (tableFirst) {
+      weights = new Map();
+      await loadGemma4Extras(backend, files, cfg, weights, quant, opts.onProgress, "table");
+      for (const [k, t] of await loadWeights(backend, files, quant, opts.onProgress, converted ? { key: converted } : undefined)) weights.set(k, t);
+    } else weights = await loadWeights(backend, files, quant, opts.onProgress, converted ? { key: converted } : undefined);
+    const modelCfg = cfg.family === "gemma4" ? await loadGemma4Extras(backend, files, cfg, weights, quant, opts.onProgress, tableFirst ? "scalars" : "all") : cfg;
     vision = idefics3
       ? await openIdefics3Vision(backend, files, idefics3, opts, converted)
       : opts.mmproj
@@ -322,24 +330,43 @@ function gemma4Rename(cfg: LlamaConfig, base: (name: string) => string | undefin
   };
 }
 
+/** Whether Gemma 4's per-layer embedding table sits before most of the bytes of the file that holds it. */
+export function gemma4TableLeads(files: readonly { tensors: readonly { name: string; offset: number; byteLength: number }[] }[]): boolean {
+  for (const file of files) {
+    const table = file.tensors.find((t) => GEMMA4_PER_LAYER_TABLE.includes(gemma4TextName(t.name)));
+    if (!table) continue;
+    let after = 0;
+    let before = 0;
+    for (const t of file.tensors) {
+      if (t === table) continue;
+      if (t.offset > table.offset) after += t.byteLength;
+      else before += t.byteLength;
+    }
+    return after > before;
+  }
+  return false;
+}
+
 /**
  * Gemma 4's per-layer embedding table, loaded as one table per layer into `weights` (see
- * `loadColumnGroups`), and each layer's output scalar, returned in the config.
+ * `loadColumnGroups`), and each layer's output scalar, returned in the config. `part` picks one of
+ * the two, for loading the table before the other weights and the scalars after.
  */
-async function loadGemma4Extras(backend: Backend, files: WeightFile[], cfg: LlamaConfig, weights: Map<string, Tensor>, quant: Quant, onProgress?: (p: LoadProgress) => void): Promise<LlamaConfig> {
+async function loadGemma4Extras(backend: Backend, files: WeightFile[], cfg: LlamaConfig, weights: Map<string, Tensor>, quant: Quant, onProgress?: (p: LoadProgress) => void, part: "all" | "table" | "scalars" = "all"): Promise<LlamaConfig> {
   const scalars = new Array<number>(cfg.numLayers).fill(1);
-  let table = false;
+  let table = part === "scalars";
   for (const file of files) {
     for (const entry of file.tensors) {
       const text = gemma4TextName(entry.name);
       const scale = GEMMA4_LAYER_SCALE.exec(text);
       if (scale) {
+        if (part === "table") continue;
         const l = Number(scale[1] ?? scale[2]);
         if (entry.byteLength > 16 || !(l < cfg.numLayers)) throw new UnsupportedModelError(`${entry.name}: not one layer's output scalar`);
         const v = toF32(entry.type as Parameters<typeof toF32>[0], await file.source.read(entry.offset, entry.byteLength), 1)[0]!;
         if (!Number.isFinite(v)) throw new UnsupportedModelError(`${entry.name}: the layer's output scalar is not a number`);
         scalars[l] = v;
-      } else if (cfg.perLayerInput && GEMMA4_PER_LAYER_TABLE.includes(text)) {
+      } else if (part !== "scalars" && cfg.perLayerInput && GEMMA4_PER_LAYER_TABLE.includes(text)) {
         if (entry.shape[0] !== cfg.vocabSize || entry.shape[1] !== cfg.numLayers * cfg.perLayerInput) {
           throw new UnsupportedModelError(`${entry.name} is [${entry.shape}], not [${cfg.vocabSize}, ${cfg.numLayers} × ${cfg.perLayerInput}]`);
         }

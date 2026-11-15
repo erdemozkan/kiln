@@ -474,6 +474,26 @@ function tensorWriter(
 }
 
 /**
+ * Bytes g · part … (g + 1) · part of each of n rows of `whole` bytes, back to back. Word by word when
+ * the sizes allow (a quantized row's blocks are 18 or 22 bytes, so a group of 8 blocks is whole words).
+ */
+export function columnSlice(bytes: Uint8Array, n: number, whole: number, part: number, g: number): Uint8Array {
+  const out = new Uint8Array(n * part);
+  if (part % 4 === 0 && whole % 4 === 0 && bytes.byteOffset % 4 === 0) {
+    const src = new Uint32Array(bytes.buffer, bytes.byteOffset, (n * whole) / 4);
+    const dst = new Uint32Array(out.buffer);
+    const [w, p] = [whole / 4, part / 4];
+    for (let i = 0, o = 0; i < n; i++) {
+      const s = i * w + g * p;
+      for (let j = 0; j < p; j++) dst[o++] = src[s + j]!;
+    }
+    return out;
+  }
+  for (let i = 0; i < n; i++) out.set(bytes.subarray(i * whole + g * part, i * whole + (g + 1) * part), i * part);
+  return out;
+}
+
+/**
  * Loads a matrix [rows, groups · cols] as one tensor per group of columns, [rows, cols] each, under
  * `names`: Gemma 4's per-layer embedding table, whose 2.3 billion values are too many for one GPU
  * buffer and of which each layer reads only its own columns. The file is read once, front to back;
@@ -507,14 +527,16 @@ export async function loadColumnGroups(
     });
     const rowsPerChunk = Math.max(1, Math.min(writers[0]!.rowsPerChunk, Math.floor(CHUNK / whole)));
     onProgress?.({ file, loaded: 0, total: e.byteLength });
+    const chunk = (r: number) => src.read(e.offset + r * whole, Math.min(rowsPerChunk, rows - r) * whole);
+    // The next chunk is asked for before this one is cut up and converted: a read that waits on the
+    // download or the network goes on meanwhile (a read of cached bytes is synchronous anyway).
+    let next: Promise<Uint8Array> | undefined = chunk(0);
     for (let r = 0; r < rows; r += rowsPerChunk) {
       const n = Math.min(rowsPerChunk, rows - r);
-      const bytes = await src.read(e.offset + r * whole, n * whole);
-      for (const [g, w] of writers.entries()) {
-        const slice = new Uint8Array(n * part);
-        for (let i = 0; i < n; i++) slice.set(bytes.subarray(i * whole + g * part, i * whole + (g + 1) * part), i * part);
-        w.put(r, n, slice);
-      }
+      const bytes = await next!;
+      next = r + rowsPerChunk < rows ? chunk(r + rowsPerChunk) : undefined;
+      next?.catch(() => undefined);
+      for (const [g, w] of writers.entries()) w.put(r, n, columnSlice(bytes, n, whole, part, g));
       onProgress?.({ file, loaded: (r + n) * whole, total: e.byteLength });
     }
     for (const w of writers) w.finish();

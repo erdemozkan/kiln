@@ -91,11 +91,19 @@ transformers forward pass within 2e-3 (a prompt at once, in chunks, and token by
 kernel passes its checks on the GPU. On unsloth's gemma-4-E2B-it Q4_0 file (Intel Iris GPU): sums
 and capitals right, four facts recalled from a 302-token prompt, a number recalled from the start
 of an 839-token prompt (past the 512-token sliding window), the next turn reusing 334 of 352 tokens;
-5 to 6 tokens/s, 6.5 s to prefill 839 tokens (3.0 s for 302), and about 50 s of the load for the per-layer table
+5 to 6 tokens/s, 6.5 s to prefill 839 tokens (3.0 s for 302), and about 19 s of a cached load for the per-layer table
 (it is kept at its 5-bit precision as 8-bit planes, so the model takes roughly 4 GB on the GPU by
 its sizes; not measured). Not done: the mixture-of-experts size (26B-A4B), LoRA adapters, the
 i8 cache (heads past 256), and a run of the safetensors checkpoint (10 GB), whose loading shares
 the GGUF path's code but was not tried.
+
+**Gemma 4 loads faster.** The per-layer table is a GGUF's second tensor and half of the file; it
+is now loaded before the other weights, so a first load reads the file once, front to back, as fast
+as it downloads (3.0 GB in 680 s at 4.5 MB/s, with nothing fetched twice). Loaded after them, as
+before, the other weights were fetched by range requests ahead of the download and then downloaded
+again. Its columns are cut out of each chunk a word at a time instead of a row at a time. A cached
+load of E2B takes 42 s instead of 71 to 78 s: 19 s for the table (from 30 to 48 s) and 18 s for the
+rest, with the same answers.
 
 **Gemma 4 E4B, run.** unsloth's gemma-4-E4B-it Q4_0 file (4.8 GB) with its mmproj-F16, on the same
 Intel Iris GPU: the sum and the capital right, the number recalled from the start of an 839-token
