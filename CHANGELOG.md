@@ -97,6 +97,13 @@ its sizes; not measured). Not done: the mixture-of-experts size (26B-A4B), LoRA 
 i8 cache (heads past 256), and a run of the safetensors checkpoint (10 GB), whose loading shares
 the GGUF path's code but was not tried.
 
+**Gemma 4 E4B, run.** unsloth's gemma-4-E4B-it Q4_0 file (4.8 GB) with its mmproj-F16, on the same
+Intel Iris GPU: the sum and the capital right, the number recalled from the start of an 839-token
+prompt, a red circle, a blue square and "KILN 4273" read off a picture, and the Kennedy clip
+transcribed word for word, punctuation included. It decodes at 3.2 to 3.8 tokens/s and prefills
+839 tokens in 25 s, several times slower than E2B's 6.5 s on this machine (not looked into; the
+model is close to what this GPU's shared memory holds). All 1031 kernel checks pass on the GPU.
+
 **Images for Gemma 4.** Chat messages may hold images: from a GGUF with its mmproj file
 (`mmproj: "mmproj-F16.gguf"`; of its 986 MB only the vision tensors, 369 MB, are read, the audio
 tower is left alone) or from the transformers checkpoint, whose files hold the tower (`vision:
@@ -140,7 +147,7 @@ gemma-4-E2B-it Q4_0 file with mmproj-F16 (Intel Iris GPU): an 11 s clip of Kenne
 of King transcribed word for word, a follow-up turn reusing 313 of 339 tokens, and two clips in one
 message told apart; roughly 2 s for the tower on 11 s of audio (from the totals) and 2.5 to 3.7 s of prefill. A plain
 440 Hz tone gets the answer that no audio was provided. Not done: audio longer than 30 s in chunks,
-the checkpoint's own tower (the 10 GB safetensors, whose loading is written but was not run), E4B.
+the checkpoint's own tower (the 10 GB safetensors, whose loading is written but was not run).
 
 **Images for Qwen 3.5.** Chat messages may hold images: from the transformers checkpoint, whose
 files hold the vision tower (`vision: false` leaves it out), or from a GGUF with its mmproj file
