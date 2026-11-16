@@ -876,6 +876,26 @@ async function main() {
     check("attention/span/flash", `T${T} H${H}/${Hkv} D${D} pos${pos0} span ${lo}-${hi}`, await download(o.buf, q.length), want, 1e-4);
   }
 
+  // The span kernel over a padded batch (an encoder's batch): sequence b's L rows and keys start at
+  // row b·L, its real rows see only its own lens[b] keys; padding rows are not checked.
+  for (const [L, H, D, lens] of [[32, 12, 64, [9, 32, 17, 1]], [40, 4, 72, [40, 33]], [24, 6, 32, [24, 5, 13, 20, 8]]] as const) {
+    if (!ops.attentionBatchable(be, D)) break;
+    const B = lens.length;
+    const q = randn(B * L * H * D);
+    const kc = randn(B * L * H * D);
+    const vc = randn(B * L * H * D);
+    const scale = 1 / Math.sqrt(D);
+    let o!: Tensor;
+    await run(S0, (ctx) => (o = ops.attentionBatched(ctx, upload(q, [B * L, H * D]), upload(kc, [0]).buf, upload(vc, [0]).buf, { B, L, H, D, scale, lens: upload(Uint32Array.from(lens), [B]).buf })));
+    const got = await download(o.buf, q.length);
+    const row = L * H * D;
+    for (let b = 0; b < B; b++) {
+      const n = lens[b]!;
+      const want = ref.attentionRef(q.subarray(b * row, b * row + n * H * D), kc.subarray(b * row, (b + 1) * row), vc.subarray(b * row, (b + 1) * row), { T: n, H, Hkv: H, D, pos0: 0, scale, window: 0, span: [0, n] });
+      check("attention/span/batched", `B${B} L${L} H${H} D${D} seq ${b} of ${n}`, got.subarray(b * row, b * row + n * H * D), want, 1e-4);
+    }
+  }
+
   // Ring caches (sliding layers keep window + slack slots, key j in slot j % slots): filled from the
   // same keys as a full cache at positions far past the ring size, they must give the same output.
   for (const [T, H, Hkv, D, pos0, maxSeq, window, slots] of [[1, 4, 1, 256, 1700, 2048, 512, 640], [1, 9, 3, 64, 3001, 4096, 300, 428], [64, 4, 1, 256, 1500, 2048, 512, 640], [33, 8, 2, 128, 900, 2048, 256, 384], [5, 9, 3, 64, 3000, 4096, 300, 428]] as const) {

@@ -358,6 +358,11 @@ export class EncoderEngine {
 
   /** Vocabulary logits of hidden rows [R, H] through the family's masked-LM head (output layer tied to the embeddings unless stored). */
   private async maskLogits(x: Float32Array): Promise<Float32Array> {
+    return this.model.maskLogits(x, await this.mlmHead());
+  }
+
+  /** The family's masked-LM head weights (output layer tied to the embeddings unless stored). */
+  private async mlmHead(): Promise<Parameters<EncoderModel["maskLogits"]>[1]> {
     const f = this.cfg.family;
     const [dense, ln, bias, decoder] =
       f === "distilbert"
@@ -367,7 +372,7 @@ export class EncoderEngine {
           : ["cls.predictions.transform.dense", "cls.predictions.transform.LayerNorm", "cls.predictions.bias", "cls.predictions.decoder.weight"];
     // On the backend: the vocabulary matmul (30k × 768 for BERT) is most of the work. A decoder that
     // is not stored is the word embedding table, already there.
-    return this.model.maskLogits(x, {
+    return {
       dense: await this.need(`${dense}.weight`),
       denseBias: await this.read(`${dense}.bias`),
       lnW: await this.need(`${ln}.weight`),
@@ -376,7 +381,7 @@ export class EncoderEngine {
       exact: this.cfg.act === "gelu",
       decoder: await this.read(decoder),
       bias: await this.read(bias),
-    });
+    };
   }
 
   async fillMask(texts: Batch, opts: { top_k?: number } = {}): Promise<MaskFill[] | MaskFill[][]> {
@@ -385,10 +390,18 @@ export class EncoderEngine {
     const maskId = mask === undefined ? undefined : this.tokenizer.tokenId(mask);
     if (maskId === undefined) throw new Error("this tokenizer has no mask token");
     const out: MaskFill[][] = [];
-    for (const { enc, h } of await this.encodeMany(many(texts).map((t) => [t] as const))) {
+    const encs = many(texts).map((t) => this.tokenizer.encode(t, undefined, this.maxLength));
+    const ats = encs.map((enc) => {
       const at = enc.ids.indexOf(maskId);
       if (at < 0) throw new Error(`Mask token (${mask}) not found in text.`);
-      const probs = softmax(await this.maskLogits(this.row(h, at)));
+      return at;
+    });
+    // The head runs on the backend right after the body, on the mask's row only.
+    const logits = await this.model.maskedLogits(encs.map((e, i) => ({ ids: e.ids, typeIds: e.typeIds, rows: [ats[i]!] })), await this.mlmHead());
+    for (let i = 0; i < encs.length; i++) {
+      const enc = encs[i]!;
+      const at = ats[i]!;
+      const probs = softmax(logits[i]!);
       out.push(
         topk(probs, k).map((id) => {
           const seq = enc.ids.slice();

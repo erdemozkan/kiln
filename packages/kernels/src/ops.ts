@@ -1,5 +1,5 @@
 import { q4Block } from "./q4";
-import { f32, isBlockQuant, lastDim, numel, u32, type Buf, type Ctx, type Grid, type Tensor, type WeightDType } from "@kiln/core";
+import { f32, isBlockQuant, lastDim, numel, u32, type Backend, type Buf, type Ctx, type Grid, type Tensor, type WeightDType } from "@kiln/core";
 import {
   ATTN_CHUNK,
   ATTN_WG,
@@ -461,6 +461,27 @@ function attentionOver(ctx: Ctx, q: Tensor, kc: Buf, vc: Buf, s: AttentionShape)
   }
   ctx.run(attentionSpec(s.kv), [params, step, q.buf, kc, vc, out.buf], [s.H, s.T, 1]);
   return out;
+}
+
+/**
+ * Bidirectional attention over a padded batch of B sequences of L rows each (an encoder's batch):
+ * q [B·L, H·D] and the f32 caches hold sequence b at rows b·L …, and its rows see only its own
+ * lens[b] keys (1 ≤ lens[b] ≤ L). Rows past a sequence's length are padding: computed, never read by
+ * the others. Only the span kernel does this, on the GPU; `attentionBatchable` says whether it can.
+ */
+export function attentionBatched(ctx: Ctx, q: Tensor, kc: Buf, vc: Buf, s: { B: number; L: number; H: number; D: number; scale?: number; lens: Buf }): Tensor {
+  const t = attentionBatchable(ctx.backend, s.D);
+  if (!t) throw new Error(`attentionBatched: not available for heads of ${s.D} on this backend`);
+  const out = ctx.alloc([s.B * s.L, s.H * s.D]);
+  const params = ctx.uniform([u32(s.L), u32(s.H), u32(s.H), u32(s.D), u32(s.B * s.L), f32(s.scale ?? 1 / Math.sqrt(s.D)), u32(1), u32(0), u32(s.B * s.L), u32(0), u32(0), u32(0)]);
+  ctx.run(attentionSpanSpec(s.D, t, true), [params, ctx.step, q.buf, kc, vc, out.buf, s.lens], [Math.ceil(s.L / (8 * t.RT)), s.H, s.B]);
+  return out;
+}
+
+/** The span kernel's tile when `attentionBatched` can run heads of D here (GPU only), else undefined. */
+export function attentionBatchable(backend: Backend, D: number): SpanTile | undefined {
+  if (backend.name === "cpu" || D > ATTN_WG || D % 4 !== 0) return undefined;
+  return spanOverride ?? spanTile(D, backend.limits.maxWorkgroupStorage);
 }
 
 /** act(gate) * up elementwise, SiLU by default. */

@@ -1420,7 +1420,7 @@ export function spanTile(D: number, wgBytes = 16384): SpanTile | undefined {
  * it only then. Against the tiled kernel this reuses every staged K and V value across 32 or 64 rows
  * and every staged Q value across 64 keys, with far fewer barriers per key.
  */
-export function attentionSpanSpec(D: number, tile: SpanTile): KernelSpec {
+export function attentionSpanSpec(D: number, tile: SpanTile, batched = false): KernelSpec {
   const { RT, DC } = tile;
   if (D % 4 !== 0 || D % DC !== 0 || DC % 4 !== 0) throw new Error(`span attention: head dim ${D} with chunk ${DC}`);
   const D4 = D / 4;
@@ -1432,7 +1432,8 @@ export function attentionSpanSpec(D: number, tile: SpanTile): KernelSpec {
   const PT = 16 * RQ;
   const SMN = spanVec4s(D, tile);
   const unroll = (n: number, f: (i: number) => string) => Array.from({ length: n }, (_, i) => f(i)).join("\n");
-  return spec(`attention/span/f32/D${D}/RT${RT}/DC${DC}`, ["uniform", "read", "read", "read", "read", "rw"], cpu.cpuAttention("f32"), () => /* wgsl */ `
+  const bindings: KernelSpec["bindings"] = batched ? ["uniform", "read", "read", "read", "read", "rw", "read"] : ["uniform", "read", "read", "read", "read", "rw"];
+  return spec(`attention/span/f32/D${D}/RT${RT}/DC${DC}${batched ? "/batched" : ""}`, bindings, batched ? undefined : cpu.cpuAttention("f32"), () => /* wgsl */ `
 ${STEP_WGSL}
 ${ATTN_P("_a")}
 ${FIRST_KEY_WGSL}
@@ -1442,7 +1443,7 @@ ${FIRST_KEY_WGSL}
 @group(0) @binding(3) var<storage, read> kc: array<vec4<f32>>;
 @group(0) @binding(4) var<storage, read> vc: array<vec4<f32>>;
 @group(0) @binding(5) var<storage, read_write> o: array<vec4<f32>>;
-const D4 = ${D4}u;
+${batched ? "@group(0) @binding(6) var<storage, read> lens: array<u32>;\n" : ""}const D4 = ${D4}u;
 const DC = ${DC}u;
 const DC4 = ${DC / 4}u;
 const RQ = ${RQ}u;
@@ -1460,9 +1461,16 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
   let stride4 = p.Hkv * D4;
   let ko4 = kvh * D4;
   let hq4 = p.H * D4;
-  // Every row sees the same keys: the first row's.
+${batched
+    ? `  // Sequence wid.z of a padded batch: its T rows and keys start at row bq, and its rows see its own
+  // lens[wid.z] keys (rows past that are padding, computed and ignored).
+  let bq = wid.z * p.T;
+  let n = lens[wid.z];
+  let lo = 0u;`
+    : `  // Every row sees the same keys: the first row's.
+  let bq = 0u;
   let n = keys(st.pos0 + r0);
-  let lo = firstKey(n, p.win);
+  let lo = firstKey(n, p.win);`}
   var m: array<f32, ${RT}>;
   var l: array<f32, ${RT}>;
   var acc: array<vec4<f32>, ${RT * NS}>;
@@ -1479,7 +1487,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
         var r4: array<vec4<f32>, 4>;
         for (var c = 0u; c < 4u; c++) {
           let row = r0 + g * 4u + c;
-          r4[c] = select(vec4<f32>(0.0), q[min(row, p.T - 1u) * hq4 + h * D4 + c0 + dq] * p.scale, row < p.T);
+          r4[c] = select(vec4<f32>(0.0), q[(bq + min(row, p.T - 1u)) * hq4 + h * D4 + c0 + dq] * p.scale, row < p.T);
         }
         for (var e = 0u; e < 4u; e++) { sm[(dq * 4u + e) * RQ + g] = vec4<f32>(r4[0][e], r4[1][e], r4[2][e], r4[3][e]); }
       }
@@ -1490,7 +1498,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
         var r4: array<vec4<f32>, 4>;
         for (var c = 0u; c < 4u; c++) {
           let j = b0 + g * 4u + c;
-          r4[c] = select(vec4<f32>(0.0), kc[min(j, n - 1u) * stride4 + ko4 + c0 + dq], j < n);
+          r4[c] = select(vec4<f32>(0.0), kc[(bq + min(j, n - 1u)) * stride4 + ko4 + c0 + dq], j < n);
         }
         for (var e = 0u; e < 4u; e++) { sm[QT + (dq * 4u + e) * 16u + g] = vec4<f32>(r4[0][e], r4[1][e], r4[2][e], r4[3][e]); }
       }
@@ -1541,7 +1549,7 @@ ${unroll(RV, (v) => `          sm[kk * RQ + tm * ${RV}u + ${v}u] = vec4<f32>(s[$
       }
       for (var it = li; it < 16u * D4; it += 128u) {
         let j = b0 + ss * 16u + it / D4;
-        sm[PT + it] = select(vec4<f32>(0.0), vc[min(j, n - 1u) * stride4 + ko4 + it % D4], j < n);
+        sm[PT + it] = select(vec4<f32>(0.0), vc[(bq + min(j, n - 1u)) * stride4 + ko4 + it % D4], j < n);
       }
       workgroupBarrier();
       for (var kk = 0u; kk < 16u; kk++) {
@@ -1572,7 +1580,7 @@ ${unroll(RV, (v) => `  sm[(tm * ${RV}u + ${v}u) * 16u + tn] = vec4<f32>(l[${v * 
       if (row < p.T) {
         for (var t = 0u; t < ${NS}u; t++) {
           let c = tn + 16u * t;
-          if (c < D4) { o[(row * p.H + h) * D4 + c] = acc[r * ${NS}u + t] / ls[e]; }
+          if (c < D4) { o[((bq + row) * p.H + h) * D4 + c] = acc[r * ${NS}u + t] / ls[e]; }
         }
       }
     }

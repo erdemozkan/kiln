@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+**Encoder inputs in batches.** On the GPU, encoder inputs of similar length now run as one padded
+batch, each sequence's attention seeing only its own tokens: 16 sentences through all-MiniLM-L6-v2
+took 15 ms instead of 29 on an M3 (61 ms of GPU time instead of 177 on the Intel Mac), and
+zero-shot classification with 5 labels 21 ms instead of 37. Hidden states match running the inputs
+one at a time within 2e-5. Fill-mask also keeps its head on the GPU, reading back only the mask's
+logits once (on the Intel Mac 109 ms instead of 227; on the M3 unchanged at 24 ms).
+
 **Gemma 4 takes video.** A chat part `{ type: "video", video: { frames, times } }` holds a video's
 frames as decoded pixels and each frame's time in seconds (or `fps` instead of times). Each frame
 goes through the vision tower as an image of up to 70 tokens at its own shape, after its time as
