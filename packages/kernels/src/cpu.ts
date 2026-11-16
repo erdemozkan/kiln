@@ -1822,3 +1822,148 @@ function i8Head(x: Float32Array, from: number, D: number, words: Uint32Array, fl
   }
   floats[base + d4] = max / 16129;
 }
+
+/** Span attention over B sequences of L rows (see attentionSpanSpec, batched): sequence b's rows see its first lens[b] rows. */
+export const cpuAttentionBatched: CpuKernel = (b) => {
+  const u = b[0]!.u32;
+  const [L, H, Hkv, D, BL] = [u[0]!, u[1]!, u[2]!, u[3]!, u[4]!];
+  const scale = b[0]!.f32[5]!;
+  const [q, k, v, o, lens] = [b[2]!.f32, b[3]!.f32, b[4]!.f32, b[5]!.f32, b[6]!.u32];
+  const s = new Float32Array(L);
+  for (let seq = 0; seq < BL / L; seq++) {
+    const n = Math.min(lens[seq]!, L);
+    for (let row = 0; row < L; row++)
+      for (let h = 0; h < H; h++) {
+        const kvh = Math.floor(h / (H / Hkv));
+        const qo = ((seq * L + row) * H + h) * D;
+        let m = -Infinity;
+        for (let j = 0; j < n; j++) {
+          const ko = ((seq * L + j) * Hkv + kvh) * D;
+          let d = 0;
+          for (let c = 0; c < D; c++) d += q[qo + c]! * k[ko + c]!;
+          s[j] = d * scale;
+          if (s[j]! > m) m = s[j]!;
+        }
+        let z = 0;
+        for (let j = 0; j < n; j++) z += s[j] = Math.exp(s[j]! - m);
+        for (let c = 0; c < D; c++) {
+          let acc = 0;
+          for (let j = 0; j < n; j++) acc += s[j]! * v[((seq * L + j) * Hkv + kvh) * D + c]!;
+          o[qo + c] = acc / z;
+        }
+      }
+  }
+};
+
+/** See samWindowSpec. */
+export const cpuSamWindow: CpuKernel = (b) => {
+  const u = b[0]!.u32;
+  const [G, Wg, win, nwx, L, H, D, DP, total] = Array.from(u.subarray(0, 9)) as number[];
+  const scale = b[0]!.f32[9]!;
+  const [qkv, rh, rw, bias, qo, ko, vo] = [b[1]!.f32, b[2]!.f32, b[3]!.f32, b[4]!.f32, b[5]!.f32, b[6]!.f32, b[7]!.f32];
+  const HD = H! * D!;
+  for (let idx = 0; idx < total!; idx++) {
+    const c = idx % DP!;
+    const t = Math.floor(idx / DP!);
+    const h = t % H!;
+    const r = Math.floor(t / H!);
+    const blk = Math.floor(r / L!);
+    const i = r % L!;
+    const inWin = i < win! * win!;
+    const wy = Math.floor(i / win!);
+    const wx = i % win!;
+    const gy = Math.floor(blk / nwx!) * win! + wy;
+    const gx = (blk % nwx!) * win! + wx;
+    const real = inWin && gy < G! && gx < Wg!;
+    const qb = (gy * Wg! + gx) * 3 * HD + h * D!;
+    let qv = 0;
+    let kv = 0;
+    let vv = 0;
+    if (c < D!) {
+      if (real) {
+        qv = qkv[qb + c]! * scale;
+        kv = qkv[qb + HD + c]!;
+        vv = qkv[qb + 2 * HD + c]!;
+      } else if (inWin) {
+        kv = bias[HD + h * D! + c]!;
+        vv = bias[2 * HD + h * D! + c]!;
+      }
+    } else if (c < D! + 2 * win!) {
+      const byRow = c < D! + win!;
+      const kk = byRow ? c - D! : c - D! - win!;
+      const pos = byRow ? wy : wx;
+      if (inWin) kv = pos === kk ? 1 : 0;
+      if (real) {
+        const table = byRow ? rh : rw;
+        const tb = (pos + win! - 1 - kk) * D!;
+        let s = 0;
+        for (let d = 0; d < D!; d++) s += qkv[qb + d]! * table[tb + d]!;
+        qv = s;
+      }
+    }
+    qo[idx] = qv;
+    ko[idx] = kv;
+    vo[idx] = vv;
+  }
+};
+
+/** See samUnwindowSpec. */
+export const cpuSamUnwindow: CpuKernel = (b) => {
+  const [G, Wg, win, nwx, L, H, D, DP] = Array.from(b[0]!.u32.subarray(0, 8)) as number[];
+  const [x, y] = [b[1]!.f32, b[2]!.f32];
+  for (let g = 0; g < G! * Wg!; g++) {
+    const gy = Math.floor(g / Wg!);
+    const gx = g % Wg!;
+    const blk = Math.floor(gy / win!) * nwx! + Math.floor(gx / win!);
+    const i = (gy % win!) * win! + (gx % win!);
+    for (let h = 0; h < H!; h++) for (let d = 0; d < D!; d++) y[(g * H! + h) * D! + d] = x[((blk * L! + i) * H! + h) * DP! + d]!;
+  }
+};
+
+/** See copyRowAtSpec. */
+export const cpuCopyRowAt: CpuKernel = (b) => {
+  const [D, src, dst] = Array.from(b[0]!.u32.subarray(0, 3)) as [number, number, number];
+  b[2]!.f32.set(b[1]!.f32.subarray(src * D, (src + 1) * D), dst * D);
+};
+
+/** See samMasksSpec. */
+export const cpuSamMasks: CpuKernel = (b) => {
+  const u = b[0]!.u32;
+  const [side, M, first, count, inSize, cw, ch, W, H, words] = Array.from(u.subarray(0, 10)) as number[];
+  const threshold = b[0]!.f32[10]!;
+  const low = b[1]!.f32;
+  const y = new Uint8Array(b[2]!.u32.buffer, b[2]!.u32.byteOffset, count! * words! * 4);
+  const f = Math.fround;
+  const src = (d: number, n: number, o: number) => Math.max(f(f(f(d + 0.5) * f(n / o)) - 0.5), 0);
+  const taps = (n: number, o: number) =>
+    Array.from({ length: o }, (_, i) => {
+      const s = src(i, n, o);
+      const lo = Math.min(Math.floor(s), n - 1);
+      return { lo, hi: Math.min(lo + 1, n - 1), t: f(s - lo) };
+    });
+  const up = taps(side!, inSize!);
+  const ax = taps(cw!, W!);
+  const ay = taps(ch!, H!);
+  for (let k = 0; k < count!; k++) {
+    const m = first! + k;
+    // The input-size map, only where the crop reads it.
+    const A = new Float32Array(cw! * ch!);
+    for (let r = 0; r < ch!; r++)
+      for (let c = 0; c < cw!; c++) {
+        const ty = up[r]!.t;
+        const tx = up[c]!.t;
+        const v = (i: number, j: number) => low[(i * side! + j) * M! + m]!;
+        A[r * cw! + c] = (1 - ty) * ((1 - tx) * v(up[r]!.lo, up[c]!.lo) + tx * v(up[r]!.lo, up[c]!.hi)) + ty * ((1 - tx) * v(up[r]!.hi, up[c]!.lo) + tx * v(up[r]!.hi, up[c]!.hi));
+      }
+    const base = k * words! * 4;
+    y.fill(0, base, base + words! * 4);
+    for (let py = 0; py < H!; py++) {
+      const { lo: y0, hi: y1, t: ty } = ay[py]!;
+      for (let px = 0; px < W!; px++) {
+        const { lo: x0, hi: x1, t: tx } = ax[px]!;
+        const v = (1 - ty) * ((1 - tx) * A[y0 * cw! + x0]! + tx * A[y0 * cw! + x1]!) + ty * ((1 - tx) * A[y1 * cw! + x0]! + tx * A[y1 * cw! + x1]!);
+        if (v > threshold) y[base + py * W! + px] = 255;
+      }
+    }
+  }
+};

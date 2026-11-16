@@ -144,7 +144,7 @@ export interface AudioInfo {
 }
 
 /** Tasks of image models. */
-export type VisionTask = "image-classification" | "image-feature-extraction" | "zero-shot-image-classification" | "object-detection" | "zero-shot-object-detection" | "depth-estimation" | "image-segmentation" | "background-removal" | "image-to-image" | "image-to-text" | "document-question-answering";
+export type VisionTask = "image-classification" | "image-feature-extraction" | "zero-shot-image-classification" | "object-detection" | "zero-shot-object-detection" | "depth-estimation" | "image-segmentation" | "background-removal" | "image-to-image" | "image-to-text" | "document-question-answering" | "mask-generation";
 
 export interface VisionInfo {
   model: string;

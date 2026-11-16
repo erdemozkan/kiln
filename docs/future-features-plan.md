@@ -25,7 +25,10 @@ form of the recurrence if prefill of the linear layers ever dominates (it is 14%
 text model, its images and its audio are done too (E2B from GGUF with its mmproj file, run; see the
 changelog), and so are its video and LoRA adapters. Open for it: the mixture-of-experts size, and the
 safetensors checkpoint (10 GB, not run). Open in the Phi family: LongRoPE past the original 4096 tokens (the long
-factors). Phi-4 mini's safetensors checkpoint (7.7 GB) was loaded and answers as the GGUF does.
+factors). Segment Anything (SAM, SlimSAM-50) is done (unreleased); open for it: SlimSAM-77, whose width of
+168 needs padding to a multiple of 32, a mask as a prompt, and the relative position bias added
+inside the attention kernel rather than through widened heads (the global layers' attention would
+take about a third of its work now). Phi-4 mini's safetensors checkpoint (7.7 GB) was loaded and answers as the GGUF does.
 
 ### More ways to load local models
 
@@ -35,8 +38,8 @@ server; `localModel` registers a picked folder (any supported format) under an i
 
 1. **A download cache in Node.js.** Hub files are fetched again on every run there (no OPFS); a
    folder under the user's cache directory would do, as transformers.js keeps one.
-2. **Remembering without handles.** Safari and Firefox have no file handles to keep; copying a picked
-   file into the browser's storage would cover them, at the cost of a second copy on disk.
+2. **Copies in OPFS instead of IndexedDB.** `remember: "copy"` keeps picked files in IndexedDB,
+   which works in every browser; not tried with files of several GB in Safari.
 
 ### A 4-bit KV cache: values only
 

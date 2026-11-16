@@ -15,6 +15,10 @@ import {
   attentionTile,
   attentionTiledSpec,
   attentionSpanSpec,
+  samWindowSpec,
+  samUnwindowSpec,
+  copyRowAtSpec,
+  samMasksSpec,
   spanTile,
   type SpanTile,
   copyRowSpec,
@@ -467,10 +471,11 @@ function attentionOver(ctx: Ctx, q: Tensor, kc: Buf, vc: Buf, s: AttentionShape)
  * Bidirectional attention over a padded batch of B sequences of L rows each (an encoder's batch):
  * q [B·L, H·D] and the f32 caches hold sequence b at rows b·L …, and its rows see only its own
  * lens[b] keys (1 ≤ lens[b] ≤ L). Rows past a sequence's length are padding: computed, never read by
- * the others. Only the span kernel does this, on the GPU; `attentionBatchable` says whether it can.
+ * the others. The span kernel does this on the GPU (`attentionBatchable` says whether it can); the CPU
+ * backend runs it too, plainly, for models that need it rather than batch for speed.
  */
 export function attentionBatched(ctx: Ctx, q: Tensor, kc: Buf, vc: Buf, s: { B: number; L: number; H: number; D: number; scale?: number; lens: Buf }): Tensor {
-  const t = attentionBatchable(ctx.backend, s.D);
+  const t = attentionBatchable(ctx.backend, s.D) ?? (ctx.backend.name === "cpu" && s.D % 4 === 0 ? { RT: 4 as const, DC: 4 } : undefined);
   if (!t) throw new Error(`attentionBatched: not available for heads of ${s.D} on this backend`);
   const out = ctx.alloc([s.B * s.L, s.H * s.D]);
   const params = ctx.uniform([u32(s.L), u32(s.H), u32(s.H), u32(s.D), u32(s.B * s.L), f32(s.scale ?? 1 / Math.sqrt(s.D)), u32(1), u32(0), u32(s.B * s.L), u32(0), u32(0), u32(0)]);
@@ -482,6 +487,59 @@ export function attentionBatched(ctx: Ctx, q: Tensor, kc: Buf, vc: Buf, s: { B: 
 export function attentionBatchable(backend: Backend, D: number): SpanTile | undefined {
   if (backend.name === "cpu" || D > ATTN_WG || D % 4 !== 0) return undefined;
   return spanOverride ?? spanTile(D, backend.limits.maxWorkgroupStorage);
+}
+
+/**
+ * SAM's windowed attention inputs (see samWindowSpec): from qkv [G·Wg, 3·H·D] and the layer's
+ * relative position tables rh, rw [2·win − 1, D], the windows' q', k', v' [B·L, H·DP] for
+ * `attentionBatched` (B windows of L rows, L = win² rounded up to 8; DP = D + 2·win rounded up to a
+ * multiple of 32), with the score scale folded into q'. A window as large as the grid is global
+ * attention.
+ */
+export function samWindow(ctx: Ctx, qkv: Tensor, rh: Tensor, rw: Tensor, bias: Tensor, o: { G: number; W: number; win: number; heads: number; D: number }): { q: Tensor; k: Tensor; v: Tensor; B: number; L: number; DP: number; nwx: number } {
+  const nwy = Math.ceil(o.G / o.win);
+  const nwx = Math.ceil(o.W / o.win);
+  const B = nwy * nwx;
+  const L = Math.ceil((o.win * o.win) / 8) * 8;
+  const DP = Math.ceil((o.D + 2 * o.win) / 32) * 32;
+  if (lastDim(qkv) !== 3 * o.heads * o.D || rowsOf(qkv) !== o.G * o.W) throw new Error(`samWindow: qkv [${qkv.shape}] is not [${o.G * o.W}, ${3 * o.heads * o.D}]`);
+  if (rh.shape[0] !== 2 * o.win - 1 || rw.shape[0] !== 2 * o.win - 1) throw new Error(`samWindow: position tables of ${rh.shape[0]} and ${rw.shape[0]} rows for windows of ${o.win}`);
+  const total = B * L * o.heads * DP;
+  const [q, k, v] = [0, 1, 2].map(() => ctx.alloc([B * L, o.heads * DP]));
+  const params = ctx.uniform([u32(o.G), u32(o.W), u32(o.win), u32(nwx), u32(L), u32(o.heads), u32(o.D), u32(DP), u32(total), f32(o.D ** -0.5), u32(0), u32(0)]);
+  ctx.run(samWindowSpec(), [params, qkv.buf, rh.buf, rw.buf, bias.buf, q!.buf, k!.buf, v!.buf], grid1d(total));
+  return { q: q!, k: k!, v: v!, B, L, DP, nwx };
+}
+
+/** The attention's output [B·L, H·DP] of `samWindow`'s layout back on the grid: [G·Wg, H·D]. */
+export function samUnwindow(ctx: Ctx, x: Tensor, o: { G: number; W: number; win: number; heads: number; D: number; L: number; DP: number; nwx: number }): Tensor {
+  const y = ctx.alloc([o.G * o.W, o.heads * o.D]);
+  ctx.run(samUnwindowSpec(), [ctx.uniform([o.G, o.W, o.win, o.nwx, o.L, o.heads, o.D, o.DP].map(u32)), x.buf, y.buf], grid1d(o.G * o.W * o.heads * o.D));
+  return y;
+}
+
+/**
+ * SAM's masks at the image's size (see samMasksSpec): from logits low [side², M], masks first …
+ * first + count − 1 as bytes (255 inside), four to a u32 word: [count, words].
+ */
+export function samMasks(ctx: Ctx, low: Tensor, o: { side: number; first: number; count: number; inSize: number; cw: number; ch: number; W: number; H: number; threshold: number }): Tensor {
+  const M = lastDim(low);
+  const words = Math.ceil((o.W * o.H) / 4);
+  const y = ctx.alloc([o.count, words], "u32");
+  const params = ctx.uniform([u32(o.side), u32(M), u32(o.first), u32(o.count), u32(o.inSize), u32(o.cw), u32(o.ch), u32(o.W), u32(o.H), u32(words), f32(o.threshold), u32(0)]);
+  ctx.run(samMasksSpec(), [params, low.buf, y.buf], grid1d(o.count * words));
+  return y;
+}
+
+/** One row per source: row rows[i] of xs[i] becomes row i of the result [n, D]. */
+export function pickRows(ctx: Ctx, xs: readonly Tensor[], rows: readonly number[]): Tensor {
+  const D = lastDim(xs[0]!);
+  const y = ctx.alloc([xs.length, D]);
+  xs.forEach((x, i) => {
+    if (lastDim(x) !== D || rows[i]! >= rowsOf(x)) throw new Error(`pickRows: row ${rows[i]} of [${x.shape}] into rows of ${D}`);
+    ctx.run(copyRowAtSpec(), [ctx.uniform([u32(D), u32(rows[i]!), u32(i), u32(0)]), x.buf, y.buf], grid1d(D));
+  });
+  return y;
 }
 
 /** act(gate) * up elementwise, SiLU by default. */

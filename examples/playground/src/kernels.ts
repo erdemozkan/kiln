@@ -896,6 +896,41 @@ async function main() {
     }
   }
 
+  // SAM's windowed attention with decomposed relative positions: window layout, the batched span
+  // kernel at the widened heads (D + 2·win rounded up to 32), and back to the grid; padded grids too.
+  // (The full-size grids only on the GPU: the CPU backend's batched attention is plain JavaScript.)
+  for (const [G, W, win, H, D] of [[20, 20, 7, 2, 64], [64, 64, 14, 2, 64], [64, 64, 64, 1, 64], [24, 18, 7, 3, 32]].filter(([G]) => !onCpu || G! < 64) as [number, number, number, number, number][]) {
+    const qkv = randn(G * W * 3 * H * D);
+    const bias = randn(3 * H * D);
+    const rh = randn((2 * win - 1) * D);
+    const rw = randn((2 * win - 1) * D);
+    let o!: Tensor;
+    await run(S0, (ctx) => {
+      const w = ops.samWindow(ctx, upload(qkv, [G * W, 3 * H * D]), upload(rh, [2 * win - 1, D]), upload(rw, [2 * win - 1, D]), upload(bias, [3 * H * D]), { G, W, win, heads: H, D });
+      const lens = upload(new Uint32Array(w.B).fill(win * win), [w.B]).buf;
+      const a = ops.attentionBatched(ctx, w.q, w.k.buf, w.v.buf, { B: w.B, L: w.L, H, D: w.DP, scale: 1, lens });
+      o = ops.samUnwindow(ctx, a, { G, W, win, heads: H, D, L: w.L, DP: w.DP, nwx: w.nwx });
+    });
+    check("sam/window-attention", `${G}×${W} win${win} H${H} D${D}`, await download(o.buf, G * W * H * D), ref.samAttentionRef(qkv, bias, rh, rw, G, W, win, H, D), 1e-4);
+  }
+
+  // SAM's mask post-processing: logits up to the input size, cropped, to the image size, thresholded.
+  for (const [side, cw, ch, Wi, Hi] of [[16, 64, 40, 103, 61], [256, 1024, 683, 1500, 1000]] as const) {
+    const M = 4;
+    const low = randn(side * side * M);
+    let o!: Tensor;
+    await run(S0, (ctx) => (o = ops.samMasks(ctx, upload(low, [side * side, M]), { side, first: 1, count: 3, inSize: 4 * side, cw, ch, W: Wi, H: Hi, threshold: 0 })));
+    const words = Math.ceil((Wi * Hi) / 4);
+    const got = new Uint8Array(await be.readback(o.buf, 0, 3 * words * 4));
+    for (let k = 0; k < 3; k++) {
+      const want = ref.samMasksRef(low, side, M, 1 + k, 4 * side, cw, ch, Wi, Hi, 0);
+      let wrong = 0;
+      for (let i = 0; i < want.length; i++) if (want[i] !== got[k * words * 4 + i]) wrong++;
+      // Pixels whose value is within float32 rounding of the threshold may land either side: one in 1e5.
+      check("sam/masks", `${side}² → ${Wi}×${Hi} mask ${k + 1} (pixels differing)`, Float32Array.of(wrong), Float32Array.of(0), Math.ceil(want.length * 1e-5));
+    }
+  }
+
   // Ring caches (sliding layers keep window + slack slots, key j in slot j % slots): filled from the
   // same keys as a full cache at positions far past the ring size, they must give the same output.
   for (const [T, H, Hkv, D, pos0, maxSeq, window, slots] of [[1, 4, 1, 256, 1700, 2048, 512, 640], [1, 9, 3, 64, 3001, 4096, 300, 428], [64, 4, 1, 256, 1500, 2048, 512, 640], [33, 8, 2, 128, 900, 2048, 256, 384], [5, 9, 3, 64, 3000, 4096, 300, 428]] as const) {

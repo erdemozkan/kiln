@@ -35,6 +35,7 @@ export type PipelineTask =
   | "depth-estimation"
   | "image-segmentation"
   | "background-removal"
+  | "mask-generation"
   | "image-to-image"
   | "image-to-text"
   | "document-question-answering"
@@ -68,6 +69,7 @@ export const DEFAULT_MODELS: Record<string, string> = {
   "image-segmentation": "facebook/detr-resnet-50-panoptic",
   // transformers.js's default (MODNet) exists only as ONNX. RMBG-1.4's license is non-commercial.
   "background-removal": "briaai/RMBG-1.4",
+  "mask-generation": "facebook/sam-vit-base",
   "image-to-image": "caidas/swin2SR-classical-sr-x2-64",
   "image-to-text": "nlpconnect/vit-gpt2-image-captioning",
   "document-question-answering": "naver-clova-ix/donut-base-finetuned-docvqa",
@@ -75,7 +77,7 @@ export const DEFAULT_MODELS: Record<string, string> = {
   "text-to-audio": "facebook/mms-tts-eng",
 };
 
-const VISION = new Set<string>(["image-classification", "image-feature-extraction", "zero-shot-image-classification", "object-detection", "zero-shot-object-detection", "depth-estimation", "image-segmentation", "background-removal", "image-to-image", "image-to-text", "document-question-answering"]);
+const VISION = new Set<string>(["image-classification", "image-feature-extraction", "zero-shot-image-classification", "object-detection", "zero-shot-object-detection", "depth-estimation", "image-segmentation", "background-removal", "mask-generation", "image-to-image", "image-to-text", "document-question-answering"]);
 
 /** Speech encoders run on raw samples (CTC or a classifier) rather than as encoder-decoders. */
 const AUDIO_ENCODERS = new Set(["wav2vec2", "hubert"]);
@@ -583,6 +585,36 @@ export interface BackgroundRemovalResult {
   channels: 4;
   data: Uint8Array;
 }
+/** Points or boxes to segment, in the image's pixel coordinates. */
+export interface MaskGenerationOptions {
+  /** Points [x, y] on the object. */
+  points?: [number, number][];
+  /** A label per point: 1 the object (default), 0 not the object. */
+  labels?: number[];
+  /** Boxes [x1, y1, x2, y2] around the object. */
+  boxes?: [number, number, number, number][];
+  /** Three masks of different extent (default true), or one. */
+  multimask_output?: boolean;
+  /** Logits above this are inside the mask (default 0). */
+  mask_threshold?: number;
+}
+/** A mask at the image's size (255 inside, 0 outside) and the model's estimate of its IoU. */
+export interface MaskGenerationResult {
+  score: number;
+  mask: { width: number; height: number; channels: 1; data: Uint8Array };
+}
+/**
+ * Segment Anything: masks for the points or boxes given. The image is encoded once and kept, so
+ * further prompts on the same image take only the mask decoder's time.
+ */
+export interface MaskGenerationPipeline {
+  readonly task: PipelineTask;
+  readonly model: KilnVision;
+  readonly info: VisionInfo;
+  dispose(): Promise<void>;
+  (image: ImageInput, options: MaskGenerationOptions): Promise<MaskGenerationResult[]>;
+}
+
 export interface BackgroundRemovalPipeline {
   readonly task: PipelineTask;
   readonly model: KilnVision;
@@ -744,6 +776,7 @@ export async function pipeline(task: "zero-shot-object-detection", model?: Pipel
 export async function pipeline(task: "depth-estimation", model?: PipelineModel, options?: PipelineOptions): Promise<DepthEstimationPipeline>;
 export async function pipeline(task: "image-segmentation", model?: PipelineModel, options?: PipelineOptions): Promise<ImageSegmentationPipeline>;
 export async function pipeline(task: "background-removal", model?: PipelineModel, options?: PipelineOptions): Promise<BackgroundRemovalPipeline>;
+export async function pipeline(task: "mask-generation", model?: PipelineModel, options?: PipelineOptions): Promise<MaskGenerationPipeline>;
 export async function pipeline(task: "image-to-image", model?: PipelineModel, options?: PipelineOptions): Promise<ImageToImagePipeline>;
 export async function pipeline(task: "image-to-text", model?: PipelineModel, options?: PipelineOptions): Promise<ImageToTextPipeline>;
 export async function pipeline(task: "document-question-answering", model?: PipelineModel, options?: PipelineOptions): Promise<DocumentQuestionAnsweringPipeline>;
@@ -776,7 +809,7 @@ export async function pipeline(task: PipelineTask, model?: PipelineModel, option
     const one = async (x: ImageInput, a?: unknown, b?: object) => {
       const img = await toWorkerImage(x);
       if (zeroShot) return m.run<unknown>(t as "zero-shot-image-classification" | "zero-shot-object-detection", img, a, { ...b });
-      const r = await m.run<unknown>(t as "image-classification" | "image-feature-extraction" | "object-detection" | "depth-estimation" | "image-segmentation" | "background-removal" | "image-to-image" | "image-to-text", img, { ...(a as object) });
+      const r = await m.run<unknown>(t as "image-classification" | "image-feature-extraction" | "object-detection" | "depth-estimation" | "image-segmentation" | "background-removal" | "mask-generation" | "image-to-image" | "image-to-text", img, { ...(a as object) });
       if (t === "image-feature-extraction") {
         const f = r as { data: Float32Array; dims: number[] };
         return new Tensor("float32", f.data, f.dims);

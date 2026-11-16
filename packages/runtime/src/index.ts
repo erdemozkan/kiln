@@ -8,6 +8,7 @@ export * from "./encoder";
 export * from "./seq2seq";
 export * from "./audio";
 export * from "./vision";
+export { samResizeSize, type GeneratedMask, type MaskGenerationOptions } from "./sam";
 export { Florence2, type FlorenceOptions } from "./florence";
 export { OwlDetector, owlv2Pixels, type ZeroShotDetectionOptions } from "./owl";
 export { DonutDocQA, donutPixels, donutProcessing, donutResize, type DocumentQuestionAnsweringOptions, type DonutProcessing } from "./donut";

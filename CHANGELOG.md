@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+**Remembering local models without file handles.** `localModel(files, { remember: "copy" })` keeps a
+copy of the picked files in the browser's storage (IndexedDB), so Safari and Firefox, which cannot
+keep a handle, can reopen a local model after a reload; `savedLocalModels()` lists copies beside
+handles (`copied`), and forgetting one deletes the copy. It is a second copy on disk, so it is asked
+for, never the default.
+
+**Segment Anything.** `pipeline("mask-generation")` runs SAM (`facebook/sam-vit-base` by default)
+and SlimSAM (`nielsr/slimsam-50-uniform`, 112 MB): give points (labelled on or off the object) or
+boxes in the image's pixels and get masks at the image's size with the model's IoU estimates, three
+of different extent or one. The image is encoded once and kept, so further prompts on it run only
+the mask decoder. Fed the same pixel values as transformers.js's ONNX exports (WASM), the image
+embedding matched within 7.6e-6 (SAM ViT-B) and 4e-6 (SlimSAM-50), the low-resolution mask logits
+within 6.7e-4, and the IoU scores to every printed digit. transformers.js on WebGPU differed from
+its own WASM run by up to 0.43 in the embedding. On the Intel Mac: SAM ViT-B encoded in 9 s
+against 16–20 s for transformers.js on WebGPU (and 174 s on WASM); each further click took about
+0.2 s. A site example cuts out what you click.
+
 **Node.js.** The package now runs in Node.js 22.12 or newer, on the CPU: its model worker and the
 CPU backend's helper threads start on worker_threads (4 threads by default), and a script ends on its
 own once its work is done. A path loads a model from disk, wherever a Hub id goes: `pipeline(task,

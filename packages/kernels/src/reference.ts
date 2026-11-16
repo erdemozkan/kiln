@@ -201,3 +201,86 @@ export function gatedDeltaRef(
   }
   return out;
 }
+
+/**
+ * SAM's vision attention as transformers writes it: the grid padded with zero tokens (so their
+ * projections are the bias), split into windows, scaled scores plus the decomposed relative position
+ * bias of each query (unscaled) against the key's row and column, softmax, values, windows put back.
+ */
+export function samAttentionRef(qkv: Float32Array, bias: Float32Array, rh: Float32Array, rw: Float32Array, G: number, W: number, win: number, H: number, D: number): Float32Array {
+  const HD = H * D;
+  const nwy = Math.ceil(G / win);
+  const nwx = Math.ceil(W / win);
+  const [Gp, Wp] = [nwy * win, nwx * win];
+  // The padded grid's projections: a padding token's are the bias.
+  const grid = new Float32Array(Gp * Wp * 3 * HD);
+  for (let y = 0; y < Gp; y++)
+    for (let x = 0; x < Wp; x++) grid.set(y < G && x < W ? qkv.subarray((y * W + x) * 3 * HD, (y * W + x + 1) * 3 * HD) : bias, (y * Wp + x) * 3 * HD);
+  const at = (y: number, x: number) => (y * Wp + x) * 3 * HD;
+  const out = new Float32Array(G * W * HD);
+  const n = win * win;
+  const s = new Float64Array(n);
+  const acc = new Float64Array(D);
+  for (let by = 0; by < nwy; by++)
+    for (let bx = 0; bx < nwx; bx++)
+      for (let h = 0; h < H; h++)
+        for (let i = 0; i < n; i++) {
+          const [iy, ix] = [Math.floor(i / win), i % win];
+          const [gy, gx] = [by * win + iy, bx * win + ix];
+          if (gy >= G || gx >= W) continue;
+          const qo = at(gy, gx) + h * D;
+          let m = -Infinity;
+          for (let j = 0; j < n; j++) {
+            const [jy, jx] = [Math.floor(j / win), j % win];
+            const ko = at(by * win + jy, bx * win + jx) + HD + h * D;
+            const ho = (iy - jy + win - 1) * D;
+            const wo = (ix - jx + win - 1) * D;
+            let d = 0;
+            let rel = 0;
+            for (let c = 0; c < D; c++) {
+              const q = grid[qo + c]!;
+              d += q * grid[ko + c]!;
+              rel += q * (rh[ho + c]! + rw[wo + c]!);
+            }
+            s[j] = d * D ** -0.5 + rel;
+            if (s[j]! > m) m = s[j]!;
+          }
+          let z = 0;
+          acc.fill(0);
+          for (let j = 0; j < n; j++) {
+            const p = Math.exp(s[j]! - m);
+            z += p;
+            const vo = at(by * win + Math.floor(j / win), bx * win + (j % win)) + 2 * HD + h * D;
+            for (let c = 0; c < D; c++) acc[c] += p * grid[vo + c]!;
+          }
+          for (let c = 0; c < D; c++) out[(gy * W + gx) * HD + h * D + c] = acc[c]! / z;
+        }
+  return out;
+}
+
+/** torch's F.interpolate(mode="bilinear", align_corners=False) of one map [h, w] to [oh, ow]. */
+export function interpolateRef(x: Float32Array, h: number, w: number, oh: number, ow: number): Float32Array {
+  const src = (d: number, n: number, o: number) => Math.max((d + 0.5) * (n / o) - 0.5, 0);
+  const out = new Float32Array(oh * ow);
+  for (let y = 0; y < oh; y++)
+    for (let xx = 0; xx < ow; xx++) {
+      const fy = src(y, h, oh);
+      const fx = src(xx, w, ow);
+      const y0 = Math.min(Math.floor(fy), h - 1);
+      const x0 = Math.min(Math.floor(fx), w - 1);
+      const y1 = Math.min(y0 + 1, h - 1);
+      const x1 = Math.min(x0 + 1, w - 1);
+      const [ty, tx] = [fy - y0, fx - x0];
+      out[y * ow + xx] = (1 - ty) * ((1 - tx) * x[y0 * w + x0]! + tx * x[y0 * w + x1]!) + ty * ((1 - tx) * x[y1 * w + x0]! + tx * x[y1 * w + x1]!);
+    }
+  return out;
+}
+
+/** SamProcessor.post_process_masks of mask m of low [side², M]: up to inSize², cropped to cw × ch, to W × H, thresholded (255 inside). */
+export function samMasksRef(low: Float32Array, side: number, M: number, m: number, inSize: number, cw: number, ch: number, W: number, H: number, threshold: number): Uint8Array {
+  const one = Float32Array.from({ length: side * side }, (_, i) => low[i * M + m]!);
+  const full = interpolateRef(one, side, side, inSize, inSize);
+  const crop = Float32Array.from({ length: cw * ch }, (_, i) => full[Math.floor(i / cw) * inSize + (i % cw)]!);
+  const back = interpolateRef(crop, ch, cw, H, W);
+  return Uint8Array.from(back, (v) => (v > threshold ? 255 : 0));
+}

@@ -828,6 +828,37 @@ background-removal pipeline rejects RMBG-1.4's config; run as its model card sho
 processor, RawImage), it took 4.0 s end to end against 2.9 s in Kiln (median of five warm
 calls, WebGPU, backgrounded pane). Kiln's GPU time is the 3×3 convolutions at the GEMM's rate.
 
+Segment Anything (`mask-generation`) runs transformers' SamModel checkpoints: SAM (`facebook/sam-vit-*`)
+and SlimSAM (`nielsr/slimsam-50-uniform`; SlimSAM-77's width of 168 is not a multiple of 32, which
+the matmuls need). The image encoder is a ViT with windowed attention (14 × 14 windows over the
+64 × 64 grid, padded to 70 with tokens whose keys and values are the projection's bias, as
+transformers pads after the LayerNorm) and four global layers, each with a decomposed relative
+position bias: rel_h[q, key row] + rel_w[q, key column], from tables indexed by query minus key.
+Kiln folds that bias into the dot product: a kernel writes each window's queries as
+[scale·q, q·Rh(row), q·Rw(column)] and its keys as [k, one-hot row, one-hot column], so the batched
+span kernel (the encoder batching's) computes score plus bias at heads widened to D + 2·win
+(rounded up to 32); a second kernel puts the windows back on the grid. That triples the global
+layers' attention work, which is most of SlimSAM's time; a kernel that adds the bias from two small
+tables would cut it. The encoder is submitted a layer per command buffer: in one, the Intel Mac's
+GPU watchdog stopped it. The image embedding stays in its own pool, so the mask decoder (two-way
+transformer, 2×2 transposed convolutions, hypernetwork MLPs) runs per prompt against it. The prompt
+encoder runs in TypeScript. SamProcessor's post-processing (bilinear to 1024, crop to the resized
+image, bilinear to the image size, threshold) runs on the GPU and reads back bytes: in TypeScript it
+took 650–775 ms for three 2646 × 1764 masks on the Intel Mac, which made a click take up to 1.7 s;
+now a click takes about 0.2 s, of which the decoder is 0.16 s.
+
+Checked on the sam-car photo with a point at (450, 600), against transformers.js 3.7.2's ONNX
+exports in fp32, fed transformers.js's own pixel values: SAM ViT-B's image embedding within 7.6e-6
+(mean 1.7e-7) of the WASM run, the three low-resolution masks within 6.0e-4, the IoU scores
+0.90670, 0.95526, 0.96896 on both; SlimSAM-50 within 4.0e-6, 6.7e-4, and 0.89982, 0.95286,
+0.97382 on both. transformers.js on WebGPU is less precise here: its embedding differs from its
+WASM run by up to 0.43 (mean 0.012) and its IoU scores by up to 0.02. Two preprocessing
+differences remain in transformers.js, so its final masks differ from Kiln's on 0.01–0.23% of the
+pixels: it resizes on a canvas rather than with PIL's filter, and it scales a point's x by the
+height ratio (682 / 1764 instead of 1024 / 2646) and rounds the resized height down (682, where
+Python's `int(682.67 + 0.5)` gives 683). Times on the Intel Mac (WebGPU): SAM ViT-B 9 s to encode
+(transformers.js 16–20 s on WebGPU, 174 s on WASM), SlimSAM-50 6 s (transformers.js 64 s on WASM).
+
 `image-segmentation` also runs SegFormer (`nvidia/segformer-*-finetuned-*`), semantic segmentation.
 Each stage's overlapping patch convolution and the sequence-reduction convolution (keys and values
 from a strided convolution, so the 16,384 first-stage queries attend to 256 keys) run on the conv

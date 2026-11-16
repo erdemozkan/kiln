@@ -1433,7 +1433,7 @@ export function attentionSpanSpec(D: number, tile: SpanTile, batched = false): K
   const SMN = spanVec4s(D, tile);
   const unroll = (n: number, f: (i: number) => string) => Array.from({ length: n }, (_, i) => f(i)).join("\n");
   const bindings: KernelSpec["bindings"] = batched ? ["uniform", "read", "read", "read", "read", "rw", "read"] : ["uniform", "read", "read", "read", "read", "rw"];
-  return spec(`attention/span/f32/D${D}/RT${RT}/DC${DC}${batched ? "/batched" : ""}`, bindings, batched ? undefined : cpu.cpuAttention("f32"), () => /* wgsl */ `
+  return spec(`attention/span/f32/D${D}/RT${RT}/DC${DC}${batched ? "/batched" : ""}`, bindings, batched ? cpu.cpuAttentionBatched : cpu.cpuAttention("f32"), () => /* wgsl */ `
 ${STEP_WGSL}
 ${ATTN_P("_a")}
 ${FIRST_KEY_WGSL}
@@ -4283,5 +4283,175 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
     out[(t * p.Hv + h) * p.Dv + col] = (sq * decay + kq * delta) * p.qScale;
   }
   for (var i = 0u; i < D4; i++) { state[sb + i] = s[i]; }
+}`);
+}
+
+/**
+ * SAM's windowed attention with decomposed relative positions, as inputs for the batched span kernel.
+ * From the fused projection qkv [G·Wg, 3·H·D] of a G × Wg token grid, writes q', k', v' [B·L, H·DP]:
+ * window b (windows of win × win, nwx to a row, the grid padded at the bottom and right) at rows
+ * b·L …, a window's token i at row b·L + i. Per head, q' = [scale·q, q·Rh(row), q·Rw(column), 0…]
+ * and k' = [k, one-hot of the key's row, one-hot of its column, 0…], so q'·k' is the scaled score
+ * plus the relative position bias rel_h[q, key row] + rel_w[q, key column] (Rh and Rw [2·win − 1, D],
+ * indexed by query minus key plus win − 1); v' = [v, 0…]. Padding tokens are zero before the
+ * projection, so their keys and values are the projection's bias (`bias` [3·H·D]); rows past win²
+ * are zero (the kernel's lens leave them out).
+ */
+export function samWindowSpec(): KernelSpec {
+  return spec("sam_window", ["uniform", "read", "read", "read", "read", "rw", "rw", "rw"], cpu.cpuSamWindow, () => /* wgsl */ `
+struct P { G: u32, Wg: u32, win: u32, nwx: u32, L: u32, H: u32, D: u32, DP: u32, total: u32, scale: f32, _a: u32, _b: u32 }
+@group(0) @binding(0) var<uniform> p: P;
+@group(0) @binding(1) var<storage, read> qkv: array<f32>;
+@group(0) @binding(2) var<storage, read> rh: array<f32>;
+@group(0) @binding(3) var<storage, read> rw: array<f32>;
+@group(0) @binding(4) var<storage, read> bias: array<f32>;
+@group(0) @binding(5) var<storage, read_write> qo: array<f32>;
+@group(0) @binding(6) var<storage, read_write> ko: array<f32>;
+@group(0) @binding(7) var<storage, read_write> vo: array<f32>;
+
+@compute @workgroup_size(${EW})
+fn main(${EW_ARGS}) {
+  ${FLAT}
+  if (idx >= p.total) { return; }
+  let c = idx % p.DP;
+  let t = idx / p.DP;
+  let h = t % p.H;
+  let r = t / p.H;
+  let b = r / p.L;
+  let i = r % p.L;
+  let inWin = i < p.win * p.win;
+  let wy = i / p.win;
+  let wx = i % p.win;
+  let gy = (b / p.nwx) * p.win + wy;
+  let gx = (b % p.nwx) * p.win + wx;
+  let real = inWin && gy < p.G && gx < p.Wg;
+  let HD = p.H * p.D;
+  let qb = (gy * p.Wg + gx) * 3u * HD + h * p.D;
+  var qv = 0.0;
+  var kv = 0.0;
+  var vv = 0.0;
+  if (c < p.D) {
+    if (real) {
+      qv = qkv[qb + c] * p.scale;
+      kv = qkv[qb + HD + c];
+      vv = qkv[qb + 2u * HD + c];
+    } else if (inWin) {
+      kv = bias[HD + h * p.D + c];
+      vv = bias[2u * HD + h * p.D + c];
+    }
+  } else if (c < p.D + 2u * p.win) {
+    let byRow = c < p.D + p.win;
+    let kk = select(c - p.D - p.win, c - p.D, byRow);
+    if (inWin) { kv = select(0.0, 1.0, select(wx, wy, byRow) == kk); }
+    if (real) {
+      let tb = (select(wx, wy, byRow) + p.win - 1u - kk) * p.D;
+      var s = 0.0;
+      for (var d = 0u; d < p.D; d++) {
+        s += qkv[qb + d] * select(rw[tb + d], rh[tb + d], byRow);
+      }
+      qv = s;
+    }
+  }
+  qo[idx] = qv;
+  ko[idx] = kv;
+  vo[idx] = vv;
+}`);
+}
+
+/** The inverse of samWindowSpec's layout for the attention's output: [B·L, H·DP] → [G·Wg, H·D], each token's first D values per head. */
+export function samUnwindowSpec(): KernelSpec {
+  return spec("sam_unwindow", ["uniform", "read", "rw"], cpu.cpuSamUnwindow, () => /* wgsl */ `
+struct P { G: u32, Wg: u32, win: u32, nwx: u32, L: u32, H: u32, D: u32, DP: u32 }
+@group(0) @binding(0) var<uniform> p: P;
+@group(0) @binding(1) var<storage, read> x: array<f32>;
+@group(0) @binding(2) var<storage, read_write> y: array<f32>;
+
+@compute @workgroup_size(${EW})
+fn main(${EW_ARGS}) {
+  ${FLAT}
+  if (idx >= p.G * p.Wg * p.H * p.D) { return; }
+  let d = idx % p.D;
+  let t = idx / p.D;
+  let h = t % p.H;
+  let g = t / p.H;
+  let gy = g / p.Wg;
+  let gx = g % p.Wg;
+  let b = (gy / p.win) * p.nwx + gx / p.win;
+  let i = (gy % p.win) * p.win + gx % p.win;
+  y[idx] = x[((b * p.L + i) * p.H + h) * p.DP + d];
+}`);
+}
+
+/** Row `src` of x [*, D] into row `dst` of y [*, D]. */
+export function copyRowAtSpec(): KernelSpec {
+  return spec("copy_row_at", ["uniform", "read", "rw"], cpu.cpuCopyRowAt, () => /* wgsl */ `
+struct P { D: u32, src: u32, dst: u32, _a: u32 }
+@group(0) @binding(0) var<uniform> p: P;
+@group(0) @binding(1) var<storage, read> x: array<f32>;
+@group(0) @binding(2) var<storage, read_write> y: array<f32>;
+
+@compute @workgroup_size(${EW})
+fn main(${EW_ARGS}) {
+  ${FLAT}
+  if (idx >= p.D) { return; }
+  y[p.dst * p.D + idx] = x[p.src * p.D + idx];
+}`);
+}
+
+/**
+ * SamProcessor.post_process_masks on the device: low-resolution mask logits low [side², M] (mask m
+ * in column m), for masks first … first + count − 1, resized bilinearly (torch, align_corners=False)
+ * to the padded input size inSize², cropped to the resized image cw × ch, resized to W × H and
+ * thresholded: y holds each mask's W·H bytes (255 inside, 0 outside), four to a word, masks one
+ * after another (each padded to whole words).
+ */
+export function samMasksSpec(): KernelSpec {
+  return spec("sam_masks", ["uniform", "read", "rw"], cpu.cpuSamMasks, () => /* wgsl */ `
+struct P { side: u32, M: u32, first: u32, count: u32, inSize: u32, cw: u32, ch: u32, W: u32, H: u32, words: u32, threshold: f32, _a: u32 }
+@group(0) @binding(0) var<uniform> p: P;
+@group(0) @binding(1) var<storage, read> low: array<f32>;
+@group(0) @binding(2) var<storage, read_write> y: array<u32>;
+
+fn src(d: u32, n: u32, o: u32) -> f32 { return max((f32(d) + 0.5) * (f32(n) / f32(o)) - 0.5, 0.0); }
+
+// The input-size map at (r, c): bilinear from the low-resolution logits.
+fn up(r: u32, c: u32, m: u32) -> f32 {
+  let fy = src(r, p.side, p.inSize);
+  let fx = src(c, p.side, p.inSize);
+  let y0 = min(u32(fy), p.side - 1u);
+  let x0 = min(u32(fx), p.side - 1u);
+  let y1 = min(y0 + 1u, p.side - 1u);
+  let x1 = min(x0 + 1u, p.side - 1u);
+  let ty = fy - f32(y0);
+  let tx = fx - f32(x0);
+  let a = low[(y0 * p.side + x0) * p.M + m];
+  let b = low[(y0 * p.side + x1) * p.M + m];
+  let c0 = low[(y1 * p.side + x0) * p.M + m];
+  let d = low[(y1 * p.side + x1) * p.M + m];
+  return (1.0 - ty) * ((1.0 - tx) * a + tx * b) + ty * ((1.0 - tx) * c0 + tx * d);
+}
+
+@compute @workgroup_size(${EW})
+fn main(${EW_ARGS}) {
+  ${FLAT}
+  if (idx >= p.count * p.words) { return; }
+  let k = idx / p.words;
+  let m = p.first + k;
+  var word = 0u;
+  for (var j = 0u; j < 4u; j++) {
+    let pix = (idx % p.words) * 4u + j;
+    if (pix >= p.W * p.H) { break; }
+    let fy = src(pix / p.W, p.ch, p.H);
+    let fx = src(pix % p.W, p.cw, p.W);
+    let y0 = min(u32(fy), p.ch - 1u);
+    let x0 = min(u32(fx), p.cw - 1u);
+    let y1 = min(y0 + 1u, p.ch - 1u);
+    let x1 = min(x0 + 1u, p.cw - 1u);
+    let ty = fy - f32(y0);
+    let tx = fx - f32(x0);
+    let v = (1.0 - ty) * ((1.0 - tx) * up(y0, x0, m) + tx * up(y0, x1, m)) + ty * ((1.0 - tx) * up(y1, x0, m) + tx * up(y1, x1, m));
+    if (v > p.threshold) { word |= 255u << (8u * j); }
+  }
+  y[idx] = word;
 }`);
 }

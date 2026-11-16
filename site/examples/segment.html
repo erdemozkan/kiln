@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Cut out anything</title>
+    <meta name="description" content="Segment Anything: click an object in a photo to select it, then save it as a cutout." />
+    <script src="../coi.js"></script>
+  </head>
+  <body data-page="examples" data-root="../">
+    <main class="page prose">
+      <p><a href="../examples.html">← Examples</a></p>
+      <h1>Cut out anything</h1>
+      <p class="muted">Segment Anything: click an object in a photo to select it, then save it as a cutout.</p>
+      <p class="tag muted" style="font-family:var(--mono);font-size:0.85rem">SlimSAM-50, about 110 MB on first use</p>
+      <div class="demo">
+<div class="row"><input type="file" id="file" accept="image/*" /></div>
+<p class="muted">Click to add a point on the object; Shift-click a part that should be left out.</p>
+<canvas id="canvas" style="max-width:100%;height:auto;border-radius:6px;display:block;cursor:crosshair"></canvas>
+<div class="row"><button id="clear">Clear points</button><button id="save" disabled>Save cutout</button></div>
+<div id="status" class="status" role="status"></div><progress id="progress" hidden max="1" value="0"></progress>
+      </div>
+      <h2 id="code">The code</h2>
+      <pre><code>const segmenter = await pipeline(&quot;mask-generation&quot;, &quot;nielsr/slimsam-50-uniform&quot;);
+// Points in the image&#x27;s pixels; labels 1 = the object, 0 = not the object.
+const masks = await segmenter(image, { points: [[450, 600]], labels: [1] });
+// Three masks of different extent, each with the model&#x27;s estimate of its quality.
+const best = masks.reduce((a, b) =&gt; (b.score &gt; a.score ? b : a));</code></pre>
+      <p>The image is encoded once: further clicks on the same image run only the small mask decoder.</p>
+      <p class="muted">Full source: <a href="https://github.com/erdemozkan/kiln/blob/main/site/src/examples/segment.ts">site/src/examples/segment.ts</a></p>
+    </main>
+    <script type="module" src="../src/examples/segment.ts"></script>
+  </body>
+</html>

@@ -24,3 +24,4 @@ export * from "./florence2";
 export * from "./owl";
 export * from "./donut";
 export * from "./kokoro";
+export * from "./sam";

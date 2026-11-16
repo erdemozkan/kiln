@@ -12,6 +12,7 @@ import { loadWeights, type LoadProgress, type WeightFile } from "./weights";
 import { createFlorence, type Florence2, type FlorenceOptions } from "./florence";
 import { createOwl, type OwlDetector, type ZeroShotDetectionOptions } from "./owl";
 import { createDonut, type DocumentQuestionAnsweringOptions, type DonutDocQA } from "./donut";
+import { createSam, type GeneratedMask, type MaskGenerationOptions, type SamSegmenter } from "./sam";
 
 export interface VisionLoadOptions {
   /** Matrix storage: "f32" (default), "q8" or "q4". */
@@ -162,6 +163,7 @@ export class VisionEngine {
     private readonly florence?: Florence2,
     private readonly owl?: OwlDetector,
     private readonly donut?: DonutDocQA,
+    private readonly sam?: SamSegmenter,
   ) {}
 
   get cfg(): VitConfig {
@@ -178,6 +180,7 @@ export class VisionEngine {
   summary(): { family: string; layers: number; hiddenSize: number; imageSize: number; labels: Record<number, string> } {
     const labels = (l: string[]) => Object.fromEntries(l.map((v, i) => [i, v]));
     if (this.matte) return { family: "rmbg", layers: 0, hiddenSize: 0, imageSize: 1024, labels: {} };
+    if (this.sam) return { family: "sam", layers: this.sam.cfg.layers, hiddenSize: this.sam.cfg.hidden, imageSize: this.sam.cfg.imageSize, labels: {} };
     if (this.donut) {
       const c = this.donut.cfg;
       return { family: "donut", layers: c.depths.reduce((a, b) => a + b, 0), hiddenSize: c.embedDim * 2 ** (c.depths.length - 1), imageSize: Math.max(...c.imageHW), labels: {} };
@@ -528,6 +531,15 @@ export class VisionEngine {
     return { width: img.width, height: img.height, channels: 1, data };
   }
 
+  /**
+   * Segment Anything: masks for points or boxes on the image (in its pixel coordinates), with their
+   * predicted IoU. The last image's embedding is kept, so more prompts on it run only the decoder.
+   */
+  async generateMasks(img: RgbImage, options: MaskGenerationOptions = {}): Promise<GeneratedMask[]> {
+    if (!this.sam) throw new Error("this model does not segment from points or boxes (use a SAM model such as facebook/sam-vit-base)");
+    return this.sam.segment(img, options);
+  }
+
   /** Background removal (RMBG): the image as RGBA with the matte as its alpha, as transformers.js returns it. */
   async removeBackground(img: RgbImage): Promise<{ width: number; height: number; channels: 4; data: Uint8Array }> {
     if (!this.matte) throw new Error("this model does not remove backgrounds (use a matting model such as briaai/RMBG-1.4)");
@@ -671,6 +683,7 @@ export class VisionEngine {
   }
 
   destroy(): void {
+    this.sam?.destroy();
     this.donut?.destroy();
     this.owl?.destroy();
     this.florence?.destroy();
@@ -707,6 +720,10 @@ async function loadVision(modelId: string, opts: VisionLoadOptions): Promise<Vis
     has("tokenizer.json").then((y) => (y ? fetchJSON<ClipTokenizerJSON>(fileUrl(ref, "tokenizer.json", ep), true) : undefined)),
   ]);
   if (config!.model_type === "detr") return createDetr(modelId, ref, config!, prep, names, opts);
+  if (config!.model_type === "sam") {
+    const { backend, sam } = await createSam(modelId, ref, config!, prep, names, opts);
+    return new VisionEngine(backend, undefined, sam.processor, {}, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, sam);
+  }
   if (config!.model_type === "depth_anything") return createDepth(modelId, ref, config!, prep, names, opts);
   if (((config!.architectures as string[] | undefined) ?? []).includes("BriaRMBG")) return createRmbg(modelId, ref, prep, names, opts);
   if (config!.model_type === "segformer") return createSegformer(modelId, ref, config!, prep, names, opts);
