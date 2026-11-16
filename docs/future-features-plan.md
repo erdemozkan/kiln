@@ -41,6 +41,24 @@ server; `localModel` registers a picked folder (any supported format) under an i
 2. **Copies in OPFS instead of IndexedDB.** `remember: "copy"` keeps picked files in IndexedDB,
    which works in every browser; not tried with files of several GB in Safari.
 
+### A Python library
+
+Asked for: `pip install kiln` with the same pipelines. The engine is TypeScript and its kernels are
+WGSL, so there are three ways, cheapest first:
+
+1. **A Python package that drives Kiln in Node.js.** Kiln runs in Node now (on the CPU); the package
+   would start a Node process and talk to it over pipes, with tensors as bytes. Little new code, the
+   same outputs by construction, but users need Node installed, and it stays CPU-only until item 2.
+2. **The GPU outside the browser.** Node has WebGPU through Dawn's bindings (the `webgpu` package):
+   with them the same kernels run on the GPU from Node, and so from the Python package. This is the
+   step that makes a Python library worth having, since on the CPU PyTorch is the better choice.
+3. **A native port.** The WGSL kernels run unchanged under wgpu-py, but the loaders, plans, engine
+   and tokenizers would be rewritten in Python: a second code base to keep correct.
+
+Start with 2 (GPU in Node), then 1. Worth asking first who it is for: Python already has PyTorch
+and llama.cpp, so Kiln's case there is one small install that runs original weights on any GPU
+(integrated ones too) with no CUDA.
+
 ### A 4-bit KV cache: values only
 
 A cache with 4-bit keys and values, after TurboQuant (arXiv:2504.19874), kept Gemma 4 E2B's answers
