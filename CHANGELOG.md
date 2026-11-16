@@ -10,6 +10,11 @@ evenly over a video in a page (32 by default, as the processor does). The frames
 their own rows, `videoFrames` of them (default 32), between the images' and the audio's, so asking
 again about the same video does not run the tower again.
 
+**LoRA adapters on Gemma 4.** PEFT adapters now load on Gemma 4: per layer at its own head size,
+and on the layers that read another layer's cache only the query projection (an adapter's k_proj and
+v_proj there change nothing, as in transformers). Updates to the vision and audio towers are left
+out, and `loadAdapter` reports how many tensors that was (`towerTensors`).
+
 **A 4-bit cache for values.** `kvDtype: "q4"` keeps keys as the i8 cache does and values in 4 bits:
 each value head turned by a Hadamard rotation, then 4-bit codes on the levels of the best quantizer
 for a normal value, with a scale per 32 values (5 bits a value). That is about 40% of the default

@@ -136,7 +136,7 @@ await llm.setAdapter(null);                     // the base model</code></pre>
         <p>
           PEFT LoRA adapters (adapter_config.json and adapter_model.safetensors) on the attention and MLP projections. Each adapter is laid out on the GPU
           when it loads, so switching between loaded adapters takes a few milliseconds. DoRA, embedding adapters and <code>modules_to_save</code> are not
-          supported.
+          supported. On Gemma 4 an adapter's updates to the text layers apply; updates to its vision or audio tower are left out (<code>towerTensors</code> counts them).
         </p>
 
         <h2 id="rag">Retrieval</h2>

@@ -567,10 +567,12 @@ export class LlamaModel {
     const out: { name: string; parts: { module: LoraModule; n: number }[]; k: number }[] = [];
     const add = (name: string, parts: LoraModule[], k: number, ns: number[]) => out.push({ name, parts: parts.map((m, i) => ({ module: m, n: ns[i]! })), k });
     const H = c.hiddenSize;
-    const q = c.numHeads * c.headDim;
-    const kv = c.numKvHeads * c.headDim;
     for (let l = 0; l < c.numLayers; l++) {
       const p = `model.layers.${l}`;
+      // Heads may differ in size from layer to layer (Gemma 4).
+      const D = headDimOf(c, l);
+      const q = c.numHeads * D;
+      const kv = c.numKvHeads * D;
       const I = this.fusedMlp ? this.w(`${p}.mlp.gate_up.weight`).shape[0]! / 2 : this.w(`${p}.mlp.gate_proj.weight`).shape[0]!;
       if (c.linearLayers?.[l]) {
         // Linear attention's five projections (Qwen 3.5), in the order the layer runs them.
@@ -584,7 +586,10 @@ export class LlamaModel {
       } else {
         // With an output gate, q_proj also writes the gates: twice the rows.
         const qRows = c.attnOutputGate ? 2 * q : q;
-        if (this.fusedQkv) add(`${l}.qkv`, ["q_proj", "k_proj", "v_proj"], H, [qRows, kv, kv]);
+        // A layer that reads another layer's keys and values (Gemma 4) runs only its query projection:
+        // an adapter's k_proj and v_proj there change nothing, as in transformers.
+        if (c.kvFrom?.[l] !== undefined) add(`${l}.q_proj`, ["q_proj"], H, [qRows]);
+        else if (this.fusedQkv) add(`${l}.qkv`, ["q_proj", "k_proj", "v_proj"], H, [qRows, kv, kv]);
         else for (const [m, n] of [["q_proj", qRows], ["k_proj", kv], ["v_proj", kv]] as const) add(`${l}.${m}`, [m], H, [n]);
         add(`${l}.o_proj`, ["o_proj"], q, [H]);
       }
@@ -627,7 +632,6 @@ export class LlamaModel {
   enableLora(rank: number): void {
     this.freeLora();
     if (rank <= 0) return;
-    if (this.cfg.kvFrom) throw new Error("LoRA adapters are not supported on Gemma 4 yet");
     const R = LlamaModel.loraSlotRank(rank);
     const slots = new Map<string, LoraSlot>();
     for (const s of this.loraLayout()) {
@@ -970,6 +974,7 @@ export class LlamaModel {
     let q = ops.linear(ctx, h, this.w(`${p}.self_attn.q_proj.weight`), this.bias(`${p}.self_attn.q_proj.bias`));
     if (c.kvFrom?.[l] !== undefined) {
       // Only a query: the keys and values are another layer's (Gemma 4), written earlier in this pass.
+      if (delta) delta(h, q, `${l}.q_proj`);
       if (c.qkNorm) q = ops.rmsnorm(ctx, q, this.w(`${p}.self_attn.q_norm.weight`), c.rmsEps, D);
       ops.rope(ctx, q, T, c.numHeads, D, invFreq, c.ropeInterleaved, step);
       return { q };

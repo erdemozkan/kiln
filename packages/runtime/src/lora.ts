@@ -30,7 +30,12 @@ export interface LoraAdapter {
   modules: LoraModule[];
   /** The base model the adapter was trained on, as its config names it. */
   base?: string;
+  /** LoRA tensors on Gemma 4's vision or audio tower, which are left out: the towers run as loaded. */
+  towerTensors?: number;
 }
+
+/** Tensors of Gemma 4's vision and audio towers and their projections into the text model. */
+const TOWER = /(^|\.)(vision_tower|audio_tower|embed_vision|embed_audio)\./;
 
 const TENSOR = /layers\.(\d+)\.(self_attn|mlp|linear_attn)\.([a-z_]+)\.lora_([AB])(?:\.default)?\.weight$/;
 
@@ -52,8 +57,14 @@ export function loraFromTensors(id: string, config: LoraConfig, tensors: Map<str
   if (config.fan_in_fan_out) throw new Error(`${id}: fan_in_fan_out adapters (GPT-2 style Conv1D) are not supported`);
   if (config.modules_to_save?.length) throw new Error(`${id}: adapters that also replace whole modules (modules_to_save: ${config.modules_to_save.join(", ")}) are not supported`);
   const parts = new Map<string, { layer: number; group: string; module: LoraModule; A?: { shape: number[]; data: Float32Array }; B?: { shape: number[]; data: Float32Array } }>();
+  let towers = 0;
   for (const [name, t] of tensors) {
     if (!/lora_|lora_embedding/.test(name)) continue;
+    // Gemma 4's vision and audio towers: their updates are left out (the towers run as loaded).
+    if (TOWER.test(name)) {
+      towers++;
+      continue;
+    }
     const m = TENSOR.exec(name);
     if (!m || !(LORA_MODULES as readonly string[]).includes(m[3]!)) throw new Error(`${id}: "${name}" adapts a module Kiln cannot (it adapts ${LORA_MODULES.join(", ")})`);
     const key = `${m[1]}.${m[3]}`;
@@ -61,7 +72,7 @@ export function loraFromTensors(id: string, config: LoraConfig, tensors: Map<str
     p[m[4] as "A" | "B"] = t;
     parts.set(key, p);
   }
-  if (!parts.size) throw new Error(`${id} has no LoRA tensors`);
+  if (!parts.size) throw new Error(towers ? `${id} adapts only the vision or audio tower, which Kiln leaves as loaded` : `${id} has no LoRA tensors`);
   const weights = new Map<string, LoraUpdate>();
   let rank = 0;
   for (const [key, p] of parts) {
@@ -74,7 +85,7 @@ export function loraFromTensors(id: string, config: LoraConfig, tensors: Map<str
     weights.set(key, { rank: r, A: p.A.data, B: p.B.data.map((v) => v * scale) });
     rank = Math.max(rank, r);
   }
-  return { id, rank, weights, modules: [...new Set([...parts.values()].map((p) => p.module))], base: config.base_model_name_or_path };
+  return { id, rank, weights, modules: [...new Set([...parts.values()].map((p) => p.module))], base: config.base_model_name_or_path, ...(towers ? { towerTensors: towers } : {}) };
 }
 
 /** Loads a PEFT LoRA adapter repo ("org/repo"): adapter_config.json and adapter_model.safetensors. */

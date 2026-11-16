@@ -26,4 +26,21 @@ describe("PEFT LoRA adapters", () => {
     expect(() => loraFromTensors("x", {}, new Map([["base_model.model.model.embed_tokens.lora_embedding_A", t([4, 4])]]))).toThrow(/cannot/);
     expect(() => loraFromTensors("x", {}, new Map([pair(0, "self_attn", "q_proj", 4)[0]]))).toThrow(/lora_B/);
   });
+
+  it("takes Gemma 4's text layers and leaves its vision and audio towers out", () => {
+    const text = (l: number, m: string) =>
+      [
+        [`base_model.model.model.language_model.layers.${l}.self_attn.${m}.lora_A.weight`, t([4, 4])],
+        [`base_model.model.model.language_model.layers.${l}.self_attn.${m}.lora_B.weight`, t([8, 4], 2)],
+      ] as const;
+    const tower = [
+      ["base_model.model.model.vision_tower.encoder.layers.0.self_attn.q_proj.linear.lora_A.weight", t([4, 4])],
+      ["base_model.model.model.audio_tower.layers.0.self_attn.q_proj.linear.lora_B.weight", t([8, 4])],
+      ["base_model.model.model.embed_vision.embedding_projection.lora_A.weight", t([4, 4])],
+    ] as const;
+    const a = loraFromTensors("g", { r: 4, lora_alpha: 4 }, new Map([...text(0, "q_proj"), ...text(3, "v_proj"), ...tower]));
+    expect([...a.weights.keys()].sort()).toEqual(["0.q_proj", "3.v_proj"]);
+    expect(a.towerTensors).toBe(3);
+    expect(() => loraFromTensors("g", {}, new Map(tower))).toThrow(/only the vision or audio tower/);
+  });
 });

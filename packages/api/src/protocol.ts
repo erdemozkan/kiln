@@ -182,6 +182,8 @@ export interface AdapterInfo {
   modules: string[];
   /** The base model its config names. */
   base?: string;
+  /** Gemma 4: LoRA tensors on its vision or audio tower, which are left out (the towers run as loaded). */
+  towerTensors?: number;
 }
 
 /** Model outputs an encoder returns (see EncoderEngine.forwardHeads). */

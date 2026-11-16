@@ -1380,7 +1380,7 @@ export class Engine {
    * Loads a PEFT LoRA adapter repo under `name` (it is used once `setAdapter(name)` or a call's
    * `adapter` picks it). Its projections must match this model's shapes.
    */
-  async loadAdapter(name: string, id: string, opts: { revision?: string; endpoint?: string } = {}): Promise<{ name: string; id: string; rank: number; modules: string[]; base?: string }> {
+  async loadAdapter(name: string, id: string, opts: { revision?: string; endpoint?: string } = {}): Promise<{ name: string; id: string; rank: number; modules: string[]; base?: string; towerTensors?: number }> {
     const a = await loadLoraAdapter(id, opts);
     const c = this.model.cfg;
     for (const key of a.weights.keys()) if (Number(key.split(".")[0]) >= c.numLayers) throw new Error(`${id} adapts layer ${key.split(".")[0]}, but this model has ${c.numLayers} layers (another base model?)`);
@@ -1391,7 +1391,7 @@ export class Engine {
     // Laid out on the GPU now, so switching to it later costs copies only.
     this.prepareAll();
     if (this.activeAdapter === name) this.setAdapter(name, true);
-    return { name, id, rank: a.rank, modules: a.modules, base: a.base };
+    return { name, id, rank: a.rank, modules: a.modules, base: a.base, ...(a.towerTensors ? { towerTensors: a.towerTensors } : {}) };
   }
 
   /** The slot rank every loaded adapter fits. */

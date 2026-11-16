@@ -341,12 +341,66 @@ describe("Gemma 4", () => {
     m.destroy();
   });
 
-  it("refuses the i8 cache for heads past 256 and adapters", () => {
+  it("refuses the i8 cache for heads past 256", () => {
     const be = new CpuBackend({ threads: 1 });
     const wide: LlamaConfig = { ...cfg, layerHeadDims: [32, 512, 32, 512, 32, 512] };
     expect(() => new LlamaModel(be, wide, new Map(), { maxSeq: 64, kvDtype: "i8" })).toThrow(/i8 cache/);
-    const m = new LlamaModel(be, cfg, upload(be, makeWeights(cfg)), { maxSeq: 64, kvDtype: "f32" });
-    expect(() => m.enableLora(8)).toThrow(/Gemma 4/);
+  });
+
+  it("runs a LoRA adapter as the reference runs the merged weights, shared layers' k and v left out", async () => {
+    const w = makeWeights(cfg);
+    // A rank-4 update on every projection the layers have; on the layers that read another's cache,
+    // k_proj and v_proj too, as a PEFT adapter may hold them, though they change nothing there.
+    const adapter = new Map<string, { rank: number; A: Float32Array; B: Float32Array }>();
+    const merged = new Map(w);
+    let seed = 500;
+    for (let l = 0; l < cfg.numLayers; l++) {
+      const D = headDimOf(cfg, l);
+      const shared = cfg.kvFrom?.[l] !== undefined;
+      const I = cfg.intermediateSize * (shared ? 2 : 1);
+      const h = cfg.hiddenSize;
+      const shapes: [string, string, number, number][] = [
+        ["q_proj", "self_attn", cfg.numHeads * D, h],
+        ["k_proj", "self_attn", cfg.numKvHeads * D, h],
+        ["v_proj", "self_attn", cfg.numKvHeads * D, h],
+        ["o_proj", "self_attn", h, cfg.numHeads * D],
+        ["gate_proj", "mlp", I, h],
+        ["up_proj", "mlp", I, h],
+        ["down_proj", "mlp", h, I],
+      ];
+      for (const [m, group, n, k] of shapes) {
+        const r = 4;
+        const A = rand(r * k, seed++, 0.3);
+        const B = rand(n * r, seed++, 0.3);
+        adapter.set(`${l}.${m}`, { rank: r, A, B });
+        const name = `model.layers.${l}.${group}.${m}.weight`;
+        const base = w.get(name);
+        if (!base) continue;
+        const data = base.data.slice();
+        for (let i = 0; i < n; i++) for (let j = 0; j < k; j++) for (let t = 0; t < r; t++) data[i * k + j]! += B[i * r + t]! * A[t * k + j]!;
+        merged.set(name, { shape: base.shape, data });
+      }
+    }
+    const want = reference(cfg, merged, TOKENS);
+    expect(maxDiff(want, reference(cfg, w, TOKENS))).toBeGreaterThan(0.1);
+    const be = new CpuBackend({ threads: 1 });
+    const read = async (t: Tensor) => new Float32Array(await be.readback(physical(t.buf), 0, t.shape.reduce((a, b) => a * b, 1) * 4));
+    const m = new LlamaModel(be, cfg, upload(be, w), { maxSeq: 64, kvDtype: "f32" });
+    m.enableLora(4);
+    m.setLora(adapter);
+    // The whole prompt at once (the shared layers on the last row alone), then token by token.
+    const whole = m.buildPlan(TOKENS.length);
+    be.write(whole.tokens, 0, Uint32Array.from(TOKENS));
+    m.setStep({ pos0: 0, lastRow: TOKENS.length - 1, seed: 0, temperature: 0 });
+    be.submit(whole.dispatches);
+    expect(maxDiff(await read(whole.logits), want)).toBeLessThan(2e-3);
+    const one = m.buildPlan(1);
+    for (let t = 0; t < TOKENS.length; t++) {
+      be.write(one.tokens, 0, Uint32Array.of(TOKENS[t]!));
+      m.setStep({ pos0: t, lastRow: 0, seed: 0, temperature: 0 });
+      be.submit(one.dispatches);
+    }
+    expect(maxDiff(await read(one.logits), want)).toBeLessThan(2e-3);
     m.destroy();
   });
 });
