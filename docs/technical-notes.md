@@ -409,7 +409,9 @@ How it got there, each step measured in one session with identical greedy output
   scores need nothing. Key and value rows now differ in size, so the model, snapshots and the prompt
   cache carry a value row size (`kvValueRowBytes`, `valueRowBytes`) beside the key one. The writer
   takes heads up to 512 (keys' largest magnitude by a strided loop), so Gemma 4's full-attention
-  layers fit, which i8 refuses. 4-bit keys were tried first and dropped: see the plan.
+  layers fit, which i8 refuses. Qwen3-0.6B perplexity on 768 tokens of these notes (CPU backend,
+  32 tokens scored at a time): f16 23.81, i8 23.84, q4 23.71. Gemma 4 E2B gave f16's answers on four
+  test prompts. 4-bit keys were tried first and dropped: see the plan.
 - **Memory planner:** liveness-based placement in one pool shared by all plans, plus online-softmax
   prefill attention instead of a [T, heads, maxSeq] f32 score buffer (9 MiB at T = 128 for this model,
   and it grows with context and heads). Intermediates 19.3 → 1.8 MiB. The new attention is also faster:

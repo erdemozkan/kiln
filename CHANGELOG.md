@@ -21,7 +21,8 @@ for a normal value, with a scale per 32 values (5 bits a value). That is about 4
 f16 cache's memory, and 80% of i8's. Unlike i8 it takes heads up to 512, so Gemma 4 can use it,
 where until now only f16 and f8 fit. Gemma 4 E2B gave the same answers with it as with f16 on four
 test prompts (sums, facts from a passage, a number recalled across 840 tokens, a short story).
-Qwen3 0.6B stays coherent. Keys stay in 8 bits because 4-bit keys broke Qwen3: its keys have a few
+On Qwen3 0.6B its perplexity on 768 tokens of English was 23.71, against
+23.81 with f16 and 23.84 with i8 (the same, within noise). Keys stay in 8 bits because 4-bit keys broke Qwen3: its keys have a few
 channels about a hundred times larger than the rest, and in 4 bits those send most of the attention
 to the wrong tokens.
 
