@@ -175,10 +175,11 @@ describe.each([
     expect(ref.maxAbsDiff(await read(o, T * H * D), want)).toBeLessThan(2e-3);
   });
 
-  it("writes a q4 ring cache and attends over it as the reference does over the values it holds", async () => {
-    const [T, H, Hkv, D, maxSeq, slots, window] = [3, 4, 2, 64, 512, 300, 270];
+  it.each([64, 512])("writes a q4 ring cache (heads of %i) and attends over it as the reference does over the values it holds", async (D) => {
+    const [T, H, Hkv, maxSeq, slots, window] = [3, 4, 2, 512, 300, 270];
     const row = Hkv * D;
     const HW = (D / 32) * 5;
+    const KW = D / 4 + 1;
     // Groups of very different sizes, one of zeros, and a value 50 times the rest in every group.
     const kf = randn(maxSeq * row).map((v, i) => (i % 32 === 5 ? 50 * v : v) * [1, 0.01, 40, 0][Math.floor(i / 32) % 4]!);
     const vf = randn(maxSeq * row).map((v, i) => v * [3, 0.2][Math.floor(i / 32) % 2]!);
@@ -194,7 +195,21 @@ describe.each([
       }
       return out;
     };
-    const kc = be.alloc(slots * Hkv * HW * 4);
+    // Keys as an i8 cache holds them: a signed byte c per value, c·|c| times the head's largest over 127².
+    const heldI8 = (f: Float32Array) => {
+      const out = new Float32Array(f.length);
+      for (let h = 0; h < f.length; h += D) {
+        let max = 0;
+        for (let i = 0; i < D; i++) max = Math.max(max, Math.abs(f[h + i]!));
+        const inv = max > 0 ? Math.fround(1 / max) : 0;
+        for (let i = 0; i < D; i++) {
+          const c = Math.sign(f[h + i]!) * Math.round(127 * Math.fround(Math.sqrt(Math.min(1, Math.abs(Math.fround(f[h + i]! * inv))))));
+          out[h + i] = c * Math.abs(c) * Math.fround(max / 16129);
+        }
+      }
+      return out;
+    };
+    const kc = be.alloc(slots * Hkv * KW * 4);
     const vc = be.alloc(slots * Hkv * HW * 4);
     const last = 400;
     for (let pos = last - slots - T; pos < last; pos += T) {
@@ -206,20 +221,21 @@ describe.each([
     let o!: Tensor;
     run(pos0, (ctx) => (o = ops.attention(ctx, upload(q.slice(), [T, H * D]), kc, vc, { T, H, Hkv, D, maxSeq, kv: "q4", window, slots })));
     const got = await read(o, T * H * D);
-    const want = ref.attentionRef(q, held(kf), held(vf), { T, H, Hkv, D, pos0, window });
+    const want = ref.attentionRef(q, heldI8(kf), held(vf), { T, H, Hkv, D, pos0, window });
     expect(ref.maxAbsDiff(got, want)).toBeLessThan(2e-3);
   });
 
-  it("attends over a q4 cache close to attention over the exact values", async () => {
-    // Keys and values of ordinary size with an outlier channel, scores of a few units: a model's.
+  it("attends over a q4 cache close to attention over the exact values, with outlier key channels", async () => {
+    // Keys with a channel far larger than the rest, and with a large mean in it (as Qwen3's), which
+    // 4-bit keys could not hold: the q4 cache keeps keys in 8 bits.
     const [T, H, Hkv, D, maxSeq] = [4, 4, 2, 128, 64];
     const row = Hkv * D;
-    const kf = randn(maxSeq * row).map((v, i) => (i % D === 7 ? 6 * v : v));
+    const kf = randn(maxSeq * row).map((v, i) => (i % D === 7 ? 8 * v + 40 : v) * 0.3);
     const vf = randn(maxSeq * row);
     const q = randn(T * H * D).map((v) => v * 0.5);
     const outOf = async (kv: "q4" | "i8") => {
-      const HW = kv === "q4" ? (D / 32) * 5 : D / 4 + 1;
-      const [kc, vc] = [be.alloc(maxSeq * Hkv * HW * 4), be.alloc(maxSeq * Hkv * HW * 4)];
+      const VW = kv === "q4" ? (D / 32) * 5 : D / 4 + 1;
+      const [kc, vc] = [be.alloc(maxSeq * Hkv * (D / 4 + 1) * 4), be.alloc(maxSeq * Hkv * VW * 4)];
       run(0, (ctx) => ops.kvWrite(ctx, upload(kf, [maxSeq, row]), upload(vf, [maxSeq, row]), kc, vc, maxSeq, maxSeq, kv, maxSeq, Hkv));
       let o!: Tensor;
       run(maxSeq - T, (ctx) => (o = ops.attention(ctx, upload(q.slice(), [T, H * D]), kc, vc, { T, H, Hkv, D, maxSeq, kv })));
@@ -227,7 +243,7 @@ describe.each([
     };
     const exact = ref.attentionRef(q, kf, vf, { T, H, Hkv, D, pos0: maxSeq - T });
     const rel = (a: Float32Array) => Math.sqrt(a.reduce((s, v, i) => s + (v - exact[i]!) ** 2, 0) / exact.reduce((s, v) => s + v * v, 0));
-    // 4 bits a value hold a normal value to about 10% (the Lloyd-Max quantizer's bound); the keys' error adds a little.
+    // 4-bit values hold a normal value to about 10% (the Lloyd-Max quantizer's bound).
     const [q4, i8] = [rel(await outOf("q4")), rel(await outOf("i8"))];
     console.log(`attention output off by ${(100 * q4).toFixed(1)}% with q4, ${(100 * i8).toFixed(1)}% with i8`);
     expect(q4).toBeLessThan(0.15);

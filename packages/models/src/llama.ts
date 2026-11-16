@@ -112,16 +112,21 @@ export function ringSlots(cfg: LlamaConfig, maxSeq: number, l: number): number {
 /** Bytes one cached value takes. */
 const KV_BYTES: Record<KvDtype, number> = { f32: 4, f16: 2, f8: 1, i8: 1, q4: 0.625 };
 
-/** Bytes of one position's keys (or values) in layer l's cache: every head's values, and for i8 a scale word per head (q4: 5 words per 32 values, the scales among them). */
-export function kvRowBytesOf(cfg: LlamaConfig, kvDtype: KvDtype, l = 0): number {
-  return cfg.numKvHeads * (headDimOf(cfg, l) * KV_BYTES[kvDtype] + (kvDtype === "i8" ? 4 : 0));
+/**
+ * Bytes of one position's keys (part "k") or values ("v") in layer l's cache: every head's values, and
+ * for i8 a scale word per head. A q4 cache holds keys as i8 and values in 5 words per 32 (the scales
+ * among them); the other types hold both alike.
+ */
+export function kvRowBytesOf(cfg: LlamaConfig, kvDtype: KvDtype, l = 0, part: "k" | "v" = "k"): number {
+  const as: KvDtype = kvDtype === "q4" && part === "k" ? "i8" : kvDtype;
+  return cfg.numKvHeads * (headDimOf(cfg, l) * KV_BYTES[as] + (as === "i8" ? 4 : 0));
 }
 
 /** KV cache bytes of a model at a context length: keys and values of every layer, rings included. */
 export function kvCacheBytes(cfg: LlamaConfig, maxSeq: number, kvDtype: KvDtype = "f16"): number {
   let bytes = 0;
-  for (let l = 0; l < cfg.numLayers; l++) bytes += ringSlots(cfg, maxSeq, l) * kvRowBytesOf(cfg, kvDtype, l);
-  return 2 * bytes;
+  for (let l = 0; l < cfg.numLayers; l++) bytes += ringSlots(cfg, maxSeq, l) * (kvRowBytesOf(cfg, kvDtype, l, "k") + kvRowBytesOf(cfg, kvDtype, l, "v"));
+  return bytes;
 }
 
 /**
@@ -203,15 +208,15 @@ export class LlamaModel {
     this.setAllowed(undefined);
     this.activations = new ActivationPool(backend);
     if (this.kvDtype === "q4" && [cfg.headDim, ...(cfg.layerHeadDims ?? [])].some((d) => d % 32 !== 0)) throw new Error("the q4 cache holds heads of a multiple of 32 values; use f16, f8 or i8 for this model");
+    if (this.kvDtype === "q4" && [cfg.headDim, ...(cfg.layerHeadDims ?? [])].some((d) => d > 2 * ATTN_WG)) throw new Error(`the q4 cache does not hold heads wider than ${2 * ATTN_WG}; use f16 or f8 for this model`);
     if (this.kvDtype === "i8" && cfg.layerHeadDims?.some((d) => d > ATTN_WG)) throw new Error(`the i8 cache does not hold heads wider than ${ATTN_WG}; use f16 or f8 for this model`);
     for (let l = 0; l < cfg.numLayers; l++) {
       const slots = ringSlots(cfg, this.maxSeq, l);
-      const row = kvRowBytesOf(cfg, this.kvDtype, l);
       this.slots.push(slots);
       // A layer without a cache (linear attention) keeps one word, so every layer has its buffers.
       this.kv.push({
-        k: backend.alloc(Math.max(4, slots * row), "storage", `kv/${l}/k`),
-        v: backend.alloc(Math.max(4, slots * row), "storage", `kv/${l}/v`),
+        k: backend.alloc(Math.max(4, slots * kvRowBytesOf(cfg, this.kvDtype, l, "k")), "storage", `kv/${l}/k`),
+        v: backend.alloc(Math.max(4, slots * kvRowBytesOf(cfg, this.kvDtype, l, "v")), "storage", `kv/${l}/v`),
       });
       if (cfg.linearLayers?.[l]) {
         const g = cfg.linear!;
@@ -304,19 +309,29 @@ export class LlamaModel {
     return { weights, kv, activations: this.activations.bytes };
   }
 
-  /** Bytes of one position's K (or V) in the first layer's cache: with `slots`, what tells two cache layouts apart. */
+  /** Bytes of one position's K in the first layer's cache: with `slots`, what tells two cache layouts apart. */
   get kvRowBytes(): number {
     return kvRowBytesOf(this.cfg, this.kvDtype);
   }
 
-  /** Bytes of one position's K (or V) in layer l's cache (layers may differ in head size). */
-  private rowBytes(l: number): number {
-    return kvRowBytesOf(this.cfg, this.kvDtype, l);
+  /** Bytes of one position's V in the first layer's cache: `kvRowBytes` but for a q4 cache. */
+  get kvValueRowBytes(): number {
+    return kvRowBytesOf(this.cfg, this.kvDtype, 0, "v");
+  }
+
+  /** Bytes of one position's K (or with part "v", V) in layer l's cache (layers may differ in head size). */
+  private rowBytes(l: number, part: "k" | "v" = "k"): number {
+    return kvRowBytesOf(this.cfg, this.kvDtype, l, part);
+  }
+
+  /** Bytes of one position's K and V together in layer l's cache. */
+  private pairBytes(l: number): number {
+    return this.rowBytes(l, "k") + this.rowBytes(l, "v");
   }
 
   /** Bytes `readKv(n)` returns: each layer's first min(n, slots) K rows and as many V rows. */
   kvSnapshotBytes(n: number): number {
-    return this.slots.reduce((t, slots, l) => t + 2 * Math.min(n, slots) * this.rowBytes(l), 0);
+    return this.slots.reduce((t, slots, l) => t + Math.min(n, slots) * this.pairBytes(l), 0);
   }
 
   /**
@@ -328,9 +343,9 @@ export class LlamaModel {
    */
   async readKv(n: number): Promise<Uint8Array> {
     const parts = this.kv.flatMap(({ k, v }, l) => {
-      const bytes = Math.min(n, this.slots[l]!) * this.rowBytes(l);
+      const rows = Math.min(n, this.slots[l]!);
       // A layer without a cache (linear attention) has no rows.
-      return bytes ? [this.backend.readback(k, 0, bytes), this.backend.readback(v, 0, bytes)] : [];
+      return rows ? [this.backend.readback(k, 0, rows * this.rowBytes(l, "k")), this.backend.readback(v, 0, rows * this.rowBytes(l, "v"))] : [];
     });
     const out = new Uint8Array(this.kvSnapshotBytes(n));
     let at = 0;
@@ -348,7 +363,7 @@ export class LlamaModel {
 
   /** Bytes `readKvRange(from, to)` returns in all. */
   kvRangeBytes(from: number, to: number): number {
-    return this.slots.reduce((t, slots, l) => t + (slots ? 2 * (to - this.kvRangeStart(l, from, to)) * this.rowBytes(l) : 0), 0);
+    return this.slots.reduce((t, slots, l) => t + (slots ? (to - this.kvRangeStart(l, from, to)) * this.pairBytes(l) : 0), 0);
   }
 
   /**
@@ -360,7 +375,6 @@ export class LlamaModel {
   async readKvRange(from: number, to: number): Promise<Uint8Array[]> {
     if (!(from >= 0 && from <= to && to <= this.maxSeq)) throw new Error(`readKvRange: ${from}…${to} is not inside the cache`);
     const parts = this.kv.flatMap(({ k, v }, l) => {
-      const row = this.rowBytes(l);
       const slots = this.slots[l]!;
       // A layer without a cache (linear attention) has no rows.
       if (!slots) return [];
@@ -369,8 +383,8 @@ export class LlamaModel {
       // Position p sits in slot p % slots, so a range may run off the ring's end and go on at slot 0.
       const first = start % slots;
       const head = Math.min(count, slots - first);
-      const runs = (buf: typeof k) => [this.backend.readback(buf, first * row, head * row), ...(count > head ? [this.backend.readback(buf, 0, (count - head) * row)] : [])];
-      return [...runs(k), ...runs(v)];
+      const runs = (buf: typeof k, row: number) => [this.backend.readback(buf, first * row, head * row), ...(count > head ? [this.backend.readback(buf, 0, (count - head) * row)] : [])];
+      return [...runs(k, this.rowBytes(l, "k")), ...runs(v, this.rowBytes(l, "v"))];
     });
     return (await Promise.all(parts)).map((p) => new Uint8Array(p));
   }
@@ -448,8 +462,9 @@ export class LlamaModel {
 
   saveKv(n: number): Buf[] {
     return this.kv.flatMap(({ k, v }, l) => {
-      const bytes = Math.min(n, this.slots[l]!) * this.rowBytes(l);
+      const rows = Math.min(n, this.slots[l]!);
       return [k, v].map((src, i) => {
+        const bytes = rows * this.rowBytes(l, i ? "v" : "k");
         // A layer without a cache (linear attention) has nothing to copy, but keeps its place in the list.
         const dst = this.backend.alloc(Math.max(4, bytes), "storage", `kv/saved/${l}/${i ? "v" : "k"}`);
         if (bytes) this.backend.copy(src, 0, dst, 0, bytes);
@@ -461,10 +476,10 @@ export class LlamaModel {
   /** Copies `saveKv(n)`'s buffers back into the cache. */
   restoreKv(n: number, saved: readonly Buf[]): void {
     for (const [l, { k, v }] of this.kv.entries()) {
-      const bytes = Math.min(n, this.slots[l]!) * this.rowBytes(l);
-      if (!bytes) continue;
-      this.backend.copy(saved[2 * l]!, 0, k, 0, bytes);
-      this.backend.copy(saved[2 * l + 1]!, 0, v, 0, bytes);
+      const rows = Math.min(n, this.slots[l]!);
+      if (!rows) continue;
+      this.backend.copy(saved[2 * l]!, 0, k, 0, rows * this.rowBytes(l, "k"));
+      this.backend.copy(saved[2 * l + 1]!, 0, v, 0, rows * this.rowBytes(l, "v"));
     }
   }
 
@@ -473,11 +488,12 @@ export class LlamaModel {
     if (n > this.maxSeq || data.length !== this.kvSnapshotBytes(n)) throw new Error(`writeKv: ${data.length} bytes do not hold ${n} positions`);
     let at = 0;
     for (const [l, { k, v }] of this.kv.entries()) {
-      const bytes = Math.min(n, this.slots[l]!) * this.rowBytes(l);
-      if (!bytes) continue;
-      this.backend.write(k, 0, data.subarray(at, at + bytes));
-      this.backend.write(v, 0, data.subarray(at + bytes, at + 2 * bytes));
-      at += 2 * bytes;
+      const rows = Math.min(n, this.slots[l]!);
+      if (!rows) continue;
+      const [kb, vb] = [rows * this.rowBytes(l, "k"), rows * this.rowBytes(l, "v")];
+      this.backend.write(k, 0, data.subarray(at, at + kb));
+      this.backend.write(v, 0, data.subarray(at + kb, at + kb + vb));
+      at += kb + vb;
     }
   }
 

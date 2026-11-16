@@ -100,13 +100,18 @@ export interface GenerateStats {
 
 export type StopReason = "stop" | "maxTokens" | "context" | "format" | "abort";
 
+/** `valueRowBytes` for a model whose V rows differ in size from its K rows (a q4 cache), else nothing. */
+const valueRows = (m: { kvRowBytes: number; kvValueRowBytes: number }): { valueRowBytes?: number } => (m.kvValueRowBytes !== m.kvRowBytes ? { valueRowBytes: m.kvValueRowBytes } : {});
+
 /** K/V cache contents for a token prefix, from `Engine.exportCache` (see `LlamaModel.readKv`). */
 export interface CacheSnapshot {
   tokens: number[];
   kvDtype: string;
   layers: number;
-  /** Bytes per position per layer, for K and for V each. */
+  /** Bytes per position per layer, for K (and for V, unless `valueRowBytes` says otherwise). */
   rowBytes: number;
+  /** Bytes per position per layer for V, where they differ from K (a q4 cache). */
+  valueRowBytes?: number;
   data: Uint8Array;
 }
 
@@ -115,6 +120,8 @@ export interface CacheShape {
   kvDtype: string;
   layers: number;
   rowBytes: number;
+  /** As in CacheSnapshot. */
+  valueRowBytes?: number;
   slots: number[];
 }
 
@@ -1235,7 +1242,7 @@ export class Engine {
   /** What decides how cached K/V is laid out: a prompt cache file made for another shape does not fit. */
   get cacheShape(): CacheShape {
     const m = this.model;
-    return { kvDtype: m.kvDtype, layers: m.cfg.numLayers, rowBytes: m.kvRowBytes, slots: [...m.slots] };
+    return { kvDtype: m.kvDtype, layers: m.cfg.numLayers, rowBytes: m.kvRowBytes, ...valueRows(m), slots: [...m.slots] };
   }
 
   /**
@@ -1252,14 +1259,14 @@ export class Engine {
     if (this.busy) throw new Error("exportCache: the engine is generating");
     const tokens = [...this.cached];
     const m = this.model;
-    return { tokens, kvDtype: m.kvDtype, layers: m.cfg.numLayers, rowBytes: m.kvRowBytes, data: await m.readKv(tokens.length) };
+    return { tokens, kvDtype: m.kvDtype, layers: m.cfg.numLayers, rowBytes: m.kvRowBytes, ...valueRows(m), data: await m.readKv(tokens.length) };
   }
 
   /** Loads a snapshot from `exportCache`; returns false (and changes nothing) if it does not fit this model. */
   importCache(s: CacheSnapshot): boolean {
     const m = this.model;
     // For a recurrent model this restores the attention layers only; `importStates` brings the rest.
-    if (this.busy || s.kvDtype !== m.kvDtype || s.layers !== m.cfg.numLayers || s.rowBytes !== m.kvRowBytes || s.tokens.length >= m.maxSeq) return false;
+    if (this.busy || s.kvDtype !== m.kvDtype || s.layers !== m.cfg.numLayers || s.rowBytes !== m.kvRowBytes || (s.valueRowBytes ?? s.rowBytes) !== m.kvValueRowBytes || s.tokens.length >= m.maxSeq) return false;
     if (s.data.length !== m.kvSnapshotBytes(s.tokens.length)) return false;
     m.writeKv(s.tokens.length, s.data);
     // Image feature slots start empty after a load, so ids of an earlier image would match a new one's.

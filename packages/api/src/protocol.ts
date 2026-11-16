@@ -10,7 +10,10 @@ export interface WireLoadOptions {
   maxSeq?: number;
   revision?: string;
   endpoint?: string;
-  /** KV cache storage: "f16" (default), "f32", or at half of f16's memory "i8" or "f8" (less exact). */
+  /**
+   * KV cache storage: "f16" (default), "f32", at half of f16's memory "i8" or "f8" (less exact), or
+   * "q4" at about 40% of it (keys as i8, values in 4 bits; heads of a multiple of 32).
+   */
   kvDtype?: KvDtype;
   /**
    * Keep the last prompt's K/V in OPFS and restore it on the next load (default true), so a page

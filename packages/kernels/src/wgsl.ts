@@ -36,21 +36,25 @@ const kvStore = (kv: KvDtype): string => (kv === "f32" ? "f32" : "u32");
  * f32's memory plus a word per head. A head is D / 4 + 1 words, so heads are (D + 4) elements apart
  * in the index sums below.
  *
- * "q4": each 32 values of a head, turned by the 32-point Hadamard rotation (see `hadamard32Spec`), as
- * 4-bit codes on the 16 levels of the optimal (Lloyd-Max) quantizer of a unit normal, scaled by the
- * group's root mean square: four words of eight codes, then the f32 scale, 5 words per 32 values (5
- * bits a value). The rotation spreads a few large values over the group, which makes it close to
- * normal; queries get the same rotation before attention and outputs are turned back after it, so
- * scores are those of the unrotated vectors. Heads are a multiple of 32; a head is 5D/32 words, which
- * the index sums below count as 5D/8 elements (4 to a word).
+ * "q4": keys as in "i8", values in 4 bits. A value head is turned by the Hadamard rotation of
+ * `q4Block(D)` values at a time, then each 32 of it stored as 4-bit codes on the 16 levels of the
+ * optimal (Lloyd-Max) quantizer of a unit normal, scaled by the group's root mean square: four words
+ * of eight codes, then the f32 scale, 5 words per 32 values (5 bits a value). The rotation spreads a
+ * few large values over the group, which makes it close to normal; attention outputs are turned back
+ * after it (the rotation is its own inverse). Keys stay in 8 bits: some models' keys (Qwen3's) have a
+ * few channels tens of times larger than the rest, and in 4 bits those move most of the attention
+ * weight, where 8-bit keys leave it as i8 does. Heads are a multiple of 32; a value head is 5D/32
+ * words, which the index sums below count as 5D/8 elements (4 to a word).
  */
 
 /** WGSL for reading the cache: kc as 4-element groups, vc element-wise. */
 interface KvRead {
   kDecl: string;
   vDecl: string;
-  /** Elements from one head of a position to the next: D, or D + 4 where a scale word follows the head. */
+  /** Elements from one key head of a position to the next: D, or D + 4 where a scale word follows the head. */
   head: string;
+  /** The same for value heads, where they differ from keys (q4). */
+  vHead?: string;
   /** Four key values, vector c of the head whose first word is kb (unscaled for i8: see `kScale`). */
   k4: (kb: string, c: string) => string;
   /** A statement scaling `d`, a sum of dot products with the head whose first word is `kb`; empty unless i8. */
@@ -66,9 +70,10 @@ function kvRead(kv: KvDtype): KvRead {
     return {
       kDecl: "array<u32>",
       vDecl: "array<u32>",
-      head: "(p.D / 8u * 5u)",
-      k4: (kb, c) => `q4x4(kc[${kb} + (${c}) / 8u * 5u + (${c}) % 8u / 2u], (${c}) % 2u * 16u, bitcast<f32>(kc[${kb} + (${c}) / 8u * 5u + 4u]))`,
-      kScale: () => "",
+      head: "(p.D + 4u)",
+      vHead: "(p.D / 8u * 5u)",
+      k4: (kb, c) => `i8x4(kc[${kb} + ${c}])`,
+      kScale: (kb) => `d *= bitcast<f32>(kc[${kb} + p.D / 4u]);`,
       v1: (base, i) =>
         `(q4lv[(vc[(${base}) / 4u + (${i}) / 32u * 5u + (${i}) % 32u / 8u] >> ((${i}) % 8u * 4u)) & 15u] * bitcast<f32>(vc[(${base}) / 4u + (${i}) / 32u * 5u + 4u]))`,
       v4: (hb, c) => `q4x4(vc[${hb} + (${c}) / 8u * 5u + (${c}) % 8u / 2u], (${c}) % 2u * 16u, bitcast<f32>(vc[${hb} + (${c}) / 8u * 5u + 4u]))`,
@@ -161,7 +166,7 @@ fn fp8pack(v: vec4<f32>) -> u32 {
   return c.x | (c.y << 8u) | (c.z << 16u) | (c.w << 24u);
 }`;
 /** The helper functions a kernel reading or writing a `kv` cache needs. */
-const kvFns = (kv: KvDtype): string => (kv === "f16" ? KV4_FN : kv === "f8" ? FP8_FN : kv === "i8" ? I8_FN : kv === "q4" ? Q4_FN : "");
+const kvFns = (kv: KvDtype): string => (kv === "f16" ? KV4_FN : kv === "f8" ? FP8_FN : kv === "i8" ? I8_FN : kv === "q4" ? I8_FN + Q4_FN : "");
 
 /** A number as a WGSL f32 literal. */
 const f32Lit = (x: number): string => (Number.isInteger(x) ? `${x}.0` : String(x));
@@ -942,13 +947,15 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
 }
 
 /**
- * Writes k/v rows [T, Hkv·D] into "q4" caches (see KvDtype): one workgroup per (head, token) turns
- * the head by the Hadamard rotation of B values at a time (`q4Block`) in workgroup memory, takes each
- * group of 32's root mean square, and stores the codes and scales. A group of zeros gets scale 0.
+ * Writes k/v rows [T, Hkv·D] into "q4" caches (see KvDtype): one workgroup per (head, token). The key
+ * head is stored as in `kvWriteI8Spec` (heads up to 512 here); the value head is turned by the Hadamard
+ * rotation of B values at a time (`q4Block`) in workgroup memory, and each group of 32 of it stored as
+ * codes over its root mean square, then that scale. A group of zeros gets scale 0.
  */
 export function kvWriteQ4Spec(): KernelSpec {
   return spec("kv_write/q4", ["uniform", "read", "read", "read", "rw", "rw"], cpu.cpuKvWriteQ4, () => /* wgsl */ `
 ${STEP_WGSL}
+${I8_FN}
 ${Q4_FN}
 struct P { T: u32, Hkv: u32, D: u32, maxSeq: u32, cap: u32, B: u32, _b: u32, _c: u32 }
 @group(0) @binding(0) var<uniform> p: P;
@@ -957,9 +964,8 @@ struct P { T: u32, Hkv: u32, D: u32, maxSeq: u32, cap: u32, B: u32, _b: u32, _c:
 @group(0) @binding(3) var<storage, read> v: array<f32>;
 @group(0) @binding(4) var<storage, read_write> kc: array<u32>;
 @group(0) @binding(5) var<storage, read_write> vc: array<u32>;
-var<workgroup> wk: array<f32, 512>;
 var<workgroup> wv: array<f32, 512>;
-var<workgroup> sk: array<f32, 16>;
+var<workgroup> red: array<f32, 256>;
 var<workgroup> sv: array<f32, 16>;
 
 @compute @workgroup_size(256)
@@ -970,20 +976,32 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
   // Writes are guarded rather than returned from: pos comes from storage, and barriers follow.
   let live = pos < p.maxSeq;
   let src = (t * p.Hkv + h) * p.D;
+  // Keys: the head's largest magnitude, then a byte per value relative to it (as kv_write/i8).
+  var mk = 0.0;
   for (var i = li; i < p.D; i += 256u) {
-    wk[i] = k[src + i];
+    mk = max(mk, abs(k[src + i]));
     wv[i] = v[src + i];
   }
+  red[li] = mk;
   workgroupBarrier();
-  // Butterflies of the rotation, every block of B at once: pair index q is (a, a + span).
+  for (var s = 128u; s > 0u; s >>= 1u) {
+    if (li < s) { red[li] = max(red[li], red[li + s]); }
+    workgroupBarrier();
+  }
+  let kMax = red[0];
+  let d4 = p.D / 4u;
+  let kb = ((pos % p.cap) * p.Hkv + h) * (d4 + 1u);
+  let ik = select(0.0, 1.0 / kMax, kMax > 0.0);
+  for (var w = li; live && w < d4; w += 256u) {
+    let e = src + w * 4u;
+    kc[kb + w] = i8pack(vec4<f32>(k[e], k[e + 1u], k[e + 2u], k[e + 3u]) * ik);
+  }
+  if (live && li == 0u) { kc[kb + d4] = bitcast<u32>(kMax / 16129.0); }
+  // Values: butterflies of the rotation, every block of B at once: pair index q is (a, a + span).
   for (var span = 1u; span < p.B; span <<= 1u) {
     for (var q = li; q < p.D / 2u; q += 256u) {
       let a = (q / span) * 2u * span + q % span;
       let b = a + span;
-      let k0 = wk[a];
-      let k1 = wk[b];
-      wk[a] = k0 + k1;
-      wk[b] = k0 - k1;
       let v0 = wv[a];
       let v1 = wv[b];
       wv[a] = v0 + v1;
@@ -992,41 +1010,24 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
     workgroupBarrier();
   }
   let f = inverseSqrt(f32(p.B));
-  for (var i = li; i < p.D; i += 256u) {
-    wk[i] *= f;
-    wv[i] *= f;
-  }
+  for (var i = li; i < p.D; i += 256u) { wv[i] *= f; }
   workgroupBarrier();
   let groups = p.D / 32u;
   if (li < groups) {
     var a = 0.0;
-    var b = 0.0;
-    for (var j = 0u; j < 32u; j++) {
-      a += wk[li * 32u + j] * wk[li * 32u + j];
-      b += wv[li * 32u + j] * wv[li * 32u + j];
-    }
-    sk[li] = sqrt(a / 32.0);
-    sv[li] = sqrt(b / 32.0);
+    for (var j = 0u; j < 32u; j++) { a += wv[li * 32u + j] * wv[li * 32u + j]; }
+    sv[li] = sqrt(a / 32.0);
   }
   workgroupBarrier();
   let base = ((pos % p.cap) * p.Hkv + h) * groups * 5u;
   // One thread per word of eight codes, and the scale after each group's four.
   for (var w = li; live && w < p.D / 8u; w += 256u) {
     let g = w / 4u;
-    let ik = select(0.0, 1.0 / sk[g], sk[g] > 0.0);
     let iv = select(0.0, 1.0 / sv[g], sv[g] > 0.0);
-    var ck = 0u;
     var cv = 0u;
-    for (var j = 0u; j < 8u; j++) {
-      ck |= q4code(wk[w * 8u + j] * ik) << (j * 4u);
-      cv |= q4code(wv[w * 8u + j] * iv) << (j * 4u);
-    }
-    kc[base + g * 5u + w % 4u] = ck;
+    for (var j = 0u; j < 8u; j++) { cv |= q4code(wv[w * 8u + j] * iv) << (j * 4u); }
     vc[base + g * 5u + w % 4u] = cv;
-    if (w % 4u == 0u) {
-      kc[base + g * 5u + 4u] = bitcast<u32>(sk[g]);
-      vc[base + g * 5u + 4u] = bitcast<u32>(sv[g]);
-    }
+    if (w % 4u == 0u) { vc[base + g * 5u + 4u] = bitcast<u32>(sv[g]); }
   }
 }`);
 }
@@ -1135,6 +1136,8 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
   let qo = (t * p.H + h) * p.D;
   let stride = p.Hkv * ${r.head};
   let ko = kvh * ${r.head};
+  let vstride = p.Hkv * ${r.vHead ?? r.head};
+  let vko = kvh * ${r.vHead ?? r.head};
   let d4 = p.D / 4u;
   if (li < d4) {
     let qb = qo + li * 4u;
@@ -1194,7 +1197,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
     m = mNew;
     acc *= corr;
     if (g < groups) {
-      for (var jj = g; jj < bn; jj += groups) { acc += ss[jj] * ${r.v1("wrap(sb + jj) * stride + ko", "i")}; }
+      for (var jj = g; jj < bn; jj += groups) { acc += ss[jj] * ${r.v1("wrap(sb + jj) * vstride + vko", "i")}; }
     }
     workgroupBarrier();
   }
@@ -1261,6 +1264,8 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
   let qo = (t * p.H + h) * p.D;
   let stride = p.Hkv * ${r.head};
   let ko = kvh * ${r.head};
+  let vstride = p.Hkv * ${r.vHead ?? r.head};
+  let vko = kvh * ${r.vHead ?? r.head};
   let d4 = p.D / 4u;
   if (li < d4) {
     let qb = qo + li * 4u;
@@ -1321,7 +1326,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
     acc *= corr;
     acc2 *= corr;
     for (var jj = 0u; jj < bn; jj++) {
-      let vb = wrap(sb + jj) * stride + ko;
+      let vb = wrap(sb + jj) * vstride + vko;
       acc += ss[jj] * ${r.v1("vb", "li")};
       if (two) { acc2 += ss[jj] * ${r.v1("vb", "(li + WG)")}; }
     }
@@ -1595,13 +1600,14 @@ export function attentionTiledSpec(kv: KvDtype, D: number, tile: AttentionTile =
   const D4 = D / 4;
   const KP = D4 + 1; // padded row stride (vec4) of the key/value tile, so rows start in different banks
   const TPR = Math.floor(256 / R);
-  // Words per head in the cache: its D / 4 vectors, and for i8 the scale after them.
-  // q4: 5 words per 32 values (see KvDtype).
-  const HW = kv === "i8" ? D4 + 1 : kv === "q4" ? (D / 32) * 5 : D4;
+  // Words per key head in the cache: its D / 4 vectors, and for i8 (and q4) the scale after them;
+  // per value head the same, but for q4 5 words per 32 values (see KvDtype).
+  const HW = kv === "i8" || kv === "q4" ? D4 + 1 : D4;
+  const VW = kv === "q4" ? (D / 32) * 5 : HW;
   const q4 = kvRead("q4");
   const load =
     kv === "q4"
-      ? { kDecl: "array<u32>", vDecl: "array<u32>", k: q4.k4("i", "c"), v: q4.v4!("i", "c") }
+      ? { kDecl: "array<u32>", vDecl: "array<u32>", k: "i8x4(kc[i + c]) * bitcast<f32>(kc[i + D4])", v: q4.v4!("i", "c") }
       : kv === "i8"
       ? { kDecl: "array<u32>", vDecl: "array<u32>", k: "i8x4(kc[i + c]) * bitcast<f32>(kc[i + D4])", v: "i8x4(vc[i + c]) * bitcast<f32>(vc[i + D4])" }
       : kv === "f8"
@@ -1644,6 +1650,8 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
   let r0 = wid.y * R;
   let stride4 = p.Hkv * ${HW}u;
   let ko4 = kvh * ${HW}u;
+  let vstride4 = p.Hkv * ${VW}u;
+  let vko4 = kvh * ${VW}u;
   for (var e = li; e < R * D4; e += 256u) {
     let rho = r0 + e / D4;
     var v = vec4<f32>(0.0);
@@ -1717,7 +1725,7 @@ ${split
     for (var e = li; e < BK * D4; e += 256u) {
       let j = b0 + e / D4;
       var v = vec4<f32>(0.0);
-      if (j < nMax) { v = V4(wrap(sb + e / D4) * stride4 + ko4, e % D4); }
+      if (j < nMax) { v = V4(wrap(sb + e / D4) * vstride4 + vko4, e % D4); }
       tile[(e / D4) * KP + e % D4] = v;
     }
     workgroupBarrier();
@@ -1808,6 +1816,8 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
   let qo = (t * p.H + h) * p.D;
   let stride = p.Hkv * ${r.head};
   let ko = kvh * ${r.head};
+  let vstride = p.Hkv * ${r.vHead ?? r.head};
+  let vko = kvh * ${r.vHead ?? r.head};
   let d4 = p.D / 4u;
   for (var c = li; c < d4; c += 64u) {
     let qb = qo + c * 4u;
@@ -1862,8 +1872,8 @@ ${r.v4
   let quads = p.D / 4u;
   let groups = max(1u, 64u / quads);
   let g = select(0u, li / quads, quads < 64u);
-  let vs = stride / 4u;
-  let vo = ko / 4u;
+  let vs = vstride / 4u;
+  let vo = vko / 4u;
   for (var pi = li % quads; pi < quads; pi += 64u) {
     var acc = vec4<f32>(0.0);
     if (g < groups) {
@@ -1897,8 +1907,8 @@ ${r.v4
   let pairs = p.D / 2u;
   let groups = max(1u, 64u / pairs);
   let g = select(0u, li / pairs, pairs < 64u);
-  let vs = stride / 2u;
-  let vo = ko / 2u;
+  let vs = vstride / 2u;
+  let vo = vko / 2u;
   for (var pi = li % pairs; pi < pairs; pi += 64u) {
     var acc = vec2<f32>(0.0);
     if (g < groups) {
@@ -1920,7 +1930,7 @@ ${r.v4
   }`
   : `  for (var i = li; i < p.D; i += 64u) {
     var acc = 0.0;
-    for (var j = 0u; j < cnt; j++) { acc += sc[j] * ${r.v1("wrap(sb + j) * stride + ko", "i")}; }
+    for (var j = 0u; j < cnt; j++) { acc += sc[j] * ${r.v1("wrap(sb + j) * vstride + vko", "i")}; }
     po[row * p.D + i] = acc;
   }`}
 }`);

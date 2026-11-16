@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+**A 4-bit cache for values.** `kvDtype: "q4"` keeps keys as the i8 cache does and values in 4 bits:
+each value head turned by a Hadamard rotation, then 4-bit codes on the levels of the best quantizer
+for a normal value, with a scale per 32 values (5 bits a value). That is about 40% of the default
+f16 cache's memory, and 80% of i8's. Unlike i8 it takes heads up to 512, so Gemma 4 can use it,
+where until now only f16 and f8 fit. Gemma 4 E2B gave the same answers with it as with f16 on four
+test prompts (sums, facts from a passage, a number recalled across 840 tokens, a short story).
+Qwen3 0.6B stays coherent. Keys stay in 8 bits because 4-bit keys broke Qwen3: its keys have a few
+channels about a hundred times larger than the rest, and in 4 bits those send most of the attention
+to the wrong tokens.
+
 **GGUF from a file or a URL.** `load` takes a `.gguf` `File` (or `Blob`) the user picked, read in
 place, and the URL of one `.gguf` on any server, downloaded into the cache like a Hub file. The
 prompt cache works for both (a file is keyed by its name, size and modification time, a URL by a hash

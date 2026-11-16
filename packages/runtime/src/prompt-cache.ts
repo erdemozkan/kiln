@@ -42,11 +42,11 @@ export interface PromptCacheSource {
   exportCacheFrom(from: number): Promise<{ tokens: number[]; parts: Uint8Array[] }>;
 }
 
-const sameShape = (a: CacheShape, b: CacheShape) => a.kvDtype === b.kvDtype && a.layers === b.layers && a.rowBytes === b.rowBytes && a.slots.length === b.slots.length && a.slots.every((s, i) => s === b.slots[i]);
+const sameShape = (a: CacheShape, b: CacheShape) => a.kvDtype === b.kvDtype && a.layers === b.layers && a.rowBytes === b.rowBytes && (a.valueRowBytes ?? a.rowBytes) === (b.valueRowBytes ?? b.rowBytes) && a.slots.length === b.slots.length && a.slots.every((s, i) => s === b.slots[i]);
 
 /** First position of from…to-1 a layer of `slots` slots still holds once `to` are written (as `LlamaModel.readKvRange`). */
 const rangeStart = (slots: number, from: number, to: number) => Math.max(from, to - slots);
-const rangeBytes = (shape: CacheShape, from: number, to: number) => shape.slots.reduce((t, s) => t + 2 * (to - rangeStart(s, from, to)) * shape.rowBytes, 0);
+const rangeBytes = (shape: CacheShape, from: number, to: number) => shape.slots.reduce((t, s) => t + (to - rangeStart(s, from, to)) * (shape.rowBytes + (shape.valueRowBytes ?? shape.rowBytes)), 0);
 
 function framed(magic: number, json: unknown): Uint8Array[] {
   const body = new TextEncoder().encode(JSON.stringify(json));
@@ -112,7 +112,8 @@ function shapeOf(json: unknown): CacheShape | undefined {
   if (!h || typeof h.kvDtype !== "string" || !count(h.layers, 4096) || !count(h.rowBytes, 2 ** 24) || !Array.isArray(h.slots) || h.slots.length !== h.layers) return undefined;
   // 0 slots: a layer that keeps no keys and values (linear attention).
   if (!h.slots.every((s) => count(s, 2 ** 24, 0)) || !h.slots.some((s) => s > 0)) return undefined;
-  return { kvDtype: h.kvDtype, layers: h.layers, rowBytes: h.rowBytes, slots: h.slots };
+  if (h.valueRowBytes !== undefined && !count(h.valueRowBytes, 2 ** 24)) return undefined;
+  return { kvDtype: h.kvDtype, layers: h.layers, rowBytes: h.rowBytes, ...(h.valueRowBytes !== undefined ? { valueRowBytes: h.valueRowBytes } : {}), slots: h.slots };
 }
 
 /**
@@ -147,7 +148,8 @@ export async function loadPromptCache(name: string): Promise<{ snapshot: CacheSn
   // many V rows. Every row of it was stored by some segment, so it is no larger than the file.
   const n = tokens.length;
   const row = shape.rowBytes;
-  const total = shape.slots.reduce((t, s) => t + 2 * Math.min(n, s) * row, 0);
+  const vrow = shape.valueRowBytes ?? row;
+  const total = shape.slots.reduce((t, s) => t + Math.min(n, s) * (row + vrow), 0);
   if (total > blob.size) return undefined;
   const data = new Uint8Array(total);
   for (const seg of segments) {
@@ -164,15 +166,15 @@ export async function loadPromptCache(name: string): Promise<{ snapshot: CacheSn
       const first = start % slots;
       const run = Math.min(rows, slots - first);
       // K rows, then V rows; a range that runs off the ring's end goes on at slot 0.
-      for (const part of [base, base + held * row]) {
-        data.set(bytes.subarray(src, src + run * row), part + first * row);
-        data.set(bytes.subarray(src + run * row, src + rows * row), part);
-        src += rows * row;
+      for (const [part, r] of [[base, row], [base + held * row, vrow]] as const) {
+        data.set(bytes.subarray(src, src + run * r), part + first * r);
+        data.set(bytes.subarray(src + run * r, src + rows * r), part);
+        src += rows * r;
       }
-      base += 2 * held * row;
+      base += held * (row + vrow);
     }
   }
-  return { snapshot: { tokens: [...tokens], kvDtype: shape.kvDtype, layers: shape.layers, rowBytes: shape.rowBytes, data }, state: { shape, tokens, segments: segments.map((s) => ({ to: s.to, end: s.end })) } };
+  return { snapshot: { tokens: [...tokens], kvDtype: shape.kvDtype, layers: shape.layers, rowBytes: shape.rowBytes, ...(shape.valueRowBytes !== undefined ? { valueRowBytes: shape.valueRowBytes } : {}), data }, state: { shape, tokens, segments: segments.map((s) => ({ to: s.to, end: s.end })) } };
 }
 
 const STATES = 0x6b737431; // "kst1"

@@ -400,16 +400,14 @@ export function hadamard(ctx: Ctx, x: Tensor, B: number): void {
 }
 
 /**
- * Attention of q over the cached keys and values. With a q4 cache q is turned in place by the
- * rotation the cache holds keys in, and the output turned back (see KvDtype).
+ * Attention of q over the cached keys and values. A q4 cache holds values rotated, so the output is
+ * turned back by the same rotation (see KvDtype).
  */
 export function attention(ctx: Ctx, q: Tensor, kc: Buf, vc: Buf, s: AttentionShape): Tensor {
   if (s.kv !== "q4") return attentionOver(ctx, q, kc, vc, s);
   if (s.D % 32 !== 0 || s.relBias) throw new Error(`attention: the q4 cache needs heads of a multiple of 32${s.relBias ? " and no relative position bias" : ""} (heads of ${s.D})`);
-  const B = q4Block(s.D);
-  hadamard(ctx, q, B);
   const out = attentionOver(ctx, q, kc, vc, s);
-  hadamard(ctx, out, B);
+  hadamard(ctx, out, q4Block(s.D));
   return out;
 }
 

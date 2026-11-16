@@ -609,13 +609,17 @@ export function cpuAttention(kv: Kv, rel = false): CpuKernel {
     const [ku, kf, vu, vf] = [b[3]!.u32, b[3]!.f32, b[4]!.u32, b[4]!.f32];
     const o = (rel ? b[6]! : b[5]!).f32;
     const stride = Hkv * D;
-    // Where key j's head starts: an element index, or for i8 a word index (heads are D / 4 + 1 words).
-    const headAt =
-      kv === "i8"
+    // A q4 cache holds its keys as i8 (see KvDtype).
+    const kKv: Kv = kv === "q4" ? "i8" : kv;
+    // Where position j's head starts: an element index, or for i8 a word index (heads are D / 4 + 1
+    // words), for q4 values a word index (heads are 5D / 32 words).
+    const headOf = (f: Kv) =>
+      f === "i8"
         ? (j: number, kvh: number) => ((j % cap) * Hkv + kvh) * ((D >>> 2) + 1)
-        : kv === "q4"
+        : f === "q4"
           ? (j: number, kvh: number) => ((j % cap) * Hkv + kvh) * (D / 32) * 5
           : (j: number, kvh: number) => (j % cap) * stride + kvh * D;
+    const [keyAt, valueAt] = [headOf(kKv), headOf(kv)];
     if (scores.length < maxSeq) scores = new Float32Array(maxSeq);
     const qs = new Float32Array(D);
     const row = new Float32Array(D);
@@ -631,7 +635,7 @@ export function cpuAttention(kv: Kv, rel = false): CpuKernel {
         for (let i = 0; i < D; i++) qs[i] = q[qo + i]! * scale;
         let mx = -Infinity;
         for (let j = first; j < n; j++) {
-          kvRow(ku, kf, headAt(j, kvh), D, kv, row);
+          kvRow(ku, kf, keyAt(j, kvh), D, kKv, row);
           let d = 0;
           for (let i = 0; i < D; i++) d += qs[i]! * row[i]!;
           if (table) d += table[t5Bucket(j - pos, bidir, buckets, maxDist) * H + h]!;
@@ -642,7 +646,7 @@ export function cpuAttention(kv: Kv, rel = false): CpuKernel {
         for (let j = first; j < n; j++) l += scores[j] = Math.exp(scores[j]! - mx);
         acc.fill(0);
         for (let j = first; j < n; j++) {
-          kvRow(vu, vf, headAt(j, kvh), D, kv, row);
+          kvRow(vu, vf, valueAt(j, kvh), D, kv, row);
           const p = scores[j]!;
           for (let i = 0; i < D; i++) acc[i]! += p * row[i]!;
         }
@@ -1761,17 +1765,20 @@ export function q4Group(x: Float32Array, o: number, out: Uint32Array, f: Float32
   f[w + 4] = s;
 }
 
-/** Writes k/v rows into q4 caches (see `kvWriteQ4Spec`). */
+/** Writes k/v rows into q4 caches: keys as i8, values rotated in 4 bits (see `kvWriteQ4Spec`). */
 export const cpuKvWriteQ4: CpuKernel = (b) => {
   const u = b[0]!.u32;
   const [T, Hkv, D, maxSeq, cap] = [u[0]!, u[1]!, u[2]!, u[3]!, u[4]!];
   const { pos0 } = step(b[1]!);
   const groups = D / 32;
-  for (const [src, dst] of [[b[2]!, b[4]!], [b[3]!, b[5]!]] as const) {
-    for (let t = 0; t < T; t++) {
-      const pos = pos0 + t;
-      if (pos >= maxSeq) continue;
-      for (let h = 0; h < Hkv; h++) q4Head(src.f32, (t * Hkv + h) * D, D, dst.u32, dst.f32, ((pos % cap) * Hkv + h) * groups * 5);
+  const [k, v, kc, vc] = [b[2]!.f32, b[3]!.f32, b[4]!, b[5]!];
+  for (let t = 0; t < T; t++) {
+    const pos = pos0 + t;
+    if (pos >= maxSeq) continue;
+    for (let h = 0; h < Hkv; h++) {
+      const from = (t * Hkv + h) * D;
+      i8Head(k, from, D, kc.u32, kc.f32, ((pos % cap) * Hkv + h) * ((D >>> 2) + 1));
+      q4Head(v, from, D, vc.u32, vc.f32, ((pos % cap) * Hkv + h) * groups * 5);
     }
   }
 };
@@ -1796,18 +1803,22 @@ export const cpuKvWriteI8: CpuKernel = (b) => {
       const pos = pos0 + t;
       if (pos >= maxSeq) continue;
       for (let h = 0; h < Hkv; h++) {
-        const from = (t * Hkv + h) * D;
-        const base = ((pos % cap) * Hkv + h) * (d4 + 1);
-        let max = 0;
-        for (let i = 0; i < D; i++) max = Math.max(max, Math.abs(x[from + i]!));
-        const inv = max > 0 ? Math.fround(1 / max) : 0;
-        const code = (v: number) => (Math.sign(v) * Math.round(127 * Math.fround(Math.sqrt(Math.min(1, Math.abs(Math.fround(v * inv))))))) & 255;
-        for (let w = 0; w < d4; w++) {
-          const e = from + w * 4;
-          words[base + w] = (code(x[e]!) | (code(x[e + 1]!) << 8) | (code(x[e + 2]!) << 16) | (code(x[e + 3]!) << 24)) >>> 0;
-        }
-        floats[base + d4] = max / 16129;
+        i8Head(x, (t * Hkv + h) * D, D, words, floats, ((pos % cap) * Hkv + h) * (d4 + 1));
       }
     }
   }
 };
+
+/** One head of D values at x[from] as i8 words at words[base]: a signed byte per value relative to the head's largest magnitude, then the scale. */
+function i8Head(x: Float32Array, from: number, D: number, words: Uint32Array, floats: Float32Array, base: number): void {
+  const d4 = D >>> 2;
+  let max = 0;
+  for (let i = 0; i < D; i++) max = Math.max(max, Math.abs(x[from + i]!));
+  const inv = max > 0 ? Math.fround(1 / max) : 0;
+  const code = (v: number) => (Math.sign(v) * Math.round(127 * Math.fround(Math.sqrt(Math.min(1, Math.abs(Math.fround(v * inv))))))) & 255;
+  for (let w = 0; w < d4; w++) {
+    const e = from + w * 4;
+    words[base + w] = (code(x[e]!) | (code(x[e + 1]!) << 8) | (code(x[e + 2]!) << 16) | (code(x[e + 3]!) << 24)) >>> 0;
+  }
+  floats[base + d4] = max / 16129;
+}

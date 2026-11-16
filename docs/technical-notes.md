@@ -400,6 +400,16 @@ How it got there, each step measured in one session with identical greedy output
   both. Evenly spaced bytes (c·scale) gave 0.14 on SmolLM2 but 2.3 on Qwen3, worse than f8: after
   its q/k norm a head has a few values far above the rest, and an even scale spends its codes on
   the empty range between. Speed as f16. 71 kernel checks cover it.
+- **q4 KV cache** (`kvDtype: "q4"`, opt-in): keys as in i8; values per head turned by the
+  normalised Hadamard rotation of `q4Block(D)` values (the largest power of two dividing D, up to
+  512), then each 32 of them as 4-bit codes on the 16 Lloyd-Max levels of a unit normal, scaled by
+  the group's root mean square: four words of codes and the f32 scale, 5 words per 32 values. The
+  rotation spreads a head's few large values over it, so the groups are close to normal; it is its
+  own inverse, so the attention output is turned back by the same rotation (`hadamard`), and the
+  scores need nothing. Key and value rows now differ in size, so the model, snapshots and the prompt
+  cache carry a value row size (`kvValueRowBytes`, `valueRowBytes`) beside the key one. The writer
+  takes heads up to 512 (keys' largest magnitude by a strided loop), so Gemma 4's full-attention
+  layers fit, which i8 refuses. 4-bit keys were tried first and dropped: see the plan.
 - **Memory planner:** liveness-based placement in one pool shared by all plans, plus online-softmax
   prefill attention instead of a [T, heads, maxSeq] f32 score buffer (9 MiB at T = 128 for this model,
   and it grows with context and heads). Intermediates 19.3 → 1.8 MiB. The new attention is also faster:
