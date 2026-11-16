@@ -2,7 +2,7 @@ import { Template, TemplateError } from "./jinja";
 import type { Tokenizer } from "./tokenizer";
 
 /** A piece of a message: text, or an image (for models that take images, such as Gemma 3 with its vision tower). */
-export type ContentPart = { type: "text"; text: string } | { type: "image"; image: unknown } | { type: "audio"; audio: unknown };
+export type ContentPart = { type: "text"; text: string } | { type: "image"; image: unknown } | { type: "audio"; audio: unknown } | { type: "video"; video: unknown };
 
 export interface ChatMessage {
   role: "system" | "user" | "assistant" | "tool";

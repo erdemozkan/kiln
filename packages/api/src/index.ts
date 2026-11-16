@@ -74,6 +74,7 @@ export {
   type TextStreamerOptions,
 } from "./pipeline";
 export { readAudio, type AudioInput } from "@kiln/loader";
+export { readVideo, type VideoInput } from "@kiln/loader";
 export { StreamingTranscriber, transcribeMicrophone, type MicrophoneOptions, type MicrophoneTranscription, type StreamingOptions, type StreamingRecognizer, type StreamingUpdate } from "./streaming-asr";
 export { readImage, preprocessImage, resizeImage, centerCrop, type RgbImage, type ImageProcessorConfig } from "@kiln/loader";
 

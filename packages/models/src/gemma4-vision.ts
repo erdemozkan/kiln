@@ -27,6 +27,9 @@ export interface Gemma4VisionConfig {
 }
 
 /** Token budgets the model was trained with. */
+/** Soft tokens a video frame becomes at most (the video processor's max_soft_tokens): a quarter of an image's default. */
+export const GEMMA4_VIDEO_FRAME_TOKENS = 70;
+
 export const GEMMA4_IMAGE_TOKENS = [70, 140, 280, 560, 1120] as const;
 
 /** The projections of a layer whose input and output the tower clips (see `Gemma4VisionTower`). */
@@ -230,9 +233,9 @@ export class Gemma4VisionTower {
     return this.maxTokens;
   }
 
-  /** The token grid an image of this size gets, and the pixel size to resize it to. */
-  grid(width: number, height: number): { rows: number; cols: number; width: number; height: number } {
-    const g = gemma4ImageGrid(width, height, this.cfg, this.maxTokens);
+  /** The token grid an image of this size gets (within `maxTokens`, at most the tower's), and the pixel size to resize it to. */
+  grid(width: number, height: number, maxTokens = this.maxTokens): { rows: number; cols: number; width: number; height: number } {
+    const g = gemma4ImageGrid(width, height, this.cfg, Math.min(maxTokens, this.maxTokens));
     const f = this.cfg.patchSize * this.cfg.poolSize;
     return { ...g, width: g.cols * f, height: g.rows * f };
   }

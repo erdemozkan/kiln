@@ -53,6 +53,7 @@ import {
   type QwenVisionConfig,
   GEMMA4_CLIPPED,
   GEMMA4_IMAGE_TOKENS,
+  GEMMA4_VIDEO_FRAME_TOKENS,
   Gemma4VisionTower,
   gemma4VisionConfig,
   gemma4VisionConfigFromGGUF,
@@ -139,6 +140,12 @@ export interface LoadOptions {
   audio?: boolean;
   /** Pieces of audio whose features stay on the GPU at once, with an audio tower (default 2). A piece is up to 30 s and 750 tokens; a longer clip is several. */
   audioSlots?: number;
+  /**
+   * Gemma 4 with its vision tower: video frames whose features stay on the GPU at once (default 32,
+   * as its video processor samples; 70 tokens each). A request's videos may hold up to this many
+   * frames in all; 0 takes no video.
+   */
+  videoFrames?: number;
   /**
    * Gemma 3's vision tower, as llama.cpp's mmproj GGUF: a file name in the model's repo
    * ("mmproj-F16.gguf") or a full id ("org/repo/mmproj.gguf"). Chat messages may then hold images.
@@ -292,10 +299,11 @@ export async function createEngine(from: ModelSource, opts: LoadOptions = {}): P
     }
     await tuning;
     const audioSlots = audio ? Math.max(1, Math.floor(opts.audioSlots ?? 2)) : 0;
-    // Feature rows: the images', then the audio clips'.
-    const imageTokens = (vision ? (opts.imageSlots ?? 4) * vision.tokensPerImage : 0) + (audio ? audioSlots * audio.tokens : 0);
+    const videoFrames = vision instanceof Gemma4VisionTower ? Math.max(0, Math.floor(opts.videoFrames ?? 32)) : 0;
+    // Feature rows: the images', the video frames', then the audio clips'.
+    const imageTokens = (vision ? (opts.imageSlots ?? 4) * vision.tokensPerImage : 0) + videoFrames * GEMMA4_VIDEO_FRAME_TOKENS + (audio ? audioSlots * audio.tokens : 0);
     model = new LlamaModel(backend, modelCfg, weights, { maxSeq: opts.maxSeq, kvDtype: opts.kvDtype, fuse: opts.fuse, imageTokens });
-    const engine = new Engine(backend, model, tokenizer, vision, audio && { tower: audio, slots: audioSlots });
+    const engine = new Engine(backend, model, tokenizer, vision, audio && { tower: audio, slots: audioSlots }, videoFrames);
     if (opts.maxSubmitMs !== undefined) engine.maxSubmitMs = opts.maxSubmitMs;
     if (opts.prefixCacheBytes !== undefined) engine.prefixCacheBytes = opts.prefixCacheBytes;
     return engine;

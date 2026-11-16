@@ -1,6 +1,6 @@
 import { type Backend, type Buf, type Dispatch, type Profile } from "@kiln/core";
 import { GrammarMatcher, TokenTrie, compileFormat, type ResponseFormat } from "@kiln/grammar";
-import { Gemma4VisionTower, LlamaModel, type Gemma4AudioTower, MAX_VERIFY_ROWS, QwenVisionTower, type ForwardPlan, type Idefics3Processing, type ImagePixels, type VisionTower } from "@kiln/models";
+import { GEMMA4_VIDEO_FRAME_TOKENS, Gemma4VisionTower, LlamaModel, type Gemma4AudioTower, MAX_VERIFY_ROWS, QwenVisionTower, type ForwardPlan, type Idefics3Processing, type ImagePixels, type VisionTower } from "@kiln/models";
 import { GEMMA4_AUDIO_MAX_SAMPLES, gemma4AudioFeatures, resizeImage } from "@kiln/loader";
 import type { StepParams } from "@kiln/core";
 import { idefics3PromptString, idefics3Tiles } from "./idefics3";
@@ -155,6 +155,30 @@ export function audioPieces(samples: Float32Array): Float32Array[] {
     out.push(piece);
   }
   return out.length ? out : [samples];
+}
+
+/** What a video part's text stands in for until the template has run (a private-use character around "video"). */
+const VIDEO_MARK = "\uE000video\uE000";
+
+/** A video's frames, decoded, and each frame's time in seconds. */
+export interface VideoFrames {
+  frames: ImagePixels[];
+  times: number[];
+}
+
+/**
+ * A video part's value as frames and their times: `{ frames, times }` (seconds), or `{ frames, fps }`
+ * (frame i at i / fps; default 1). Frames must be decoded pixels (see `readVideo`).
+ */
+export function videoFrames(v: unknown): VideoFrames {
+  const o = v as { frames?: unknown; times?: unknown; fps?: unknown };
+  if (!o || !Array.isArray(o.frames) || !o.frames.length) throw new Error("a video part must hold { frames, times } or { frames, fps }, with at least one frame (see readVideo)");
+  for (const f of o.frames as ImagePixels[]) if (!f || !(f.width > 0) || !(f.height > 0) || !f.data) throw new Error("a video frame must be decoded pixels { width, height, data } (see readVideo)");
+  const fps = o.fps === undefined ? 1 : Number(o.fps);
+  if (!(fps > 0)) throw new Error(`a video's fps must be above 0 (got ${String(o.fps)})`);
+  const times = o.times === undefined ? (o.frames as unknown[]).map((_, i) => i / fps) : (o.times as number[]);
+  if (!Array.isArray(times) || times.length !== o.frames.length || times.some((t) => !(t >= 0))) throw new Error("a video's times must be one non-negative number of seconds per frame");
+  return { frames: o.frames as ImagePixels[], times };
 }
 
 /** The key of a piece of audio: the same samples get the same slot (see `imageKey`). */
@@ -345,6 +369,12 @@ export class Engine {
      * may then hold audio. Its rows come after the images' in `model.imageFeatures`.
      */
     readonly audio?: { tower: Gemma4AudioTower; slots: number },
+    /**
+     * Video frames whose features stay on the GPU at once (Gemma 4's vision tower): chat messages may
+     * then hold video, up to this many frames in a request. Their rows sit between the images' and
+     * the audio clips'.
+     */
+    readonly videoFrames = 0,
   ) {
     try {
       this.chatFormat = detectChatFormat(tokenizer);
@@ -367,6 +397,10 @@ export class Engine {
     const clips = messages.flatMap((m) => (typeof m.content === "string" ? [] : m.content.flatMap((p) => (p.type === "audio" ? [p.audio] : []))));
     if (clips.length && !this.audio) throw new Error("this model takes no audio (load Gemma 4 with its mmproj file to give it audio)");
     if (clips.some((c) => !(c instanceof Float32Array))) throw new Error("an audio part must hold mono samples at 16 kHz as a Float32Array (see readAudio)");
+    const videos = messages.flatMap((m) => (typeof m.content === "string" ? [] : m.content.flatMap((p) => (p.type === "video" ? [videoFrames(p.video)] : []))));
+    if (videos.length && !(this.vision instanceof Gemma4VisionTower && this.videoFrames > 0)) throw new Error("this model takes no video (load Gemma 4 with its vision tower, and videoFrames above 0, to give it video)");
+    const frameCount = videos.reduce((n, v) => n + v.frames.length, 0);
+    if (frameCount > this.videoFrames) throw new Error(`these videos have ${frameCount} frames, but ${this.videoFrames} fit; load with a larger videoFrames, or take fewer frames`);
     const idefics3 = this.vision?.processing;
     // Templates see image parts without their pixels; Gemma's writes <start_of_image> for each,
     // SmolVLM's <image>. SmolVLM's template reads every message's content as a list of parts.
@@ -375,14 +409,18 @@ export class Engine {
         ? idefics3
           ? { ...m, content: [{ type: "text" as const, text: m.content }] }
           : m
-        : { ...m, content: m.content.map((p) => (p.type === "image" ? { type: "image" as const, image: null } : p.type === "audio" ? { type: "audio" as const, audio: null } : p)) },
+        : {
+            ...m,
+            // A video goes through the template as text holding a marker, expanded once it is rendered.
+            content: m.content.map((p) => (p.type === "image" ? { type: "image" as const, image: null } : p.type === "audio" ? { type: "audio" as const, audio: null } : p.type === "video" ? { type: "text" as const, text: VIDEO_MARK } : p)),
+          },
     );
     const prompt = this.chatFormat.render(shown, {
       enableThinking: thinks ? opts.enableThinking : undefined,
       tools: opts.tools,
       documents: opts.documents,
     });
-    if (!images.length && !clips.length) {
+    if (!images.length && !clips.length && !videos.length) {
       yield* this.complete(prompt, this.forceToolCall(opts));
       return;
     }
@@ -404,12 +442,16 @@ export class Engine {
         const g = (this.vision as QwenVisionTower | Gemma4VisionTower).grid(img.width, img.height);
         slots.push(await this.imageSlot(resizeImage(img, g.width, g.height, 3)));
       }
-      // Gemma 4's processor also puts each image's tokens between <|image> and <image|>, and each
-      // clip's between <|audio> and <audio|>.
-      let ids =
-        this.vision instanceof QwenVisionTower
-          ? this.withGridImages(prompt, slots, "<|image_pad|>")
-          : this.withGridImages(this.audioMarkers(prompt.split("<|image|>").join("<|image><|image|><image|>"), pieces), slots, "<|image|>");
+      const imageRuns = slots.map((slot) => ({ base: this.model.cfg.vocabSize + slot * this.vision!.tokens, count: this.imageSlots[slot]!.grid!.rows * this.imageSlots[slot]!.grid!.cols }));
+      // Gemma 4's processor also puts each image's tokens between <|image> and <image|>, each
+      // clip's between <|audio> and <audio|>, and each video frame's after its time, as an image's.
+      let runs = imageRuns;
+      let text = prompt;
+      if (!(this.vision instanceof QwenVisionTower)) {
+        text = this.audioMarkers(text.split("<|image|>").join("<|image><|image|><image|>"), pieces);
+        if (videos.length) ({ text, runs } = await this.withVideos(text, videos, imageRuns));
+      }
+      let ids = this.withGridImages(text, runs, this.vision instanceof QwenVisionTower ? "<|image_pad|>" : "<|image|>");
       if (clips.length) {
         const runs: { base: number; count: number }[] = [];
         for (const piece of pieces.flat()) runs.push(await this.audioSlot(piece));
@@ -425,17 +467,16 @@ export class Engine {
   /**
    * Prompt ids as Qwen's and Gemma 4's processors expand them: each `marker` token in the prompt
    * (Qwen's <|image_pad|>, which its template writes between <|vision_start|> and <|vision_end|>;
-   * Gemma 4's <|image|>) becomes the image's rows · cols soft tokens, with ids
-   * vocabSize + slot · (a slot's tokens) + i.
+   * Gemma 4's <|image|>) becomes its run of soft tokens, in order: an image's rows · cols, with ids
+   * vocabSize + slot · (a slot's tokens) + i, or a video frame's (see `withVideos`).
    */
-  private withGridImages(prompt: string, slots: readonly number[], marker: string): number[] {
+  private withGridImages(prompt: string, runs: readonly { base: number; count: number }[], marker: string): number[] {
     const pad = this.tokenizer.tokenId(marker);
     if (pad === undefined) throw new Error(`the tokenizer has no ${marker} token`);
     const ids = this.tokenizer.encode(prompt);
     const marks = ids.reduce((n, id) => n + (id === pad ? 1 : 0), 0);
-    if (marks !== slots.length) throw new Error(`the chat template wrote ${marks} image markers for ${slots.length} images`);
-    if (!slots.length) return ids;
-    const per = this.vision!.tokens;
+    if (marks !== runs.length) throw new Error(`the chat template wrote ${marks} image markers for ${runs.length} images and video frames`);
+    if (!runs.length) return ids;
     const out: number[] = [];
     let k = 0;
     for (const id of ids) {
@@ -443,12 +484,66 @@ export class Engine {
         out.push(id);
         continue;
       }
-      const slot = slots[k++]!;
-      const g = this.imageSlots[slot]!.grid!;
-      const base = this.model.cfg.vocabSize + slot * per;
-      for (let i = 0; i < g.rows * g.cols; i++) out.push(base + i);
+      const { base, count } = runs[k++]!;
+      for (let i = 0; i < count; i++) out.push(base + i);
     }
     return out;
+  }
+
+  /** Feature rows of the video frames, after the images'. */
+  private videoKey: string | undefined;
+  private videoGrids: { rows: number; cols: number }[] = [];
+
+  /**
+   * `prompt` with each video marker written as Gemma 4's processor writes a video: per frame its time
+   * as "mm:ss", a space, and the frame as an image (<|image><|image|><image|>), frames apart by a
+   * space. Each frame becomes up to GEMMA4_VIDEO_FRAME_TOKENS soft tokens (its own aspect ratio, as
+   * an image at that budget), its features at its place in the video rows; frames run through the
+   * vision tower unless these videos' frames are already there. Returns the text and the runs of
+   * every <|image|> marker in it, images' and frames' in prompt order.
+   */
+  private async withVideos(prompt: string, videos: readonly VideoFrames[], imageRuns: readonly { base: number; count: number }[]): Promise<{ text: string; runs: { base: number; count: number }[] }> {
+    const tower = this.vision as Gemma4VisionTower;
+    const per = GEMMA4_VIDEO_FRAME_TOKENS;
+    const row0 = this.model.cfg.vocabSize + this.imageRows;
+    const key = videos.map((v) => v.frames.map(imageKey).join(",")).join(";");
+    if (key !== this.videoKey) {
+      // Prefixes that saw the old frames would otherwise resume a prompt with these.
+      if (this.videoKey !== undefined) this.forgetRows(row0, this.videoFrames * per);
+      this.videoKey = undefined;
+      this.videoGrids = [];
+      let f = 0;
+      for (const v of videos)
+        for (const frame of v.frames) {
+          const g = tower.grid(frame.width, frame.height, per);
+          this.videoGrids.push(await tower.encode(resizeImage(frame, g.width, g.height, 3), this.model.imageFeatures!, (this.imageRows + f++ * per) * this.model.cfg.hiddenSize * 4));
+        }
+      this.videoKey = key;
+    }
+    // Markers in order: an image's <|image|> or a video's marker; their runs follow the same order.
+    const pieces = prompt.split(/(<\|image\|>|\uE000video\uE000)/);
+    const runs: { base: number; count: number }[] = [];
+    let [img, vid, f] = [0, 0, 0];
+    let text = "";
+    for (const piece of pieces) {
+      if (piece === "<|image|>") {
+        runs.push(imageRuns[img++]!);
+        text += piece;
+      } else if (piece === VIDEO_MARK) {
+        const v = videos[vid++];
+        if (!v) throw new Error("the chat template wrote more video markers than there are videos");
+        text += v.frames
+          .map((_, i) => {
+            const g = this.videoGrids[f]!;
+            runs.push({ base: row0 + f++ * per, count: g.rows * g.cols });
+            const t = v.times[i]!;
+            return `${String(Math.floor(t / 60)).padStart(2, "0")}:${String(Math.floor(t % 60)).padStart(2, "0")} <|image><|image|><image|>`;
+          })
+          .join(" ");
+      } else text += piece;
+    }
+    if (vid !== videos.length) throw new Error(`the chat template wrote ${vid} video markers for ${videos.length} videos`);
+    return { text, runs };
   }
 
   /**
@@ -538,9 +633,14 @@ export class Engine {
     return out;
   }
 
-  /** Rows of `model.imageFeatures` that hold images; audio clips' rows come after them. */
+  /** Rows of `model.imageFeatures` that hold images; video frames' rows come after them, then audio clips'. */
   private get imageRows(): number {
-    return this.model.imageFeatures!.size / 4 / this.model.cfg.hiddenSize - (this.audio ? this.audio.slots * this.audio.tower.tokens : 0);
+    return this.model.imageFeatures!.size / 4 / this.model.cfg.hiddenSize - this.videoFrames * GEMMA4_VIDEO_FRAME_TOKENS - (this.audio ? this.audio.slots * this.audio.tower.tokens : 0);
+  }
+
+  /** The first row of `model.imageFeatures` that holds audio. */
+  private get audioRows0(): number {
+    return this.imageRows + this.videoFrames * GEMMA4_VIDEO_FRAME_TOKENS;
   }
 
   /** Clips whose features sit in `model.imageFeatures`, by slot. */
@@ -562,7 +662,7 @@ export class Engine {
     const { tower, slots: cap } = this.audio!;
     const heard = samples.subarray(0, GEMMA4_AUDIO_MAX_SAMPLES);
     const key = audioKey(heard);
-    const first = this.model.cfg.vocabSize + this.imageRows;
+    const first = this.model.cfg.vocabSize + this.audioRows0;
     let slot = this.audioSlots.findIndex((s) => s?.key === key);
     if (slot < 0) {
       slot = this.audioSlots.length < cap ? this.audioSlots.length : this.audioSlots.reduce((lru, s, i) => (s!.used < this.audioSlots[lru]!.used ? i : lru), 0);
@@ -570,7 +670,7 @@ export class Engine {
       this.audioSlots[slot] = undefined;
       const { features, frames } = gemma4AudioFeatures(heard);
       if (tower.tokensFor(frames) < 1) throw new Error("an audio part is too short: it needs at least 20 ms of sound");
-      const count = await tower.encode(features, frames, this.model.imageFeatures!, (this.imageRows + slot * tower.tokens) * this.model.cfg.hiddenSize * 4);
+      const count = await tower.encode(features, frames, this.model.imageFeatures!, (this.audioRows0 + slot * tower.tokens) * this.model.cfg.hiddenSize * 4);
       this.audioSlots[slot] = { key, used: 0, count };
     }
     const s = this.audioSlots[slot]!;

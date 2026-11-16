@@ -9,4 +9,5 @@ export * from "./convert";
 export * from "./hub";
 export * from "./local";
 export * from "./audio";
+export * from "./video";
 export * from "./image";

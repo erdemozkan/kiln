@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+**Gemma 4 takes video.** A chat part `{ type: "video", video: { frames, times } }` holds a video's
+frames as decoded pixels and each frame's time in seconds (or `fps` instead of times). Each frame
+goes through the vision tower as an image of up to 70 tokens at its own shape, after its time as
+"mm:ss", as Gemma 4's processor writes a video. `readVideo(fileOrUrl, { frames })` samples frames
+evenly over a video in a page (32 by default, as the processor does). The frames' features have
+their own rows, `videoFrames` of them (default 32), between the images' and the audio's, so asking
+again about the same video does not run the tower again.
+
 **A 4-bit cache for values.** `kvDtype: "q4"` keeps keys as the i8 cache does and values in 4 bits:
 each value head turned by a Hadamard rotation, then 4-bit codes on the levels of the best quantizer
 for a normal value, with a scale per 32 values (5 bits a value). That is about 40% of the default

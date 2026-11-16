@@ -32,6 +32,12 @@ export interface WireLoadOptions {
   audio?: boolean;
   /** Pieces of audio (up to 30 s each; a longer clip is several) whose features stay on the GPU at once, with an audio tower (default 2). */
   audioSlots?: number;
+  /**
+   * Gemma 4 with its vision tower: video frames whose features stay on the GPU at once (default 32).
+   * Messages may hold `{ type: "video", video: { frames, times } }` parts (see `readVideo`), up to this
+   * many frames in a request; 0 takes no video.
+   */
+  videoFrames?: number;
   /** Images whose features stay on the GPU at once, with a vision tower (default 4). */
   imageSlots?: number;
   /** Qwen 3.5: the most tokens an image becomes (default 576, a 768 × 768 picture); larger images are scaled down to fit. */

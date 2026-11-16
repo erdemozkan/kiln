@@ -126,6 +126,13 @@ async function toPixels(image: unknown, size: number | undefined): Promise<{ wid
   return ctx.getImageData(0, 0, w, h);
 }
 
+/** A video part's frames as pixels at their own size, its times or fps kept. */
+async function videoPixels(video: unknown): Promise<unknown> {
+  const v = video as { frames?: unknown[] };
+  if (!v || !Array.isArray(v.frames)) return video;
+  return { ...v, frames: await Promise.all(v.frames.map((f) => toPixels(f, undefined))) };
+}
+
 async function generate(msg: Extract<Request, { type: "chat" | "complete" }>, ac: AbortController): Promise<void> {
   try {
     if (!engine) throw new Error("no model loaded");
@@ -138,7 +145,7 @@ async function generate(msg: Extract<Request, { type: "chat" | "complete" }>, ac
     if (vision && messages.some((m) => typeof m.content !== "string")) {
       messages = await Promise.all(
         messages.map(async (m) =>
-          typeof m.content === "string" ? m : { ...m, content: await Promise.all(m.content.map(async (p) => (p.type === "image" ? { type: "image" as const, image: await toPixels(p.image, size) } : p))) },
+          typeof m.content === "string" ? m : { ...m, content: await Promise.all(m.content.map(async (p) => (p.type === "image" ? { type: "image" as const, image: await toPixels(p.image, size) } : p.type === "video" ? { type: "video" as const, video: await videoPixels(p.video) } : p))) },
         ),
       );
     }
