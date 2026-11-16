@@ -35,6 +35,9 @@
         <label for="folder">or open a model folder (config.json, the tokenizer files and safetensors weights, as a Hub repo has them):</label>
         <input id="folder" type="file" webkitdirectory />
       </div>
+      <div id="keep-row" class="row status" hidden>
+        <label><input id="keep" type="checkbox" /> Remember the picked file or folder (this browser has no file handles, so it keeps a copy in its storage)</label>
+      </div>
       <div id="recent" class="row status" hidden></div>
       <progress id="progress" max="1" value="0"></progress>
       <div id="status" class="status">Not loaded.</div>

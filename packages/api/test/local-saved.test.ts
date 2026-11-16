@@ -63,6 +63,19 @@ describe("remembered local models", () => {
     expect(await saved!.open()).toBeUndefined();
   });
 
+  it("keeps a copy of picked files where there are no handles, and reopens it to the same id", async () => {
+    const files = [new File(["{}"], "config.json", { lastModified: 3 }), new File(["w"], "model.safetensors", { lastModified: 4 })].map((f) => Object.assign(f, { webkitRelativePath: `bert-tiny/${f.name}` }));
+    const id = await localModel(files, { remember: "copy" });
+    const [saved] = await savedLocalModels();
+    expect([saved!.name, saved!.kind, saved!.copied]).toEqual(["bert-tiny", "directory", true]);
+    expect(await saved!.open()).toBe(id);
+    const gguf = await localModel(new File(["x"], "tiny.gguf", { lastModified: 1 }), { remember: "copy" });
+    const again = (await savedLocalModels()).find((s) => s.name === "tiny")!;
+    expect([again.kind, await again.open()]).toEqual(["file", gguf]);
+    await saved!.forget();
+    expect((await savedLocalModels()).map((s) => s.name)).toEqual(["tiny"]);
+  });
+
   it("cannot remember what is not a handle, and lists nothing without IndexedDB", async () => {
     await expect(localModel(new File(["x"], "a.gguf"), { remember: true })).rejects.toThrow("only a file or directory handle");
     delete g.indexedDB;

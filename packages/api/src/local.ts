@@ -45,9 +45,12 @@ const isHandle = (v: unknown): v is FileHandle | DirectoryHandle => typeof v ===
  * as a Hub repo is laid out (config.json, the tokenizer files and the weights at its top level); a
  * single .gguf needs nothing beside it. Files are read in place when the model loads: nothing is
  * uploaded or copied. The id lasts for this page: after a reload the files are registered again.
- * `remember: true` keeps a handle for that (see `savedLocalModels`).
+ * `remember: true` keeps a handle for that (see `savedLocalModels`), where the browser has handles
+ * (Chrome, Edge). `remember: "copy"` works everywhere (Safari and Firefox too, and for an
+ * `<input>`'s files): it copies the files into the browser's storage (IndexedDB), a second copy
+ * on disk that stays until it is forgotten.
  */
-export async function localModel(input: LocalModelInput, opts: { name?: string; remember?: boolean } = {}): Promise<string> {
+export async function localModel(input: LocalModelInput, opts: { name?: string; remember?: boolean | "copy" } = {}): Promise<string> {
   let files: [string, LocalFile][];
   let name = opts.name;
   if (typeof input === "string") {
@@ -55,8 +58,8 @@ export async function localModel(input: LocalModelInput, opts: { name?: string; 
     const disk = diskModel(input);
     return registerLocalModel(disk.files, opts.name ?? disk.name);
   }
-  if (opts.remember) {
-    if (!isHandle(input)) throw new Error("localModel: only a file or directory handle (showOpenFilePicker, showDirectoryPicker, a drop) can be remembered; an <input>'s files cannot be reopened after a reload");
+  if (opts.remember === true) {
+    if (!isHandle(input)) throw new Error("localModel: only a file or directory handle (showOpenFilePicker, showDirectoryPicker, a drop) can be remembered; an <input>'s files cannot be reopened after a reload (remember: \"copy\" keeps a copy of them instead)");
     await saveHandle(opts.name ?? input.name, { handle: input, name: opts.name });
   }
   if (isHandle(input)) {
@@ -77,6 +80,16 @@ export async function localModel(input: LocalModelInput, opts: { name?: string; 
     name ??= first || (list.length === 1 ? list[0]!.name.replace(/\.gguf$/i, "") : undefined);
   } else {
     files = Object.entries(input as Record<string, Blob>);
+  }
+  if (opts.remember === "copy") {
+    const blobs = files.filter((f): f is [string, Blob] => f[1] instanceof Blob);
+    if (blobs.length !== files.length) throw new Error("localModel: only picked files can be copied");
+    const key = name ?? "model";
+    try {
+      await saveHandle(key, { files: blobs, name });
+    } catch (err) {
+      throw new Error(`localModel: could not copy "${key}" into the browser's storage (${err instanceof Error ? err.message : String(err)}); it may not have room for ${(blobs.reduce((n, [, b]) => n + b.size, 0) / 2 ** 30).toFixed(1)} GB`);
+    }
   }
   return registerLocalModel(files, name);
 }
@@ -163,13 +176,15 @@ export interface SavedLocalModel {
   /** The name it was saved under: `opts.name`, or the file's or folder's own. */
   name: string;
   kind: "file" | "directory";
+  /** True when the browser's storage holds a copy of the files (`remember: "copy"`), not a handle to them. */
+  copied: boolean;
   /**
    * Registers the files again and resolves to the model's id, or to undefined when the user does not
    * allow reading them. After a reload the browser asks for that permission once more, which it only
    * does from a click or a key press: call this from one.
    */
   open(): Promise<string | undefined>;
-  /** Forgets the handle; the files and any caches stay. */
+  /** Forgets the handle, or deletes the copy; the user's own files and any caches stay. */
   forget(): Promise<void>;
 }
 
@@ -199,9 +214,13 @@ function idb<T>(mode: IDBTransactionMode, run: (store: IDBObjectStore) => IDBReq
   });
 }
 
-/** A stored handle, with the name the caller gave it (if any): reopening with the same name yields the same id. */
+/**
+ * A stored handle, or the files themselves (IndexedDB keeps Blobs on disk and hands them back
+ * unread), with the name the caller gave it (if any): reopening with the same name yields the same id.
+ */
 interface SavedRecord {
-  handle: SavedHandle;
+  handle?: SavedHandle;
+  files?: [string, Blob][];
   name?: string;
 }
 
@@ -210,9 +229,9 @@ async function saveHandle(key: string, record: SavedRecord): Promise<void> {
 }
 
 /**
- * The local models remembered with `localModel(handle, { remember: true })`, by name. Empty where the
- * browser has no IndexedDB. Handles come from the File System Access API (Chrome and Edge); other
- * browsers have nothing to remember, and the user picks the files again.
+ * The local models remembered with `localModel(handle, { remember: true })` or `localModel(files,
+ * { remember: "copy" })`, by name. Empty where the browser has no IndexedDB. Handles come from the
+ * File System Access API (Chrome and Edge); copies work in every browser.
  */
 export async function savedLocalModels(): Promise<SavedLocalModel[]> {
   let names: string[];
@@ -224,18 +243,24 @@ export async function savedLocalModels(): Promise<SavedLocalModel[]> {
     return [];
   }
   return names.map((name, i) => {
-    const { handle, name: given } = records[i]!;
+    const { handle, files, name: given } = records[i]!;
+    const forget = async () => {
+      await idb("readwrite", (s) => s.delete(name));
+    };
+    if (!handle) {
+      const copy = files ?? [];
+      return { name, kind: copy.length === 1 ? ("file" as const) : ("directory" as const), copied: true, open: async () => localModel(new Map(copy), { name: given ?? name }), forget };
+    }
     return {
       name,
       kind: handle.kind,
+      copied: false,
       async open() {
         let state = (await handle.queryPermission?.({ mode: "read" })) ?? "granted";
         if (state === "prompt") state = (await handle.requestPermission?.({ mode: "read" })) ?? "denied";
         return state === "granted" ? localModel(handle as unknown as FileSystemHandle, { name: given }) : undefined;
       },
-      async forget() {
-        await idb("readwrite", (s) => s.delete(name));
-      },
+      forget,
     };
   });
 }

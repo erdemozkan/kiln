@@ -62,7 +62,7 @@ async function showRecent(): Promise<void> {
     const forget = document.createElement("button");
     forget.className = "secondary";
     forget.textContent = "×";
-    forget.title = `Forget ${s.name} (the files stay)`;
+    forget.title = s.copied ? `Forget ${s.name} (deletes the browser's copy; your own files stay)` : `Forget ${s.name} (the files stay)`;
     forget.setAttribute("aria-label", `Forget ${s.name}`);
     forget.onclick = async () => {
       await s.forget();
@@ -97,6 +97,8 @@ async function pick(get: () => Promise<FileSystemHandle>): Promise<void> {
     status.textContent = err instanceof Error ? err.message : String(err);
   }
 }
+const keepBox = $<HTMLInputElement>("keep");
+$("keep-row").hidden = !!(pickers.showOpenFilePicker && pickers.showDirectoryPicker);
 if (pickers.showOpenFilePicker) {
   fileInput.addEventListener("click", (e) => {
     e.preventDefault();
@@ -185,7 +187,10 @@ loadBtn.onclick = async () => {
   try {
     await model?.unload();
     // A picked folder becomes a local model id; a picked .gguf is passed as the file it is.
-    const source = picked ?? (folderInput.files?.length ? await localModel(folderInput.files) : (fileInput.files?.[0] ?? modelInput.value.trim()));
+    // Without file handles (Safari, Firefox), a picked model is remembered as a copy, if asked.
+    const keep = keepBox.checked ? ({ remember: "copy" } as const) : {};
+    const source = picked ?? (folderInput.files?.length ? await localModel(folderInput.files, keep) : fileInput.files?.[0] && keepBox.checked ? await localModel(fileInput.files[0], keep) : (fileInput.files?.[0] ?? modelInput.value.trim()));
+    if (keepBox.checked) void showRecent();
     model = await load(source, {
       quant: quant.value as "auto" | "q4" | "q8" | "f32",
       device: device.value as "auto" | "gpu" | "cpu",
