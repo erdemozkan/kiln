@@ -1,6 +1,6 @@
 import { type Backend, type Buf, type Dispatch, type Profile } from "@kiln/core";
 import { GrammarMatcher, TokenTrie, compileFormat, type ResponseFormat } from "@kiln/grammar";
-import { GEMMA4_VIDEO_FRAME_TOKENS, Gemma4VisionTower, LlamaModel, type Gemma4AudioTower, MAX_VERIFY_ROWS, QwenVisionTower, type ForwardPlan, type Idefics3Processing, type ImagePixels, type VisionTower } from "@kiln/models";
+import { GEMMA4_VIDEO_FRAME_TOKENS, QWEN_VIDEO_PAIR_TOKENS, Gemma4VisionTower, LlamaModel, type Gemma4AudioTower, MAX_VERIFY_ROWS, QwenVisionTower, type ForwardPlan, type Idefics3Processing, type ImagePixels, type VisionTower } from "@kiln/models";
 import { GEMMA4_AUDIO_MAX_SAMPLES, gemma4AudioFeatures, resizeImage } from "@kiln/loader";
 import type { StepParams } from "@kiln/core";
 import { idefics3PromptString, idefics3Tiles } from "./idefics3";
@@ -159,6 +159,24 @@ export function audioPieces(samples: Float32Array): Float32Array[] {
 
 /** What a video part's text stands in for until the template has run (a private-use character around "video"). */
 const VIDEO_MARK = "\uE000video\uE000";
+
+/**
+ * Feature rows `frames` video frames take beside this vision tower: Gemma 4's are 70 tokens a frame,
+ * Qwen 3.5's go in pairs of up to 64 tokens; other towers take no video.
+ */
+export function videoRows(vision: unknown, frames: number): number {
+  if (vision instanceof Gemma4VisionTower) return frames * GEMMA4_VIDEO_FRAME_TOKENS;
+  if (vision instanceof QwenVisionTower) return Math.ceil(frames / 2) * QWEN_VIDEO_PAIR_TOKENS;
+  return 0;
+}
+
+/** A number with one decimal as Python's f"{x:.1f}" writes it: ties (x.25, x.75) go to the even digit, where toFixed rounds them up. */
+export function pythonFixed1(x: number): string {
+  const tie = Number.isInteger(x * 4) && Math.abs(x * 4) % 2 === 1;
+  if (!tie) return x.toFixed(1);
+  const lower = Math.floor(x * 10);
+  return ((lower % 2 === 0 ? lower : lower + 1) / 10).toFixed(1);
+}
 
 /** A video's frames, decoded, and each frame's time in seconds. */
 export interface VideoFrames {
@@ -398,7 +416,7 @@ export class Engine {
     if (clips.length && !this.audio) throw new Error("this model takes no audio (load Gemma 4 with its mmproj file to give it audio)");
     if (clips.some((c) => !(c instanceof Float32Array))) throw new Error("an audio part must hold mono samples at 16 kHz as a Float32Array (see readAudio)");
     const videos = messages.flatMap((m) => (typeof m.content === "string" ? [] : m.content.flatMap((p) => (p.type === "video" ? [videoFrames(p.video)] : []))));
-    if (videos.length && !(this.vision instanceof Gemma4VisionTower && this.videoFrames > 0)) throw new Error("this model takes no video (load Gemma 4 with its vision tower, and videoFrames above 0, to give it video)");
+    if (videos.length && !((this.vision instanceof Gemma4VisionTower || (this.vision instanceof QwenVisionTower && this.vision.takesVideo)) && this.videoFrames > 0)) throw new Error("this model takes no video (load Gemma 4 or Qwen 3.5 with its vision tower, and videoFrames above 0, to give it video)");
     const frameCount = videos.reduce((n, v) => n + v.frames.length, 0);
     if (frameCount > this.videoFrames) throw new Error(`these videos have ${frameCount} frames, but ${this.videoFrames} fit; load with a larger videoFrames, or take fewer frames`);
     const idefics3 = this.vision?.processing;
@@ -450,7 +468,7 @@ export class Engine {
       if (!(this.vision instanceof QwenVisionTower)) {
         text = this.audioMarkers(text.split("<|image|>").join("<|image><|image|><image|>"), pieces);
         if (videos.length) ({ text, runs } = await this.withVideos(text, videos, imageRuns));
-      }
+      } else if (videos.length) ({ text, runs } = await this.withQwenVideos(text, videos, imageRuns));
       let ids = this.withGridImages(text, runs, this.vision instanceof QwenVisionTower ? "<|image_pad|>" : "<|image|>");
       if (clips.length) {
         const runs: { base: number; count: number }[] = [];
@@ -547,6 +565,73 @@ export class Engine {
   }
 
   /**
+   * `prompt` with each video marker written as Qwen's processor writes a video: the frames in pairs
+   * (the tower joins two frames; an odd last frame is paired with itself), each pair as its time,
+   * "<1.5 seconds>" (the mean of its two frames' times), and <|vision_start|>, its tokens,
+   * <|vision_end|>. A pair becomes up to QWEN_VIDEO_PAIR_TOKENS soft tokens, at the frames' aspect
+   * ratio, its features at its place in the video rows. Returns the text, with <|image_pad|> where a
+   * pair's tokens go, and the runs of every <|image_pad|> in it, images' and pairs' in prompt order.
+   */
+  private async withQwenVideos(prompt: string, videos: readonly VideoFrames[], imageRuns: readonly { base: number; count: number }[]): Promise<{ text: string; runs: { base: number; count: number }[] }> {
+    const tower = this.vision as QwenVisionTower;
+    const per = QWEN_VIDEO_PAIR_TOKENS;
+    const row0 = this.model.cfg.vocabSize + this.imageRows;
+    const pairs = videos.reduce((n, v) => n + Math.ceil(v.frames.length / 2), 0);
+    if (pairs * per > videoRows(tower, this.videoFrames)) throw new Error(`these videos make ${pairs} pairs of frames, but ${Math.ceil(this.videoFrames / 2)} fit; load with a larger videoFrames, or take fewer frames`);
+    const key = videos.map((v) => v.frames.map(imageKey).join(",")).join(";");
+    if (key !== this.videoKey) {
+      if (this.videoKey !== undefined) this.forgetRows(row0, videoRows(tower, this.videoFrames));
+      this.videoKey = undefined;
+      this.videoGrids = [];
+      let pair = 0;
+      for (const v of videos) {
+        // Every frame of a video at the first frame's grid, as the processor resizes a video as one.
+        const g = tower.grid(v.frames[0]!.width, v.frames[0]!.height, per);
+        const sized = (f: ImagePixels) => resizeImage(f, g.width, g.height, 3);
+        for (let i = 0; i < v.frames.length; i += 2) {
+          const a = sized(v.frames[i]!);
+          this.videoGrids.push(await tower.encode(a, this.model.imageFeatures!, (this.imageRows + pair++ * per) * this.model.cfg.hiddenSize * 4, i + 1 < v.frames.length ? sized(v.frames[i + 1]!) : a));
+        }
+      }
+      this.videoKey = key;
+    }
+    const pieces = prompt.split(/(<\|image_pad\|>|\uE000video\uE000)/);
+    const runs: { base: number; count: number }[] = [];
+    let [img, vid, pair] = [0, 0, 0];
+    let text = "";
+    for (const piece of pieces) {
+      if (piece === "<|image_pad|>") {
+        runs.push(imageRuns[img++]!);
+        text += piece;
+      } else if (piece === VIDEO_MARK) {
+        const v = videos[vid++];
+        if (!v) throw new Error("the chat template wrote more video markers than there are videos");
+        for (let i = 0; i < v.frames.length; i += 2) {
+          const g = this.videoGrids[pair]!;
+          runs.push({ base: row0 + pair++ * per, count: g.rows * g.cols });
+          const t = (v.times[i]! + v.times[Math.min(i + 1, v.frames.length - 1)]!) / 2;
+          text += `<${pythonFixed1(t)} seconds><|vision_start|><|image_pad|><|vision_end|>`;
+        }
+      } else text += piece;
+    }
+    if (vid !== videos.length) throw new Error(`the chat template wrote ${vid} video markers for ${videos.length} videos`);
+    return { text, runs };
+  }
+
+  /** The token grid behind an image or video token id of Qwen 3.5: its image slot's, or its pair of frames'. */
+  private qwenGrid(id: number): { rows: number; cols: number; span: number } {
+    const row = id - this.model.cfg.vocabSize;
+    if (row >= this.imageRows) {
+      const g = this.videoGrids[Math.floor((row - this.imageRows) / QWEN_VIDEO_PAIR_TOKENS)];
+      if (!g) throw new Error("a video token has no frames behind it");
+      return { ...g, span: g.rows * g.cols };
+    }
+    const g = this.imageSlots[Math.floor(row / this.vision!.tokens)]?.grid;
+    if (!g) throw new Error("an image token has no image behind it");
+    return { ...g, span: g.rows * g.cols };
+  }
+
+  /**
    * The rotary position fields of the step that starts at index `at` of `ids` (see `StepParams`).
    * Only Qwen 3.5 with images differs from the index: an image's tokens share a time position and
    * count rows and columns from it, and the text after continues past the image's longer side, so
@@ -555,16 +640,15 @@ export class Engine {
   private ropeAt(ids: readonly number[], at: number): Pick<StepParams, "posShift" | "imgLo" | "imgHi" | "imgW" | "imgPos"> {
     if (!(this.vision instanceof QwenVisionTower)) return {};
     const vocab = this.model.cfg.vocabSize;
-    const per = this.vision.tokens;
     let shift = 0;
     for (let i = 0; i < ids.length && i <= at; ) {
       if (ids[i]! < vocab) {
         i++;
         continue;
       }
-      const g = this.imageSlots[Math.floor((ids[i]! - vocab) / per)]?.grid;
-      if (!g) throw new Error("an image token has no image behind it");
-      const n = g.rows * g.cols;
+      // A pair of video frames sits as an image does (the processor gives each pair a grid of its own).
+      const g = this.qwenGrid(ids[i]!);
+      const n = g.span;
       if (at < i + n) return { imgLo: i, imgHi: i + n, imgW: g.cols, imgPos: i - shift };
       shift += n - Math.max(g.rows, g.cols);
       i += n;
@@ -635,12 +719,12 @@ export class Engine {
 
   /** Rows of `model.imageFeatures` that hold images; video frames' rows come after them, then audio clips'. */
   private get imageRows(): number {
-    return this.model.imageFeatures!.size / 4 / this.model.cfg.hiddenSize - this.videoFrames * GEMMA4_VIDEO_FRAME_TOKENS - (this.audio ? this.audio.slots * this.audio.tower.tokens : 0);
+    return this.model.imageFeatures!.size / 4 / this.model.cfg.hiddenSize - videoRows(this.vision, this.videoFrames) - (this.audio ? this.audio.slots * this.audio.tower.tokens : 0);
   }
 
   /** The first row of `model.imageFeatures` that holds audio. */
   private get audioRows0(): number {
-    return this.imageRows + this.videoFrames * GEMMA4_VIDEO_FRAME_TOKENS;
+    return this.imageRows + videoRows(this.vision, this.videoFrames);
   }
 
   /** Clips whose features sit in `model.imageFeatures`, by slot. */

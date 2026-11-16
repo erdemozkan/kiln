@@ -30,6 +30,13 @@ export interface QwenVisionConfig {
 
 const THETA = 10000;
 
+/**
+ * Most tokens Kiln gives a pair of video frames (the tower joins two frames into one set of
+ * tokens). The processor's own budget, up to 768 a pair, is more than a browser's context holds for
+ * a clip of any length.
+ */
+export const QWEN_VIDEO_PAIR_TOKENS = 64;
+
 /** A number from a config, or `d` where the key is absent. */
 const num = (o: Record<string, unknown>, k: string, d: number): number => (o[k] === undefined || o[k] === null ? d : configNumber(k, o[k]));
 
@@ -141,25 +148,31 @@ function patchAt(r: number, gw: number, m: number): [number, number] {
 /**
  * Patch rows [patches, 3 · p · p] of an image already resized to the grid: each patch's values in
  * (channel, row, column) order, as the convolution weight flattens, normalised with the config's
- * mean and std, in merge-block order.
+ * mean and std, in merge-block order. With `second` (a video's next frame, the same size), each row
+ * holds the patch of both frames, one after the other: [patches, 2 · 3 · p · p].
  */
-export function qwenPatches(c: QwenVisionConfig, img: ImagePixels): Float32Array {
+export function qwenPatches(c: QwenVisionConfig, img: ImagePixels, second?: ImagePixels): Float32Array {
   const P = c.patchSize;
   const [gh, gw] = [img.height / P, img.width / P];
   if (!Number.isInteger(gh / c.mergeSize) || !Number.isInteger(gw / c.mergeSize)) throw new Error(`image is ${img.width}×${img.height}, not whole tokens of ${P * c.mergeSize} pixels`);
   const ch = img.data.length / (img.width * img.height);
   if (ch !== 3 && ch !== 4) throw new Error("image data must be RGB or RGBA bytes");
+  if (second && (second.width !== img.width || second.height !== img.height || second.data.length !== img.data.length)) throw new Error("a video's frames must all have the same size");
   const K = 3 * P * P;
-  const out = new Float32Array(gh * gw * K);
+  const frames = second ? [img, second] : [img];
+  const row = K * frames.length;
+  const out = new Float32Array(gh * gw * row);
   for (let r = 0; r < gh * gw; r++) {
     const [py, px] = patchAt(r, gw, c.mergeSize);
-    const o = r * K;
-    for (let k = 0; k < 3; k++)
-      for (let y = 0; y < P; y++)
-        for (let x = 0; x < P; x++) {
-          const v = img.data[((py * P + y) * img.width + px * P + x) * ch + k]! / 255;
-          out[o + (k * P + y) * P + x] = (v - c.mean[k]!) / c.std[k]!;
-        }
+    frames.forEach((f, t) => {
+      const o = r * row + t * K;
+      for (let k = 0; k < 3; k++)
+        for (let y = 0; y < P; y++)
+          for (let x = 0; x < P; x++) {
+            const v = f.data[((py * P + y) * f.width + px * P + x) * ch + k]! / 255;
+            out[o + (k * P + y) * P + x] = (v - c.mean[k]!) / c.std[k]!;
+          }
+    });
   }
   return out;
 }
@@ -220,7 +233,8 @@ interface Plan {
 /**
  * The tower on the GPU. Weights use llama.cpp's mmproj names (the loader renames a transformers
  * checkpoint's): `v.patch_embd.weight` as one [hidden, 3 · p · p] matrix (the two frames of the
- * model's video convolution added, since a still image is both frames), `v.blk.N.*` with q, k and v
+ * model's video convolution added, since a still image is both frames; `v.patch_embd.pair.weight`
+ * [hidden, 2 · 3 · p · p] keeps them apart, for a video's pairs of frames), `v.blk.N.*` with q, k and v
  * as one `attn_qkv`, `v.post_ln` (the merger's norm) and `mm.0` / `mm.2` (its two layers). The
  * position table stays on the CPU, where it is resampled per image size. Attention is the text
  * model's over a 'cache' of one slot per patch with a span over all of them (see `VisionTower`).
@@ -258,14 +272,19 @@ export class QwenVisionTower {
     return this.maxTokens;
   }
 
+  /** Whether the tower has the video convolution's two frames apart, to take a video's pairs of frames. */
+  get takesVideo(): boolean {
+    return this.weights.has("v.patch_embd.pair.weight");
+  }
+
   /** As `tokensPerImage`: the engine's unit for slots. */
   get tokens(): number {
     return this.maxTokens;
   }
 
-  /** The token grid an image of this size gets, and the pixel size to resize it to. */
-  grid(width: number, height: number): { rows: number; cols: number; width: number; height: number } {
-    const g = qwenImageGrid(width, height, this.cfg, this.maxTokens);
+  /** The token grid an image of this size gets (at most `maxTokens` tokens), and the pixel size to resize it to. */
+  grid(width: number, height: number, maxTokens = this.maxTokens): { rows: number; cols: number; width: number; height: number } {
+    const g = qwenImageGrid(width, height, this.cfg, Math.min(maxTokens, this.maxTokens));
     const f = this.cfg.patchSize * this.cfg.mergeSize;
     return { ...g, width: g.cols * f, height: g.rows * f };
   }
@@ -276,17 +295,17 @@ export class QwenVisionTower {
     return t;
   }
 
-  private build(gh: number, gw: number): Plan {
+  private build(gh: number, gw: number, pair: boolean): Plan {
     const c = this.cfg;
     const n = gh * gw;
     const D = c.hidden / c.heads;
-    const K = 3 * c.patchSize ** 2;
+    const K = (pair ? 2 : 1) * 3 * c.patchSize ** 2;
     const ctx = new Ctx(this.backend, this.step, "vision", this.pool);
     const patches = ctx.buffer(n * K * 4, "vision/patches");
     const pos = ctx.buffer(n * c.hidden * 4, "vision/pos");
     const anglesBuf = ctx.buffer(n * (D / 2) * 4, "vision/angles");
     const angles: Tensor = { shape: [n, D / 2], dtype: "f32", buf: anglesBuf };
-    const x = ops.linear(ctx, { shape: [n, K], dtype: "f32", buf: patches }, this.w("v.patch_embd.weight"), { bias: this.w("v.patch_embd.bias") });
+    const x = ops.linear(ctx, { shape: [n, K], dtype: "f32", buf: patches }, this.w(pair ? "v.patch_embd.pair.weight" : "v.patch_embd.weight"), { bias: this.w("v.patch_embd.bias") });
     ops.addInPlace(ctx, x, { shape: [n, c.hidden], dtype: "f32", buf: pos });
     const shape = { T: n, H: c.heads, Hkv: c.heads, D, maxSeq: n, kv: "f32" as const, scale: D ** -0.5, span: true };
     for (let l = 0; l < c.layers; l++) {
@@ -321,15 +340,16 @@ export class QwenVisionTower {
   /**
    * Runs the tower on an image already resized to `grid`'s size and copies its rows · cols features
    * into `dst` at byte offset `dstOffset`; returns the token grid. Plans are kept for the three most
-   * recent grid sizes. The work goes out a layer at a time, as `VisionTower.encode` does.
+   * recent grid sizes. The work goes out a layer at a time, as `VisionTower.encode` does. With
+   * `second`, the two are consecutive frames of a video, joined by the model's video convolution.
    */
-  async encode(img: ImagePixels, dst: Buf, dstOffset: number): Promise<{ rows: number; cols: number }> {
+  async encode(img: ImagePixels, dst: Buf, dstOffset: number, second?: ImagePixels): Promise<{ rows: number; cols: number }> {
     const c = this.cfg;
     const [gh, gw] = [img.height / c.patchSize, img.width / c.patchSize];
     const [rows, cols] = [gh / c.mergeSize, gw / c.mergeSize];
     if (!Number.isInteger(rows) || !Number.isInteger(cols)) throw new Error(`image is ${img.width}×${img.height}, not whole tokens of ${c.patchSize * c.mergeSize} pixels`);
     if (rows * cols > this.maxTokens) throw new Error(`image makes ${rows * cols} tokens, but at most ${this.maxTokens} fit`);
-    const key = `${gh}x${gw}`;
+    const key = `${gh}x${gw}${second ? "/pair" : ""}`;
     let plan = this.plans.get(key);
     if (!plan) {
       if (this.plans.size >= 3) {
@@ -337,13 +357,13 @@ export class QwenVisionTower {
         this.plans.get(oldest)!.ctx.destroy();
         this.plans.delete(oldest);
       }
-      plan = this.build(gh, gw);
+      plan = this.build(gh, gw, !!second);
       this.plans.set(key, plan);
     }
     plan.used = ++this.clock;
     const n = gh * gw;
     this.backend.write(this.step, 0, packStep({ pos0: 0, lastRow: 0, seed: 0, temperature: 0, spanLo: 0, spanHi: n }));
-    this.backend.write(plan.patches, 0, qwenPatches(c, img));
+    this.backend.write(plan.patches, 0, qwenPatches(c, img, second));
     this.backend.write(plan.pos, 0, qwenPositionEmbeddings(this.posTable, c, gh, gw));
     this.backend.write(plan.angles, 0, qwenRotaryAngles(c, gh, gw));
     const d = plan.dispatches;

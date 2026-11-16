@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+**Qwen 3.5 takes video.** The same `{ type: "video", video: { frames, times } }` part as Gemma 4's,
+written as Qwen's processor writes a video: the frames go through the vision tower in pairs (its
+patch convolution spans two frames; an odd last frame is paired with itself), each pair after its
+time, "<4.5 seconds>" (the mean of its two frames' times), between <|vision_start|> and
+<|vision_end|>, and placed in the language model as an image is. A pair becomes up to 64 tokens at
+the video's shape (the processor's own budget, up to 768 a pair, is more than a browser's context
+takes), and a request's videos hold up to `videoFrames` frames (default 32). On the 0.8B model
+(safetensors, WebGPU): four colours shown for two seconds each were listed in order, the blue was
+placed "from 4.5 seconds", the digits 1, 2, 3 on three pairs were read in order, and a photo given
+as two frames was described as the photo is. Within one pair the first frame counts for more: the
+checkpoint's convolution has 1.8 times the weight on it. Not compared number for number with
+another implementation; a GGUF with its mmproj file takes the same path and was not run.
+
 **Remembering local models without file handles.** `localModel(files, { remember: "copy" })` keeps a
 copy of the picked files in the browser's storage (IndexedDB), so Safari and Firefox, which cannot
 keep a handle, can reopen a local model after a reload; `savedLocalModels()` lists copies beside
@@ -237,8 +250,8 @@ named, three lines of small text and large text on a sign read exactly, two imag
 follow-up question reusing the first turn. A 640 × 416 picture is 260 tokens and takes about 3 s to
 prefill on the 0.8B model. Large letters alone on a blank white picture are often misread, more so
 the larger the picture; the same letters on a photo are read at every size tried, so this is the
-model, not the code. Not compared number for number with another implementation. Video is not
-supported.
+model, not the code. Not compared number for number with another implementation. Video came
+later (see "Qwen 3.5 takes video").
 
 **Live transcription.** `transcribeMicrophone(asr, { onUpdate })` transcribes the microphone as it
 is spoken, and `StreamingTranscriber` does the same for audio fed in pieces from anywhere

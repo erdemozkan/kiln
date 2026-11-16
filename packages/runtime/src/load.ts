@@ -53,7 +53,6 @@ import {
   type QwenVisionConfig,
   GEMMA4_CLIPPED,
   GEMMA4_IMAGE_TOKENS,
-  GEMMA4_VIDEO_FRAME_TOKENS,
   Gemma4VisionTower,
   gemma4VisionConfig,
   gemma4VisionConfigFromGGUF,
@@ -73,7 +72,7 @@ import {
   type LlamaConfig,
 } from "@kiln/models";
 import { Tokenizer, type ChatTemplate, type TokenizerJSON } from "@kiln/tokenizers";
-import { Engine } from "./engine";
+import { Engine, videoRows } from "./engine";
 import { splitQwen35Merged } from "./qwen35-gguf";
 import { llamaMatmulShapes, tuneMatmuls } from "./tune";
 import { freeWeights, loadColumnGroups, loadWeights, type LoadProgress, type Quant, type WeightFile } from "./weights";
@@ -141,9 +140,10 @@ export interface LoadOptions {
   /** Pieces of audio whose features stay on the GPU at once, with an audio tower (default 2). A piece is up to 30 s and 750 tokens; a longer clip is several. */
   audioSlots?: number;
   /**
-   * Gemma 4 with its vision tower: video frames whose features stay on the GPU at once (default 32,
-   * as its video processor samples; 70 tokens each). A request's videos may hold up to this many
-   * frames in all; 0 takes no video.
+   * Gemma 4 or Qwen 3.5 with its vision tower: video frames whose features stay on the GPU at once
+   * (default 32; Gemma 4: 70 tokens each, as its video processor samples; Qwen 3.5: frames go in
+   * pairs of up to 64 tokens). A request's videos may hold up to this many frames in all; 0 takes
+   * no video.
    */
   videoFrames?: number;
   /**
@@ -299,9 +299,9 @@ export async function createEngine(from: ModelSource, opts: LoadOptions = {}): P
     }
     await tuning;
     const audioSlots = audio ? Math.max(1, Math.floor(opts.audioSlots ?? 2)) : 0;
-    const videoFrames = vision instanceof Gemma4VisionTower ? Math.max(0, Math.floor(opts.videoFrames ?? 32)) : 0;
+    const videoFrames = vision instanceof Gemma4VisionTower || (vision instanceof QwenVisionTower && vision.takesVideo) ? Math.max(0, Math.floor(opts.videoFrames ?? 32)) : 0;
     // Feature rows: the images', the video frames', then the audio clips'.
-    const imageTokens = (vision ? (opts.imageSlots ?? 4) * vision.tokensPerImage : 0) + videoFrames * GEMMA4_VIDEO_FRAME_TOKENS + (audio ? audioSlots * audio.tokens : 0);
+    const imageTokens = (vision ? (opts.imageSlots ?? 4) * vision.tokensPerImage : 0) + videoRows(vision, videoFrames) + (audio ? audioSlots * audio.tokens : 0);
     model = new LlamaModel(backend, modelCfg, weights, { maxSeq: opts.maxSeq, kvDtype: opts.kvDtype, fuse: opts.fuse, imageTokens });
     const engine = new Engine(backend, model, tokenizer, vision, audio && { tower: audio, slots: audioSlots }, videoFrames);
     if (opts.maxSubmitMs !== undefined) engine.maxSubmitMs = opts.maxSubmitMs;
@@ -638,12 +638,16 @@ async function openQwenTower(backend: Backend, files: WeightFile[], nameOf: (nam
     const K = 3 * cfg.patchSize ** 2;
     const pp = cfg.patchSize ** 2;
     const patchW = new Float32Array(cfg.hidden * K);
+    // The two frames' weights side by side, for a video's pairs of frames: [hidden, 2 · K].
+    let pairW: Float32Array | undefined;
     if (found.has("v.patch_embd.weight.1")) {
       // An mmproj file: one [hidden, 3, p, p] tensor per frame.
-      for (const name of ["v.patch_embd.weight", "v.patch_embd.weight.1"]) {
+      pairW = new Float32Array(cfg.hidden * 2 * K);
+      for (const [t, name] of ["v.patch_embd.weight", "v.patch_embd.weight.1"].entries()) {
         const w = await read(name);
         if (w.length !== patchW.length) throw new Error(`vision tower: ${name} has ${w.length} values, not ${patchW.length}`);
         for (let i = 0; i < w.length; i++) patchW[i] += w[i]!;
+        for (let o = 0; o < cfg.hidden; o++) pairW.set(w.subarray(o * K, (o + 1) * K), (o * 2 + t) * K);
       }
     } else {
       // A checkpoint: [hidden, 3, frames, p, p].
@@ -651,10 +655,19 @@ async function openQwenTower(backend: Backend, files: WeightFile[], nameOf: (nam
       const frames = w.length / patchW.length;
       if (!Number.isInteger(frames)) throw new Error(`vision tower: the patch weight has ${w.length} values, not a multiple of ${patchW.length}`);
       for (let oc = 0; oc < cfg.hidden * 3; oc++) for (let t = 0; t < frames; t++) for (let i = 0; i < pp; i++) patchW[oc * pp + i] += w[(oc * frames + t) * pp + i]!;
+      if (frames === 2) {
+        pairW = new Float32Array(cfg.hidden * 2 * K);
+        for (let o = 0; o < cfg.hidden; o++) for (let ch = 0; ch < 3; ch++) for (let t = 0; t < 2; t++) for (let i = 0; i < pp; i++) pairW[(o * 2 + t) * K + ch * pp + i] = w[((o * 3 + ch) * 2 + t) * pp + i]!;
+      }
     }
     const buf = backend.alloc(patchW.byteLength, "storage", "vision/w");
     backend.write(buf, 0, patchW);
     weights.set("v.patch_embd.weight", { shape: [cfg.hidden, K], dtype: "f32", buf });
+    if (pairW) {
+      const pairBuf = backend.alloc(pairW.byteLength, "storage", "vision/w-pair");
+      backend.write(pairBuf, 0, pairW);
+      weights.set("v.patch_embd.pair.weight", { shape: [cfg.hidden, 2 * K], dtype: "f32", buf: pairBuf });
+    }
     const maxTokens = Math.max(1, Math.min(Math.floor(opts.maxImageTokens ?? 576), cfg.maxTokens));
     return new QwenVisionTower(backend, cfg, weights, await read("v.position_embd.weight"), maxTokens);
   } catch (err) {

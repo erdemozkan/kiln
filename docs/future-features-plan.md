@@ -20,7 +20,7 @@ the rope kernels now take. Qwen 3.5's text model is done too (unreleased), from 
 linear-attention layers (a gated delta net) run in their own kernels, and the engine snapshots their
 recurrent state; GGUF files, the prompt cache across reloads, speculative decoding and adapters
 work too, and so do images (its vision tower, and rotary positions on three axes in the language
-model: a token's position is then no longer its index). Open for it: video, and the chunked
+model: a token's position is then no longer its index). Video is done too (frames in pairs of up to 64 tokens). Open for it: a larger budget per pair, and the chunked
 form of the recurrence if prefill of the linear layers ever dominates (it is 14% now). Gemma 4's
 text model, its images and its audio are done too (E2B from GGUF with its mmproj file, run; see the
 changelog), and so are its video and LoRA adapters. Open for it: the mixture-of-experts size, and the
