@@ -6,6 +6,7 @@ import { KilnEncoder, KilnModel, KilnVision } from "./client";
 import { PreTrainedTokenizer, RawImage, envEndpoint } from "./compat";
 import { encoderQuant, toGenerateOptions, toLoadOptions, type PipelineOptions, type Streamer } from "./pipeline";
 import type { EncoderHead, RawOutputs, VisionHead } from "./protocol";
+import { resolveModel } from "./local";
 import { Tensor } from "./tensor";
 
 /** Loading options, as transformers.js takes them (`dtype`, `device`, `progress_callback`, `revision`) plus Kiln's. */
@@ -176,6 +177,7 @@ export class PreTrainedModel {
 
   /** Loads `id` for this class's outputs (see the Auto classes for which models each takes). */
   static async load(id: string, options: ModelOptions, head: string, kind: "encoder" | "vision" | "causal" | "auto"): Promise<PreTrainedModel> {
+    id = await resolveModel(id);
     const opts = withEndpoint(options);
     const config = await readConfig(id, opts);
     const type = String(config.model_type);
@@ -317,6 +319,7 @@ export class Processor {
   }
 
   static async from_pretrained(id: string, options: ModelOptions = {}): Promise<Processor & ((input: unknown, ...args: unknown[]) => Promise<Record<string, unknown>>)> {
+    id = await resolveModel(id);
     const ref = parseModelId(id, options.revision);
     const ep = options.endpoint ?? envEndpoint();
     const files = await listRepoFiles(ref, ep);

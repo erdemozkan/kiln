@@ -5,7 +5,7 @@ import type { LoadProgress } from "@kiln/runtime";
 import type { ChatMessage } from "@kiln/tokenizers";
 import { KilnVision, KilnAudio, KilnEncoder, KilnModel, KilnSeq2Seq, type GenerateOptions, type LoadOptions, type TextStream } from "./client";
 import { fetchJSON, fileUrl, parseModelId, readAudio, type AudioInput } from "@kiln/loader";
-import { localModel, type LocalModelInput } from "./local";
+import { localModel, resolveModel, type LocalModelInput } from "./local";
 import { Tensor } from "./tensor";
 import { PreTrainedTokenizer, RawImage, envEndpoint } from "./compat";
 import type { VisionInfo, AudioInfo, EncoderInfo, EncoderTask, ModelInfo, Seq2SeqInfo, Seq2SeqTask } from "./protocol";
@@ -752,7 +752,7 @@ export async function pipeline(task: PipelineTask, model?: PipelineModel, option
   if (options.endpoint === undefined && envEndpoint()) options = { ...options, endpoint: envEndpoint() };
   const t = ALIASES[task] ?? task;
   // Picked files become a local model id, which every loader below takes like a Hub id.
-  const id = model === undefined ? DEFAULT_MODELS[t] : typeof model === "string" ? model : await localModel(model);
+  const id = model === undefined ? DEFAULT_MODELS[t] : typeof model === "string" ? await resolveModel(model) : await localModel(model);
   if (!id) {
     throw new Error(`Kiln: unsupported pipeline task "${task}" (Kiln runs ${Object.keys(DEFAULT_MODELS).map((k) => `"${k}"`).join(", ")})`);
   }

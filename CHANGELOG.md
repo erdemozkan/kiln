@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+**Node.js.** The package now runs in Node.js 22.12 or newer, on the CPU: its model worker and the
+CPU backend's helper threads start on worker_threads (4 threads by default), and a script ends on its
+own once its work is done. A path loads a model from disk, wherever a Hub id goes: `pipeline(task,
+"./models/bert")`, `load("/data/model.gguf")`, `AutoTokenizer.from_pretrained("~/models/bert")`, or
+`localModel(path)`. Files are read in place; links (as in a Hugging Face cache snapshot) are
+followed. With `env.allowLocalModels = true`, a repo name found as a folder under
+`env.localModelPath` loads from there, as in transformers.js. all-MiniLM-L6-v2 from a folder gave
+the same vector as from the Hub, in 2.2 s from start to the first embedding; SmolLM2-135M from a
+.gguf answered as in the browser. Downloads from the Hub are not cached in Node yet.
+
 **Encoder inputs in batches.** On the GPU, encoder inputs of similar length now run as one padded
 batch, each sequence's attention seeing only its own tokens: 16 sentences through all-MiniLM-L6-v2
 took 15 ms instead of 29 on an M3 (61 ms of GPU time instead of 177 on the Intel Mac), and

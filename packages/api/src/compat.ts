@@ -18,14 +18,16 @@ import {
   type EncoderTokenizerJSON,
   type TokenizerJSON,
 } from "@kiln/tokenizers";
+import { resolveModel } from "./local";
 import { Tensor } from "./tensor";
 
 const UTF8 = new TextDecoder();
 
 /**
  * transformers.js's `env`. Kiln reads `remoteHost` (a mirror of the Hub, used by `AutoTokenizer` and
- * `pipeline` unless a call passes `endpoint`); the other settings are accepted and have no effect:
- * Kiln always loads from the Hub (or `remoteHost`) and caches weights in OPFS itself.
+ * `pipeline` unless a call passes `endpoint`), and in Node.js `allowLocalModels` with
+ * `localModelPath`: when set, a repo name found as a folder there loads from disk. The other
+ * settings are accepted and have no effect: Kiln caches weights in OPFS itself.
  */
 export const env: {
   remoteHost: string;
@@ -310,6 +312,7 @@ export class PreTrainedTokenizer {
 
   /** The files `from_pretrained` builds a tokenizer from, fetched but not yet parsed into one. */
   static async fetchFiles(id: string, options: PretrainedOptions = {}): Promise<{ tok: TokenizerJSON | EncoderTokenizerJSON; cfg: TokenizerConfig; jinja: string | undefined }> {
+    id = await resolveModel(id);
     const ref = parseModelId(id, options.revision);
     const ep = options.endpoint ?? envEndpoint();
     const listing = listRepoFiles(ref, ep);

@@ -148,7 +148,7 @@ export class CachedHttpSource implements ByteSource {
     }: { fresh?: boolean; segment?: number; retryMs?: number; readAhead?: number; finishOnClose?: number } = {},
   ): Promise<ByteSource> {
     if (isLocalUrl(url)) {
-      const blob = localBlob(url);
+      const blob = await localBlob(url);
       if (!blob) throw new Error(`the model folder has no ${url.replace(/^[a-z-]+:\/\/[^/]+\//, "")}`);
       return new BlobSource(blob, key);
     }

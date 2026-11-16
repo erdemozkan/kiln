@@ -3,7 +3,7 @@ import type { GenerateStats, LoadProgress } from "@kiln/runtime";
 import type { ChatMessage } from "@kiln/tokenizers";
 import { accessToken, isLocalModel, localModelFiles, localRepo } from "@kiln/loader";
 import { createWorker } from "./default-worker";
-import { localModel, type LocalModelInput } from "./local";
+import { localModel, resolveModel, type LocalModelInput } from "./local";
 import type { AdapterInfo, EncoderHead, RawOutputs, VisionHead, VisionInfo, VisionTask, AudioInfo, AudioTask, EncoderInfo, EncoderTask, ModelInfo, Request, Response, Seq2SeqInfo, Seq2SeqTask, WireAudioOptions, WireEncoderOptions, WireGenerateOptions, WireLoadOptions, WireSeq2SeqOptions } from "./protocol";
 
 type Listener = (msg: Response) => void;
@@ -61,12 +61,25 @@ abstract class WorkerChannel {
   protected send(body: RequestBody, onMsg: (msg: Response) => boolean): number {
     const id = this.nextId++;
     this.listeners.set(id, (msg) => {
-      if (onMsg(msg)) this.listeners.delete(id);
+      if (!onMsg(msg)) return;
+      this.listeners.delete(id);
+      if (!this.listeners.size) this.idle(true);
     });
+    if (this.listeners.size === 1) this.idle(false);
     this.shareToken();
     this.shareLocal(body);
     this.post({ ...body, id } as Request);
     return id;
+  }
+
+  /**
+   * Node.js only (its worker threads have ref/unref, Web Workers do not): an idle worker does not keep
+   * the process running, so a script ends once its own work is done, and a busy one does.
+   */
+  private idle(yes: boolean): void {
+    const w = this.worker as Worker & { ref?(): void; unref?(): void };
+    if (yes) w.unref?.();
+    else w.ref?.();
   }
 
   /** The access token this worker was last given. */
@@ -153,7 +166,8 @@ export class KilnModel extends WorkerChannel {
 
   static async load(model: string | LocalModelInput, opts: LoadOptions = {}): Promise<KilnModel> {
     // A .gguf Blob loads as it is; a folder's files or a handle become a local model id first.
-    if (typeof model !== "string" && !(model instanceof Blob)) model = await localModel(model);
+    if (typeof model === "string") model = await resolveModel(model);
+    else if (!(model instanceof Blob)) model = await localModel(model);
     const worker = opts.worker ?? createWorker();
     const m = new KilnModel(worker, undefined as unknown as ModelInfo);
     const { onProgress, worker: _w, persist = true, ...wire } = opts;
@@ -296,6 +310,7 @@ export class KilnEncoder extends WorkerChannel {
   }
 
   static async load(model: string, opts: EncoderLoadOptions = {}): Promise<KilnEncoder> {
+    model = await resolveModel(model);
     const worker = opts.worker ?? createWorker();
     const m = new KilnEncoder(worker, undefined as unknown as EncoderInfo);
     const { onProgress, worker: _w, ...wire } = opts;
@@ -350,6 +365,7 @@ export class KilnSeq2Seq extends WorkerChannel {
   }
 
   static async load(model: string, opts: Seq2SeqLoadOptions = {}): Promise<KilnSeq2Seq> {
+    model = await resolveModel(model);
     const worker = opts.worker ?? createWorker();
     const m = new KilnSeq2Seq(worker, undefined as unknown as Seq2SeqInfo);
     const { onProgress, worker: _w, ...wire } = opts;
@@ -399,6 +415,7 @@ export class KilnAudio extends WorkerChannel {
   }
 
   static async load(model: string, opts: AudioLoadOptions = {}): Promise<KilnAudio> {
+    model = await resolveModel(model);
     const worker = opts.worker ?? createWorker();
     const m = new KilnAudio(worker, undefined as unknown as AudioInfo);
     const { onProgress, worker: _w, ...wire } = opts;
@@ -451,6 +468,7 @@ export class KilnVision extends WorkerChannel {
   }
 
   static async load(model: string, opts: AudioLoadOptions = {}): Promise<KilnVision> {
+    model = await resolveModel(model);
     const worker = opts.worker ?? createWorker();
     const m = new KilnVision(worker, undefined as unknown as VisionInfo);
     const { onProgress, worker: _w, ...wire } = opts;

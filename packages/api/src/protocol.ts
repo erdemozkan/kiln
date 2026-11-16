@@ -1,6 +1,7 @@
 import type { Profile } from "@kiln/core";
 import type { GenerateOptions, GenerateStats, KvDtype, LoadProgress, Quant } from "@kiln/runtime";
 import type { ChatMessage } from "@kiln/tokenizers";
+import type { LocalFile } from "@kiln/loader";
 
 export type WireGenerateOptions = Omit<GenerateOptions, "signal">;
 
@@ -196,7 +197,7 @@ export type RawOutputs = Record<string, { data: Float32Array; dims: number[] }>;
 export type Request =
   | { id: number; type: "load"; model: string | Blob; opts: WireLoadOptions }
   /** The files of a local model ("@local/…"), sent before the first request that names it. Not answered. */
-  | { id: number; type: "local"; model: string; files: [string, Blob][] }
+  | { id: number; type: "local"; model: string; files: [string, LocalFile][] }
   /** The Hub access token (see `setAccessToken`), sent before the first request after it changed; null clears it. Not answered. */
   | { id: number; type: "token"; token: string | null }
   | { id: number; type: "loadEncoder"; model: string; opts: WireEncoderOptions }

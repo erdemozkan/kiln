@@ -1,6 +1,7 @@
 // Models from the user's own disk: `localModel()` turns picked files into an id that `load`,
 // `pipeline` and the Auto classes accept like a Hub id.
-import { registerLocalModel } from "@kiln/loader";
+import { registerLocalModel, type DiskFile, type LocalFile } from "@kiln/loader";
+import { env } from "./compat";
 
 /** The slice of the File System Access API used here (Chromium; not in every TypeScript lib). */
 interface FileHandle {
@@ -17,15 +18,16 @@ interface DirectoryHandle {
 /**
  * What `localModel` takes: the files of an `<input type="file">` (with `webkitdirectory` for a
  * folder, or several files picked together), a directory or file handle from `showDirectoryPicker()`
- * / `showOpenFilePicker()` or a drop, one `.gguf` `File`, or a map from repo path to `Blob`.
+ * / `showOpenFilePicker()` or a drop, one `.gguf` `File`, a map from repo path to `Blob`, or in
+ * Node.js the path of a model folder or of one .gguf file.
  */
-export type LocalModelInput = FileList | readonly File[] | Blob | FileSystemHandle | Map<string, Blob> | Record<string, Blob>;
+export type LocalModelInput = FileList | readonly File[] | Blob | FileSystemHandle | Map<string, Blob> | Record<string, Blob> | string;
 
 /** Folders deeper than this are not part of a model repo (and a wrong pick, such as a home folder, must end). */
 const MAX_DEPTH = 4;
 const MAX_FILES = 5000;
 
-async function walk(dir: DirectoryHandle, prefix: string, depth: number, out: [string, Blob][]): Promise<void> {
+async function walk(dir: DirectoryHandle, prefix: string, depth: number, out: [string, LocalFile][]): Promise<void> {
   for await (const entry of dir.values()) {
     if (entry.name.startsWith(".")) continue;
     if (entry.kind === "file") {
@@ -46,8 +48,13 @@ const isHandle = (v: unknown): v is FileHandle | DirectoryHandle => typeof v ===
  * `remember: true` keeps a handle for that (see `savedLocalModels`).
  */
 export async function localModel(input: LocalModelInput, opts: { name?: string; remember?: boolean } = {}): Promise<string> {
-  let files: [string, Blob][];
+  let files: [string, LocalFile][];
   let name = opts.name;
+  if (typeof input === "string") {
+    if (opts.remember) throw new Error("localModel: a path on disk needs no remembering; pass it again");
+    const disk = diskModel(input);
+    return registerLocalModel(disk.files, opts.name ?? disk.name);
+  }
   if (opts.remember) {
     if (!isHandle(input)) throw new Error("localModel: only a file or directory handle (showOpenFilePicker, showDirectoryPicker, a drop) can be remembered; an <input>'s files cannot be reopened after a reload");
     await saveHandle(opts.name ?? input.name, { handle: input, name: opts.name });
@@ -72,6 +79,83 @@ export async function localModel(input: LocalModelInput, opts: { name?: string; 
     files = Object.entries(input as Record<string, Blob>);
   }
   return registerLocalModel(files, name);
+}
+
+/** The slice of Node's fs and path modules used to read a model folder. */
+interface NodeFs {
+  statSync(path: string, opts?: { throwIfNoEntry?: boolean }): { isDirectory(): boolean; isFile(): boolean; size: number; mtimeMs: number } | undefined;
+  readdirSync(path: string, opts: { withFileTypes: true }): { name: string; isDirectory(): boolean; isFile(): boolean }[];
+}
+interface NodePath {
+  resolve(...parts: string[]): string;
+  join(...parts: string[]): string;
+  basename(path: string, ext?: string): string;
+}
+interface NodeOs {
+  homedir(): string;
+}
+
+function nodeModules(): { fs: NodeFs; path: NodePath; os: NodeOs } | undefined {
+  const get = (globalThis as { process?: { getBuiltinModule?(id: string): unknown } }).process?.getBuiltinModule;
+  if (!get) return undefined;
+  return { fs: get("node:fs") as NodeFs, path: get("node:path") as NodePath, os: get("node:os") as NodeOs };
+}
+
+/** A model folder or a .gguf on disk (Node.js), as files read in place. */
+function diskModel(where: string): { files: [string, DiskFile][]; name: string } {
+  const node = nodeModules();
+  if (!node) throw new Error(`localModel: "${where}" is a path on disk, which only Node.js can read; in a browser, pass picked files or a handle`);
+  const { fs, path, os } = node;
+  const full = path.resolve(where.startsWith("file:") ? decodeURIComponent(new URL(where).pathname) : where.replace(/^~(?=$|[\\/])/, os.homedir()));
+  const stat = fs.statSync(full, { throwIfNoEntry: false });
+  if (!stat) throw new Error(`localModel: ${full} does not exist`);
+  const disk = (p: string, s: { size: number; mtimeMs: number }): DiskFile => ({ path: p, size: s.size, lastModified: Math.round(s.mtimeMs) });
+  if (stat.isFile()) {
+    const file = path.basename(full);
+    if (!/\.gguf$/i.test(file)) throw new Error(`localModel: ${full} is a file; give a model folder, or a .gguf file`);
+    return { files: [[file, disk(full, stat)]], name: file.replace(/\.gguf$/i, "") };
+  }
+  const files: [string, DiskFile][] = [];
+  const walkDisk = (dir: string, prefix: string, depth: number) => {
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      if (entry.name.startsWith(".")) continue;
+      const p = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        if (depth < MAX_DEPTH) walkDisk(p, `${prefix}${entry.name}/`, depth + 1);
+        continue;
+      }
+      // A symbolic link (as in a Hugging Face cache snapshot) is followed to its file.
+      const s = fs.statSync(p, { throwIfNoEntry: false });
+      if (!s?.isFile()) continue;
+      files.push([prefix + entry.name, disk(p, s)]);
+      if (files.length > MAX_FILES) throw new Error(`localModel: ${full} holds more than ${MAX_FILES} files: give the model's own folder`);
+    }
+  };
+  walkDisk(full, "", 0);
+  if (!files.length) throw new Error(`localModel: ${full} has no files`);
+  return { files, name: path.basename(full) };
+}
+
+/** True for a string that names a place on disk rather than a Hub repo: "./x", "../x", "/x", "~/x", "C:\\x", "file:…". */
+export function isDiskPath(id: string): boolean {
+  return /^(\.{1,2}([\\/]|$)|[\\/]|~([\\/]|$)|[A-Za-z]:[\\/]|file:)/.test(id);
+}
+
+/**
+ * The id to load a string as. In Node.js a path ("./models/bert", "/data/llama.gguf") becomes a local
+ * model id; so does a repo name found under `env.localModelPath` when `env.allowLocalModels` is set,
+ * as transformers.js does. Anything else (a Hub id, a URL, an "@local/…" id) is returned as it is.
+ */
+export async function resolveModel(id: string): Promise<string> {
+  if (!nodeModules()) return id;
+  if (isDiskPath(id)) return localModel(id);
+  if (env.allowLocalModels && !/^(@local\/|https?:)/i.test(id)) {
+    const { fs, path } = nodeModules()!;
+    const dir = path.resolve(env.localModelPath, id);
+    const stat = fs.statSync(dir, { throwIfNoEntry: false });
+    if (stat?.isDirectory() || (stat?.isFile() && /\.gguf$/i.test(id))) return localModel(dir);
+  }
+  return id;
 }
 
 /** A local model the user picked earlier and asked to be remembered. */

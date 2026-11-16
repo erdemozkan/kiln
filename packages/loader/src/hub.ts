@@ -120,7 +120,7 @@ const checked = new Set<string>();
  */
 async function hubFile(url: string, keep404: boolean, name = hubEntryName(url)): Promise<HubFile> {
   if (isLocalUrl(url)) {
-    const blob = localBlob(url);
+    const blob = await localBlob(url);
     return blob ? { status: 200, bytes: new Uint8Array(await blob.arrayBuffer()) } : { status: 404 };
   }
   const keeps = (f: HubFile) => f.status === 200 || (keep404 && f.status === 404);

@@ -8,7 +8,30 @@
 const PREFIX = "@local/";
 const SCHEME = "kiln-local://";
 
-const registry = new Map<string, Map<string, Blob>>();
+/**
+ * A file on disk, named by its path (Node.js). Read through `fs.openAsBlob` where it is used, so the
+ * entry itself is plain data that crosses to a worker thread (Node cannot send a disk-backed Blob to
+ * one).
+ */
+export interface DiskFile {
+  readonly path: string;
+  readonly size: number;
+  readonly lastModified: number;
+}
+
+/** A local model's file: a Blob in the browser, a path on disk in Node.js. */
+export type LocalFile = Blob | DiskFile;
+
+const registry = new Map<string, Map<string, LocalFile>>();
+
+const isDiskFile = (f: LocalFile): f is DiskFile => !(f instanceof Blob) && typeof (f as DiskFile).path === "string";
+
+/** Opens a disk file as a Blob read in place; its data is not loaded until it is read. */
+async function openDisk(f: DiskFile): Promise<Blob> {
+  const fs = (globalThis as { process?: { getBuiltinModule?(id: string): unknown } }).process?.getBuiltinModule?.("node:fs") as { openAsBlob?(path: string): Promise<Blob> } | undefined;
+  if (!fs?.openAsBlob) throw new Error(`cannot read ${f.path}: files on disk need Node.js 22 or newer`);
+  return fs.openAsBlob(f.path);
+}
 
 /** True for an id (or a repo) that names registered local files. */
 export function isLocalModel(id: string): boolean {
@@ -30,7 +53,7 @@ function hash(text: string): string {
 }
 
 /** Paths as a repo has them: forward slashes, and without the folder(s) every file shares. */
-function normalize(files: Iterable<readonly [string, Blob]>): Map<string, Blob> {
+function normalize(files: Iterable<readonly [string, LocalFile]>): Map<string, LocalFile> {
   let entries = [...files].map(([path, blob]) => [path.replace(/\\/g, "/").replace(/^\/+/, "").split("/"), blob] as const).filter(([p]) => p.every((s) => s && s !== "." && s !== ".."));
   // A picked folder's files arrive as "folder/config.json": the shared leading folders are not part of the repo.
   while (entries.length && entries.every(([p]) => p.length > 1 && p[0] === entries[0]![0][0])) entries = entries.map(([p, b]) => [p.slice(1), b] as const);
@@ -43,7 +66,7 @@ function normalize(files: Iterable<readonly [string, Blob]>): Map<string, Blob> 
  * are not reused once a file changes. A folder holding one .gguf and no config.json yields the id of
  * that file, as "org/repo/file.gguf" does on the Hub.
  */
-export function registerLocalModel(files: Iterable<readonly [string, Blob]>, name = "model"): string {
+export function registerLocalModel(files: Iterable<readonly [string, LocalFile]>, name = "model"): string {
   const map = normalize(files);
   if (!map.size) throw new Error("no files to load: pick a model folder or a .gguf file");
   const print = [...map].map(([p, b]) => `${p}|${b.size}|${(b as Partial<File>).lastModified ?? 0}`).sort().join("\n");
@@ -60,12 +83,12 @@ export function localRepo(id: string): string {
 }
 
 /** The files registered for a local id, for handing them to another thread. */
-export function localModelFiles(id: string): Map<string, Blob> | undefined {
+export function localModelFiles(id: string): Map<string, LocalFile> | undefined {
   return registry.get(localRepo(id).slice(PREFIX.length));
 }
 
 /** Registers files under an id another thread made with `registerLocalModel`. */
-export function adoptLocalModel(id: string, files: Iterable<readonly [string, Blob]>): void {
+export function adoptLocalModel(id: string, files: Iterable<readonly [string, LocalFile]>): void {
   registry.set(localRepo(id).slice(PREFIX.length), new Map(files));
 }
 
@@ -84,12 +107,13 @@ export function isLocalUrl(url: string): boolean {
 }
 
 /** The Blob behind a local URL; undefined when the folder has no such file. Throws for a model that is not registered. */
-export function localBlob(url: string): Blob | undefined {
+export async function localBlob(url: string): Promise<Blob | undefined> {
   const rest = url.slice(SCHEME.length);
   const cut = rest.indexOf("/");
   const files = registry.get(rest.slice(0, cut));
   if (!files) throw new Error(`the local model "${rest.slice(0, cut)}" is not registered in this page (local ids do not survive a reload: register the files again)`);
-  return files.get(rest.slice(cut + 1));
+  const file = files.get(rest.slice(cut + 1));
+  return file && isDiskFile(file) ? openDisk(file) : file;
 }
 
 /** The file names of a local repo. */

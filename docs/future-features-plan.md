@@ -23,7 +23,7 @@ work too, and so do images (its vision tower, and rotary positions on three axes
 model: a token's position is then no longer its index). Open for it: video, and the chunked
 form of the recurrence if prefill of the linear layers ever dominates (it is 14% now). Gemma 4's
 text model, its images and its audio are done too (E2B from GGUF with its mmproj file, run; see the
-changelog). Open for it: video, the mixture-of-experts size, adapters, and the
+changelog), and so are its video and LoRA adapters. Open for it: the mixture-of-experts size, and the
 safetensors checkpoint (10 GB, not run). Open in the Phi family: LongRoPE past the original 4096 tokens (the long
 factors). Phi-4 mini's safetensors checkpoint (7.7 GB) was loaded and answers as the GGUF does.
 
@@ -31,10 +31,10 @@ factors). Phi-4 mini's safetensors checkpoint (7.7 GB) was loaded and answers as
 
 Done, unreleased: `load` takes a `.gguf` `File` the user picked, and the URL of one `.gguf` on any
 server; `localModel` registers a picked folder (any supported format) under an id that `load`,
-`pipeline` and the Auto classes accept (both also take the picked files directly), and can remember a picked handle across reloads. Still open:
+`pipeline` and the Auto classes accept (both also take the picked files directly), and can remember a picked handle across reloads. In Node.js a path loads a folder or a .gguf from disk, and `env.localModelPath` works as in transformers.js. Still open:
 
-1. **A folder on disk in Node.js**, the equivalent of transformers.js's `env.localModelPath`. Needs a
-   file-system `ByteSource` and a check of what else in the engine assumes a browser.
+1. **A download cache in Node.js.** Hub files are fetched again on every run there (no OPFS); a
+   folder under the user's cache directory would do, as transformers.js keeps one.
 2. **Remembering without handles.** Safari and Firefox have no file handles to keep; copying a picked
    file into the browser's storage would cover them, at the cost of a second copy on disk.
 
