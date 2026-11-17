@@ -14,6 +14,8 @@
     "dev": "npm run dev -w @kiln/playground",
     "build:playground": "npm run build -w @kiln/playground",
     "build:package": "npm run build -w kiln-webgpu",
+    "build:python": "npm run build:package && node scripts/python-bundle.mjs",
+    "test:python": "python3 -m unittest discover -s python/tests",
     "build:site": "npm run build:package && npm run build -w @kiln/site",
     "dev:site": "npm run build:package && npm run dev -w @kiln/site"
   },

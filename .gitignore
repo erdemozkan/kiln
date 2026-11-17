@@ -4,3 +4,8 @@ dist-share/
 .DS_Store
 *.log
 packages/kiln-webgpu/LICENSE
+python/kiln_webgpu/_js/index.js
+__pycache__/
+*.egg-info/
+python/build/
+python/dist/

@@ -50,6 +50,20 @@ export interface WebGPUOptions {
   validateKernels?: boolean;
 }
 
+/**
+ * Why the GPU is off in Node.js on this system, or undefined. On macOS before 15 only an old build of
+ * Dawn's package loads (0.2.12; later ones need macOS 15), and with it heavy models hung the GPU
+ * (Segment Anything's encoder, on an Intel Mac with macOS 13) until macOS restarted. Browsers on the
+ * same Mac run the same kernels safely, so Node.js runs on the CPU there.
+ */
+export function nodeGPUBlocked(platform: string, release: string): string | undefined {
+  // Darwin 24 is macOS 15.
+  if (platform === "darwin" && Number.parseInt(release, 10) < 24) {
+    return "The GPU in Node.js needs macOS 15 or newer (older versions of Dawn's webgpu package can hang the GPU there)";
+  }
+  return undefined;
+}
+
 /** Dawn's GPU object in Node.js, kept for the life of the thread: its devices stop working once it is collected. */
 let dawn: GPU | undefined;
 
@@ -63,6 +77,9 @@ function nodeGPU(): GPU | undefined {
   if (dawn) return dawn;
   const proc = (globalThis as { process?: { getBuiltinModule?(id: string): unknown; argv?: string[]; cwd?(): string } }).process;
   if (typeof proc?.getBuiltinModule !== "function" || typeof proc.cwd !== "function") return undefined;
+  const os = proc.getBuiltinModule("node:os") as { platform(): string; release(): string };
+  const blocked = nodeGPUBlocked(os.platform(), os.release());
+  if (blocked) throw new Error(blocked);
   const { createRequire } = proc.getBuiltinModule("node:module") as { createRequire(from: string): (id: string) => unknown };
   let failure: unknown;
   for (const from of [proc.argv?.[1], `${proc.cwd()}/index.js`]) {

@@ -49,7 +49,7 @@ most existing code moves over by changing the import and the model id.
 
 - **A browser with WebGPU** for full speed: current Chrome or Edge, Safari 26 or newer, or Firefox 141 or newer on Windows. Without WebGPU, Kiln runs on the CPU (WASM SIMD), more slowly.
 - **Nothing to install** when importing from a CDN. With a bundler, any setup that handles ES modules works (Vite, webpack 5 and others).
-- **Node 22.12 or newer** to run Kiln in Node.js, or to build this repository yourself. In Node.js Kiln runs on the CPU, or on the GPU once the `webgpu` package (Dawn's WebGPU for Node) is installed beside it.
+- **Node 22.12 or newer** to run Kiln in Node.js, or to build this repository yourself. In Node.js Kiln runs on the CPU, or on the GPU once the `webgpu` package (Dawn's WebGPU for Node) is installed beside it (on a Mac, macOS 15 or newer).
 
 ## Quickstart
 
@@ -111,6 +111,15 @@ const chat = await pipeline("text-generation", "/data/SmolLM2-135M-Instruct-Q8_0
 ```
 
 For the GPU in Node.js, install Dawn's WebGPU bindings next to Kiln (`npm install kiln-webgpu webgpu`). Kiln finds the package by itself and runs the same kernels as in the browser; without it, it runs on the CPU as before.
+
+From Python, the same pipelines run through the `kiln-webgpu` package in [python/](python/README.md), which drives Kiln in a Node.js process:
+
+```python
+from kiln_webgpu import pipeline
+
+embed = pipeline("feature-extraction", "sentence-transformers/all-MiniLM-L6-v2")
+vectors = embed(["Hello world", "Hi"], pooling="mean", normalize=True)
+```
 
 To try the playground from the animation above:
 

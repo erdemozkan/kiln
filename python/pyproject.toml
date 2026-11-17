@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kiln-webgpu"
+version = "0.2.0"
+description = "Kiln for Python: AI models on any GPU (WebGPU) or the CPU, from their original safetensors or GGUF files, with transformers-style pipelines"
+readme = "README.md"
+license = { text = "MIT" }
+authors = [{ name = "Erdem Ozkan" }]
+requires-python = ">=3.8"
+keywords = ["webgpu", "llm", "inference", "gguf", "safetensors", "pipeline", "embeddings"]
+classifiers = ["Programming Language :: Python :: 3", "License :: OSI Approved :: MIT License", "Operating System :: OS Independent"]
+
+[project.urls]
+Homepage = "https://erdemozkan.github.io/kiln/"
+Repository = "https://github.com/erdemozkan/kiln"
+
+[tool.setuptools]
+packages = ["kiln_webgpu"]
+
+[tool.setuptools.package-data]
+kiln_webgpu = ["_js/*.js", "_js/*.mjs"]

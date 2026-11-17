@@ -41,23 +41,18 @@ server; `localModel` registers a picked folder (any supported format) under an i
 2. **Copies in OPFS instead of IndexedDB.** `remember: "copy"` keeps picked files in IndexedDB,
    which works in every browser; not tried with files of several GB in Safari.
 
-### A Python library
+### A Python library: what is left
 
-Asked for: `pip install kiln` with the same pipelines. The engine is TypeScript and its kernels are
-WGSL, so there are three ways, cheapest first:
+The package in python/ (`kiln_webgpu`) drives Kiln in a Node.js process over pipes, and Node runs
+the GPU through Dawn's `webgpu` package. Left to do:
 
-1. **A Python package that drives Kiln in Node.js.** Kiln runs in Node now; the package
-   would start a Node process and talk to it over pipes, with tensors as bytes. Little new code, the
-   same outputs by construction, but users need Node installed.
-2. **The GPU outside the browser.** Done: with Dawn's bindings (the `webgpu` package) installed, the
-   same kernels run on the GPU from Node, and so will from the Python package. This is the step
-   that makes a Python library worth having, since on the CPU PyTorch is the better choice.
-3. **A native port.** The WGSL kernels run unchanged under wgpu-py, but the loaders, plans, engine
-   and tokenizers would be rewritten in Python: a second code base to keep correct.
-
-Item 2 is in; item 1 is next. Worth asking first who it is for: Python already has PyTorch
-and llama.cpp, so Kiln's case there is one small install that runs original weights on any GPU
-(integrated ones too) with no CUDA.
+- **Publishing** to PyPI (the name `kiln-webgpu` is free there; `kiln` is taken).
+- **A download cache in Node.js**: every new process fetches a Hub model again.
+- **Image and audio decoding** without Pillow or a WAV file: Kiln's decoders are the browser's.
+- **Requests in parallel** and an asyncio interface; the bridge runs one request at a time.
+- **Not needing Node installed**: shipping a Node binary in the wheel, or a native port (the WGSL
+  kernels run unchanged under wgpu-py, but the loaders, plans, engine and tokenizers would be
+  rewritten in Python, a second code base to keep correct).
 
 ### A 4-bit KV cache: values only
 
