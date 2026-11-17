@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+**The GPU in Node.js.** With Dawn's WebGPU bindings installed beside Kiln (`npm install webgpu`),
+Node runs the same kernels on the GPU as a browser does; without the package it runs on the CPU as
+before, and `device: "gpu"` says what to install. Kiln's worker thread has no file of its own to
+resolve a package from, so it looks from the script Node was started with and from the working
+directory. On an Intel Mac (macOS 13, webgpu 0.2.12; current releases of the package need macOS 15):
+all-MiniLM-L6-v2 gave the CPU's vector within 6e-8 at 15 ms a sentence against 48 ms on the CPU, and
+SmolLM2-360M wrote the same 48 tokens as on the CPU, in 4.4 s against 3.8 s (the first run on a GPU
+includes compiling its kernels, and a model this small gains little there). Not run on Windows or
+Linux.
+
 **Qwen 3.5 takes video.** The same `{ type: "video", video: { frames, times } }` part as Gemma 4's,
 written as Qwen's processor writes a video: the frames go through the vision tower in pairs (its
 patch convolution spans two frames; an odd last frame is paired with itself), each pair after its

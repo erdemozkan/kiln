@@ -46,16 +46,16 @@ server; `localModel` registers a picked folder (any supported format) under an i
 Asked for: `pip install kiln` with the same pipelines. The engine is TypeScript and its kernels are
 WGSL, so there are three ways, cheapest first:
 
-1. **A Python package that drives Kiln in Node.js.** Kiln runs in Node now (on the CPU); the package
+1. **A Python package that drives Kiln in Node.js.** Kiln runs in Node now; the package
    would start a Node process and talk to it over pipes, with tensors as bytes. Little new code, the
-   same outputs by construction, but users need Node installed, and it stays CPU-only until item 2.
-2. **The GPU outside the browser.** Node has WebGPU through Dawn's bindings (the `webgpu` package):
-   with them the same kernels run on the GPU from Node, and so from the Python package. This is the
-   step that makes a Python library worth having, since on the CPU PyTorch is the better choice.
+   same outputs by construction, but users need Node installed.
+2. **The GPU outside the browser.** Done: with Dawn's bindings (the `webgpu` package) installed, the
+   same kernels run on the GPU from Node, and so will from the Python package. This is the step
+   that makes a Python library worth having, since on the CPU PyTorch is the better choice.
 3. **A native port.** The WGSL kernels run unchanged under wgpu-py, but the loaders, plans, engine
    and tokenizers would be rewritten in Python: a second code base to keep correct.
 
-Start with 2 (GPU in Node), then 1. Worth asking first who it is for: Python already has PyTorch
+Item 2 is in; item 1 is next. Worth asking first who it is for: Python already has PyTorch
 and llama.cpp, so Kiln's case there is one small install that runs original weights on any GPU
 (integrated ones too) with no CUDA.
 

@@ -50,8 +50,41 @@ export interface WebGPUOptions {
   validateKernels?: boolean;
 }
 
+/** Dawn's GPU object in Node.js, kept for the life of the thread: its devices stop working once it is collected. */
+let dawn: GPU | undefined;
+
+/**
+ * WebGPU in Node.js, from Dawn's `webgpu` package when the application has it installed. Node has no
+ * navigator.gpu, and Kiln's worker thread has no file of its own to resolve a package from, so the
+ * package is looked up from the script Node was started with and from the working directory.
+ * Returns undefined outside Node.js; throws, saying what to install, when the package is missing.
+ */
+function nodeGPU(): GPU | undefined {
+  if (dawn) return dawn;
+  const proc = (globalThis as { process?: { getBuiltinModule?(id: string): unknown; argv?: string[]; cwd?(): string } }).process;
+  if (typeof proc?.getBuiltinModule !== "function" || typeof proc.cwd !== "function") return undefined;
+  const { createRequire } = proc.getBuiltinModule("node:module") as { createRequire(from: string): (id: string) => unknown };
+  let failure: unknown;
+  for (const from of [proc.argv?.[1], `${proc.cwd()}/index.js`]) {
+    if (!from) continue;
+    try {
+      const m = createRequire(from)("webgpu") as { create(flags: string[]): GPU; globals: Record<string, unknown> };
+      const g = globalThis as Record<string, unknown>;
+      // The constants and classes a browser has as globals (GPUBufferUsage, GPUMapMode and the rest).
+      for (const [k, v] of Object.entries(m.globals)) if (!(k in g)) g[k] = v;
+      dawn = m.create([]);
+      return dawn;
+    } catch (err) {
+      // Not installed is the usual case; a package that is there and does not load says why.
+      if ((err as { code?: string }).code !== "MODULE_NOT_FOUND") failure = err;
+    }
+  }
+  if (failure) throw new Error(`The "webgpu" package did not load: ${failure instanceof Error ? failure.message.split("\n")[0] : String(failure)}`);
+  throw new Error('The GPU in Node.js needs the "webgpu" package (npm install webgpu)');
+}
+
 export async function createWebGPUBackend(opts: WebGPUOptions = {}): Promise<WebGPUBackend> {
-  const gpu = (globalThis.navigator as Navigator | undefined)?.gpu;
+  const gpu = (globalThis.navigator as Navigator | undefined)?.gpu ?? nodeGPU();
   if (!gpu) throw new Error("WebGPU is not available in this environment (navigator.gpu is missing)");
   const adapter = await gpu.requestAdapter({ powerPreference: opts.powerPreference ?? "high-performance" });
   if (!adapter) throw new Error("No WebGPU adapter found");
@@ -103,9 +136,13 @@ export class WebGPUBackend implements Backend {
       this.lostReason = `${info.reason}: ${info.message}`;
       console.error(`[kiln] WebGPU device lost (${this.lostReason})`);
     });
-    device.addEventListener("uncapturederror", (e) => {
-      console.error("[kiln] uncaptured WebGPU error:", (e as GPUUncapturedErrorEvent).error.message);
-    });
+    try {
+      device.addEventListener("uncapturederror", (e) => {
+        console.error("[kiln] uncaptured WebGPU error:", (e as GPUUncapturedErrorEvent).error.message);
+      });
+    } catch {
+      // Dawn in Node.js (older builds) takes no listener here and prints these errors itself.
+    }
   }
 
   alloc(bytes: number, usage: BufUsage = "storage", label = "buf"): Buf {
