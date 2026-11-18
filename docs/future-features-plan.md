@@ -65,8 +65,12 @@ A chat model asks for a function (`get_weather("Paris")`), the caller runs it an
 answer back. Kiln's grammar-constrained output makes the call's JSON valid.
 
 Done (unreleased): `runTools` runs the loop, and calls under "auto" are checked against the tools'
-schemas; see the changelog. Open: Mistral's call format, calls inside a thinking block, a Python
-`run_tools`, and a GPU run of the checked path.
+schemas, on the CPU and the GPU, from JavaScript and Python (`run_tools`); see the changelog. Open:
+Mistral's call format (its smallest model, 7B, needs more than the CPU backend's 4 GiB and has not
+been run on a GPU), and a run of the thinking-block rule on a reasoning model (unit-tested only).
+
+Found on the way: in Node.js a download that fails starts again from zero and shows no progress
+(the browser's resumes); on a slow link a 1 GB model never arrived.
 
 ## Later
 

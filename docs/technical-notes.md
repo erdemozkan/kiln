@@ -1421,8 +1421,8 @@ Known limits, roughly in roadmap order:
   `toolChoice` forces one call. Under "auto" the model's own calls are checked too (`checkToolCalls`,
   on by default): text runs unconstrained, with the template's call marker as a stop token; after the
   marker the call runs under the grammar, and free text resumes from the cache. That needs the marker
-  to be one token (`<tool_call>`, Granite's `<|tool_call|>`), so Mistral's calls are not checked, and a
-  marker written inside a thinking block opens a call there.
+  to be one token (`<tool_call>`, Granite's `<|tool_call|>`); Mistral's calls are not checked. A
+  marker written inside a `<think>` block stays text.
 - Q6_K (scales every 16 values) is rounded to q8 on load rather than run as stored; the other GGUF
   block types are held exactly.
 - `toolChoice` only constrains the `<tool_call>` format (the check under "auto" also covers Granite's list).

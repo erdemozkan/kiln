@@ -834,7 +834,10 @@ export class Engine {
     const trigger = this.tokenizer.tokenId(syntax === "tags_body" ? "<tool_call>" : "<|tool_call|>");
     if (trigger === undefined) return undefined;
     const close = syntax === "tags_body" ? this.tokenizer.tokenId("</tool_call>") : undefined;
-    return { trigger, close, format: { type: "tool_call", syntax: close === undefined ? syntax : "tags_inner", tools: opts.tools.map((t) => ({ name: t.function.name, parameters: t.function.parameters })) } };
+    const open = this.tokenizer.tokenId("<think>");
+    const shut = this.tokenizer.tokenId("</think>");
+    const think = open !== undefined && shut !== undefined ? { open, close: shut } : undefined;
+    return { trigger, close, think, format: { type: "tool_call", syntax: close === undefined ? syntax : "tags_inner", tools: opts.tools.map((t) => ({ name: t.function.name, parameters: t.function.parameters })) } };
   }
 
   /** `opts` with `toolChoice` turned into a `tool_call` format. */

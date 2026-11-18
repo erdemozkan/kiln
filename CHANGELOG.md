@@ -13,8 +13,12 @@ arguments must follow its `parameters` schema, and free text resumes after the c
 (`checkToolCalls: false` for the old behaviour; Mistral's format is not checked). Free text keeps its
 speed: only the call waits for the grammar's masks. On Qwen2.5-0.5B (q8, an Intel Mac's CPU) the
 checked reply to a weather question is the same 26 tokens as the unchecked one, with 16 ms of mask
-time, and the round trip ends in "The current weather in Paris is 18°C". The playground has a page to
-try it (tools.html): nine scenarios with tools that run in the page.
+time, and the round trip ends in "The current weather in Paris is 18°C". On an M3 MacBook Air's GPU
+(macOS 15, Node.js through Dawn, from Python) four scenarios gave the same text checked, unchecked
+and without speculative drafts, a reply in 0.1 to 0.7 s. A marker written inside a `<think>` block
+stays text. From Python, `run_tools(chat, messages, tools)` is the same loop, each tool's Python
+function under `"execute"`. The playground has a page to try it (tools.html): nine scenarios with
+tools that run in the page.
 
 **Mixture-of-experts language models.** Qwen3-MoE (safetensors and GGUF `qwen3moe`) and
 Granite-MoE (`granitemoe`, e.g. granite-3.0-1b-a400m) load like any other model. In each MoE layer a

@@ -101,6 +101,23 @@ describe("checked tool calls", () => {
     expect(stats?.generatedTokens).toBe(6);
   });
 
+  it("leaves a marker inside a reasoning block as text", async () => {
+    const think = { open: 70, close: 71 };
+    const run = async (script: number[], prompt = [1, 2]) => {
+      const m = fake(script);
+      const out: number[] = [];
+      for await (const id of checkedToolCalls(prompt, {}, { ...CHECK, think }, m.run, m.end, () => {})) out.push(id);
+      return { out, formats: m.calls.map((c) => !!c.opts.format) };
+    };
+    const r = await run([70, 5, TRIGGER, 6, 71, TRIGGER, 10, CLOSE]);
+    expect(r.out).toEqual([70, 5, TRIGGER, 6, 71, TRIGGER, 10, CLOSE]);
+    expect(r.formats).toEqual([false, false, true, false]);
+    // The prompt can open the block itself.
+    const p = await run([TRIGGER, 71, 7], [1, 70]);
+    expect(p.out).toEqual([TRIGGER, 71, 7]);
+    expect(p.formats).toEqual([false, false]);
+  });
+
   it("keeps the caller's stop tokens in both phases", async () => {
     const r = await reply([5, 44, 6], { stopTokenIds: [44] });
     expect(r.out).toEqual([5]);

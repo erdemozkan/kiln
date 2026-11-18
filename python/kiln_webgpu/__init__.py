@@ -8,8 +8,8 @@ package starts.
     vectors = embed(["Hello world", "Hi"], pooling="mean", normalize=True)
 """
 from ._bridge import install_gpu
-from ._pipeline import Pipeline, invoke, pipeline, runtime, set_access_token, set_env, shutdown
+from ._pipeline import Pipeline, invoke, pipeline, run_tools, runtime, set_access_token, set_env, shutdown
 from ._types import KilnError, RawImage, Tensor, write_wav
 
 __version__ = "0.2.0"
-__all__ = ["pipeline", "Pipeline", "Tensor", "RawImage", "KilnError", "install_gpu", "invoke", "runtime", "set_access_token", "set_env", "shutdown", "write_wav"]
+__all__ = ["pipeline", "Pipeline", "Tensor", "RawImage", "KilnError", "install_gpu", "invoke", "run_tools", "runtime", "set_access_token", "set_env", "shutdown", "write_wav"]

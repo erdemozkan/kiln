@@ -137,6 +137,40 @@ class ThroughNode(unittest.TestCase):
         self.assertAlmostEqual(kiln_webgpu.invoke("cos_sim", array.array("f", [1, 0]), array.array("f", [1, 0])), 1.0)
         self.assertAlmostEqual(kiln_webgpu.invoke("cos_sim", [1, 0], [0, 1]), 0.0)
 
+    def test_run_tools(self):
+        """The loop against a scripted model: Kiln's own parser reads the calls."""
+        call = lambda name, args: '<tool_call>\n{"name": "%s", "arguments": %s}\n</tool_call>' % (name, args)
+        replies = [call("get_weather", '{"city": "Paris"}') + call("boom", "{}") + call("nope", "{}"), "It is 18 degrees."]
+        asked = []
+
+        class Scripted:
+            def stream(self, messages, **options):
+                asked.append((list(messages), options))
+                text = replies[len(asked) - 1]
+                yield text[:5]
+                yield text[5:]
+
+        def boom():
+            raise ValueError("no network")
+
+        tools = [
+            {"type": "function", "function": {"name": "get_weather", "parameters": {"type": "object"}}, "execute": lambda city: {"city": city, "celsius": 18}},
+            {"type": "function", "function": {"name": "boom"}, "execute": boom},
+        ]
+        seen = []
+        r = kiln_webgpu.run_tools(Scripted(), [{"role": "user", "content": "Weather in Paris?"}], tools, on_text=seen.append, toolChoice="required", max_new_tokens=64)
+        self.assertEqual(r["content"], "It is 18 degrees.")
+        self.assertFalse(r["unfinished"])
+        self.assertEqual([m["role"] for m in r["messages"]], ["user", "assistant", "tool", "tool", "tool", "assistant"])
+        self.assertEqual(r["messages"][2]["content"], '{"city": "Paris", "celsius": 18}')
+        self.assertEqual([s.get("error") for s in r["steps"]], [None, "no network", "no tool named 'nope'"])
+        self.assertEqual("".join(seen), "".join(replies))
+        # The model sees the specs without the functions; toolChoice holds for the first reply only.
+        self.assertEqual(asked[0][1], {"tools": [{k: v for k, v in t.items() if k != "execute"} for t in tools], "toolChoice": "required", "max_new_tokens": 64})
+        self.assertNotIn("toolChoice", asked[1][1])
+        with self.assertRaisesRegex(KilnError, "at least one tool"):
+            kiln_webgpu.run_tools(Scripted(), [], [])
+
     def test_errors_come_back(self):
         with self.assertRaisesRegex(KilnError, "no function"):
             kiln_webgpu.invoke("no_such_function")

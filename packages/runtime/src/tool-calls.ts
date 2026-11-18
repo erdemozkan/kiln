@@ -14,6 +14,11 @@ export interface CallCheck {
    * grammar's vocabulary: left to the grammar, `</tool_call>` would be spelled out in ordinary tokens.
    */
   close?: number;
+  /**
+   * The tokens around a reasoning block (`<think>`, `</think>`). A marker written inside one is
+   * the model thinking about a call, not making it: it stays text.
+   */
+  think?: { open: number; close: number };
 }
 
 /** What one generation call left behind: its stats and the stop token that ended it, if one did. */
@@ -56,17 +61,28 @@ export async function* checkedToolCalls(
   let left = opts.maxTokens ?? 512;
   let total: GenerateStats | undefined;
   let stopId: number | undefined;
+  // A prompt may itself end inside a reasoning block (templates that open one for the model).
+  const think = check.think;
+  let thinking = !!think && prompt.lastIndexOf(think.open) > prompt.lastIndexOf(think.close);
   try {
     for (;;) {
       let n = 0;
       for await (const id of run([...ids], { ...free, maxTokens: left })) {
         ids.push(id);
         n++;
+        if (think && (id === think.open || id === think.close)) thinking = id === think.open;
         yield id;
       }
       left -= n;
       const e = end();
       const opened = e.stopId === check.trigger && e.stats?.stopReason === "stop";
+      if (opened && thinking && left >= 2) {
+        total = merge(total, e.stats, 1);
+        ids.push(check.trigger);
+        left--;
+        yield check.trigger;
+        continue;
+      }
       // The marker needs room for a call after it; without it the reply ends as one cut short would.
       if (!opened || left < 2) {
         total = merge(total, e.stats, 0);

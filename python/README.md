@@ -65,6 +65,10 @@ masks[0]["mask"].save("mask.png")
   a `RawImage` (`save("x.png")`, `numpy()`, `to_pil()`); everything else as lists and dicts.
   `write_wav(path, samples, sampling_rate)` saves generated speech.
 - **Streaming:** `pipe.stream(...)` yields text as a text-generation model writes it.
+- **Tool calls:** `run_tools(chat, messages, tools, max_new_tokens=128)` chats until the model
+  answers in words; each tool is an OpenAI-style function spec with the Python function that runs
+  it under `"execute"` (called with the call's arguments as keyword arguments). It returns the
+  answer, every call with its result or error, and the conversation.
 - `pipe.dispose()` unloads a model (or use `with pipeline(...) as pipe:`); `shutdown()` stops Node.
 
 Requests run one at a time. Downloads are not cached in Node.js yet, so a model from the Hub is

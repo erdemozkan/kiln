@@ -1,4 +1,5 @@
 """pipeline(): Kiln's transformers.js-style pipelines, called from Python."""
+import json
 import os
 
 from ._bridge import BRIDGE
@@ -131,6 +132,79 @@ def pipeline(task, model=None, **options):
         model = os.path.expanduser(model)
     r = BRIDGE.request("pipeline", {"task": task, "model": model, "options": options})
     return Pipeline(r["handle"], r["task"], r.get("info"))
+
+
+def run_tools(pipe, messages, tools, max_rounds=5, on_text=None, on_tool_call=None, **options):
+    """Chats with tools until the model answers without calling one.
+
+    `pipe` is a text-generation pipeline of a model whose chat template supports tools (Qwen2.5,
+    Qwen3, Granite). `tools` are OpenAI-style function specs, each with the function that runs it
+    under "execute":
+
+        def get_weather(city, unit="celsius"):
+            return {"city": city, "temperature": 18, "unit": unit}
+
+        tools = [{"type": "function",
+                  "function": {"name": "get_weather", "description": "Get the weather in a city.",
+                               "parameters": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}},
+                  "execute": get_weather}]
+        result = run_tools(chat, [{"role": "user", "content": "Weather in Paris?"}], tools, max_new_tokens=128)
+        print(result["content"])
+
+    `execute` is called with the call's arguments as keyword arguments; what it returns goes back to
+    the model as JSON, and an exception as {"error": message}, which the model reads. Other keyword
+    arguments are the pipeline's options (`max_new_tokens`, `temperature`, `toolChoice` for the first
+    reply only ...). `on_text(piece)` receives the model's text as it is written, `on_tool_call(step)`
+    each finished call.
+
+    Returns a dict: "content" (the final answer), "messages" (the conversation with the calls, the
+    tools' answers and the reply appended), "steps" (each {"call", "result"} or {"call", "error"})
+    and "unfinished" (True when the model was still calling tools after `max_rounds` replies).
+    """
+    if not tools:
+        raise KilnError("run_tools needs at least one tool")
+    specs = [{k: v for k, v in t.items() if k != "execute"} for t in tools]
+    by_name = {t["function"]["name"]: t for t in tools}
+    for t in tools:
+        if not callable(t.get("execute")):
+            raise KilnError("tool %r has no function under \"execute\"" % t["function"]["name"])
+    options = dict(options)
+    choice = options.pop("toolChoice", None)
+    history = list(messages)
+    steps = []
+    content = ""
+    for round_ in range(max_rounds):
+        extra = {"toolChoice": choice} if choice is not None and round_ == 0 else {}
+        text = ""
+        for piece in pipe.stream(history, tools=specs, **extra, **options):
+            text += piece
+            if on_text:
+                on_text(piece)
+        reply = invoke("parseToolCalls", text)
+        content = reply["content"]
+        calls = reply["toolCalls"]
+        if not calls:
+            history.append({"role": "assistant", "content": text})
+            return {"content": content, "messages": history, "steps": steps, "unfinished": False}
+        history.append({"role": "assistant", "content": content, "tool_calls": calls})
+        for call in calls:
+            name = call["function"]["name"]
+            step = {"call": call}
+            try:
+                if name not in by_name:
+                    raise KilnError("no tool named %r" % name)
+                step["result"] = by_name[name]["execute"](**call["function"]["arguments"])
+            except Exception as err:  # the model gets to read what went wrong
+                step["error"] = str(err)
+            steps.append(step)
+            if on_tool_call:
+                on_tool_call(step)
+            answer = {"error": step["error"]} if "error" in step else step["result"]
+            message = {"role": "tool", "name": name, "content": answer if isinstance(answer, str) else json.dumps(answer)}
+            if call.get("id"):
+                message["tool_call_id"] = call["id"]
+            history.append(message)
+    return {"content": content, "messages": history, "steps": steps, "unfinished": True}
 
 
 def invoke(name, *args):
