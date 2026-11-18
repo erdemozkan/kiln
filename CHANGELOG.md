@@ -13,8 +13,9 @@ block's time projection, so it is folded into that block's first convolution bia
 scheduler is the one model_index.json names (SDXS's is DEIS, a DDIM step for one step), or Euler.
 Against diffusers 0.43 in float32 on the same latent and prompt: the text states within 5e-6, the
 latent after the step within 4e-4, the decoded pixels within half a byte level. On the CPU of an
-Intel Mac a picture takes 27 minutes (the UNet 15, the decoder 7.5); the GPU is the way to run it.
-From Python, the same pipeline returns a `RawImage`.
+Intel Mac a picture takes 27 minutes (the UNet 15, the decoder 7.5); on an M3 MacBook Air's GPU
+(macOS 15, Node.js through Dawn, from Python) 0.9 to 1.1 s, the pixels within half a byte level of
+diffusers' again, and the same seed gives the same bytes. From Python the pipeline returns a `RawImage`.
 
 **Kiln from Python.** The `kiln-webgpu` package in python/ (`pip install ./python` after
 `npm run build:python`) has the same pipelines: `pipeline(task, model, **options)`, called with
