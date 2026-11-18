@@ -8,6 +8,59 @@ Version 0.2.0 is published on npm (`kiln-webgpu`), the repository is public, and
 playground are live on GitHub Pages. Versioned copies on the Pages site are scripted
 (`scripts/pages-versions.mjs`, run by the deploy workflow) and take effect with the next deploy.
 
+## Next, in order
+
+Three features, built one after another: pictures from text, mixture-of-experts language models,
+then tool calls in chat.
+
+### 1. Pictures from text (`text-to-image`)
+
+Neither Kiln nor transformers.js makes images from a prompt; a one-step model makes it a demo that
+runs in a second or two on a laptop GPU.
+
+**Model: SDXS-512-DreamShaper** (`IDKiro/sdxs-512-dreamshaper`, OpenRAIL++, 512 × 512 in one
+step, no classifier-free guidance). In diffusers' layout, safetensors, about 1.8 GB in fp32 (half
+that in fp16):
+
+- Text encoder: CLIP ViT-L/14's text model (12 layers, 768 wide, quick GELU), 77 tokens, the last
+  hidden state (not the pooled one) as the UNet's context. Kiln's CLIP text tower and tokenizer
+  already run it.
+- UNet (`UNet2DConditionModel`, 316M parameters): 3 levels of 320, 640 and 1280 channels, one
+  ResNet block per level, no middle block; cross-attention transformers (8 heads: diffusers' old
+  `attention_head_dim` names the head count) on the two lower levels down and the two upper up,
+  each a GroupNorm, a 1×1 projection in, self-attention, cross-attention on the text, a GEGLU
+  feed-forward, a projection out. Latents 64 × 64 × 4.
+- Decoder: TAESD (`AutoencoderTiny`, 2.4M parameters): 3×3 convolutions with ReLU, nearest
+  upsampling ×2 three times, latents scaled by `latent_magnitude` 3 and shifted by 0.5.
+- Scheduler: one Euler step at timestep 999 (`trailing` spacing, `scaled_linear` betas, epsilon
+  prediction): noise z goes in as is, and the result is z · √(σ² + 1) − σ · ε, σ that timestep's.
+
+Kernels: most are there (conv2d, GroupNorm, LayerNorm, attention, GEGLU through `gatedAct`, nearest
+upsampling, `cols` for the skip connections' concatenation). New: the sinusoidal timestep
+embedding (on the CPU, one row), and tanh-clamped output in the decoder (conv2d has `tanh`).
+
+API: `pipeline("text-to-image")` → `(prompt, { seed, width, height })` returning a `RawImage`;
+fixed seed gives the same picture on CPU and GPU within rounding. Python gets it through the bridge
+unchanged.
+
+Checks: each part against diffusers in float32 on the same latents (the text encoder's hidden state,
+the UNet's noise prediction, the decoder's pixels), on a machine with PyTorch (the MacBook Air; not
+on the Intel Mac). GPU runs only in Chrome or on macOS 15 and later.
+
+Later: 1024 × 1024 (SDXS-1024 is not released), image-to-image from a starting picture, more
+steps for other distilled models (SD-Turbo's licence is non-commercial).
+
+### 2. Mixture-of-experts language models
+
+gpt-oss-20b, Qwen3-30B-A3B and Gemma 4's MoE size: a router picks a few experts per token, so the
+model answers like a large one at the speed of a small one, but needs 12–20 GB of memory. Planned
+after text-to-image.
+
+### 3. Tool calls in chat
+
+A chat model asks for a function (`get_weather("Paris")`), the caller runs it and passes the
+answer back. Kiln's grammar-constrained output makes the call's JSON valid. Planned last.
+
 ## Later
 
 ### More architectures
