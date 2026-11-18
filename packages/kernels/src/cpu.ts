@@ -1967,3 +1967,87 @@ export const cpuSamMasks: CpuKernel = (b) => {
     }
   }
 };
+
+// ---- mixture of experts ----
+
+/** Top-k experts per row of router logits [R, E]: ids [R·k] and weights [R·k] (see moeRouteSpec). */
+export const cpuMoeRoute: CpuKernel = (b) => {
+  const [R, E, k, renorm] = [b[0]!.u32[0]!, b[0]!.u32[1]!, b[0]!.u32[2]!, b[0]!.u32[3]!];
+  const logits = b[1]!.f32;
+  const ids = b[2]!.u32;
+  const wts = b[3]!.f32;
+  for (let r = 0; r < R; r++) {
+    const o = r * E;
+    let max = -Infinity;
+    for (let e = 0; e < E; e++) max = Math.max(max, logits[o + e]!);
+    const picked: number[] = [];
+    for (let j = 0; j < k; j++) {
+      let best = -1;
+      for (let e = 0; e < E; e++) if (!picked.includes(e) && (best < 0 || logits[o + e]! > logits[o + best]!)) best = e;
+      picked.push(best);
+    }
+    // Softmax over the picked logits (renormalised), or over all of them.
+    let sum = 0;
+    if (renorm) for (const e of picked) sum += Math.exp(logits[o + e]! - max);
+    else for (let e = 0; e < E; e++) sum += Math.exp(logits[o + e]! - max);
+    picked.forEach((e, j) => {
+      ids[r * k + j] = e;
+      wts[r * k + j] = Math.exp(logits[o + e]! - max) / sum;
+    });
+  }
+};
+
+/**
+ * y[s, n] = Σ_k x[row(s), k] · W[ids[s]·N + n, k] for every slot s of S (see moeGatherSpec): each
+ * slot reads its expert's N rows of the stacked weight.
+ */
+export function cpuMoeGather(wdtype: WeightDType, affine: boolean): CpuKernel {
+  const quant = wdtype !== "f32";
+  return (b) => {
+    const [S, N, K, k, perSlot] = [b[0]!.u32[0]!, b[0]!.u32[1]!, b[0]!.u32[2]!, b[0]!.u32[3]!, b[0]!.u32[4]!];
+    const x = b[1]!.f32;
+    const ids = b[2]!.u32;
+    const y = b[quant ? (affine ? 6 : 5) : 4]!.f32;
+    const KB = K >>> 5;
+    for (let s = 0; s < S; s++) {
+      const xo = (perSlot ? s : Math.floor(s / k)) * K;
+      const base = ids[s]! * N;
+      let xsum: Float32Array | undefined;
+      if (quant) {
+        xsum = new Float32Array(KB);
+        for (let bl = 0; bl < KB; bl++) for (let e = 0; e < 32; e++) xsum[bl]! += x[xo + bl * 32 + e]!;
+      }
+      for (let n = 0; n < N; n++) {
+        const row = base + n;
+        if (!quant) {
+          y[s * N + n] = dotF32(x, xo, b[3]!.f32, row * K, K);
+          continue;
+        }
+        const ws = b[4]!.f32;
+        const wm = affine ? b[5]!.f32 : undefined;
+        let total = 0;
+        for (let bl = 0; bl < KB; bl++) {
+          const blk = row * KB + bl;
+          const t = wdtype === "q4" ? dotQ4(x, xo + bl * 32, b[3]!.u32, blk * 4) : dotQ8(x, xo + bl * 32, b[3]!.i8, blk * 32);
+          const sx = xsum![bl]!;
+          total += wm ? ws[blk]! * t + wm[blk]! * sx : wdtype === "q4" ? ws[blk]! * (t - 8 * sx) : ws[blk]! * t;
+        }
+        y[s * N + n] = total;
+      }
+    }
+  };
+}
+
+/** x[r] += Σ_j wts[r·k + j] · d[r·k + j] over rows of H (see moeCombineSpec). */
+export const cpuMoeCombine: CpuKernel = (b) => {
+  const [R, H, k] = [b[0]!.u32[0]!, b[0]!.u32[1]!, b[0]!.u32[2]!];
+  const x = b[1]!.f32;
+  const d = b[2]!.f32;
+  const w = b[3]!.f32;
+  for (let r = 0; r < R; r++)
+    for (let h = 0; h < H; h++) {
+      let s = 0;
+      for (let j = 0; j < k; j++) s += w[r * k + j]! * d[(r * k + j) * H + h]!;
+      x[r * H + h]! += s;
+    }
+};

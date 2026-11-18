@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+**Mixture-of-experts language models.** Qwen3-MoE (safetensors and GGUF `qwen3moe`) and
+Granite-MoE (`granitemoe`, e.g. granite-3.0-1b-a400m) load like any other model. In each MoE layer a
+router picks the top k experts per token (their softmax renormalized, or their share of the full
+softmax, as the config says), and three new kernels run them: the routing, a matmul that reads only
+the picked experts' rows of the stacked weights (f32, q8 and q4), and the weighted sum back onto the
+residual. Routers stay f32 when the experts are quantized. Against transformers 5.23 in float32,
+greedy decoding of "The capital of France is" gives the same 20 tokens for a tiny random
+Qwen3-MoE and for granite-3.0-1b-a400m-instruct (q8 on Kiln's side: " Paris. Paris is a beautiful
+city with a rich history and culture. It is home to"), 20 tokens in 35 s on an Intel Mac's CPU.
+Not yet run on a GPU. LoRA adapters on MoE layers are not supported.
+
 **Pictures from text.** `pipeline("text-to-image")` runs diffusers Stable Diffusion checkpoints
 whose decoder is TAESD, by default SDXS-512-DreamShaper (`IDKiro/sdxs-512-dreamshaper`, OpenRAIL++),
 which makes a 512 × 512 picture in one step: `painter(prompt, { seed, width, height,

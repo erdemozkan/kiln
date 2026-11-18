@@ -32,6 +32,7 @@ import {
   ggufToHF,
   qwen35GgufValues,
   graniteName,
+  qwen3MoeName,
   phi3Name,
   PHI3_ROPE_SHORT,
   idefics3Processing,
@@ -936,7 +937,7 @@ async function openSafetensors(ref: ModelRef, endpoint?: string): Promise<{ cfg:
         ? (name: string, v: Float32Array) => (name.endsWith("norm.weight") && !name.includes("linear_attn") ? addOne(v) : undefined)
         : undefined;
   // Multimodal Gemma 3 (4B and up): load the language model's weights under their text names, skip the rest.
-  const rename = cfg.family === "gemma4" ? gemma4Rename(cfg, config!.model_type === "gemma4" ? multimodalTextName : (n) => n) : config!.model_type === "gemma3" || config!.model_type === "qwen3_5" ? multimodalTextName : config!.model_type === "granitemoehybrid" ? graniteName : config!.model_type === "phi3" ? phi3Name : idefics3 ? idefics3TextName : undefined;
+  const rename = cfg.family === "gemma4" ? gemma4Rename(cfg, config!.model_type === "gemma4" ? multimodalTextName : (n) => n) : config!.model_type === "gemma3" || config!.model_type === "qwen3_5" ? multimodalTextName : config!.model_type === "granitemoehybrid" || config!.model_type === "granitemoe" ? graniteName : config!.model_type === "qwen3_moe" ? qwen3MoeName : config!.model_type === "phi3" ? phi3Name : idefics3 ? idefics3TextName : undefined;
   const scale = cfg.residualScale !== undefined || cfg.logitScale !== undefined ? (name: string) => weightScale(cfg, name) : undefined;
   // Shards are opened together: each open is a request (and a header to read) on a first load.
   const opened = await Promise.allSettled(names.map((name) => openParsed(ref, name, endpoint, readSafetensorsHeader)));

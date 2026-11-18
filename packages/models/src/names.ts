@@ -11,6 +11,11 @@ const BLOCK: Record<string, string> = {
   ffn_gate: "mlp.gate_proj",
   ffn_up: "mlp.up_proj",
   ffn_down: "mlp.down_proj",
+  // A mixture of experts: the router, and every expert's gate, up and down stacked (expert-major).
+  ffn_gate_inp: "mlp.router",
+  ffn_gate_exps: "mlp.experts.gate",
+  ffn_up_exps: "mlp.experts.up",
+  ffn_down_exps: "mlp.experts.down",
 };
 
 const GLOBAL: Record<string, string> = {
@@ -91,6 +96,8 @@ export function ggufToHF(name: string, arch = "llama"): string | undefined {
 export function isQuantizable(name: string, shape: readonly number[]): boolean {
   // Linear attention's decay and write-strength projections are a few rows that steer a recurrent state: kept exact.
   if (/\.linear_attn\.in_proj_[ab]\./.test(name)) return false;
+  // A mixture of experts' router: a few rows whose order decides which experts run, kept exact.
+  if (/\.mlp\.router\./.test(name)) return false;
   return shape.length === 2 && name.endsWith(".weight") && !name.includes("norm") && shape[1]! % 32 === 0;
 }
 

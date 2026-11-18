@@ -4455,3 +4455,152 @@ fn main(${EW_ARGS}) {
   y[idx] = word;
 }`);
 }
+
+// ---- mixture of experts ----
+
+/** Most experts a token may use (top-k). */
+export const MOE_MAX_K = 16;
+
+/**
+ * A mixture of experts' router: for each row of logits [R, E], the k largest (ties to the lower
+ * index) as expert ids [R·k], and their weights [R·k]: a softmax over the k picked logits
+ * (`renorm`, as Mixtral and Qwen3 with norm_topk_prob have it), or their probabilities in a softmax
+ * over all E. One thread per row.
+ */
+export function moeRouteSpec(): KernelSpec {
+  return spec("moe_route", ["uniform", "read", "rw", "rw"], cpu.cpuMoeRoute, () => /* wgsl */ `
+struct P { R: u32, E: u32, k: u32, renorm: u32 }
+@group(0) @binding(0) var<uniform> p: P;
+@group(0) @binding(1) var<storage, read> logits: array<f32>;
+@group(0) @binding(2) var<storage, read_write> ids: array<u32>;
+@group(0) @binding(3) var<storage, read_write> wts: array<f32>;
+
+@compute @workgroup_size(${EW})
+fn main(${EW_ARGS}) {
+  ${FLAT}
+  let r = idx;
+  if (r >= p.R) { return; }
+  let o = r * p.E;
+  var mx = -3.4e38;
+  for (var e = 0u; e < p.E; e++) { mx = max(mx, logits[o + e]); }
+  var sel: array<u32, ${MOE_MAX_K}>;
+  for (var j = 0u; j < p.k; j++) {
+    var best = 0xffffffffu;
+    var bv = -3.4e38;
+    for (var e = 0u; e < p.E; e++) {
+      var taken = false;
+      for (var i = 0u; i < j; i++) { if (sel[i] == e) { taken = true; } }
+      let v = logits[o + e];
+      if (!taken && (best == 0xffffffffu || v > bv)) { best = e; bv = v; }
+    }
+    sel[j] = best;
+  }
+  var sum = 0.0;
+  if (p.renorm != 0u) {
+    for (var j = 0u; j < p.k; j++) { sum += exp(logits[o + sel[j]] - mx); }
+  } else {
+    for (var e = 0u; e < p.E; e++) { sum += exp(logits[o + e] - mx); }
+  }
+  for (var j = 0u; j < p.k; j++) {
+    ids[r * p.k + j] = sel[j];
+    wts[r * p.k + j] = exp(logits[o + sel[j]] - mx) / sum;
+  }
+}`);
+}
+
+/** Output rows per workgroup of the expert matmul (32 lanes each). */
+export const MOE_ROWS = 8;
+
+/**
+ * The experts' matmul: y[s, n] = Σ_k x[row(s), k] · W[ids[s]·N + n, k] for S slots, where W stacks
+ * the experts' [N, K] matrices and ids[s] picks one; row(s) is s (`perSlot`, each slot its own input,
+ * as for the down projection) or s / k (the slots of a token share its input). A workgroup takes
+ * MOE_ROWS output rows of one slot, 32 lanes a row, each lane whole 32-value blocks.
+ */
+export function moeGatherSpec(wdtype: WeightDType, affine: boolean): KernelSpec {
+  const quant = wdtype !== "f32";
+  const aff = quant && affine;
+  const bindings: BindingKind[] = quant ? ["uniform", "read", "read", "read", "read"] : ["uniform", "read", "read", "read"];
+  if (aff) bindings.push("read");
+  bindings.push("rw");
+  const yb = bindings.length - 1;
+  const d4 = aff ? "dq4u" : "dq4";
+  const tail = aff ? " + xsum * wm[blk]" : "";
+  const dot =
+    wdtype === "q4"
+      ? `let q = wq[blk];
+      acc += (dot(x0, ${d4}(q.x)) + dot(x1, ${d4}(q.x >> 16u)) + dot(x2, ${d4}(q.y)) + dot(x3, ${d4}(q.y >> 16u))
+        + dot(x4, ${d4}(q.z)) + dot(x5, ${d4}(q.z >> 16u)) + dot(x6, ${d4}(q.w)) + dot(x7, ${d4}(q.w >> 16u))) * ws[blk]${tail};`
+      : quant
+        ? `let q0 = wq[blk * 2u];
+      let q1 = wq[blk * 2u + 1u];
+      acc += (dot(x0, dq8(q0.x)) + dot(x1, dq8(q0.y)) + dot(x2, dq8(q0.z)) + dot(x3, dq8(q0.w))
+        + dot(x4, dq8(q1.x)) + dot(x5, dq8(q1.y)) + dot(x6, dq8(q1.z)) + dot(x7, dq8(q1.w))) * ws[blk]${tail};`
+        : `let o = blk * 8u;
+      acc += dot(x0, w[o]) + dot(x1, w[o + 1u]) + dot(x2, w[o + 2u]) + dot(x3, w[o + 3u])
+        + dot(x4, w[o + 4u]) + dot(x5, w[o + 5u]) + dot(x6, w[o + 6u]) + dot(x7, w[o + 7u]);`;
+  return spec(`moe_gather/${wdtype}${aff ? "a" : ""}`, bindings, cpu.cpuMoeGather(wdtype, aff), () => /* wgsl */ `
+struct P { S: u32, N: u32, K: u32, k: u32, perSlot: u32, _a: u32, _b: u32, _c: u32 }
+@group(0) @binding(0) var<uniform> p: P;
+@group(0) @binding(1) var<storage, read> x: array<vec4<f32>>;
+@group(0) @binding(2) var<storage, read> ids: array<u32>;
+${quant
+  ? `@group(0) @binding(3) var<storage, read> wq: array<vec4<u32>>;
+@group(0) @binding(4) var<storage, read> ws: array<f32>;${aff ? "\n@group(0) @binding(5) var<storage, read> wm: array<f32>;" : ""}`
+  : `@group(0) @binding(3) var<storage, read> w: array<vec4<f32>>;`}
+@group(0) @binding(${yb}) var<storage, read_write> y: array<f32>;
+var<workgroup> red: array<f32, 256>;
+
+fn dq4(w: u32) -> vec4<f32> { return vec4<f32>(vec4<u32>(w, w >> 4u, w >> 8u, w >> 12u) & vec4<u32>(15u)) - 8.0; }
+fn dq4u(w: u32) -> vec4<f32> { return vec4<f32>(vec4<u32>(w, w >> 4u, w >> 8u, w >> 12u) & vec4<u32>(15u)); }
+fn dq8(w: u32) -> vec4<f32> { return vec4<f32>(bitcast<vec4<i32>>(vec4<u32>(w << 24u, w << 16u, w << 8u, w)) >> vec4<u32>(24u)); }
+
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) li: u32) {
+  let s = wid.y + wid.z * 65535u;
+  let lane = li % 32u;
+  let n = wid.x * ${MOE_ROWS}u + li / 32u;
+  let ok = s < p.S && n < p.N;
+  let blocks = p.K / 32u;
+  var acc = 0.0;
+  if (ok) {
+    let xo = select(s / p.k, s, p.perSlot != 0u) * (p.K / 4u);
+    let row = ids[s] * p.N + n;
+    for (var bi = lane; bi < blocks; bi += 32u) {
+      let xb = xo + bi * 8u;
+      let x0 = x[xb]; let x1 = x[xb + 1u]; let x2 = x[xb + 2u]; let x3 = x[xb + 3u];
+      let x4 = x[xb + 4u]; let x5 = x[xb + 5u]; let x6 = x[xb + 6u]; let x7 = x[xb + 7u];${aff ? "\n      let xsum = dot(((x0 + x1) + (x2 + x3)) + ((x4 + x5) + (x6 + x7)), vec4<f32>(1.0));" : ""}
+      let blk = row * blocks + bi;
+      ${dot}
+    }
+  }
+  red[li] = acc;
+  workgroupBarrier();
+  for (var st = 16u; st > 0u; st >>= 1u) {
+    if (lane < st) { red[li] += red[li + st]; }
+    workgroupBarrier();
+  }
+  if (ok && lane == 0u) { y[s * p.N + n] = red[li]; }
+}`);
+}
+
+/** x[r, h] += Σ_j wts[r·k + j] · d[r·k + j, h]: the experts' outputs, weighted, onto the residual. */
+export function moeCombineSpec(): KernelSpec {
+  return spec("moe_combine", ["uniform", "rw", "read", "read"], cpu.cpuMoeCombine, () => /* wgsl */ `
+struct P { R: u32, H: u32, k: u32, _a: u32 }
+@group(0) @binding(0) var<uniform> p: P;
+@group(0) @binding(1) var<storage, read_write> x: array<f32>;
+@group(0) @binding(2) var<storage, read> d: array<f32>;
+@group(0) @binding(3) var<storage, read> wts: array<f32>;
+
+@compute @workgroup_size(${EW})
+fn main(${EW_ARGS}) {
+  ${FLAT}
+  if (idx >= p.R * p.H) { return; }
+  let r = idx / p.H;
+  let h = idx % p.H;
+  var s = 0.0;
+  for (var j = 0u; j < p.k; j++) { s += wts[r * p.k + j] * d[(r * p.k + j) * p.H + h]; }
+  x[idx] += s;
+}`);
+}

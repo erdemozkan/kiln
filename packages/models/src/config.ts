@@ -99,6 +99,24 @@ export interface LlamaConfig {
   layerScalars?: number[];
   /** Logits are squashed to ±cap with tanh before sampling (Gemma's final_logit_softcapping). */
   logitSoftcap?: number;
+  /**
+   * A mixture of experts in place of the MLP (Qwen3-MoE, Granite-MoE): a router scores the experts
+   * for each token, the top ones run, and their outputs are added in proportion to their scores.
+   */
+  moe?: MoeConfig;
+}
+
+/** Sizes and routing of a mixture-of-experts MLP. */
+export interface MoeConfig {
+  experts: number;
+  /** Experts each token uses. */
+  topK: number;
+  /** An expert's intermediate size. */
+  intermediate: number;
+  /** Weights: a softmax over the picked experts' scores (true), or their share of a softmax over all. */
+  renorm: boolean;
+  /** Which layers have experts; the others have a dense MLP of `intermediateSize`. */
+  layers: boolean[];
 }
 
 /** The head size of layer l. */
@@ -134,7 +152,7 @@ export class UnsupportedModelError extends Error {}
 /** The tensor a phi3 GGUF keeps LongRoPE's short factors in. */
 export const PHI3_ROPE_SHORT = "rope_factors_short.weight";
 
-const SUPPORTED = ["llama", "mistral", "qwen2", "qwen3", "qwen3_5_text", "granite", "granitemoehybrid", "gemma3_text", "gemma4_text", "phi3"];
+const SUPPORTED = ["llama", "mistral", "qwen2", "qwen3", "qwen3_moe", "qwen3_5_text", "granite", "granitemoe", "granitemoehybrid", "gemma3_text", "gemma4_text", "phi3"];
 
 type HFConfig = Record<string, unknown>;
 /**
@@ -171,6 +189,14 @@ const SIZE_LIMITS: Record<string, number> = {
   "ssm.time_step_rank": 1024,
   "ssm.inner_size": 262144,
   full_attention_interval: 1024,
+  num_experts: 1024,
+  num_local_experts: 1024,
+  num_experts_per_tok: 64,
+  moe_intermediate_size: 262144,
+  decoder_sparse_step: 1024,
+  expert_count: 1024,
+  expert_used_count: 64,
+  expert_feed_forward_length: 262144,
 };
 
 /**
@@ -251,7 +277,7 @@ export function configFromHF(c: HFConfig, generation?: HFConfig): LlamaConfig {
   }
   const numHeads = num(c, "num_attention_heads");
   const hiddenSize = num(c, "hidden_size");
-  const family = type === "qwen2" ? "qwen2" : type === "qwen3" ? "qwen3" : type === "qwen3_5_text" ? "qwen35" : type === "gemma3_text" ? "gemma3" : type === "phi3" ? "phi3" : "llama";
+  const family = type === "qwen2" ? "qwen2" : type === "qwen3" || type === "qwen3_moe" ? "qwen3" : type === "qwen3_5_text" ? "qwen35" : type === "gemma3_text" ? "gemma3" : type === "phi3" ? "phi3" : "llama";
   if (family === "gemma3") return gemma3({ ...GEMMA3_DEFAULTS, ...c }, generation);
   const base: LlamaConfig = {
     family,
@@ -275,7 +301,33 @@ export function configFromHF(c: HFConfig, generation?: HFConfig): LlamaConfig {
   };
   if (type === "phi3") return phi3(c, base);
   if (family === "qwen35") return qwen35(c, base);
+  if (type === "qwen3_moe") return { ...base, moe: qwen3Moe(c, base.numLayers) };
+  if (type === "granitemoe") {
+    const experts = num(c, "num_local_experts");
+    return { ...granite(c, base), moe: { experts, topK: num(c, "num_experts_per_tok"), intermediate: num(c, "intermediate_size"), renorm: true, layers: Array(base.numLayers).fill(true) } };
+  }
   return type === "granite" || type === "granitemoehybrid" ? granite(c, base) : base;
+}
+
+/** Qwen3-MoE: experts in every `decoder_sparse_step`-th layer but those in `mlp_only_layers`. */
+function qwen3Moe(c: HFConfig, layers: number): MoeConfig {
+  const step = num(c, "decoder_sparse_step", 1);
+  const dense = new Set(Array.isArray(c.mlp_only_layers) ? (c.mlp_only_layers as unknown[]).map(Number) : []);
+  const experts = num(c, "num_experts");
+  const topK = num(c, "num_experts_per_tok");
+  if (topK > experts) throw new UnsupportedModelError(`qwen3_moe: ${topK} experts per token of ${experts}`);
+  return {
+    experts,
+    topK,
+    intermediate: num(c, "moe_intermediate_size"),
+    renorm: c.norm_topk_prob === true,
+    layers: Array.from({ length: layers }, (_, l) => !dense.has(l) && (l + 1) % step === 0),
+  };
+}
+
+/** Qwen3-MoE checkpoints' router (mlp.gate) under the name the model reads (mlp.router). */
+export function qwen3MoeName(name: string): string {
+  return name.replace(/\.mlp\.gate\.weight$/, ".mlp.router.weight");
 }
 
 /**
@@ -388,12 +440,18 @@ function granite(c: HFConfig, base: LlamaConfig): LlamaConfig {
 
 /** Granite 4 checkpoints' MLP names → the fused gate_up and down_proj that the model reads. */
 export function graniteName(name: string): string {
-  return name.replace(".shared_mlp.input_linear.", ".mlp.gate_up.").replace(".shared_mlp.output_linear.", ".mlp.down_proj.");
+  return name
+    .replace(".shared_mlp.input_linear.", ".mlp.gate_up.")
+    .replace(".shared_mlp.output_linear.", ".mlp.down_proj.")
+    // Granite 3 MoE: the router, and every expert's [gate; up] and down stacked in one tensor each.
+    .replace(".block_sparse_moe.router.layer.", ".mlp.router.")
+    .replace(".block_sparse_moe.input_linear.", ".mlp.experts.gate_up.")
+    .replace(".block_sparse_moe.output_linear.", ".mlp.experts.down.");
 }
 
 /** The factor a weight is multiplied by at load (Granite's residual and logit multipliers), if any. */
 export function weightScale(cfg: Pick<LlamaConfig, "residualScale" | "logitScale" | "tieEmbeddings">, name: string): number | undefined {
-  if (cfg.residualScale !== undefined && /\.(o_proj|down_proj)\.weight$/.test(name)) return cfg.residualScale;
+  if (cfg.residualScale !== undefined && /\.(o_proj|down_proj|experts\.down)\.weight$/.test(name)) return cfg.residualScale;
   if (cfg.logitScale !== undefined && (name === "lm_head.weight" || (cfg.tieEmbeddings && name === "model.embed_tokens.weight"))) return cfg.logitScale;
   return undefined;
 }
@@ -570,8 +628,8 @@ function ropeScalingFromHF(s: HFConfig | null | undefined): Llama3RopeScaling | 
  */
 export function configFromGGUF(meta: Map<string, unknown>, tensorNames: readonly string[], ropeShort?: ArrayLike<number>): LlamaConfig {
   const arch = String(meta.get("general.architecture"));
-  if (!["llama", "qwen2", "qwen3", "qwen35", "granite", "gemma3", "gemma4", "phi3"].includes(arch)) {
-    throw new UnsupportedModelError(`GGUF architecture "${arch}" is not supported yet (llama, qwen2, qwen3, qwen35, granite, gemma3, gemma4, phi3)`);
+  if (!["llama", "qwen2", "qwen3", "qwen3moe", "qwen35", "granite", "gemma3", "gemma4", "phi3"].includes(arch)) {
+    throw new UnsupportedModelError(`GGUF architecture "${arch}" is not supported yet (llama, qwen2, qwen3, qwen3moe, qwen35, granite, gemma3, gemma4, phi3)`);
   }
   const get = (k: string, fallback?: number): number => {
     let v: unknown = meta.get(`${arch}.${k}`) ?? fallback;
@@ -589,11 +647,13 @@ export function configFromGGUF(meta: Map<string, unknown>, tensorNames: readonly
   const tokens = meta.get("tokenizer.ggml.tokens") as unknown[] | undefined;
   if (arch === "gemma3") return gemma3FromGGUF(meta, tensorNames, get, tokens);
   if (arch === "gemma4") return gemma4FromGGUF(meta, tensorNames, get, tokens);
-  if (arch === "granite" && get("expert_count", 0)) throw new UnsupportedModelError("Granite mixture-of-experts models are not supported");
+  if (arch === "granite" && Number(meta.get("granite.expert_count") ?? 0) > 0) throw new UnsupportedModelError("Granite mixture-of-experts models are not supported");
+  const moe = arch === "qwen3moe";
   const base: LlamaConfig = {
-    family: arch as LlamaConfig["family"],
+    family: (moe ? "qwen3" : arch) as LlamaConfig["family"],
     hiddenSize,
-    intermediateSize: get("feed_forward_length"),
+    // A Qwen3-MoE file may leave the dense size out: no layer has a dense MLP.
+    intermediateSize: get("feed_forward_length", moe ? get("expert_feed_forward_length") : undefined),
     numLayers: get("block_count"),
     numHeads,
     numKvHeads: get("attention.head_count_kv", numHeads),
@@ -611,6 +671,12 @@ export function configFromGGUF(meta: Map<string, unknown>, tensorNames: readonly
     bosTokenId: meta.has("tokenizer.ggml.bos_token_id") ? Number(meta.get("tokenizer.ggml.bos_token_id")) : undefined,
     contextLength: optNum(meta.get(`${arch}.context_length`)),
   };
+  if (moe) {
+    // llama.cpp's qwen3moe always renormalises the picked experts' weights (norm_topk_prob).
+    const experts = get("expert_count");
+    const layers = Array.from({ length: base.numLayers }, (_, l) => tensorNames.includes(`blk.${l}.ffn_gate_inp.weight`));
+    return { ...base, moe: { experts, topK: get("expert_used_count"), intermediate: get("expert_feed_forward_length"), renorm: true, layers } };
+  }
   if (arch === "phi3") {
     // Phi-4 mini: fewer rotated dimensions than the head has.
     const rotary = get("rope.dimension_count", base.headDim);

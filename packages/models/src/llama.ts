@@ -255,6 +255,20 @@ export class LlamaModel {
     this.fusedQkv = weights.has("model.layers.0.self_attn.qkv.weight") || (fuse.qkv && !cfg.linearLayers && !cfg.valueNorm && !cfg.kvFrom && !cfg.layerHeadDims && this.fuse("self_attn", ["q_proj", "k_proj", "v_proj"], "qkv", cfg.attentionBias));
     // Granite 4 and Phi-3 checkpoints store gate_up already stacked.
     this.fusedMlp = weights.has("model.layers.0.mlp.gate_up.weight") || (fuse.mlp && this.fuse("mlp", ["gate_proj", "up_proj"], "gate_up", false));
+    // A mixture of experts runs from one stacked tensor per projection, the experts in turn: gate, up
+    // and down (a GGUF file has them so), or [gate; up] per expert and down (Granite's checkpoints).
+    if (cfg.moe) {
+      for (let l = 0; l < cfg.numLayers; l++) {
+        if (!cfg.moe.layers[l]) continue;
+        const p = `model.layers.${l}.mlp.experts`;
+        if (weights.has(`${p}.gate_up.weight`)) continue;
+        if (weights.has(`${p}.gate.weight`)) continue;
+        const experts = Array.from({ length: cfg.moe.experts }, (_, e) => e);
+        for (const [part, to] of [["gate_proj", "gate"], ["up_proj", "up"], ["down_proj", "down"]] as const) {
+          this.stack(experts.map((e) => `${p}.${e}.${part}.weight`), `${p}.${to}.weight`);
+        }
+      }
+    }
   }
 
   /**
@@ -811,8 +825,24 @@ export class LlamaModel {
       }
 
       const mlpNorm = { w: this.w(`${p}.${c.sandwichNorms ? "pre_feedforward_layernorm" : "post_attention_layernorm"}.weight`), eps: c.rmsEps };
-      let m: Tensor;
-      if (L) {
+      let m!: Tensor;
+      const moe = c.moe?.layers[l] ? c.moe : undefined;
+      if (moe) {
+        // Mixture of experts: the router picks topK experts per token, each runs its gated MLP, and
+        // their outputs go onto the residual weighted by the router.
+        if (L) throw new Error("LoRA adapters on a mixture-of-experts model are not supported");
+        const xn = ops.rmsnorm(ctx, x, mlpNorm.w, mlpNorm.eps);
+        const { ids, wts } = ops.moeRoute(ctx, ops.linear(ctx, xn, this.w(`${p}.mlp.router.weight`)), moe.topK, moe.renorm);
+        const e = `${p}.mlp.experts`;
+        const act = gelu ? "gelu" : "silu";
+        const I = moe.intermediate;
+        const g = { N: I, k: moe.topK };
+        const h = this.weights.has(`${e}.gate_up.weight`)
+          ? ops.gatedAct(ctx, ops.moeGather(ctx, xn, this.w(`${e}.gate_up.weight`), ids, { N: 2 * I, k: moe.topK }), act)
+          : ops.siluMul(ctx, ops.moeGather(ctx, xn, this.w(`${e}.gate.weight`), ids, g), ops.moeGather(ctx, xn, this.w(`${e}.up.weight`), ids, g), act);
+        const d = ops.moeGather(ctx, h, this.w(`${e}.down.weight`), ids, { N: c.hiddenSize, k: moe.topK, perSlot: true });
+        ops.moeCombine(ctx, x, d, wts, moe.topK);
+      } else if (L) {
         // Updates go in before the gated activation: gate and up as plain matmuls on the normalised input.
         const xn = ops.rmsnorm(ctx, x, mlpNorm.w, mlpNorm.eps);
         if (this.fusedMlp) {
@@ -833,7 +863,9 @@ export class LlamaModel {
         const u = ops.linear(ctx, x, this.w(`${p}.mlp.up_proj.weight`), { norm: mlpNorm });
         m = ops.siluMul(ctx, h2, u, gelu ? "gelu" : "silu");
       }
-      if (c.sandwichNorms) {
+      if (moe) {
+        // Added above.
+      } else if (c.sandwichNorms) {
         const d = ops.linear(ctx, m, this.w(`${p}.mlp.down_proj.weight`));
         if (L) delta(m, d, `${l}.down_proj`);
         ops.addInPlace(ctx, x, norm(d, `${p}.post_feedforward_layernorm.weight`));

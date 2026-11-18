@@ -1,6 +1,11 @@
 import { q4Block } from "./q4";
 import { f32, isBlockQuant, lastDim, numel, u32, type Backend, type Buf, type Ctx, type Grid, type Tensor, type WeightDType } from "@kiln/core";
 import {
+  MOE_MAX_K,
+  MOE_ROWS,
+  moeCombineSpec,
+  moeGatherSpec,
+  moeRouteSpec,
   ATTN_CHUNK,
   ATTN_WG,
   EW,
@@ -1133,4 +1138,46 @@ export function gatedDelta(ctx: Ctx, qk: Tensor, conv: Tensor, a: Tensor, b: Ten
   const params = ctx.uniform([u32(s.T), u32(s.valueHeads), u32(s.keyHeads), u32(s.keyDim), u32(s.valueDim), u32(C), u32(vOff), f32(1 / Math.sqrt(s.keyDim)), u32(s.tiled ? 1 : 0), u32(0), u32(0), u32(0)]);
   ctx.run(gatedDeltaSpec(s.keyDim), [params, qk.buf, conv.buf, a.buf, b.buf, aLog.buf, dtBias.buf, state, out.buf], [Math.ceil(s.valueDim / 64), s.valueHeads, 1]);
   return out;
+}
+
+// ---- mixture of experts ----
+
+/**
+ * The top `k` experts of each row of router logits [R, E] and their weights: ids [R·k] (u32) and
+ * wts [R·k], a softmax over the picked logits (`renorm`) or their share of a softmax over all.
+ */
+export function moeRoute(ctx: Ctx, logits: Tensor, k: number, renorm: boolean): { ids: Tensor; wts: Tensor } {
+  const E = lastDim(logits);
+  const R = rowsOf(logits);
+  if (k < 1 || k > MOE_MAX_K || k > E) throw new Error(`moeRoute: top ${k} of ${E} experts (at most ${MOE_MAX_K})`);
+  const ids = ctx.alloc([R * k], "u32");
+  const wts = ctx.alloc([R * k]);
+  ctx.run(moeRouteSpec(), [ctx.uniform([u32(R), u32(E), u32(k), u32(renorm ? 1 : 0)]), logits.buf, ids.buf, wts.buf], grid1d(R));
+  return { ids, wts };
+}
+
+/**
+ * The picked experts' matmul over a stacked weight w [E·N, K] (each expert's [N, K] in turn): for
+ * each of the S = R·k slots, y[s] = W[ids[s]] · x[row], x [R, K] shared by a token's k slots, or
+ * x [S, K] one row per slot with `perSlot`. y [S, N].
+ */
+export function moeGather(ctx: Ctx, x: Tensor, w: Tensor, ids: Tensor, o: { N: number; k: number; perSlot?: boolean }): Tensor {
+  const K = lastDim(x);
+  const S = numel(ids.shape);
+  if (K % 32 !== 0) throw new Error(`moeGather: K must be a multiple of 32 (K=${K})`);
+  if (w.shape[1] !== K || w.shape[0]! % o.N !== 0) throw new Error(`moeGather: weight [${w.shape}] is not experts of [${o.N}, ${K}]`);
+  if (rowsOf(x) !== (o.perSlot ? S : S / o.k)) throw new Error(`moeGather: ${rowsOf(x)} input rows for ${S} slots of ${o.k}`);
+  const y = ctx.alloc([S, o.N]);
+  const wd = weightDType(w);
+  const grid: Grid = [Math.ceil(o.N / MOE_ROWS), Math.min(S, 65535), Math.ceil(S / 65535)];
+  ctx.run(moeGatherSpec(wd, !!w.mins), [ctx.uniform([u32(S), u32(o.N), u32(K), u32(o.k), u32(o.perSlot ? 1 : 0), u32(0), u32(0), u32(0)]), x.buf, ids.buf, ...weightBufs(w), y.buf], grid, `moe_gather/${wd} ${o.N}x${K}`);
+  return y;
+}
+
+/** x [R, H] += Σ_j wts[r·k + j] · d[r·k + j] for the experts' outputs d [R·k, H]. */
+export function moeCombine(ctx: Ctx, x: Tensor, d: Tensor, wts: Tensor, k: number): void {
+  const H = lastDim(x);
+  const R = rowsOf(x);
+  if (numel(d.shape) !== R * k * H) throw new Error(`moeCombine: [${d.shape}] is not ${R}·${k} rows of ${H}`);
+  ctx.run(moeCombineSpec(), [ctx.uniform([u32(R), u32(H), u32(k), u32(0)]), x.buf, d.buf, wts.buf], grid1d(R * H));
 }
