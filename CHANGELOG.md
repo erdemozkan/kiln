@@ -11,7 +11,8 @@ residual. Routers stay f32 when the experts are quantized. Against transformers 
 greedy decoding of "The capital of France is" gives the same 20 tokens for a tiny random
 Qwen3-MoE and for granite-3.0-1b-a400m-instruct (q8 on Kiln's side: " Paris. Paris is a beautiful
 city with a rich history and culture. It is home to"), 20 tokens in 35 s on an Intel Mac's CPU.
-Not yet run on a GPU. LoRA adapters on MoE layers are not supported.
+On an M3 MacBook Air's GPU (macOS 15, Node.js through Dawn, from Python) both give the same text
+again, Granite's 20 tokens in 0.8 s. LoRA adapters on MoE layers are not supported.
 
 **Pictures from text.** `pipeline("text-to-image")` runs diffusers Stable Diffusion checkpoints
 whose decoder is TAESD, by default SDXS-512-DreamShaper (`IDKiro/sdxs-512-dreamshaper`, OpenRAIL++),

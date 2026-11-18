@@ -56,7 +56,7 @@ gpt-oss-20b, Qwen3-30B-A3B and Gemma 4's MoE size: a router picks a few experts 
 model answers like a large one at the speed of a small one, but needs 12–20 GB of memory.
 
 Done (unreleased): Qwen3-MoE (safetensors and GGUF) and Granite-MoE, matching transformers' greedy
-tokens; see the changelog. Open: a GPU run, gpt-oss (its own attention sinks and activation),
+tokens; see the changelog. Open: gpt-oss (its own attention sinks and activation),
 Gemma 4's MoE size, and memory for the 30B sizes.
 
 ### 3. Tool calls in chat
