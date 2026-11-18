@@ -39,6 +39,7 @@ export type PipelineTask =
   | "image-to-image"
   | "image-to-text"
   | "document-question-answering"
+  | "text-to-image"
   | "text-to-audio"
   | "text-to-speech";
 
@@ -73,11 +74,13 @@ export const DEFAULT_MODELS: Record<string, string> = {
   "image-to-image": "caidas/swin2SR-classical-sr-x2-64",
   "image-to-text": "nlpconnect/vit-gpt2-image-captioning",
   "document-question-answering": "naver-clova-ix/donut-base-finetuned-docvqa",
+  // transformers.js has no text-to-image. SDXS makes a 512 × 512 picture in one step (OpenRAIL++).
+  "text-to-image": "IDKiro/sdxs-512-dreamshaper",
   // transformers.js's default (Supertonic) exists only as ONNX.
   "text-to-audio": "facebook/mms-tts-eng",
 };
 
-const VISION = new Set<string>(["image-classification", "image-feature-extraction", "zero-shot-image-classification", "object-detection", "zero-shot-object-detection", "depth-estimation", "image-segmentation", "background-removal", "mask-generation", "image-to-image", "image-to-text", "document-question-answering"]);
+const VISION = new Set<string>(["image-classification", "image-feature-extraction", "zero-shot-image-classification", "object-detection", "zero-shot-object-detection", "depth-estimation", "image-segmentation", "background-removal", "mask-generation", "image-to-image", "image-to-text", "document-question-answering", "text-to-image"]);
 
 /** Speech encoders run on raw samples (CTC or a classifier) rather than as encoder-decoders. */
 const AUDIO_ENCODERS = new Set(["wav2vec2", "hubert"]);
@@ -640,6 +643,36 @@ export interface ImageToImagePipeline {
   (images: ImageInput[]): Promise<ImageToImageResult[]>;
 }
 
+/** Options for `pipeline("text-to-image")`. */
+export interface TextToImageOptions {
+  /** Same seed, same prompt, same picture (default: random). */
+  seed?: number;
+  /** Size in pixels, multiples of 32 (default 512 × 512). */
+  width?: number;
+  height?: number;
+  /** Denoising steps (default 1, what SDXS is made for). */
+  num_inference_steps?: number;
+  /** Classifier-free guidance; above 1 runs the model twice per step (default 0: none). */
+  guidance_scale?: number;
+  /** What to steer away from, with guidance above 1. */
+  negative_prompt?: string;
+}
+/** A generated picture as RGB bytes, row by row. */
+export interface TextToImageResult {
+  width: number;
+  height: number;
+  channels: 3;
+  data: Uint8Array;
+}
+export interface TextToImagePipeline {
+  readonly task: PipelineTask;
+  readonly model: KilnVision;
+  readonly info: VisionInfo;
+  dispose(): Promise<void>;
+  (prompt: string, options?: TextToImageOptions): Promise<TextToImageResult>;
+  (prompts: string[], options?: TextToImageOptions): Promise<TextToImageResult[]>;
+}
+
 export interface ImageToTextOptions {
   /** Most tokens to generate (default: up to max_length, 20, counting the start token; Florence-2: 1024). */
   max_new_tokens?: number;
@@ -780,6 +813,7 @@ export async function pipeline(task: "mask-generation", model?: PipelineModel, o
 export async function pipeline(task: "image-to-image", model?: PipelineModel, options?: PipelineOptions): Promise<ImageToImagePipeline>;
 export async function pipeline(task: "image-to-text", model?: PipelineModel, options?: PipelineOptions): Promise<ImageToTextPipeline>;
 export async function pipeline(task: "document-question-answering", model?: PipelineModel, options?: PipelineOptions): Promise<DocumentQuestionAnsweringPipeline>;
+export async function pipeline(task: "text-to-image", model?: PipelineModel, options?: PipelineOptions): Promise<TextToImagePipeline>;
 export async function pipeline(task: "text-to-audio" | "text-to-speech", model?: PipelineModel, options?: PipelineOptions): Promise<TextToAudioPipeline>;
 export async function pipeline(task: PipelineTask, model?: PipelineModel, options: PipelineOptions = {}): Promise<unknown> {
   if (options.endpoint === undefined && envEndpoint()) options = { ...options, endpoint: envEndpoint() };
@@ -805,6 +839,16 @@ export async function pipeline(task: PipelineTask, model?: PipelineModel, option
   if (VISION.has(t)) {
     const m = await KilnVision.load(id, { quant: q, device: dev, cpuThreads, revision, endpoint, worker, onProgress: progress });
     progress_callback?.({ status: "ready", task, model: id });
+    if (t === "text-to-image") {
+      const paint = async (prompts: string | string[], o: TextToImageOptions = {}) => {
+        if (!Array.isArray(prompts)) return m.run<TextToImageResult>("text-to-image", prompts, { ...o });
+        const out: TextToImageResult[] = [];
+        // Each picture its own seed when one is given, so a batch is not one picture repeated.
+        for (const [i, p] of prompts.entries()) out.push(await m.run<TextToImageResult>("text-to-image", p, { ...o, seed: o.seed === undefined ? undefined : o.seed + i }));
+        return out;
+      };
+      return Object.assign(paint, { task, model: m, info: m.info, tokenizer: {}, dispose: () => m.unload() });
+    }
     const zeroShot = t === "zero-shot-image-classification" || t === "zero-shot-object-detection";
     const one = async (x: ImageInput, a?: unknown, b?: object) => {
       const img = await toWorkerImage(x);

@@ -313,6 +313,10 @@ scope.onmessage = async (e: MessageEvent<Request>) => {
         queue = queue.then(async () => {
           try {
             const task = msg.task as VisionTask;
+            if (task === "text-to-image") {
+              post({ id: msg.id, type: "result", result: await v.paint(msg.args[0] as string, msg.args[1] as Record<string, unknown> | undefined) });
+              return;
+            }
             const img = await readImage(msg.args[0] as ImageInput);
             const result =
               task === "zero-shot-image-classification"

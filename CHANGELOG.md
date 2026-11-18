@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+**Pictures from text.** `pipeline("text-to-image")` runs diffusers Stable Diffusion checkpoints
+whose decoder is TAESD, by default SDXS-512-DreamShaper (`IDKiro/sdxs-512-dreamshaper`, OpenRAIL++),
+which makes a 512 × 512 picture in one step: `painter(prompt, { seed, width, height,
+num_inference_steps, guidance_scale, negative_prompt })` returns `{ width, height, channels: 3, data }`.
+CLIP's text tower reads the prompt (padded to 77 tokens), the UNet (UNet2DConditionModel: ResNet
+blocks, cross-attention transformers with GEGLU, skip connections concatenated) predicts the noise,
+and TAESD turns the latent into pixels. The timestep reaches the UNet only through each ResNet
+block's time projection, so it is folded into that block's first convolution bias on the CPU. The
+scheduler is the one model_index.json names (SDXS's is DEIS, a DDIM step for one step), or Euler.
+Against diffusers 0.43 in float32 on the same latent and prompt: the text states within 5e-6, the
+latent after the step within 4e-4, the decoded pixels within half a byte level. On the CPU of an
+Intel Mac a picture takes 27 minutes (the UNet 15, the decoder 7.5); the GPU is the way to run it.
+From Python, the same pipeline returns a `RawImage`.
+
 **Kiln from Python.** The `kiln-webgpu` package in python/ (`pip install ./python` after
 `npm run build:python`) has the same pipelines: `pipeline(task, model, **options)`, called with
 the same inputs and options, with images as file paths, Pillow images, NumPy arrays or `RawImage`,

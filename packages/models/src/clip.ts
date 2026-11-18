@@ -173,6 +173,18 @@ export class ClipTextModel {
     return res;
   }
 
+  /** The final-normed hidden states [ids.length, hidden] of every row of `ids` (a diffusion model's text context). */
+  async hiddenStates(ids: readonly number[]): Promise<Float32Array> {
+    const T = ids.length;
+    if (!T || T > this.cfg.maxPositions) throw new Error(`CLIP text: sequences take 1 to ${this.cfg.maxPositions} tokens`);
+    const plan = this.plan(1, T);
+    const be = this.backend;
+    be.write(plan.ids, 0, Uint32Array.from(ids));
+    be.write(plan.pos, 0, Uint32Array.from({ length: T }, (_, t) => t));
+    be.submit(plan.dispatches);
+    return new Float32Array(await be.readback(physical(plan.out.buf), 0, T * this.cfg.hidden * 4));
+  }
+
   /** The final-normed hidden state [hidden] at row `row` of the token sequence `ids`. */
   async forward(ids: readonly number[], row: number): Promise<Float32Array> {
     return (await this.forwardBatch([ids], [row]))[0]!;

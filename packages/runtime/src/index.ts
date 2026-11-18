@@ -14,3 +14,4 @@ export { OwlDetector, owlv2Pixels, type ZeroShotDetectionOptions } from "./owl";
 export { DonutDocQA, donutPixels, donutProcessing, donutResize, type DocumentQuestionAnsweringOptions, type DonutProcessing } from "./donut";
 export * from "./tts";
 export * from "./lora";
+export * from "./diffusion";

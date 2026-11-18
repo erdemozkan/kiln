@@ -214,6 +214,10 @@ const big = await upscaler("small.png"); // { width: 2 × w, height: 2 × h, cha
 // RMBG-1.4 (non-commercial license): the image as RGBA, the background transparent.
 const remover = await pipeline("background-removal"); // briaai/RMBG-1.4
 const cutout = await remover("portrait.jpg"); // { width, height, channels: 4, data }
+
+// SDXS: a 512 × 512 picture from a prompt in one step (diffusers checkpoints with a TAESD decoder).
+const painter = await pipeline("text-to-image"); // IDKiro/sdxs-512-dreamshaper
+const picture = await painter("a lighthouse on a cliff at sunset", { seed: 42 }); // { width: 512, height: 512, channels: 3, data }
 ```
 
 With a CLIP model, `image-feature-extraction` returns the image embedding (the visual projection's

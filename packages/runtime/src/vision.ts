@@ -13,6 +13,7 @@ import { createFlorence, type Florence2, type FlorenceOptions } from "./florence
 import { createOwl, type OwlDetector, type ZeroShotDetectionOptions } from "./owl";
 import { createDonut, type DocumentQuestionAnsweringOptions, type DonutDocQA } from "./donut";
 import { createSam, type GeneratedMask, type MaskGenerationOptions, type SamSegmenter } from "./sam";
+import { createTextToImage, type GeneratedImage, type TextToImage, type TextToImageOptions } from "./diffusion";
 
 export interface VisionLoadOptions {
   /** Matrix storage: "f32" (default), "q8" or "q4". */
@@ -164,6 +165,7 @@ export class VisionEngine {
     private readonly owl?: OwlDetector,
     private readonly donut?: DonutDocQA,
     private readonly sam?: SamSegmenter,
+    private readonly painter?: TextToImage,
   ) {}
 
   get cfg(): VitConfig {
@@ -179,6 +181,7 @@ export class VisionEngine {
   /** Family, depth, width, input size and labels, for the model info. */
   summary(): { family: string; layers: number; hiddenSize: number; imageSize: number; labels: Record<number, string> } {
     const labels = (l: string[]) => Object.fromEntries(l.map((v, i) => [i, v]));
+    if (this.painter) return { family: "stable_diffusion", layers: this.painter.cfg.channels.length, hiddenSize: this.painter.cfg.crossDim, imageSize: 512, labels: {} };
     if (this.matte) return { family: "rmbg", layers: 0, hiddenSize: 0, imageSize: 1024, labels: {} };
     if (this.sam) return { family: "sam", layers: this.sam.cfg.layers, hiddenSize: this.sam.cfg.hidden, imageSize: this.sam.cfg.imageSize, labels: {} };
     if (this.donut) {
@@ -540,6 +543,13 @@ export class VisionEngine {
     return this.sam.segment(img, options);
   }
 
+  /** A picture for a prompt (a diffusers text-to-image model such as SDXS). */
+  async paint(prompt: string, options: TextToImageOptions = {}): Promise<GeneratedImage> {
+    if (!this.painter) throw new Error("this model does not make pictures from text (use a text-to-image model such as IDKiro/sdxs-512-dreamshaper)");
+    if (typeof prompt !== "string") throw new Error("text-to-image takes a prompt string");
+    return this.painter.generate(prompt, options);
+  }
+
   /** Background removal (RMBG): the image as RGBA with the matte as its alpha, as transformers.js returns it. */
   async removeBackground(img: RgbImage): Promise<{ width: number; height: number; channels: 4; data: Uint8Array }> {
     if (!this.matte) throw new Error("this model does not remove backgrounds (use a matting model such as briaai/RMBG-1.4)");
@@ -690,6 +700,7 @@ export class VisionEngine {
     this.vit?.model.destroy();
     this.detr?.model.destroy();
     this.depthModel?.model.destroy();
+    this.painter?.destroy();
     this.matte?.destroy();
     this.semantic?.model.destroy();
     this.sr?.destroy();
@@ -713,6 +724,12 @@ async function loadVision(modelId: string, opts: VisionLoadOptions): Promise<Vis
     const files = await listing;
     return !files || files.has(f);
   };
+  // A diffusers pipeline (model_index.json, its parts in folders) makes pictures from text.
+  const index = (await has("model_index.json")) && !(await listing)?.has("config.json") ? await fetchJSON<Record<string, unknown>>(fileUrl(ref, "model_index.json", ep), true) : undefined;
+  if (index) {
+    const painter = await createTextToImage(modelId, opts);
+    return new VisionEngine(painter.backend, undefined, {} as ImageProcessorConfig, {}, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, painter);
+  }
   const [config, prep, names, tokJson] = await Promise.all([
     fetchJSON<Record<string, unknown>>(fileUrl(ref, "config.json", ep)),
     has("preprocessor_config.json").then((y) => (y ? fetchJSON<ImageProcessorConfig>(fileUrl(ref, "preprocessor_config.json", ep), true) : undefined)),
