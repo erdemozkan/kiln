@@ -1,0 +1,73 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Tool calls</title>
+    <script vite-ignore src="./coi.js"></script>
+    <link rel="stylesheet" href="./src/style.css" />
+    <style>
+      .scenarios { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 8px; margin-bottom: 12px; }
+      .scenario { text-align: left; background: var(--card); color: var(--fg); border-color: var(--line); padding: 10px 12px; }
+      .scenario strong { display: block; }
+      .scenario span { display: block; font-size: 13px; color: var(--muted); }
+      .scenario[aria-pressed="true"] { border-color: var(--accent); }
+      .msg.call, .msg.result { font: 13px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; }
+      .msg.call { border-color: var(--accent); }
+      .msg.result.failed { border-color: var(--bad); }
+      details { margin: 4px 0 12px; }
+      details pre { margin: 8px 0 0; padding: 10px 12px; border: 1px solid var(--line); border-radius: 10px; background: var(--card); overflow-x: auto; font-size: 12px; }
+      label.opt { display: inline-flex; gap: 6px; align-items: center; font-size: 13px; color: var(--muted); }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>Tool calls</h1>
+      <p class="sub">
+        A chat model asks for a function, this page runs it and passes the answer back. The tools here are small functions in the page with made-up data; nothing is sent anywhere.
+        <a href="./">Playground</a>
+      </p>
+
+      <div class="row">
+        <select id="model" aria-label="Model" style="flex: 1 1 280px">
+          <option value="Qwen/Qwen2.5-0.5B-Instruct">Qwen2.5 0.5B Instruct (about 1 GB, quick)</option>
+          <option value="Qwen/Qwen2.5-1.5B-Instruct">Qwen2.5 1.5B Instruct (about 3 GB, better at picking tools)</option>
+          <option value="Qwen/Qwen3-0.6B">Qwen3 0.6B (about 1.5 GB)</option>
+          <option value="ibm-granite/granite-4.0-350m">Granite 4.0 350M (about 0.7 GB)</option>
+        </select>
+        <select id="device" aria-label="Device">
+          <option value="auto">auto</option>
+          <option value="gpu">GPU</option>
+          <option value="cpu">CPU</option>
+        </select>
+        <button id="load">Load</button>
+      </div>
+      <progress id="progress" value="0" max="1"></progress>
+      <div id="status" class="status">Pick a model and press Load. The first load downloads it; later loads come from the browser's cache.</div>
+
+      <h2 style="font-size: 16px; margin: 20px 0 8px">Scenarios</h2>
+      <div id="scenarios" class="scenarios"></div>
+
+      <textarea id="prompt" aria-label="Your message"></textarea>
+      <div class="row" style="margin-top: 8px">
+        <button id="run" disabled>Run</button>
+        <button id="stop" class="secondary" disabled>Stop</button>
+        <label class="opt">Tool choice
+          <select id="choice">
+            <option value="auto">auto (the model decides)</option>
+            <option value="required">required (must call one)</option>
+          </select>
+        </label>
+        <label class="opt"><input id="check" type="checkbox" checked /> Check calls against the tools' schemas</label>
+      </div>
+      <details>
+        <summary class="status">Tools the model is offered in this scenario</summary>
+        <pre id="specs"></pre>
+      </details>
+
+      <div id="log" class="log" aria-live="polite"></div>
+      <div id="summary" class="status"></div>
+    </main>
+    <script type="module" src="./src/tools.ts"></script>
+  </body>
+</html>

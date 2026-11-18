@@ -62,7 +62,11 @@ Gemma 4's MoE size, and memory for the 30B sizes.
 ### 3. Tool calls in chat
 
 A chat model asks for a function (`get_weather("Paris")`), the caller runs it and passes the
-answer back. Kiln's grammar-constrained output makes the call's JSON valid. Planned last.
+answer back. Kiln's grammar-constrained output makes the call's JSON valid.
+
+Done (unreleased): `runTools` runs the loop, and calls under "auto" are checked against the tools'
+schemas; see the changelog. Open: Mistral's call format, calls inside a thinking block, a Python
+`run_tools`, and a GPU run of the checked path.
 
 ## Later
 

@@ -16,6 +16,7 @@ export default defineConfig({
       input: {
         chat: resolve(__dirname, "index.html"),
         kernels: resolve(__dirname, "kernels.html"),
+        tools: resolve(__dirname, "tools.html"),
         bench: resolve(__dirname, "bench.html"),
       },
     },

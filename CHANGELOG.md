@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+**Tool calls, run and checked.** `runTools(llm, messages, { tools })` is the whole loop: each tool
+is an OpenAI-style function spec with an `execute` function; the model's calls are run, their answers
+(or `{"error": …}` when one throws or names no tool) go back as `tool` messages, and the loop ends
+when the model answers in words (`maxRounds`, default 5). It returns the answer, every step and the
+conversation. And the calls a model makes on its own (`toolChoice: "auto"`) are now generated under
+a grammar, like forced ones: text runs free until the model writes its template's call marker
+(`<tool_call>`, or Granite's `<|tool_call|>`), then the name must be one of the tools and the
+arguments must follow its `parameters` schema, and free text resumes after the call
+(`checkToolCalls: false` for the old behaviour; Mistral's format is not checked). Free text keeps its
+speed: only the call waits for the grammar's masks. On Qwen2.5-0.5B (q8, an Intel Mac's CPU) the
+checked reply to a weather question is the same 26 tokens as the unchecked one, with 16 ms of mask
+time, and the round trip ends in "The current weather in Paris is 18°C". The playground has a page to
+try it (tools.html): nine scenarios with tools that run in the page.
+
 **Mixture-of-experts language models.** Qwen3-MoE (safetensors and GGUF `qwen3moe`) and
 Granite-MoE (`granitemoe`, e.g. granite-3.0-1b-a400m) load like any other model. In each MoE layer a
 router picks the top k experts per token (their softmax renormalized, or their share of the full

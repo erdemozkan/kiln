@@ -57,7 +57,7 @@ export type ResponseFormat =
    * (the format of Qwen, SmolLM3 and Hermes-style templates), with the arguments following the
    * function's `parameters` schema. Whitespace inside the JSON is compact.
    */
-  | { type: "tool_call"; tools: { name: string; parameters?: JsonSchema }[] };
+  | { type: "tool_call"; tools: { name: string; parameters?: JsonSchema }[]; syntax?: ToolCallSyntax };
 
 const utf8 = new TextEncoder();
 const lit = (s: string): Node => ({ kind: "lit", bytes: utf8.encode(s) });
@@ -338,24 +338,31 @@ export function compileFormat(f: ResponseFormat): Node {
     if (!f.choices.length) throw new Error("choice format needs at least one choice");
     return { kind: "alt", nodes: f.choices.map(lit) };
   }
-  if (f.type === "tool_call") return toolCallGrammar(f.tools);
+  if (f.type === "tool_call") return toolCallGrammar(f.tools, f.syntax);
   if (f.type === "regex") return regexNode(f.pattern);
   if (f.type === "grammar") return gbnfNode(f.grammar, f.root);
   throw new Error(`unknown response format ${JSON.stringify(f)}`);
 }
 
+/**
+ * How a `tool_call` format writes its calls. "tags" (default): one call as
+ * `<tool_call>\n{…}\n</tool_call>`. "tags_body": the same after an opening tag the model already
+ * wrote, and "tags_inner" without the closing tag as well (the caller writes it). "list_body":
+ * Granite's JSON list of one or more calls, after its `<|tool_call|>` marker.
+ */
+export type ToolCallSyntax = "tags" | "tags_body" | "tags_inner" | "list_body";
+
 /** See the `tool_call` response format. */
-export function toolCallGrammar(tools: readonly { name: string; parameters?: JsonSchema }[]): Node {
+export function toolCallGrammar(tools: readonly { name: string; parameters?: JsonSchema }[], syntax: ToolCallSyntax = "tags"): Node {
   if (!tools.length) throw new Error("tool_call format needs at least one tool");
-  const call = compileSchema(
-    {
-      anyOf: tools.map((t) => ({
-        type: "object",
-        properties: { name: { const: t.name }, arguments: t.parameters ?? { type: "object" } },
-        required: ["name", "arguments"],
-      })),
-    },
-    COMPACT,
-  );
-  return { kind: "seq", nodes: [lit("<tool_call>\n"), call, lit("\n</tool_call>")] };
+  const one: JsonSchema = {
+    anyOf: tools.map((t) => ({
+      type: "object",
+      properties: { name: { const: t.name }, arguments: t.parameters ?? { type: "object" } },
+      required: ["name", "arguments"],
+    })),
+  };
+  if (syntax === "list_body") return compileSchema({ type: "array", items: one, minItems: 1 }, COMPACT);
+  const call = compileSchema(one, COMPACT);
+  return { kind: "seq", nodes: [lit(syntax === "tags" ? "<tool_call>\n" : "\n"), call, lit(syntax === "tags_inner" ? "\n" : "\n</tool_call>")] };
 }

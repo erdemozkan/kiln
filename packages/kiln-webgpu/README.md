@@ -259,6 +259,39 @@ SST-2 model: 7 of 8), 6 of 6 extractive answers including null for both unanswer
 all typed right and none invented (BERT-NER found all 13: for the standard types a dedicated model
 is still better; the LLM's are your own types).
 
+## Tool calls
+
+A chat model asks for a function; `runTools` runs it and passes the answer back, until the model
+answers in words:
+
+```js
+import { load, runTools } from "kiln-webgpu";
+
+const llm = await load("Qwen/Qwen2.5-0.5B-Instruct");
+const { content, steps } = await runTools(llm, [{ role: "user", content: "What's the weather in Paris, in celsius?" }], {
+  tools: [
+    {
+      type: "function",
+      function: {
+        name: "get_weather",
+        description: "Get the current weather in a city.",
+        parameters: { type: "object", properties: { city: { type: "string" }, unit: { enum: ["celsius", "fahrenheit"] } }, required: ["city", "unit"] },
+      },
+      execute: async ({ city, unit }) => ({ city, temperature: 18, unit }),
+    },
+  ],
+  onText: (delta) => console.log(delta),
+});
+```
+
+`steps` lists each call with its result or error (a function that throws is answered with
+`{"error": …}`, which the model reads), and `messages` is the whole conversation, ready for the next
+turn. `maxRounds` (default 5) bounds the loop; `toolChoice: "required"` forces a call in the first
+reply. Calls are generated under a grammar, so the name is always one of your tools and the
+arguments always follow its `parameters` schema (`checkToolCalls: false` turns that off). To run the
+loop yourself, pass `tools` to `llm.chat()` and read the reply with `parseToolCalls`. The model's
+chat template must support tools (Qwen2.5, Qwen3, Granite, Mistral; SmolLM2 does not).
+
 ## Retrieval (RAG)
 
 Embeddings, an index and generation in one library:

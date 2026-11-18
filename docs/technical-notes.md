@@ -1418,10 +1418,14 @@ Known limits, roughly in roadmap order:
   several tokens). Regexes have no backreferences, lookaround or word boundaries; GBNF rules may not
   be left-recursive; a string with `pattern` cannot also have
   `minLength`/`maxLength`.
-  `toolChoice` forces one call; under "auto" calls are not checked against the tool schemas.
+  `toolChoice` forces one call. Under "auto" the model's own calls are checked too (`checkToolCalls`,
+  on by default): text runs unconstrained, with the template's call marker as a stop token; after the
+  marker the call runs under the grammar, and free text resumes from the cache. That needs the marker
+  to be one token (`<tool_call>`, Granite's `<|tool_call|>`), so Mistral's calls are not checked, and a
+  marker written inside a thinking block opens a call there.
 - Q6_K (scales every 16 values) is rounded to q8 on load rather than run as stored; the other GGUF
   block types are held exactly.
-- `toolChoice` only constrains the `<tool_call>` format.
+- `toolChoice` only constrains the `<tool_call>` format (the check under "auto" also covers Granite's list).
 - Single storage binding per tensor: very large f32 embeddings can exceed `maxStorageBufferBindingSize`
   (use q4 or q8).
 - Images: Gemma 3 (from its transformers checkpoint or llama.cpp's mmproj GGUF) and SmolVLM; for

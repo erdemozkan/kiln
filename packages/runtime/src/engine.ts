@@ -4,6 +4,7 @@ import { GEMMA4_VIDEO_FRAME_TOKENS, QWEN_VIDEO_PAIR_TOKENS, Gemma4VisionTower, L
 import { GEMMA4_AUDIO_MAX_SAMPLES, gemma4AudioFeatures, resizeImage } from "@kiln/loader";
 import type { StepParams } from "@kiln/core";
 import { idefics3PromptString, idefics3Tiles } from "./idefics3";
+import { checkedToolCalls, type CallCheck } from "./tool-calls";
 import { detectChatFormat, type ChatDocument, type ChatFormat, type ChatMessage, type Tokenizer, type ToolSpec } from "@kiln/tokenizers";
 import { SubmitPacer } from "./pace";
 import { PrefixStore } from "./prefix-store";
@@ -54,6 +55,13 @@ export interface GenerateOptions {
    * response format). Needs a template in the `<tool_call>` format; not combined with `format`.
    */
   toolChoice?: "auto" | "required" | { type: "function"; function: { name: string } };
+  /**
+   * Under toolChoice "auto": check the calls the model makes (default true). Text is generated
+   * freely; once the model writes its template's call marker (`<tool_call>`, or Granite's
+   * `<|tool_call|>`), the call is generated under a grammar, so its name is one of `tools` and its
+   * arguments follow that tool's `parameters` schema. Other call formats (Mistral's) are not checked.
+   */
+  checkToolCalls?: boolean;
   /**
    * Constrain the output: `{ type: "json" }` for any JSON value, `{ type: "json", schema }` for a JSON
    * Schema (properties in declared order), `{ type: "choice", choices }` for one of a set of strings,
@@ -817,6 +825,18 @@ export class Engine {
     for (let i = this.states.length - 1; i >= 0; i--) if (holds(this.states[i]!.tokens) >= 0) this.dropState(i);
   }
 
+  /** The check for calls the model makes on its own, when this reply can make them and the template's format is known. */
+  private callCheck(opts: GenerateOptions): CallCheck | undefined {
+    if (!opts.tools?.length || opts.format || (opts.toolChoice ?? "auto") !== "auto" || opts.checkToolCalls === false) return undefined;
+    const syntax = this.chatFormat?.toolCallTags ? "tags_body" : this.chatFormat?.toolCallList ? "list_body" : undefined;
+    if (!syntax) return undefined;
+    // The marker must be one token: that is what ends the free text.
+    const trigger = this.tokenizer.tokenId(syntax === "tags_body" ? "<tool_call>" : "<|tool_call|>");
+    if (trigger === undefined) return undefined;
+    const close = syntax === "tags_body" ? this.tokenizer.tokenId("</tool_call>") : undefined;
+    return { trigger, close, format: { type: "tool_call", syntax: close === undefined ? syntax : "tags_inner", tools: opts.tools.map((t) => ({ name: t.function.name, parameters: t.function.parameters })) } };
+  }
+
   /** `opts` with `toolChoice` turned into a `tool_call` format. */
   private forceToolCall(opts: GenerateOptions): GenerateOptions {
     const choice = opts.toolChoice ?? "auto";
@@ -951,7 +971,21 @@ export class Engine {
   /** Generates from prompt ids, yielding text as it decodes. */
   private async *decodeIds(ids: readonly number[], opts: GenerateOptions): AsyncGenerator<TextDelta> {
     const decoder = this.tokenizer.decoder();
-    for await (const id of this.generateTokens(ids, opts)) {
+    const check = this.callCheck(opts);
+    const tokens = check
+      ? checkedToolCalls(
+          ids,
+          opts,
+          check,
+          (p, o) => this.generateTokens(p, o),
+          () => ({ stats: this.lastStats, stopId: this.lastStopId }),
+          (stats, stopId) => {
+            this.lastStats = stats ?? this.lastStats;
+            this.lastStopId = stopId;
+          },
+        )
+      : this.generateTokens(ids, opts);
+    for await (const id of tokens) {
       const text = decoder.push(id);
       if (text) yield { text, tokenId: id };
     }

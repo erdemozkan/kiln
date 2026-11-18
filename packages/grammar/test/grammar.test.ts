@@ -244,6 +244,19 @@ describe("tool call grammar", () => {
     expect(match(f, '<tool_call>\n{"name": "set_').prefix).toBe(false);
     expect(() => compileFormat({ type: "tool_call", tools: [] })).toThrow(/at least one tool/);
   });
+
+  it("writes the call after a tag the model already wrote, or as Granite's list of calls", () => {
+    const body: ResponseFormat = { ...f, syntax: "tags_body" };
+    expect(full(body, '\n{"name": "get_weather", "arguments": {"city": "Paris"}}\n</tool_call>')).toBe(true);
+    expect(match(body, '<tool_call>\n{"name"').prefix).toBe(false);
+    expect(full({ ...f, syntax: "tags_inner" }, '\n{"name": "get_time", "arguments": {}}\n')).toBe(true);
+    expect(match(body, '\n{"name": "get_wether"').prefix).toBe(false);
+    const list: ResponseFormat = { ...f, syntax: "list_body" };
+    expect(full(list, '[{"name": "get_weather", "arguments": {"city": "Paris", "unit": "celsius"}}]')).toBe(true);
+    expect(full(list, '[{"name": "get_time", "arguments": {}}, {"name": "get_weather", "arguments": {"city": "Rome"}}]')).toBe(true);
+    expect(match(list, "[]").full).toBe(false);
+    expect(match(list, '[{"name": "other"').prefix).toBe(false);
+  });
 });
 
 describe("token masks", () => {
