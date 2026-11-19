@@ -6,7 +6,7 @@ import type { BenchResult, KernelTime } from "./bench.worker";
  * render (`.grow`) and every mark has a <title> for an exact-value tooltip.
  */
 
-const esc = (s: string) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;");
+const esc = (s: string) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/"/g, "&quot;");
 const fmt = (v: number, digits = 1) => v.toFixed(digits);
 
 /** A round axis maximum at or above `v` (1, 2, 2.5 or 5 × 10^n). */

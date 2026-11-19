@@ -60,6 +60,14 @@ class Codec(unittest.TestCase):
         with self.assertRaises(KilnError):
             encode(object(), [], [])
 
+    def test_tags_in_a_models_own_text_stay_plain(self):
+        """A tool call's arguments can hold the codec's keys; only Kiln's exact tags are read as tags."""
+        from kiln_webgpu._codec import decode
+        for forged in ({"$blob": 3, "dtype": "uint8"}, {"$blob": "x", "dtype": "uint8"}, {"$blob": 0, "dtype": "nope"}, {"$float": 1}, {"$float": "1e999"}, {"$bigint": "9" * 5000}, {"$bigint": "12", "x": 1}):
+            self.assertEqual(decode(forged, [b"abc"]), forged)
+        self.assertEqual(decode({"$bigint": "-12"}, []), -12)
+        self.assertEqual(decode({"$float": "-Infinity"}, []), float("-inf"))
+
     def test_gpu_off_on_old_macos(self):
         from kiln_webgpu._bridge import gpu_blocked
 
@@ -170,6 +178,32 @@ class ThroughNode(unittest.TestCase):
         self.assertNotIn("toolChoice", asked[1][1])
         with self.assertRaisesRegex(KilnError, "at least one tool"):
             kiln_webgpu.run_tools(Scripted(), [], [])
+
+    def test_run_tools_results_the_model_can_read(self):
+        call = lambda name: '<tool_call>\n{"name": "%s", "arguments": {}}\n</tool_call>' % name
+        replies = [call("city") + call("when"), "ok"]
+
+        class Scripted:
+            n = 0
+
+            def stream(self, messages, **options):
+                Scripted.n += 1
+                self.options = options
+                yield replies[Scripted.n - 1]
+
+        import datetime
+        tools = [
+            {"type": "function", "function": {"name": "city"}, "execute": lambda: {"city": "Niğde"}},
+            {"type": "function", "function": {"name": "when"}, "execute": lambda: datetime.datetime(2026, 1, 1)},
+        ]
+        chat = Scripted()
+        r = kiln_webgpu.run_tools(chat, [{"role": "user", "content": "?"}], tools, tool_choice="required")
+        self.assertEqual(r["messages"][2]["content"], '{"city": "Niğde"}')
+        self.assertIn("not JSON serializable", r["steps"][1]["error"])
+        self.assertIn("not JSON serializable", r["messages"][3]["content"])
+        self.assertNotIn("tool_choice", chat.options)
+        with self.assertRaises(kiln_webgpu.KilnError):
+            kiln_webgpu.run_tools(chat, [], tools + [tools[0]])
 
     def test_errors_come_back(self):
         with self.assertRaisesRegex(KilnError, "no function"):

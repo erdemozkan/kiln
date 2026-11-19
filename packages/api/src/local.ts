@@ -103,6 +103,8 @@ interface NodePath {
   resolve(...parts: string[]): string;
   join(...parts: string[]): string;
   basename(path: string, ext?: string): string;
+  relative(from: string, to: string): string;
+  isAbsolute(path: string): boolean;
 }
 interface NodeOs {
   homedir(): string;
@@ -165,6 +167,9 @@ export async function resolveModel(id: string): Promise<string> {
   if (env.allowLocalModels && !/^(@local\/|https?:)/i.test(id)) {
     const { fs, path } = nodeModules()!;
     const dir = path.resolve(env.localModelPath, id);
+    // Only what lies under localModelPath: a name such as "../../x" is not a model of that folder.
+    const inside = path.relative(path.resolve(env.localModelPath), dir);
+    if (!inside || inside.startsWith("..") || path.isAbsolute(inside)) return id;
     const stat = fs.statSync(dir, { throwIfNoEntry: false });
     if (stat?.isDirectory() || (stat?.isFile() && /\.gguf$/i.test(id))) return localModel(dir);
   }

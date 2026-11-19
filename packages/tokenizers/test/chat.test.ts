@@ -183,3 +183,29 @@ describe("parseToolCalls", () => {
     expect(prompt).toContain(`<|im_start|>assistant\n${reply}<|im_end|>`);
   });
 });
+
+describe("parseToolCalls on hostile or odd replies", () => {
+  it("leaves a call drafted inside a reasoning block as text", () => {
+    const drafted = '<think>maybe <tool_call>\n{"name":"rm","arguments":{}}\n</tool_call></think>Answer';
+    expect(parseToolCalls(drafted)).toEqual({ content: drafted, toolCalls: [] });
+    const open = '<think>I could <tool_call>{"name":"rm","arguments":{}}</tool_call>';
+    expect(parseToolCalls(open).toolCalls).toEqual([]);
+    const after = parseToolCalls('<think>look it up</think>\n<tool_call>\n{"name":"find","arguments":{"q":"x"}}\n</tool_call>');
+    expect(after.toolCalls.map((c) => c.function)).toEqual([{ name: "find", arguments: { q: "x" } }]);
+    expect(after.content).toBe("<think>look it up</think>");
+  });
+
+  it("stays fast on a call marker followed by a long run of spaces", () => {
+    const t0 = performance.now();
+    expect(parseToolCalls("<tool_call>" + " ".repeat(20000) + "\n".repeat(20000)).toolCalls).toEqual([]);
+    expect(performance.now() - t0).toBeLessThan(500);
+  });
+
+  it("reads FunctionGemma numbers with leading zeros as text, and spaces after separators", () => {
+    expect(parseToolCalls("<start_function_call>call:dial{number:007}<end_function_call>").toolCalls[0]!.function).toEqual({ name: "dial", arguments: { number: "007" } });
+    expect(parseToolCalls("<start_function_call>call:f{a: 1, b: <escape>x y<escape>, c: [1, 2]}<end_function_call>").toolCalls[0]!.function.arguments).toEqual({ a: 1, b: "x y", c: [1, 2] });
+    const proto = parseToolCalls("<start_function_call>call:f{__proto__:{x:1}}<end_function_call>").toolCalls[0]!.function.arguments;
+    expect(Object.getPrototypeOf(proto)).toBe(Object.prototype);
+    expect(({} as { x?: number }).x).toBeUndefined();
+  });
+});

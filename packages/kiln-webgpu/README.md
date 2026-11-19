@@ -287,8 +287,9 @@ const { content, steps } = await runTools(llm, [{ role: "user", content: "What's
 `steps` lists each call with its result or error (a function that throws is answered with
 `{"error": …}`, which the model reads), and `messages` is the whole conversation, ready for the next
 turn. `maxRounds` (default 5) bounds the loop; `toolChoice: "required"` forces a call in the first
-reply. Calls are generated under a grammar, so the name is always one of your tools and the
-arguments always follow its `parameters` schema (`checkToolCalls: false` turns that off). To run the
+reply. For models that write calls in `<tool_call>` tags (Qwen, Hermes, Granite), calls are
+generated under a grammar, so the name is one of your tools and the arguments follow its
+`parameters` schema (`checkToolCalls: false` turns that off). To run the
 loop yourself, pass `tools` to `llm.chat()` and read the reply with `parseToolCalls`. The model's
 chat template must support tools (Qwen2.5, Qwen3, Granite, Mistral; SmolLM2 does not).
 
@@ -308,12 +309,12 @@ const { content } = await runTools(llm, [
 
 | Skill | What it does | Network |
 | --- | --- | --- |
-| `calculate` | Exact arithmetic on an expression (its own parser; the model's text is never run as code) | none |
+| `calculate` | Arithmetic on an expression, exact for whole numbers up to 2^53 (its own parser; the model's text is never run as code) | none |
 | `get_date_time` | The date and time now, here or in a city or IANA time zone | none |
 | `search_wikipedia` | The start of the best matching Wikipedia article, in any language edition | the query goes to Wikipedia |
 | `read_web_page` | A page's readable text | the address goes to that site |
 
-`read_web_page` refuses this machine and private networks by default (`allowUrl` decides), and in a
+`read_web_page` refuses this machine, private networks and the page's own site by default (`allowUrl` decides), and in a
 browser it can only read sites that allow other pages to (most do not; Wikipedia articles go through
 Wikipedia's API, which does). `maxChars` (default 2000) bounds the text a skill hands the model.
 Each skill is also exported alone (`calculatorSkill()` …), to mix with your own tools. The smallest

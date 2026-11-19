@@ -117,12 +117,16 @@ def decode(v, blobs):
         return [decode(x, blobs) for x in v]
     if not isinstance(v, dict):
         return v
-    if "$blob" in v:
-        data = blobs[v["$blob"]]
+    # The tags are read only in the exact form Kiln writes them: text a model wrote (a tool call's
+    # arguments) can hold these keys too, and then it is a plain dict.
+    keys = set(v)
+    index = v.get("$blob")
+    if keys == {"$blob", "dtype"} and type(index) is int and 0 <= index < len(blobs) and v["dtype"] in TYPECODES:
+        data = blobs[index]
         return Tensor(v["dtype"], [len(data) // struct.calcsize(TYPECODES[v["dtype"]])], data)
-    if "$bigint" in v:
+    if keys == {"$bigint"} and isinstance(v["$bigint"], str) and len(v["$bigint"]) <= 400 and v["$bigint"].lstrip("-").isdigit():
         return int(v["$bigint"])
-    if "$float" in v:
+    if keys == {"$float"} and v["$float"] in ("NaN", "Infinity", "-Infinity"):
         return float(v["$float"].replace("Infinity", "inf"))
     d = {k: decode(x, blobs) for k, x in v.items()}
     data = d.get("data")

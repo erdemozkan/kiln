@@ -153,7 +153,7 @@ def run_tools(pipe, messages, tools, max_rounds=5, on_text=None, on_tool_call=No
 
     `execute` is called with the call's arguments as keyword arguments; what it returns goes back to
     the model as JSON, and an exception as {"error": message}, which the model reads. Other keyword
-    arguments are the pipeline's options (`max_new_tokens`, `temperature`, `toolChoice` for the first
+    arguments are the pipeline's options (`max_new_tokens`, `temperature`, `tool_choice` for the first
     reply only ...). `on_text(piece)` receives the model's text as it is written, `on_tool_call(step)`
     each finished call.
 
@@ -165,11 +165,14 @@ def run_tools(pipe, messages, tools, max_rounds=5, on_text=None, on_tool_call=No
         raise KilnError("run_tools needs at least one tool")
     specs = [{k: v for k, v in t.items() if k != "execute"} for t in tools]
     by_name = {t["function"]["name"]: t for t in tools}
+    if len(by_name) < len(tools):
+        raise KilnError("two tools share a name; each tool needs its own")
     for t in tools:
         if not callable(t.get("execute")):
             raise KilnError("tool %r has no function under \"execute\"" % t["function"]["name"])
     options = dict(options)
-    choice = options.pop("toolChoice", None)
+    choice = options.pop("tool_choice", None)
+    choice = options.pop("toolChoice", choice)
     history = list(messages)
     steps = []
     content = ""
@@ -193,14 +196,18 @@ def run_tools(pipe, messages, tools, max_rounds=5, on_text=None, on_tool_call=No
             try:
                 if name not in by_name:
                     raise KilnError("no tool named %r" % name)
-                step["result"] = by_name[name]["execute"](**call["function"]["arguments"])
+                result = by_name[name]["execute"](**call["function"]["arguments"])
+                # Characters as they are (not \uXXXX): the model reads this text. A result JSON
+                # cannot hold (a datetime, a set) is the tool's error, like one it raised.
+                answer = result if isinstance(result, str) else json.dumps(result, ensure_ascii=False)
+                step["result"] = result
             except Exception as err:  # the model gets to read what went wrong
                 step["error"] = str(err)
+                answer = json.dumps({"error": step["error"]}, ensure_ascii=False)
             steps.append(step)
             if on_tool_call:
                 on_tool_call(step)
-            answer = {"error": step["error"]} if "error" in step else step["result"]
-            message = {"role": "tool", "name": name, "content": answer if isinstance(answer, str) else json.dumps(answer)}
+            message = {"role": "tool", "name": name, "content": answer}
             if call.get("id"):
                 message["tool_call_id"] = call["id"]
             history.append(message)

@@ -205,7 +205,8 @@ export function detectChatFormat(tok: Tokenizer): ChatFormat {
   throw new Error("this model has no chat template, and its tokenizer matches no built-in format (chatml, llama3)");
 }
 
-const TOOL_CALL = /<tool_call>\s*([\s\S]*?)\s*<\/tool_call>/g;
+// No `\s*` around the body: next to the lazy group it backtracks cubically on a run of spaces.
+const TOOL_CALL = /<tool_call>([\s\S]*?)<\/tool_call>/g;
 
 /**
  * Special tokens that mark tool calls. The decoder keeps them in the text (it drops other special
@@ -311,6 +312,7 @@ const ESCAPE = "<escape>";
  * where it ends, or undefined if `s` does not hold one there.
  */
 function gemmaValue(s: string, i: number): [unknown, number] | undefined {
+  while (s[i] === " ") i++;
   if (s.startsWith(ESCAPE, i)) {
     const end = s.indexOf(ESCAPE, i + ESCAPE.length);
     return end < 0 ? undefined : [s.slice(i + ESCAPE.length, end), end + ESCAPE.length];
@@ -333,10 +335,13 @@ function gemmaValue(s: string, i: number): [unknown, number] | undefined {
       if (!key || s[i] !== ":") return undefined;
       const v = gemmaValue(s, i + 1);
       if (!v) return undefined;
-      out[key] = v[0];
+      // Not `out[key] =`: a key named __proto__ would replace the object's prototype.
+      Object.defineProperty(out, key, { value: v[0], enumerable: true, writable: true, configurable: true });
       i = v[1];
+      while (s[i] === " ") i++;
       if (s[i] === ",") i++;
       else if (s[i] !== "}") return undefined;
+      while (s[i] === " ") i++;
     }
     return [out, i + 1];
   }
@@ -348,13 +353,20 @@ function gemmaValue(s: string, i: number): [unknown, number] | undefined {
       if (!v) return undefined;
       out.push(v[0]);
       i = v[1];
+      while (s[i] === " ") i++;
       if (s[i] === ",") i++;
       else if (s[i] !== "]") return undefined;
     }
     return [out, i + 1];
   }
   const word = /^(true|false|null|-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)(?=[,}\]]|$)/.exec(s.slice(i, i + 40));
-  if (word) return [JSON.parse(word[0]), i + word[0].length];
+  if (word) {
+    try {
+      return [JSON.parse(word[0]), i + word[0].length];
+    } catch {
+      // "007": digits JSON does not take as a number. It is a string, read below.
+    }
+  }
   // A bare word: a string the model forgot to escape. It ends at the next separator.
   const bare = /^[^,}\]<]+/.exec(s.slice(i));
   return bare ? [bare[0].trim(), i + bare[0].length] : undefined;
@@ -393,12 +405,25 @@ function gemmaCalls(text: string): { content: string; toolCalls: ToolCall[] } {
  * (and object arguments) stays in the text.
  */
 export function parseToolCalls(text: string): { content: string; toolCalls: ToolCall[] } {
+  // A call drafted inside a reasoning block is thought, not a request: only what follows the
+  // reasoning is read for calls (and nothing, while the block is still open).
+  const think = text.lastIndexOf("</think>");
+  if (think >= 0 || text.includes("<think>")) {
+    if (think < 0) return { content: text, toolCalls: [] };
+    const head = text.slice(0, think + 8);
+    const rest = callsIn(text.slice(think + 8));
+    return rest.toolCalls.length ? { content: (head + rest.content).trim(), toolCalls: rest.toolCalls } : { content: text, toolCalls: [] };
+  }
+  return callsIn(text);
+}
+
+function callsIn(text: string): { content: string; toolCalls: ToolCall[] } {
   if (text.includes("<start_function_call>")) return gemmaCalls(text);
   const toolCalls: ToolCall[] = [];
   let content = text.replace(TOOL_CALL, (block, body: string) => {
     let v: unknown;
     try {
-      v = JSON.parse(body);
+      v = JSON.parse(body.trim());
     } catch {
       return block;
     }

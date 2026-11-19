@@ -143,6 +143,21 @@ export function defaultMaxSeq(cfg: LlamaConfig, kvDtype: KvDtype = "f16"): numbe
   return n;
 }
 
+/**
+ * The context length a model would be made with, or an error for options it cannot take: called
+ * by the constructor, and by a loader before it downloads the weights.
+ */
+export function checkModelOptions(cfg: LlamaConfig, opts: Pick<LlamaOptions, "maxSeq" | "kvDtype"> = {}): number {
+  const kvDtype = opts.kvDtype ?? "f16";
+  const maxSeq = opts.maxSeq ?? defaultMaxSeq(cfg, kvDtype);
+  if (cfg.maxPositions !== undefined && maxSeq > cfg.maxPositions) throw new Error(`maxSeq ${maxSeq} is past the ${cfg.maxPositions} tokens this model's rotary factors are loaded for`);
+  const dims = [cfg.headDim, ...(cfg.layerHeadDims ?? [])];
+  if (kvDtype === "q4" && dims.some((d) => d % 32 !== 0)) throw new Error("the q4 cache holds heads of a multiple of 32 values; use f16, f8 or i8 for this model");
+  if (kvDtype === "q4" && dims.some((d) => d > 2 * ATTN_WG)) throw new Error(`the q4 cache does not hold heads wider than ${2 * ATTN_WG}; use f16 or f8 for this model`);
+  if (kvDtype === "i8" && cfg.layerHeadDims?.some((d) => d > ATTN_WG)) throw new Error(`the i8 cache does not hold heads wider than ${ATTN_WG}; use f16 or f8 for this model`);
+  return maxSeq;
+}
+
 /** Most rows a verify plan can have (the last token plus a draft of up to 31). */
 export const MAX_VERIFY_ROWS = 32;
 
@@ -194,80 +209,80 @@ export class LlamaModel {
     opts: LlamaOptions = {},
   ) {
     this.kvDtype = opts.kvDtype ?? "f16";
-    this.imageFeatures = opts.imageTokens ? backend.alloc(opts.imageTokens * cfg.hiddenSize * 4, "storage", "image/features") : undefined;
-    this.maxSeq = opts.maxSeq ?? defaultMaxSeq(cfg, this.kvDtype);
-    if (cfg.maxPositions !== undefined && this.maxSeq > cfg.maxPositions) {
-      throw new Error(`maxSeq ${this.maxSeq} is past the ${cfg.maxPositions} tokens this model's rotary factors are loaded for`);
-    }
-    this.step = backend.alloc(STEP_BYTES, "storage", "step");
-    if (cfg.kvFrom) this.tailStep = backend.alloc(STEP_BYTES, "storage", "step/tail");
-    this.history = backend.alloc(this.maxSeq * 4, "storage", "history");
-    this.seen = backend.alloc(Math.ceil(cfg.vocabSize / 32) * 4, "storage", "seen");
-    this.allowed = backend.alloc((1 + Math.ceil(cfg.vocabSize / 32)) * 4, "storage", "allowed");
-    this.allowedRows = backend.alloc(MAX_VERIFY_ROWS * (1 + Math.ceil(cfg.vocabSize / 32)) * 4, "storage", "allowed/rows");
-    this.setAllowed(undefined);
-    this.activations = new ActivationPool(backend);
-    if (this.kvDtype === "q4" && [cfg.headDim, ...(cfg.layerHeadDims ?? [])].some((d) => d % 32 !== 0)) throw new Error("the q4 cache holds heads of a multiple of 32 values; use f16, f8 or i8 for this model");
-    if (this.kvDtype === "q4" && [cfg.headDim, ...(cfg.layerHeadDims ?? [])].some((d) => d > 2 * ATTN_WG)) throw new Error(`the q4 cache does not hold heads wider than ${2 * ATTN_WG}; use f16 or f8 for this model`);
-    if (this.kvDtype === "i8" && cfg.layerHeadDims?.some((d) => d > ATTN_WG)) throw new Error(`the i8 cache does not hold heads wider than ${ATTN_WG}; use f16 or f8 for this model`);
-    for (let l = 0; l < cfg.numLayers; l++) {
-      const slots = ringSlots(cfg, this.maxSeq, l);
-      this.slots.push(slots);
-      // A layer without a cache (linear attention) keeps one word, so every layer has its buffers.
-      this.kv.push({
-        k: backend.alloc(Math.max(4, slots * kvRowBytesOf(cfg, this.kvDtype, l, "k")), "storage", `kv/${l}/k`),
-        v: backend.alloc(Math.max(4, slots * kvRowBytesOf(cfg, this.kvDtype, l, "v")), "storage", `kv/${l}/v`),
-      });
-      if (cfg.linearLayers?.[l]) {
-        const g = cfg.linear!;
-        const channels = 2 * g.keyHeads * g.keyDim + g.valueHeads * g.valueDim;
-        this.linearState.set(l, {
-          s: backend.alloc(g.valueHeads * g.valueDim * g.keyDim * 4, "storage", `linear/${l}/state`),
-          conv: backend.alloc((g.convKernel - 1) * channels * 4, "storage", `linear/${l}/conv`),
-        });
-      }
-    }
-    if (cfg.linear) {
-      // x · rsqrt(Σx² + 1e-6) is RMSNorm with eps 1e-6 / D and a weight of 1 / √D.
-      const D = cfg.linear.keyDim;
-      const w = new Float32Array(D).fill(1 / Math.sqrt(D));
-      const buf = backend.alloc(w.byteLength, "storage", "linear/l2");
-      backend.write(buf, 0, w);
-      this.l2Weight = { shape: [D], dtype: "f32", buf };
-      this.resetState();
-    }
-    const freqs = (f: Float32Array, label: string): Tensor => {
-      const buf = backend.alloc(f.byteLength, "storage", label);
-      backend.write(buf, 0, f);
-      return { shape: [f.length], dtype: "f32", buf };
-    };
-    // With two head sizes (Gemma 4), the full-attention layers' is the one `ropeTheta` and its options describe.
-    const fullLayer = cfg.slidingLayers?.indexOf(false) ?? 0;
-    this.invFreq = freqs(ropeInvFreq({ ...cfg, headDim: headDimOf(cfg, Math.max(0, fullLayer)) }), "rope/inv_freq");
-    this.localInvFreq =
-      cfg.ropeLocalTheta !== undefined && (cfg.ropeLocalTheta !== cfg.ropeTheta || cfg.ropeLinear || cfg.layerHeadDims || cfg.ropeProportional !== undefined)
-        ? freqs(ropeInvFreq({ headDim: cfg.headDim, ropeTheta: cfg.ropeLocalTheta }), "rope/inv_freq/local")
-        : this.invFreq;
-    this.w("model.embed_tokens.weight");
-    const fuse = typeof opts.fuse === "object" ? { qkv: true, mlp: true, ...opts.fuse } : { qkv: opts.fuse ?? true, mlp: opts.fuse ?? true };
-    // Phi-3 checkpoints store qkv already stacked.
-    // Qwen 3.5's q_proj carries a gate beside each query, and not every layer has attention: its q/k/v stay apart.
-    this.fusedQkv = weights.has("model.layers.0.self_attn.qkv.weight") || (fuse.qkv && !cfg.linearLayers && !cfg.valueNorm && !cfg.kvFrom && !cfg.layerHeadDims && this.fuse("self_attn", ["q_proj", "k_proj", "v_proj"], "qkv", cfg.attentionBias));
-    // Granite 4 and Phi-3 checkpoints store gate_up already stacked.
-    this.fusedMlp = weights.has("model.layers.0.mlp.gate_up.weight") || (fuse.mlp && this.fuse("mlp", ["gate_proj", "up_proj"], "gate_up", false));
-    // A mixture of experts runs from one stacked tensor per projection, the experts in turn: gate, up
-    // and down (a GGUF file has them so), or [gate; up] per expert and down (Granite's checkpoints).
-    if (cfg.moe) {
+    this.maxSeq = checkModelOptions(cfg, opts);
+    try {
+      this.imageFeatures = opts.imageTokens ? backend.alloc(opts.imageTokens * cfg.hiddenSize * 4, "storage", "image/features") : undefined;
+      this.step = backend.alloc(STEP_BYTES, "storage", "step");
+      if (cfg.kvFrom) this.tailStep = backend.alloc(STEP_BYTES, "storage", "step/tail");
+      this.history = backend.alloc(this.maxSeq * 4, "storage", "history");
+      this.seen = backend.alloc(Math.ceil(cfg.vocabSize / 32) * 4, "storage", "seen");
+      this.allowed = backend.alloc((1 + Math.ceil(cfg.vocabSize / 32)) * 4, "storage", "allowed");
+      this.allowedRows = backend.alloc(MAX_VERIFY_ROWS * (1 + Math.ceil(cfg.vocabSize / 32)) * 4, "storage", "allowed/rows");
+      this.setAllowed(undefined);
+      this.activations = new ActivationPool(backend);
       for (let l = 0; l < cfg.numLayers; l++) {
-        if (!cfg.moe.layers[l]) continue;
-        const p = `model.layers.${l}.mlp.experts`;
-        if (weights.has(`${p}.gate_up.weight`)) continue;
-        if (weights.has(`${p}.gate.weight`)) continue;
-        const experts = Array.from({ length: cfg.moe.experts }, (_, e) => e);
-        for (const [part, to] of [["gate_proj", "gate"], ["up_proj", "up"], ["down_proj", "down"]] as const) {
-          this.stack(experts.map((e) => `${p}.${e}.${part}.weight`), `${p}.${to}.weight`);
+        const slots = ringSlots(cfg, this.maxSeq, l);
+        this.slots.push(slots);
+        // A layer without a cache (linear attention) keeps one word, so every layer has its buffers.
+        this.kv.push({
+          k: backend.alloc(Math.max(4, slots * kvRowBytesOf(cfg, this.kvDtype, l, "k")), "storage", `kv/${l}/k`),
+          v: backend.alloc(Math.max(4, slots * kvRowBytesOf(cfg, this.kvDtype, l, "v")), "storage", `kv/${l}/v`),
+        });
+        if (cfg.linearLayers?.[l]) {
+          const g = cfg.linear!;
+          const channels = 2 * g.keyHeads * g.keyDim + g.valueHeads * g.valueDim;
+          this.linearState.set(l, {
+            s: backend.alloc(g.valueHeads * g.valueDim * g.keyDim * 4, "storage", `linear/${l}/state`),
+            conv: backend.alloc((g.convKernel - 1) * channels * 4, "storage", `linear/${l}/conv`),
+          });
         }
       }
+      if (cfg.linear) {
+        // x · rsqrt(Σx² + 1e-6) is RMSNorm with eps 1e-6 / D and a weight of 1 / √D.
+        const D = cfg.linear.keyDim;
+        const w = new Float32Array(D).fill(1 / Math.sqrt(D));
+        const buf = backend.alloc(w.byteLength, "storage", "linear/l2");
+        backend.write(buf, 0, w);
+        this.l2Weight = { shape: [D], dtype: "f32", buf };
+        this.resetState();
+      }
+      const freqs = (f: Float32Array, label: string): Tensor => {
+        const buf = backend.alloc(f.byteLength, "storage", label);
+        backend.write(buf, 0, f);
+        return { shape: [f.length], dtype: "f32", buf };
+      };
+      // With two head sizes (Gemma 4), the full-attention layers' is the one `ropeTheta` and its options describe.
+      const fullLayer = cfg.slidingLayers?.indexOf(false) ?? 0;
+      this.invFreq = freqs(ropeInvFreq({ ...cfg, headDim: headDimOf(cfg, Math.max(0, fullLayer)) }), "rope/inv_freq");
+      this.localInvFreq =
+        cfg.ropeLocalTheta !== undefined && (cfg.ropeLocalTheta !== cfg.ropeTheta || cfg.ropeLinear || cfg.layerHeadDims || cfg.ropeProportional !== undefined)
+          ? freqs(ropeInvFreq({ headDim: cfg.headDim, ropeTheta: cfg.ropeLocalTheta }), "rope/inv_freq/local")
+          : this.invFreq;
+      this.w("model.embed_tokens.weight");
+      const fuse = typeof opts.fuse === "object" ? { qkv: true, mlp: true, ...opts.fuse } : { qkv: opts.fuse ?? true, mlp: opts.fuse ?? true };
+      // Phi-3 checkpoints store qkv already stacked.
+      // Qwen 3.5's q_proj carries a gate beside each query, and not every layer has attention: its q/k/v stay apart.
+      this.fusedQkv = weights.has("model.layers.0.self_attn.qkv.weight") || (fuse.qkv && !cfg.linearLayers && !cfg.valueNorm && !cfg.kvFrom && !cfg.layerHeadDims && this.fuse("self_attn", ["q_proj", "k_proj", "v_proj"], "qkv", cfg.attentionBias));
+      // Granite 4 and Phi-3 checkpoints store gate_up already stacked.
+      this.fusedMlp = weights.has("model.layers.0.mlp.gate_up.weight") || (fuse.mlp && this.fuse("mlp", ["gate_proj", "up_proj"], "gate_up", false));
+      // A mixture of experts runs from one stacked tensor per projection, the experts in turn: gate, up
+      // and down (a GGUF file has them so), or [gate; up] per expert and down (Granite's checkpoints).
+      if (cfg.moe) {
+        for (let l = 0; l < cfg.numLayers; l++) {
+          if (!cfg.moe.layers[l]) continue;
+          const p = `model.layers.${l}.mlp.experts`;
+          if (weights.has(`${p}.gate_up.weight`)) continue;
+          if (weights.has(`${p}.gate.weight`)) continue;
+          const experts = Array.from({ length: cfg.moe.experts }, (_, e) => e);
+          for (const [part, to] of [["gate_proj", "gate"], ["up_proj", "up"], ["down_proj", "down"]] as const) {
+            this.stack(experts.map((e) => `${p}.${e}.${part}.weight`), `${p}.${to}.weight`);
+          }
+        }
+      }
+    } catch (err) {
+      // Buffers made so far are the model's own; the weights stay the caller's to free.
+      this.freeOwn();
+      throw err;
     }
   }
 
@@ -928,32 +943,38 @@ export class LlamaModel {
   }
 
   destroy(): void {
-    for (const { k, v } of this.kv) {
-      this.backend.free(k);
-      this.backend.free(v);
-    }
-    for (const t of this.unit.values()) this.backend.free(t.buf);
     for (const t of this.weights.values()) {
       this.backend.free(t.buf);
       if (t.scales) this.backend.free(t.scales);
       if (t.mins) this.backend.free(t.mins);
     }
-    if (this.imageFeatures) this.backend.free(this.imageFeatures);
-    this.freeLora();
-    this.backend.free(this.invFreq.buf);
-    if (this.localInvFreq !== this.invFreq) this.backend.free(this.localInvFreq.buf);
-    for (const { s, conv } of this.linearState.values()) {
-      this.backend.free(s);
-      this.backend.free(conv);
+    this.freeOwn();
+  }
+
+  /** Frees every buffer but the weights; a constructor that failed part way has made only some of them. */
+  private freeOwn(): void {
+    const free = (b: Buf | undefined) => b && this.backend.free(b);
+    for (const { k, v } of this.kv) {
+      free(k);
+      free(v);
     }
-    if (this.l2Weight) this.backend.free(this.l2Weight.buf);
-    this.backend.free(this.step);
-    if (this.tailStep) this.backend.free(this.tailStep);
-    this.backend.free(this.history);
-    this.backend.free(this.seen);
-    this.backend.free(this.allowed);
-    this.backend.free(this.allowedRows);
-    this.activations.destroy();
+    for (const t of this.unit.values()) free(t.buf);
+    free(this.imageFeatures);
+    this.freeLora();
+    free(this.invFreq?.buf);
+    if (this.localInvFreq !== this.invFreq) free(this.localInvFreq?.buf);
+    for (const { s, conv } of this.linearState.values()) {
+      free(s);
+      free(conv);
+    }
+    free(this.l2Weight?.buf);
+    free(this.step);
+    free(this.tailStep);
+    free(this.history);
+    free(this.seen);
+    free(this.allowed);
+    free(this.allowedRows);
+    this.activations?.destroy();
   }
 
   private w(name: string): Tensor {

@@ -38,6 +38,7 @@ function installNodeWorkers(inThread: boolean): WorkerCtor {
   class Worker implements NodeWebWorker {
     onmessage: NodeWebWorker["onmessage"] = null;
     onerror: NodeWebWorker["onerror"] = null;
+    private failed = false;
     private thread: InstanceType<typeof wt.Worker> | undefined;
     private readonly pending: [unknown, unknown[] | undefined][] = [];
     private readonly listeners: { message: ((e: never) => void)[]; error: ((e: never) => void)[] } = { message: [], error: [] };
@@ -70,6 +71,11 @@ function installNodeWorkers(inThread: boolean): WorkerCtor {
             for (const f of this.listeners.message) f(e);
           });
           t.on("error", (err: never) => this.fail(err));
+          // A thread that stops by itself (out of memory, process.exit in it) raises no error: say so,
+          // or the calls waiting on it would wait for ever.
+          t.on("exit", (code: never) => {
+            if (!this.ended) this.fail(new Error(`the worker thread stopped (exit code ${String(code)})`));
+          });
           this.thread = t;
           for (const [m, tr] of this.pending.splice(0)) t.postMessage(m, tr);
         },
@@ -78,6 +84,8 @@ function installNodeWorkers(inThread: boolean): WorkerCtor {
     }
 
     private fail(err: unknown): void {
+      if (this.failed) return;
+      this.failed = true;
       const e = { message: err instanceof Error ? err.message : String(err), error: err, preventDefault() {} } as never;
       this.onerror?.(e);
       for (const f of this.listeners.error) f(e);

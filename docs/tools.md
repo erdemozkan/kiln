@@ -46,7 +46,7 @@ for (const s of steps) console.log(s.call.function.name, s.call.function.argumen
 
 | Skill | What it does | Network |
 | --- | --- | --- |
-| `calculate` | Exact arithmetic on an expression. It has its own parser; the model's text is never run as code. | none |
+| `calculate` | Arithmetic on an expression: exact for whole numbers up to 2^53, 12 significant digits otherwise. It has its own parser; the model's text is never run as code. | none |
 | `get_date_time` | The date, weekday and time now, here or in a city or IANA time zone. | none |
 | `search_wikipedia` | The start of the best matching Wikipedia article, in any language edition. | the query goes to Wikipedia |
 | `read_web_page` | A page's readable text. | the address goes to that site |
@@ -60,7 +60,7 @@ Each is also exported alone, to mix with your own tools: `calculatorSkill()`, `d
 | --- | --- | --- |
 | `maxChars` | 2000 | Most characters of text a network skill hands the model. It all goes into the context, so keep it small for small models. |
 | `language` | `"en"` | The Wikipedia edition used when the model names none. |
-| `allowUrl(url)` | refuses this machine and private networks | Decides whether `read_web_page` may fetch an address. |
+| `allowUrl(url)` | refuses this machine, private networks and the page's own site | Decides whether `read_web_page` may fetch an address. |
 | `fetch` | the global `fetch` | The function the network skills use, for a proxy or a test. |
 | `userAgent` | a built-in name | Your application's name, sent to Wikipedia only. Wikimedia asks clients to identify themselves. |
 
@@ -93,8 +93,10 @@ const { content } = await runTools(llm, [{ role: "user", content: "Where is my o
 });
 ```
 
-- `execute` gets the call's arguments as one object. What it returns is sent back to the model as
-  JSON; it may be async.
+- `execute` gets the call's arguments as one object, and may be async. A string it returns goes to
+  the model as it is; anything else goes as JSON.
+- Its second argument is `{ signal }`, the run's stop signal. Pass it to `fetch` so a stopped run
+  does not wait for the network.
 - If `execute` throws, or the model calls a tool that does not exist, the model gets
   `{"error": "…"}` as the answer and can try again.
 - Write the `description` for the model: say what the tool is for in one plain sentence. Avoid
@@ -108,7 +110,7 @@ const { content } = await runTools(llm, [{ role: "user", content: "Where is my o
 | `content` | The model's final answer. |
 | `steps` | Every call the model made: `call` (name and arguments), and `result` or `error`. |
 | `messages` | The whole conversation with the calls, the tools' answers and the final reply. Pass it back with the next user message to continue the chat. |
-| `unfinished` | True when the model was still calling tools after `maxRounds` replies. |
+| `unfinished` | True when the model was still calling tools after `maxRounds` replies, or the run was stopped (`signal`). `content` is then its last text. |
 
 ## Options
 
@@ -119,7 +121,8 @@ const { content } = await runTools(llm, [{ role: "user", content: "Where is my o
 | `maxRounds` | 5 | Most replies the model may write, the final answer included. |
 | `onText(delta)` | | The model's text as it is written, call markup included. |
 | `onToolCall(step)` | | Called after each call has run. |
-| `toolChoice` | `"auto"` | `"required"` forces a call in the first reply. Later replies are always free. |
+| `toolChoice` | `"auto"` | `"required"` forces a call in the first reply (models with `<tool_call>` tags only). Later replies are always free. |
+| `signal` | | An `AbortSignal` that stops the run: the model, and a skill's network request. |
 | `checkToolCalls` | `true` | See below. |
 
 Every generation option works too (`maxTokens`, `temperature`, `enableThinking` …). Use
@@ -138,6 +141,8 @@ again.
 - FunctionGemma and Mistral write calls in formats of their own. Kiln reads them but does not check
   them.
 - `checkToolCalls: false` turns the check off.
+- A tool whose schema uses a keyword the grammar does not support is offered unchecked.
+- A call the model drafts inside a reasoning block (`<think>`) is not run.
 - The check guarantees the form of a call, not its sense: a model can still call the wrong tool, or
   pass a wrong but valid value.
 
@@ -170,9 +175,14 @@ each does better with the prompt it was trained on, which Kiln writes for you.
 
 - The model runs on the user's device. `calculate` and `get_date_time` use no network.
 - `search_wikipedia` sends the model's query to Wikipedia. `read_web_page` sends a request to the
-  address the model chose. Nothing else is sent, and no conversation text goes with it.
+  address the model chose. Nothing else is sent: no cookies, no referrer. But the model writes the
+  query and the address, so words from the conversation can be in them.
 - The model picks the address, and a page it has read can suggest another. So `read_web_page`
-  refuses `localhost` and private networks (10.x, 192.168.x …) unless your `allowUrl` allows them.
+  refuses `localhost`, private networks (10.x, 192.168.x …) and the page's own site, on every
+  redirect too, unless your `allowUrl` allows them. In Node.js it also looks the name up and refuses
+  one that points at a private address. A name can still change between that check and the
+  request, so do not run it next to services that trust the local network.
+- A network skill gives up after 15 seconds and reads at most 2 MB of a page.
 - In a browser, `read_web_page` can only read sites that let other pages read them, and most do
   not. The model is told when a site refuses. Wikipedia articles are read through Wikipedia's API,
   which does allow it. In Node.js there is no such limit.
@@ -224,7 +234,8 @@ const { content, toolCalls } = parseToolCalls(text);   // toolCalls: [{ function
 
 Run each call. Then append the assistant's reply as
 `{ role: "assistant", content, tool_calls: toolCalls }`, one
-`{ role: "tool", name, content: JSON.stringify(result) }` message per call, and chat again.
+`{ role: "tool", name, tool_call_id: call.id, content }` message per call (`content` a string: the
+result as JSON; `tool_call_id` only when the call has an `id`, as Mistral's do), and chat again.
 
 ## Limits
 

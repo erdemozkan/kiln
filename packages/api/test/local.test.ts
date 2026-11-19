@@ -94,6 +94,9 @@ describe("localModel in Node.js", () => {
       env.localModelPath = root;
       expect(await resolveModel("bert-tiny")).toMatch(/^@local\/bert-tiny-/);
       expect(await resolveModel("Xenova/bert-tiny")).toBe("Xenova/bert-tiny");
+      // A name that climbs out of the folder is not one of its models.
+      env.localModelPath = dir;
+      expect(await resolveModel("x/../../bert-tiny")).toBe("x/../../bert-tiny");
     } finally {
       env.allowLocalModels = saved.allow;
       env.localModelPath = saved.path;

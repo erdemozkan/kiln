@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { ChatMessage } from "@kiln/tokenizers";
 import { runTools, type RunnableTool } from "../src/tools";
-import type { GenerateOptions, KilnModel } from "../src/client";
+import { KilnModel, type GenerateOptions } from "../src/client";
 
 /** A model that gives `replies` in turn and records what it was asked. */
 function scripted(replies: string[]) {
@@ -61,5 +61,55 @@ describe("runTools", () => {
     expect(r.unfinished).toBe(true);
     expect(r.steps.length).toBe(2);
     await expect(runTools(llm, [], { tools: [] })).rejects.toThrow(/at least one tool/);
+  });
+
+  it("refuses two tools with one name", async () => {
+    const { llm } = scripted(["hi"]);
+    await expect(runTools(llm, [], { tools: [weather, { ...weather }] })).rejects.toThrow(/two tools are named "get_weather"/);
+  });
+
+  it("passes the run's signal to the tools", async () => {
+    const signals: (AbortSignal | undefined)[] = [];
+    const probe: RunnableTool = { ...weather, execute: (_args, context) => (signals.push(context?.signal), "ok") };
+    const stop = new AbortController();
+    const { llm } = scripted([call("get_weather", { city: "Rome" }), "Done."]);
+    await runTools(llm, [{ role: "user", content: "go" }], { tools: [probe], signal: stop.signal });
+    expect(signals).toEqual([stop.signal]);
+  });
+
+  it("runs nothing from a reply cut off by stopping", async () => {
+    const stop = new AbortController();
+    let ran = 0;
+    const counted: RunnableTool = { ...weather, execute: () => ++ran };
+    const llm = {
+      chat: () =>
+        (async function* () {
+          yield '<tool_call>\n{"name": "get_weather", "arguments": {"city": "Ro';
+          stop.abort();
+        })(),
+    } as unknown as Pick<KilnModel, "chat">;
+    const r = await runTools(llm, [{ role: "user", content: "go" }], { tools: [counted], signal: stop.signal });
+    expect(ran).toBe(0);
+    expect(r.unfinished).toBe(true);
+    expect(r.steps).toEqual([]);
+    expect(r.content).toContain('"city": "Ro');
+    expect(r.messages.at(-1)).toEqual({ role: "assistant", content: r.content });
+  });
+});
+
+describe("KilnModel and a signal already aborted", () => {
+  it("asks the worker to stop at once", () => {
+    const posted: { id: number; type: string; target?: number }[] = [];
+    const worker = { postMessage: (m: { id: number; type: string }) => posted.push(m), terminate() {} } as unknown as Worker;
+    const Model = KilnModel as unknown as new (w: Worker, info: unknown) => KilnModel;
+    const m = new Model(worker, {});
+    const stop = new AbortController();
+    stop.abort();
+    m.chat([{ role: "user", content: "hi" }], { signal: stop.signal });
+    const chat = posted.find((p) => p.type === "chat")!;
+    expect(posted.filter((p) => p.type === "abort")).toEqual([expect.objectContaining({ type: "abort", target: chat.id })]);
+    void m.generateIds([1, 2], { signal: stop.signal });
+    const ids = posted.find((p) => p.type === "generateIds")!;
+    expect(posted.filter((p) => p.type === "abort").map((p) => p.target)).toEqual([chat.id, ids.id]);
   });
 });

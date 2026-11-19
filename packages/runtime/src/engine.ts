@@ -1,6 +1,6 @@
 import { type Backend, type Buf, type Dispatch, type Profile } from "@kiln/core";
-import { GrammarMatcher, TokenTrie, compileFormat, type ResponseFormat } from "@kiln/grammar";
-import { GEMMA4_VIDEO_FRAME_TOKENS, QWEN_VIDEO_PAIR_TOKENS, Gemma4VisionTower, LlamaModel, type Gemma4AudioTower, MAX_VERIFY_ROWS, QwenVisionTower, type ForwardPlan, type Idefics3Processing, type ImagePixels, type VisionTower } from "@kiln/models";
+import { GrammarMatcher, TokenTrie, compileFormat, type Node as Grammar, type ResponseFormat } from "@kiln/grammar";
+import { GEMMA4_VIDEO_FRAME_TOKENS, QWEN_VIDEO_PAIR_TOKENS, Gemma4VisionTower, LlamaModel, kvRowBytesOf, type Gemma4AudioTower, MAX_VERIFY_ROWS, QwenVisionTower, type ForwardPlan, type Idefics3Processing, type ImagePixels, type VisionTower } from "@kiln/models";
 import { GEMMA4_AUDIO_MAX_SAMPLES, gemma4AudioFeatures, resizeImage } from "@kiln/loader";
 import type { StepParams } from "@kiln/core";
 import { idefics3PromptString, idefics3Tiles } from "./idefics3";
@@ -111,6 +111,12 @@ export type StopReason = "stop" | "maxTokens" | "context" | "format" | "abort";
 /** `valueRowBytes` for a model whose V rows differ in size from its K rows (a q4 cache), else nothing. */
 const valueRows = (m: { kvRowBytes: number; kvValueRowBytes: number }): { valueRowBytes?: number } => (m.kvValueRowBytes !== m.kvRowBytes ? { valueRowBytes: m.kvValueRowBytes } : {});
 
+/** `layerRowBytes` for a model whose layers' rows differ in size (Gemma 4's wider full-attention heads), else nothing. */
+function layerRows(m: LlamaModel): { layerRowBytes?: [number, number][] } {
+  const rows = m.slots.map((_, l): [number, number] => [kvRowBytesOf(m.cfg, m.kvDtype, l, "k"), kvRowBytesOf(m.cfg, m.kvDtype, l, "v")]);
+  return rows.every(([k, v]) => k === m.kvRowBytes && v === m.kvValueRowBytes) ? {} : { layerRowBytes: rows };
+}
+
 /** K/V cache contents for a token prefix, from `Engine.exportCache` (see `LlamaModel.readKv`). */
 export interface CacheSnapshot {
   tokens: number[];
@@ -120,6 +126,8 @@ export interface CacheSnapshot {
   rowBytes: number;
   /** Bytes per position per layer for V, where they differ from K (a q4 cache). */
   valueRowBytes?: number;
+  /** Per layer, K and V bytes per position, where layers differ (then `rowBytes` is layer 0's). */
+  layerRowBytes?: [number, number][];
   data: Uint8Array;
 }
 
@@ -130,6 +138,8 @@ export interface CacheShape {
   rowBytes: number;
   /** As in CacheSnapshot. */
   valueRowBytes?: number;
+  /** As in CacheSnapshot. */
+  layerRowBytes?: [number, number][];
   slots: number[];
 }
 
@@ -224,6 +234,14 @@ export function imageKey(img: ImagePixels): string {
   return `${img.width}x${img.height}:${(h1 >>> 0).toString(16)}${(h2 >>> 0).toString(16)}`;
 }
 
+/** The feature slot to fill next of `cap`: an empty one (never filled, or left by an encode that failed), else the least recently used. */
+function freeSlot(slots: readonly ({ used: number } | undefined)[], cap: number): number {
+  const empty = slots.findIndex((s) => !s);
+  if (empty >= 0) return empty;
+  if (slots.length < cap) return slots.length;
+  return slots.reduce((lru, s, i) => (s!.used < slots[lru]!.used ? i : lru), 0);
+}
+
 /** Shortest cached prefix worth saving before a call overwrites it. */
 const MIN_SAVED_TOKENS = 32;
 
@@ -258,6 +276,8 @@ export class Engine {
    * several submits so the display and other apps get the GPU in between (see `SubmitPacer`).
    */
   maxSubmitMs = 50;
+  /** Destroy the backend with the engine: set by `createEngine` when it opened the backend itself. */
+  ownsBackend = false;
   /** GPU cost per dispatch of single-row plans and per dispatch-row of multi-row ones, as measured. */
   private readonly pace = { rows1: new SubmitPacer(0.12), rows: new SubmitPacer(0.025) };
   /** Submits since the current call started (GenerateStats.submits). */
@@ -345,17 +365,28 @@ export class Engine {
     return taken;
   }
 
-  /** Snapshots the model, whose recurrent state must be the state after exactly `tokens`. */
-  private checkpoint(tokens: readonly number[]): void {
+  /**
+   * Snapshots the model, whose recurrent state must be the state after exactly `tokens`. With
+   * `behind`, the newest snapshot is the one this call took RESUME_TAIL tokens earlier, which the
+   * next turn resumes from: it is evicted last, and when it and this one do not fit together, this
+   * one is not kept (from it, a call continuing this very prompt prefills those few tokens again).
+   */
+  private checkpoint(tokens: readonly number[], behind = false): void {
     const same = this.states.findIndex((s) => s.tokens.length === tokens.length && s.tokens.every((t, i) => t === tokens[i]));
     if (same >= 0) this.dropState(same);
     const n = tokens.length;
     const bytes = this.model.stateBytes + this.model.kvSnapshotBytes(n);
+    const keep = behind ? this.states.at(-1) : undefined;
     let total = this.states.reduce((sum, s) => sum + s.bytes, bytes);
-    while (this.states.length && total > Engine.STATE_BUDGET) {
-      total -= this.states[0]!.bytes;
-      this.dropState(0);
+    for (let i = 0; i < this.states.length && total > Engine.STATE_BUDGET; ) {
+      if (this.states[i] === keep) {
+        i++;
+        continue;
+      }
+      total -= this.states[i]!.bytes;
+      this.dropState(i);
     }
+    if (keep && total > Engine.STATE_BUDGET) return;
     this.states.push({ tokens: [...tokens], state: this.model.saveState(), kv: this.model.saveKv(n), bytes });
   }
 
@@ -450,13 +481,25 @@ export class Engine {
       yield* this.complete(prompt, this.forceToolCall(opts));
       return;
     }
-    if (idefics3) {
-      yield* this.decodeIds(await this.withTiles(prompt, images, idefics3), this.forceToolCall(opts));
-      return;
+    // Encoding rewrites feature rows and cached prefixes that a call already generating, or one
+    // still encoding, relies on: the engine counts as busy from here, so a second call fails first.
+    if (this.busy) throw new Error("Engine is already generating; await or abort the previous call");
+    this.busy = true;
+    let ids: number[];
+    try {
+      ids = await this.mediaIds(prompt, images, clips as Float32Array[], videos, idefics3);
+    } finally {
+      this.busy = false;
     }
+    yield* this.decodeIds(ids, this.forceToolCall(opts));
+  }
+
+  /** The ids of a rendered prompt with its images, video frames and audio clips encoded into feature rows. */
+  private async mediaIds(prompt: string, images: readonly ImagePixels[], clips: readonly Float32Array[], videos: readonly VideoFrames[], idefics3: Idefics3Processing | undefined): Promise<number[]> {
+    if (idefics3) return this.withTiles(prompt, images, idefics3);
     const slots: number[] = [];
     // A clip past 30 s goes in as consecutive pieces of 30 s, each a run of audio tokens of its own.
-    const pieces = clips.map((c) => audioPieces(c as Float32Array));
+    const pieces = clips.map((c) => audioPieces(c));
     if (clips.length) {
       const distinct = new Set(pieces.flat().map(audioKey)).size;
       if (distinct > this.audio!.slots) throw new Error(`this audio makes ${distinct} pieces of up to 30 s, but ${this.audio!.slots} fit; load with a larger audioSlots`);
@@ -464,10 +507,12 @@ export class Engine {
     if (this.vision instanceof QwenVisionTower || this.vision instanceof Gemma4VisionTower || clips.length) {
       if (images.length && !(this.vision instanceof QwenVisionTower || this.vision instanceof Gemma4VisionTower)) throw new Error("images beside audio need Gemma 4's vision tower");
       // Each image at its own aspect ratio, resized to whole tokens (bicubic, as the processors do).
-      for (const img of images) {
+      const sized = images.map((img) => {
         const g = (this.vision as QwenVisionTower | Gemma4VisionTower).grid(img.width, img.height);
-        slots.push(await this.imageSlot(resizeImage(img, g.width, g.height, 3)));
-      }
+        return resizeImage(img, g.width, g.height, 3);
+      });
+      const keys = this.imageKeys(sized);
+      for (const [i, img] of sized.entries()) slots.push(await this.imageSlot(img, keys[i]));
       const imageRuns = slots.map((slot) => ({ base: this.model.cfg.vocabSize + slot * this.vision!.tokens, count: this.imageSlots[slot]!.grid!.rows * this.imageSlots[slot]!.grid!.cols }));
       // Gemma 4's processor also puts each image's tokens between <|image> and <image|>, each
       // clip's between <|audio> and <audio|>, and each video frame's after its time, as an image's.
@@ -483,11 +528,24 @@ export class Engine {
         for (const piece of pieces.flat()) runs.push(await this.audioSlot(piece));
         ids = this.withAudio(ids, runs);
       }
-      yield* this.decodeIds(ids, this.forceToolCall(opts));
-      return;
+      return ids;
     }
-    for (const img of images) slots.push(await this.imageSlot(img));
-    yield* this.decodeIds(this.withImages(prompt, slots), this.forceToolCall(opts));
+    const keys = this.imageKeys(images);
+    for (const [i, img] of images.entries()) slots.push(await this.imageSlot(img, keys[i]));
+    return this.withImages(prompt, slots);
+  }
+
+  /**
+   * Each image's key, once the distinct ones are known to fit the feature slots together: one more
+   * would take the least recently used slot, which an earlier image of the same prompt holds.
+   */
+  private imageKeys(images: readonly ImagePixels[]): string[] {
+    if (!images.length) return [];
+    const keys = images.map(imageKey);
+    const distinct = new Set(keys).size;
+    const cap = (this.imageRows / this.vision!.tokens) | 0;
+    if (distinct > cap) throw new Error(`these messages hold ${distinct} different images, but ${cap} fit; load with a larger imageSlots`);
+    return keys;
   }
 
   /**
@@ -757,11 +815,12 @@ export class Engine {
     const first = this.model.cfg.vocabSize + this.audioRows0;
     let slot = this.audioSlots.findIndex((s) => s?.key === key);
     if (slot < 0) {
-      slot = this.audioSlots.length < cap ? this.audioSlots.length : this.audioSlots.reduce((lru, s, i) => (s!.used < this.audioSlots[lru]!.used ? i : lru), 0);
-      if (this.audioSlots[slot]) this.forgetRows(first + slot * tower.tokens, tower.tokens);
-      this.audioSlots[slot] = undefined;
       const { features, frames } = gemma4AudioFeatures(heard);
       if (tower.tokensFor(frames) < 1) throw new Error("an audio part is too short: it needs at least 20 ms of sound");
+      slot = freeSlot(this.audioSlots, cap);
+      if (this.audioSlots[slot]) this.forgetRows(first + slot * tower.tokens, tower.tokens);
+      // Empty until the encode has filled its rows: one that fails leaves a free slot, not a half-written clip.
+      this.audioSlots[slot] = undefined;
       const count = await tower.encode(features, frames, this.model.imageFeatures!, (this.audioRows0 + slot * tower.tokens) * this.model.cfg.hiddenSize * 4);
       this.audioSlots[slot] = { key, used: 0, count };
     }
@@ -793,17 +852,17 @@ export class Engine {
    * The feature slot holding this image, running the vision tower if it is not there yet (the least
    * recently used slot is reused; cached prefixes that saw its old image are forgotten).
    */
-  private async imageSlot(img: ImagePixels): Promise<number> {
+  private async imageSlot(img: ImagePixels, key = imageKey(img)): Promise<number> {
     const vision = this.vision!;
-    const key = imageKey(img);
     const cap = (this.imageRows / vision.tokens) | 0;
     let slot = this.imageSlots.findIndex((s) => s?.key === key);
     if (slot < 0) {
-      slot = this.imageSlots.length < cap ? this.imageSlots.length : this.imageSlots.reduce((lru, s, i) => (s!.used < this.imageSlots[lru]!.used ? i : lru), 0);
+      slot = freeSlot(this.imageSlots, cap);
       if (this.imageSlots[slot]) this.forgetImage(slot);
-      this.imageSlots[slot] = { key, used: 0 };
+      // Recorded once the encode has filled its rows: after one that fails, the same image is encoded again.
+      this.imageSlots[slot] = undefined;
       const grid = await vision.encode(img, this.model.imageFeatures!, slot * vision.tokens * this.model.cfg.hiddenSize * 4);
-      if (grid) this.imageSlots[slot]!.grid = grid;
+      this.imageSlots[slot] = { key, used: 0, ...(grid ? { grid } : {}) };
     }
     this.imageSlots[slot]!.used = ++this.imageClock;
     return slot;
@@ -837,7 +896,15 @@ export class Engine {
     const open = this.tokenizer.tokenId("<think>");
     const shut = this.tokenizer.tokenId("</think>");
     const think = open !== undefined && shut !== undefined ? { open, close: shut } : undefined;
-    return { trigger, close, think, format: { type: "tool_call", syntax: close === undefined ? syntax : "tags_inner", tools: opts.tools.map((t) => ({ name: t.function.name, parameters: t.function.parameters })) } };
+    const format: ResponseFormat = { type: "tool_call", syntax: close === undefined ? syntax : "tags_inner", tools: opts.tools.map((t) => ({ name: t.function.name, parameters: t.function.parameters })) };
+    // Compiled now, once for every call of the reply: a schema the grammar cannot express (uniqueItems,
+    // not, …) then leaves the reply unchecked, rather than failing at a call after text has streamed.
+    try {
+      this.grammars.set(format, compileFormat(format));
+    } catch {
+      return undefined;
+    }
+    return { trigger, close, think, format, context: this.model.maxSeq };
   }
 
   /** `opts` with `toolChoice` turned into a `tool_call` format. */
@@ -1022,6 +1089,13 @@ export class Engine {
     if (sampling.topK < 0 || !(sampling.topP > 0 && sampling.topP <= 1) || !(sampling.repetitionPenalty > 0)) {
       throw new Error(`invalid sampling options ${JSON.stringify(sampling)}`);
     }
+    const stats: GenerateStats = { promptTokens: promptIds.length, cachedTokens: 0, generatedTokens: 0, prefillMs: 0, decodeMs: 0, ttftMs: 0 };
+    // A call aborted while it waited for an earlier one leaves the cache as it is: nothing to prefill for.
+    if (opts.signal?.aborted) {
+      this.lastStats = { ...stats, submits: 0, stopReason: "abort" };
+      this.lastStopId = undefined;
+      return;
+    }
     const stop = new Set([...this.stopIds, ...(opts.stopTokenIds ?? [])]);
     const t0 = performance.now();
     const grammar = opts.format ? this.matcher(opts.format, [...stop]) : undefined;
@@ -1032,33 +1106,6 @@ export class Engine {
     // Reuse the shared prefix, but always prefill at least the last prompt token to get its logits.
     let start = 0;
     const reuse = opts.reuseCache ?? true;
-    if (reuse) {
-      const prev = this.cached;
-      while (start < prev.length && start < promptIds.length - 1 && prev[start] === promptIds[start]) start++;
-      // Ring caches (sliding layers) keep only the last window + slack positions written; resuming
-      // further back would read overwritten keys, so the prompt is prefilled from the start instead.
-      if (start < this.model.minReuseStart(this.written)) start = 0;
-    }
-    if (recurrent) {
-      if (reuse) start = this.rewind(promptIds, start, promptIds.length - 1);
-      else this.model.resetState();
-    }
-    const saved = reuse && !recurrent ? this.prefixes.best(promptIds, start, (w) => this.model.minReuseStart(w)) : undefined;
-    // The live cache is about to be overwritten past `start` (or replaced): keep it for later calls.
-    if (saved || start < this.cached.length) this.saveLive();
-    if (saved) {
-      this.model.restoreKv(saved.entry.tokens.length, saved.entry.data);
-      this.written = saved.entry.written;
-      start = saved.length;
-    }
-    // An image's tokens attend to each other both ways (Gemma 3), so each image is prefilled whole, in
-    // one chunk. SmolVLM's are causal, like text.
-    // Qwen 3.5's are causal, but an image is prefilled in steps of its own: its positions differ.
-    const bidirectional = !!this.vision?.bidirectional;
-    const spans = bidirectional || this.vision instanceof QwenVisionTower ? imageSpans(promptIds, this.model.cfg.vocabSize) : [];
-    if (bidirectional) for (const [lo, hi] of spans) if (start > lo && start < hi) start = lo;
-    this.cached = [];
-    const stats: GenerateStats = { promptTokens: promptIds.length, cachedTokens: start, generatedTokens: 0, prefillMs: 0, decodeMs: 0, ttftMs: 0 };
     this.submits = 0;
     // Ids read back so far (including any past a stop token) and decode steps submitted.
     const readIds: number[] = [];
@@ -1068,6 +1115,35 @@ export class Engine {
     let spoken: number[] | undefined;
 
     try {
+      if (reuse) {
+        const prev = this.cached;
+        while (start < prev.length && start < promptIds.length - 1 && prev[start] === promptIds[start]) start++;
+        // Ring caches (sliding layers) keep only the last window + slack positions written; resuming
+        // further back would read overwritten keys, so the prompt is prefilled from the start instead.
+        if (start < this.model.minReuseStart(this.written)) start = 0;
+      }
+      if (recurrent) {
+        if (reuse) start = this.rewind(promptIds, start, promptIds.length - 1);
+        else this.model.resetState();
+      }
+      const saved = reuse && !recurrent ? this.prefixes.best(promptIds, start, (w) => this.model.minReuseStart(w)) : undefined;
+      // The live cache is about to be overwritten past `start` (or replaced): keep it for later calls.
+      if (saved || start < this.cached.length) this.saveLive();
+      if (saved) {
+        this.model.restoreKv(saved.entry.tokens.length, saved.entry.data);
+        this.written = saved.entry.written;
+        start = saved.length;
+      }
+      // An image's tokens attend to each other both ways (Gemma 3), so each image is prefilled whole, in
+      // one chunk. SmolVLM's are causal, like text.
+      // Qwen 3.5's are causal, but an image is prefilled in steps of its own: its positions differ.
+      const bidirectional = !!this.vision?.bidirectional;
+      const spans = bidirectional || this.vision instanceof QwenVisionTower ? imageSpans(promptIds, this.model.cfg.vocabSize) : [];
+      if (bidirectional) for (const [lo, hi] of spans) if (start > lo && start < hi) start = lo;
+      // Moved back to an image's start, the window before it may be one a ring has overwritten.
+      if (bidirectional && start < this.model.minReuseStart(this.written)) start = 0;
+      this.cached = [];
+      stats.cachedTokens = start;
       this.model.setSeen(promptIds);
       if (grammar) {
         const t = performance.now();
@@ -1081,8 +1157,12 @@ export class Engine {
       // repeats this one only up to the template's last tokens (an empty thinking block after the
       // assistant header, say, which the history then leaves out), and can resume no later than that.
       const early = recurrent ? promptIds.length - RESUME_TAIL : -1;
+      let tookEarly = false;
       while (pos < promptIds.length) {
-        if (pos === early && pos > start) this.checkpoint(promptIds.slice(0, pos));
+        if (pos === early && pos > start) {
+          this.checkpoint(promptIds.slice(0, pos));
+          tookEarly = true;
+        }
         const span = spans.find(([, hi]) => hi > pos);
         let T: number;
         let n: number;
@@ -1115,7 +1195,7 @@ export class Engine {
       }
       // The state after the prompt: where the next turn, which repeats this prompt and goes on, resumes.
       // (After the reply it has run past the last token kept, since decode steps are queued ahead.)
-      if (recurrent) this.checkpoint(promptIds);
+      if (recurrent) this.checkpoint(promptIds, tookEarly);
 
       if (draftTokens > 0) {
         spoken = [...promptIds];
@@ -1201,12 +1281,16 @@ export class Engine {
       // Decode step j fed id j at position promptLength + j; every submitted step writes its K/V,
       // including steps still in flight, which run before anything submitted later. This also holds
       // when the consumer stops iterating early.
-      if (!failed) this.cached = spoken ? spoken.slice(0, -1) : [...promptIds, ...readIds.slice(0, Math.max(0, queued - 1))];
+      this.cached = failed ? [] : spoken ? spoken.slice(0, -1) : [...promptIds, ...readIds.slice(0, Math.max(0, queued - 1))];
       // Verify passes write up to MAX_VERIFY_ROWS positions past the kept ones. Plain decode writes
       // one position per submitted step, read back or not: when a stop token ends the reply, the
       // steps queued behind it have still run, past the ids kept. A ring cache (sliding layers)
       // that those steps wrapped has lost its first keys, which only `written` can tell.
-      this.written = failed ? this.model.maxSeq : spoken ? this.cached.length + MAX_VERIFY_ROWS : Math.max(this.cached.length, promptIds.length + Math.max(0, queued - 1));
+      const end = spoken ? this.cached.length + MAX_VERIFY_ROWS : Math.max(this.cached.length, promptIds.length + Math.max(0, queued - 1));
+      // A call that resumed a prefix wrote from there on only: ring slots of positions past its end
+      // still hold what an earlier, longer call wrote over the prefix's keys. Only a prefill from
+      // position 0 rewrote every slot the kept tokens use.
+      this.written = failed ? this.model.maxSeq : start > 0 ? Math.max(this.written, end) : end;
       stats.submits = this.submits;
       stats.stopReason = opts.signal?.aborted
         ? "abort"
@@ -1445,8 +1529,11 @@ export class Engine {
     return p;
   }
 
+  /** Grammars compiled ahead of the calls that use them (see `callCheck`), by format. */
+  private readonly grammars = new WeakMap<ResponseFormat, Grammar>();
+
   private matcher(format: ResponseFormat, stopIds: number[]): GrammarMatcher {
-    const grammar = compileFormat(format);
+    const grammar = this.grammars.get(format) ?? compileFormat(format);
     if (!this.trie) {
       const tokens = Array.from({ length: this.tokenizer.vocabSize }, (_, id) => this.tokenizer.tokenBytes(id));
       this.trie = { trie: new TokenTrie(tokens), tokens };
@@ -1466,7 +1553,7 @@ export class Engine {
   /** What decides how cached K/V is laid out: a prompt cache file made for another shape does not fit. */
   get cacheShape(): CacheShape {
     const m = this.model;
-    return { kvDtype: m.kvDtype, layers: m.cfg.numLayers, rowBytes: m.kvRowBytes, ...valueRows(m), slots: [...m.slots] };
+    return { kvDtype: m.kvDtype, layers: m.cfg.numLayers, rowBytes: m.kvRowBytes, ...valueRows(m), ...layerRows(m), slots: [...m.slots] };
   }
 
   /**
@@ -1483,7 +1570,7 @@ export class Engine {
     if (this.busy) throw new Error("exportCache: the engine is generating");
     const tokens = [...this.cached];
     const m = this.model;
-    return { tokens, kvDtype: m.kvDtype, layers: m.cfg.numLayers, rowBytes: m.kvRowBytes, ...valueRows(m), data: await m.readKv(tokens.length) };
+    return { tokens, kvDtype: m.kvDtype, layers: m.cfg.numLayers, rowBytes: m.kvRowBytes, ...valueRows(m), ...layerRows(m), data: await m.readKv(tokens.length) };
   }
 
   /** Loads a snapshot from `exportCache`; returns false (and changes nothing) if it does not fit this model. */
@@ -1491,6 +1578,7 @@ export class Engine {
     const m = this.model;
     // For a recurrent model this restores the attention layers only; `importStates` brings the rest.
     if (this.busy || s.kvDtype !== m.kvDtype || s.layers !== m.cfg.numLayers || s.rowBytes !== m.kvRowBytes || (s.valueRowBytes ?? s.rowBytes) !== m.kvValueRowBytes || s.tokens.length >= m.maxSeq) return false;
+    if (JSON.stringify(s.layerRowBytes) !== JSON.stringify(layerRows(m).layerRowBytes)) return false;
     if (s.data.length !== m.kvSnapshotBytes(s.tokens.length)) return false;
     m.writeKv(s.tokens.length, s.data);
     // Image feature slots start empty after a load, so ids of an earlier image would match a new one's.
@@ -1634,7 +1722,9 @@ export class Engine {
     this.advances.clear();
     this.chains.clear();
     this.audio?.tower.destroy();
+    this.vision?.destroy();
     this.model.destroy();
+    if (this.ownsBackend) this.backend.destroy();
   }
 
   /** Feeds the id sampled into `sampled` to the decode plan and advances the step. */

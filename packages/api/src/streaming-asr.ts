@@ -88,7 +88,8 @@ export class StreamingTranscriber {
 
   /** Transcribes what is left and commits it all; returns the whole text. */
   async finish(): Promise<string> {
-    await this.running;
+    // A pass that ends starts the next one if enough audio is waiting: wait until none is running.
+    while (this.running) await this.running;
     if (this.failed !== undefined) throw this.failed;
     await this.pass(true);
     return this.committed;

@@ -25,6 +25,7 @@ import { CpuBackend, ops, type KvDtype } from "@kiln/kernels";
 export type { KvDtype };
 import {
   LlamaModel,
+  checkModelOptions,
   UnsupportedModelError,
   VisionTower,
   configFromGGUF,
@@ -258,6 +259,8 @@ export async function createEngine(from: ModelSource, opts: LoadOptions = {}): P
     const opened = !ref ? await openGGUFFile(from) : ref.gguf ? await openGGUF(ref, opts.endpoint) : await openSafetensors(ref, opts.endpoint);
     const { cfg, tokenizer, idefics3, gemma3, qwen35, gemma4 } = opened;
     files = opened.files;
+    // Options the model cannot take fail now, not after the weights have downloaded.
+    checkModelOptions(cfg, opts);
     const tuning =
       opts.tune === false || backend.name === "cpu"
         ? Promise.resolve()
@@ -305,6 +308,8 @@ export async function createEngine(from: ModelSource, opts: LoadOptions = {}): P
     const imageTokens = (vision ? (opts.imageSlots ?? 4) * vision.tokensPerImage : 0) + videoRows(vision, videoFrames) + (audio ? audioSlots * audio.tokens : 0);
     model = new LlamaModel(backend, modelCfg, weights, { maxSeq: opts.maxSeq, kvDtype: opts.kvDtype, fuse: opts.fuse, imageTokens });
     const engine = new Engine(backend, model, tokenizer, vision, audio && { tower: audio, slots: audioSlots }, videoFrames);
+    // A device opened here goes with the engine; a caller's backend stays the caller's.
+    engine.ownsBackend = ownsBackend;
     if (opts.maxSubmitMs !== undefined) engine.maxSubmitMs = opts.maxSubmitMs;
     if (opts.prefixCacheBytes !== undefined) engine.prefixCacheBytes = opts.prefixCacheBytes;
     return engine;

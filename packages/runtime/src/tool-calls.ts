@@ -19,6 +19,8 @@ export interface CallCheck {
    * the model thinking about a call, not making it: it stays text.
    */
   think?: { open: number; close: number };
+  /** Positions in the model's context: no phase is asked for more than fits (default: no limit). */
+  context?: number;
 }
 
 /** What one generation call left behind: its stats and the stop token that ended it, if one did. */
@@ -37,6 +39,7 @@ function merge(total: GenerateStats | undefined, s: GenerateStats | undefined, e
     decodeMs: total.decodeMs + s.prefillMs + s.decodeMs,
     maskMs: total.maskMs === undefined && s.maskMs === undefined ? undefined : (total.maskMs ?? 0) + (s.maskMs ?? 0),
     submits: (total.submits ?? 0) + (s.submits ?? 0),
+    speculation: total.speculation && s.speculation ? { passes: total.speculation.passes + s.speculation.passes, drafted: total.speculation.drafted + s.speculation.drafted, accepted: total.speculation.accepted + s.speculation.accepted } : (total.speculation ?? s.speculation),
     stopReason: s.stopReason,
   };
 }
@@ -61,12 +64,28 @@ export async function* checkedToolCalls(
   let left = opts.maxTokens ?? 512;
   let total: GenerateStats | undefined;
   let stopId: number | undefined;
+  /** While a phase runs: the stats the last call had left before it, to tell whether it left its own. */
+  let running: { before: GenerateStats | undefined } | undefined;
+  const add = (e: PhaseEnd, extra: number) => {
+    running = undefined;
+    total = merge(total, e.stats, extra);
+  };
+  /** Set while a marker the driver writes itself is yielded (the consumer may stop reading there). */
+  let marker = false;
+  /** Tokens the context still has room for after `ids`. */
+  const room = () => (check.context ?? Infinity) - ids.length;
   // A prompt may itself end inside a reasoning block (templates that open one for the model).
   const think = check.think;
   let thinking = !!think && prompt.lastIndexOf(think.open) > prompt.lastIndexOf(think.close);
   try {
     for (;;) {
+      // After a call, no room even for the next token: the reply ends as one that filled the context does.
+      if (total && room() < 1) {
+        if (total) total.stopReason = "context";
+        return;
+      }
       let n = 0;
+      running = { before: end().stats };
       for await (const id of run([...ids], { ...free, maxTokens: left })) {
         ids.push(id);
         n++;
@@ -76,25 +95,32 @@ export async function* checkedToolCalls(
       left -= n;
       const e = end();
       const opened = e.stopId === check.trigger && e.stats?.stopReason === "stop";
-      if (opened && thinking && left >= 2) {
-        total = merge(total, e.stats, 1);
+      // The marker and at least one token after it, within maxTokens and the context.
+      const fits = left >= 2 && room() >= 2;
+      if (opened && thinking && fits) {
+        add(e, 1);
         ids.push(check.trigger);
         left--;
+        marker = true;
         yield check.trigger;
+        marker = false;
         continue;
       }
       // The marker needs room for a call after it; without it the reply ends as one cut short would.
-      if (!opened || left < 2) {
-        total = merge(total, e.stats, 0);
+      if (!opened || !fits) {
+        add(e, 0);
         stopId = opened ? undefined : e.stopId;
-        if (opened && total) total.stopReason = "maxTokens";
+        if (opened && total) total.stopReason = left < 2 ? "maxTokens" : "context";
         return;
       }
-      total = merge(total, e.stats, 1);
+      add(e, 1);
       ids.push(check.trigger);
       left--;
+      marker = true;
       yield check.trigger;
+      marker = false;
       n = 0;
+      running = { before: end().stats };
       for await (const id of run([...ids], { ...call, maxTokens: left })) {
         ids.push(id);
         n++;
@@ -102,15 +128,17 @@ export async function* checkedToolCalls(
       }
       left -= n;
       const c = end();
-      total = merge(total, c.stats, 0);
+      add(c, 0);
       stopId = c.stopId;
       // After a complete call the model may end its turn, write text, or call again.
       if (c.stats?.stopReason !== "format") return;
-      if (check.close !== undefined && left >= 1) {
+      if (check.close !== undefined && left >= 1 && room() >= 1) {
         ids.push(check.close);
         left--;
         if (total) total.generatedTokens++;
+        marker = true;
         yield check.close;
+        marker = false;
       }
       if (left < 1) {
         if (total) total.stopReason = "maxTokens";
@@ -118,6 +146,17 @@ export async function* checkedToolCalls(
       }
     }
   } finally {
+    // The consumer stopped reading, or a phase threw: that phase's own end (its stats, abort or
+    // otherwise) is the reply's, unless it never got as far as replacing the last phase's.
+    if (running) {
+      const e = end();
+      const own = e.stats !== running.before;
+      if (own) total = merge(total, e.stats, 0);
+      stopId = own ? e.stopId : undefined;
+    } else if (marker && total) {
+      total.stopReason = "abort";
+      stopId = undefined;
+    }
     done(total, stopId);
   }
 }

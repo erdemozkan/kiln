@@ -123,7 +123,7 @@ vectors = embed(["Hello world", "Hi"], pooling="mean", normalize=True)
 
 ### Tools and skills
 
-A chat model can call your functions, and Kiln ships four ready-made skills: a calculator, the date and time, a Wikipedia lookup and a web page reader. Calls are generated under a grammar, so their names and arguments always match your tools.
+A chat model can call your functions, and Kiln ships four ready-made skills: a calculator, the date and time, a Wikipedia lookup and a web page reader. For models that write calls in `<tool_call>` tags (Qwen, Hermes, Granite), calls are generated under a grammar, so their names and arguments match your tools.
 
 ```js
 import { load, runTools, skills } from "kiln-webgpu";

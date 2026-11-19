@@ -251,8 +251,15 @@ export class KilnModel extends WorkerChannel {
         else if (msg.type === "error") reject(new Error(msg.message));
         return msg.type === "done" || msg.type === "error";
       });
-      signal?.addEventListener("abort", () => this.post({ id: this.nextId++, type: "abort", target: id }), { once: true });
+      this.abortOn(signal, id);
     });
+  }
+
+  /** Asks the worker to stop request `id` when `signal` fires; at once when it already has ("abort" never fires again). */
+  private abortOn(signal: AbortSignal | undefined, id: number): void {
+    const abort = () => this.post({ id: this.nextId++, type: "abort", target: id });
+    if (signal?.aborted) abort();
+    else signal?.addEventListener("abort", abort, { once: true });
   }
 
   private stream(body: RequestBody, signal?: AbortSignal): TextStream {
@@ -276,7 +283,7 @@ export class KilnModel extends WorkerChannel {
       wake?.();
       return finished;
     });
-    signal?.addEventListener("abort", () => this.post({ id: this.nextId++, type: "abort", target: id }), { once: true });
+    this.abortOn(signal, id);
 
     return {
       stats,

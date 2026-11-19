@@ -11,48 +11,59 @@ const CHECK: CallCheck = { trigger: TRIGGER, format: { type: "tool_call", syntax
  * without yielding it), and under a format it ends once CLOSE has been written.
  */
 const CLOSE = 99;
-function fake(script: number[]) {
+/** `context`: the engine's maxSeq, which a prompt must stay under and generation stops at. */
+function fake(script: number[], context = Infinity) {
   const calls: { prompt: number[]; opts: GenerateOptions }[] = [];
   let last: PhaseEnd = {};
   const promptLength = 2;
   async function* run(ids: readonly number[], opts: GenerateOptions): AsyncGenerator<number> {
+    if (ids.length >= context) throw new Error(`prompt has ${ids.length} tokens but the context is ${context}`);
     calls.push({ prompt: [...ids], opts });
     const given = ids.length;
     const stop = new Set([EOS, ...(opts.stopTokenIds ?? [])]);
-    const stats: GenerateStats = { promptTokens: ids.length, cachedTokens: 0, generatedTokens: 0, prefillMs: 1, decodeMs: 2, ttftMs: 1 };
+    const stats: GenerateStats = { promptTokens: ids.length, cachedTokens: 0, generatedTokens: 0, prefillMs: 1, decodeMs: 2, ttftMs: 1, speculation: { passes: 1, drafted: 3, accepted: 2 } };
     let at = ids.length - promptLength;
     let stopId: number | undefined;
-    for (;;) {
-      if (stats.generatedTokens >= (opts.maxTokens ?? 512)) {
-        stats.stopReason = "maxTokens";
-        break;
+    const requested = opts.maxTokens ?? 512;
+    const max = Math.min(requested, context - ids.length);
+    try {
+      for (;;) {
+        if (stats.generatedTokens >= max) {
+          stats.stopReason = max < requested ? "context" : "maxTokens";
+          break;
+        }
+        const id = script[at++] ?? EOS;
+        if (stop.has(id)) {
+          stats.stopReason = "stop";
+          stopId = id;
+          break;
+        }
+        stats.generatedTokens++;
+        yield id;
+        if (opts.format && id === CLOSE) {
+          stats.stopReason = "format";
+          break;
+        }
       }
-      const id = script[at++] ?? EOS;
-      if (stop.has(id)) {
-        stats.stopReason = "stop";
-        stopId = id;
-        break;
-      }
-      stats.generatedTokens++;
-      yield id;
-      if (opts.format && id === CLOSE) {
-        stats.stopReason = "format";
-        break;
-      }
+      // The engine reads its prompt again when the call ends: it must not have grown meanwhile.
+      if (ids.length !== given) throw new Error("the prompt changed during the call");
+    } finally {
+      // As the engine does, also when the caller stops reading.
+      last = { stats: { ...stats, stopReason: stats.stopReason ?? "abort" }, stopId };
     }
-    // The engine reads its prompt again when the call ends: it must not have grown meanwhile.
-    if (ids.length !== given) throw new Error("the prompt changed during the call");
-    last = { stats, stopId };
   }
   return { run, end: () => last, calls };
 }
 
-async function reply(script: number[], opts: GenerateOptions = {}) {
-  const m = fake(script);
+async function reply(script: number[], opts: GenerateOptions = {}, check: CallCheck = CHECK, stopAfter = Infinity) {
+  const m = fake(script, check.context);
   const out: number[] = [];
   let stats: GenerateStats | undefined;
   let stopId: number | undefined;
-  for await (const id of checkedToolCalls([1, 2], opts, CHECK, m.run, m.end, (s, id) => ((stats = s), (stopId = id)))) out.push(id);
+  for await (const id of checkedToolCalls([1, 2], opts, check, m.run, m.end, (s, id) => ((stats = s), (stopId = id)))) {
+    out.push(id);
+    if (out.length >= stopAfter) break;
+  }
   return { out, stats, stopId, calls: m.calls };
 }
 
@@ -123,5 +134,37 @@ describe("checked tool calls", () => {
     expect(r.out).toEqual([5]);
     expect(r.stopId).toBe(44);
     expect(r.calls[0]!.opts.stopTokenIds).toEqual([44, TRIGGER]);
+  });
+
+  it("ends the reply at the context's end instead of starting a phase that cannot fit", async () => {
+    // Prompt 2 + text 1: the marker and a call need two more positions than the context's 4 leave.
+    const r = await reply([5, TRIGGER, 10, CLOSE], {}, { ...CHECK, context: 4 });
+    expect(r.out).toEqual([5]);
+    expect(r.stats).toMatchObject({ generatedTokens: 1, stopReason: "context" });
+    expect(r.stopId).toBeUndefined();
+    // A call that ends with its closing token at the last position: no free phase follows.
+    const c = await reply([5, TRIGGER, 10, CLOSE, 7], {}, { ...CHECK, close: 98, context: 7 });
+    expect(c.out).toEqual([5, TRIGGER, 10, CLOSE, 98]);
+    expect(c.stats).toMatchObject({ generatedTokens: 5, stopReason: "context" });
+    // A call cut by the context is a reply cut by the context.
+    const d = await reply([5, TRIGGER, 10, 11, 12, CLOSE], {}, { ...CHECK, context: 6 });
+    expect(d.out).toEqual([5, TRIGGER, 10, 11]);
+    expect(d.stats).toMatchObject({ generatedTokens: 4, stopReason: "context" });
+  });
+
+  it("reports the phase the consumer stopped reading in", async () => {
+    const r = await reply([5, TRIGGER, 10, 11, 12, CLOSE], {}, CHECK, 4);
+    expect(r.out).toEqual([5, TRIGGER, 10, 11]);
+    expect(r.stats).toMatchObject({ generatedTokens: 4, stopReason: "abort" });
+    expect(r.stopId).toBeUndefined();
+    // Stopped at the marker the driver wrote itself.
+    const m = await reply([5, TRIGGER, 10, CLOSE], {}, CHECK, 2);
+    expect(m.stats).toMatchObject({ generatedTokens: 2, stopReason: "abort" });
+  });
+
+  it("adds up speculation over the phases", async () => {
+    const r = await reply([5, TRIGGER, 10, CLOSE, 6]);
+    expect(r.calls.length).toBe(3);
+    expect(r.stats?.speculation).toEqual({ passes: 3, drafted: 9, accepted: 6 });
   });
 });

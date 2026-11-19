@@ -23,6 +23,9 @@ const FLUSH_EVERY = 32 * 2 ** 20;
  */
 const SEGMENT = 2 ** 30;
 
+/** No model file is larger (256 GiB). */
+const MAX_FILE = 2 ** 38;
+
 const partName = (name: string, i: number) => (i === 0 ? name : `${name}.part${i}`);
 
 /** One logical file over segment files of `seg` bytes each (the last may be shorter). */
@@ -152,7 +155,9 @@ export class CachedHttpSource implements ByteSource {
       if (!blob) throw new Error(`the model folder has no ${url.replace(/^[a-z-]+:\/\/[^/]+\//, "")}`);
       return new BlobSource(blob, key);
     }
-    if (!opfsAvailable()) return new HttpSource(url);
+    // A file named like a segment or a size record of another ("x.part1", "x.meta.json") would share
+    // its cache entry: such a file is read from the network each time.
+    if (!opfsAvailable() || /\.(part\d+|meta\.json)$/.test(key)) return new HttpSource(url);
     const root = await navigator.storage.getDirectory();
     const dir = await root.getDirectoryHandle(DIR, { create: true });
     const fileName = encodeURIComponent(key);
@@ -168,6 +173,8 @@ export class CachedHttpSource implements ByteSource {
     const parts: SyncHandle[] = [];
     try {
       if (!Number.isSafeInteger(total) || total < 0) throw new Error(`${url}: the server did not say how large the file is`);
+      // Each segment is a file created up front: a server must not be able to ask for millions.
+      if (total > MAX_FILE) throw new Error(`${url}: the server says the file has ${total} bytes, more than any model file`);
       for (let i = 0; i < Math.max(1, Math.ceil(total / segment)); i++) {
         const file = (await dir.getFileHandle(partName(fileName, i), { create: true })) as SyncFileHandle;
         parts.push(await file.createSyncAccessHandle());

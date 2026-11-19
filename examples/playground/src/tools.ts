@@ -26,6 +26,19 @@ if (query.get("model")) {
   modelSelect.value = id;
 }
 
+/**
+ * ?endpoint=… loads from a mirror of the Hub (same paths), for testing. Only this page's own server
+ * or this machine: a link must not be able to point the page at somebody else's models.
+ */
+const endpoint = ((): string | undefined => {
+  const given = query.get("endpoint");
+  if (!given) return undefined;
+  const url = new URL(given, location.href);
+  const here = url.origin === location.origin || ["localhost", "127.0.0.1", "[::1]"].includes(url.hostname);
+  if (!here) console.warn(`[skills] ignoring ?endpoint=${given}: only this site or this machine`);
+  return here ? url.href.replace(/\/$/, "") : undefined;
+})();
+
 // Kiln's built-in skills: real arithmetic, the real clock, Wikipedia, and a web page's text.
 const ALL = skills({ maxChars: 1500 });
 const [calculate, dateTime, wikipedia, webPage] = ALL as [RunnableTool, RunnableTool, RunnableTool, RunnableTool];
@@ -51,11 +64,13 @@ const SCENARIOS: Scenario[] = [
 ];
 
 let model: KilnModel | undefined;
+/** The id of the model that is loaded (the list may show another by the time Run is pressed). */
+let loaded = "";
 let current = SCENARIOS[0]!;
 let abort: AbortController | undefined;
 
 /** The system message for this run. Only the small Qwen models gain from Kiln's; the others do better with the prompt they were trained on (docs/skill-models.md). */
-const instructions = (): string | undefined => current.system ?? (/hermes|granite|functiongemma/i.test(modelSelect.value) ? undefined : SKILL_INSTRUCTIONS);
+const instructions = (): string | undefined => current.system ?? (/hermes|granite|functiongemma/i.test(loaded) ? undefined : SKILL_INSTRUCTIONS);
 
 function pick(s: Scenario): void {
   current = s;
@@ -100,11 +115,11 @@ loadBtn.onclick = async () => {
   try {
     await model?.unload();
     model = undefined;
-    model = await load(modelSelect.value, {
+    const id = modelSelect.value;
+    model = await load(id, {
       // The smallest models pick skills far better at 8 bits than at 4.
       quant: /0\.5B|350m/i.test(modelSelect.value) ? "q8" : /functiongemma/i.test(modelSelect.value) ? "f32" : "auto",
-      // ?endpoint=… loads from a mirror of the Hub (same paths), e.g. a server on this machine.
-      ...(query.get("endpoint") ? { endpoint: new URL(query.get("endpoint")!, location.href).href.replace(/\/$/, "") } : {}),
+      ...(endpoint ? { endpoint } : {}),
       device: device.value as "auto" | "gpu" | "cpu",
       onProgress: (p) => {
         progress.value = p.total ? p.loaded / p.total : 0;
@@ -112,6 +127,7 @@ loadBtn.onclick = async () => {
       },
     });
     progress.value = 1;
+    loaded = id;
     const i = model.info;
     status.textContent = `Loaded ${i.model} on the ${i.backend === "cpu" ? "CPU" : "GPU"} in ${((performance.now() - t0) / 1000).toFixed(1)} s. Pick a scenario and press Run.`;
     runBtn.disabled = false;

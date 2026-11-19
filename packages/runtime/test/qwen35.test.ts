@@ -337,4 +337,23 @@ describe("Qwen 3.5 (linear attention)", () => {
     slots.setLora(undefined);
     expect(diff((await logits(slots))[0]!, base[0]!)).toBeLessThan(1e-5);
   });
+
+  it("keeps the snapshot the next turn resumes from when two of a call's do not fit together", async () => {
+    const be = new CpuBackend({ threads: 1 });
+    const e = new Engine(be, new LlamaModel(be, CFG, weights(be), { maxSeq: 64, kvDtype: "f32" }), tok());
+    const first = Array.from({ length: 24 }, (_, i) => 3 + ((i * 11) % 80));
+    // Room for the snapshot after the whole prompt alone, not for it and the one 16 tokens earlier.
+    const budget = Engine as unknown as { STATE_BUDGET: number };
+    const was = budget.STATE_BUDGET;
+    budget.STATE_BUDGET = e.model.stateBytes + e.model.kvSnapshotBytes(first.length);
+    try {
+      for await (const _ of e.generateTokens(first, { maxTokens: 2, temperature: 0 })) void _;
+      // The next turn's template leaves out the prompt's last tokens: it resumes 16 before its end.
+      const next = [...first.slice(0, first.length - 4), 50, 51, 52];
+      for await (const _ of e.generateTokens(next, { maxTokens: 2, temperature: 0 })) void _;
+      expect(e.lastStats?.cachedTokens).toBe(first.length - 16);
+    } finally {
+      budget.STATE_BUDGET = was;
+    }
+  });
 });

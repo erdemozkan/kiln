@@ -42,11 +42,18 @@ export interface PromptCacheSource {
   exportCacheFrom(from: number): Promise<{ tokens: number[]; parts: Uint8Array[] }>;
 }
 
-const sameShape = (a: CacheShape, b: CacheShape) => a.kvDtype === b.kvDtype && a.layers === b.layers && a.rowBytes === b.rowBytes && (a.valueRowBytes ?? a.rowBytes) === (b.valueRowBytes ?? b.rowBytes) && a.slots.length === b.slots.length && a.slots.every((s, i) => s === b.slots[i]);
+const sameShape = (a: CacheShape, b: CacheShape) => a.kvDtype === b.kvDtype && a.layers === b.layers && a.rowBytes === b.rowBytes && (a.valueRowBytes ?? a.rowBytes) === (b.valueRowBytes ?? b.rowBytes) && JSON.stringify(a.layerRowBytes) === JSON.stringify(b.layerRowBytes) && a.slots.length === b.slots.length && a.slots.every((s, i) => s === b.slots[i]);
+
+/** Layer l's K and V bytes per position: its own where layers differ, else every layer's. */
+const rowsOf = (shape: CacheShape, l: number): readonly [number, number] => shape.layerRowBytes?.[l] ?? [shape.rowBytes, shape.valueRowBytes ?? shape.rowBytes];
 
 /** First position of from…to-1 a layer of `slots` slots still holds once `to` are written (as `LlamaModel.readKvRange`). */
 const rangeStart = (slots: number, from: number, to: number) => Math.max(from, to - slots);
-const rangeBytes = (shape: CacheShape, from: number, to: number) => shape.slots.reduce((t, s) => t + (to - rangeStart(s, from, to)) * (shape.rowBytes + (shape.valueRowBytes ?? shape.rowBytes)), 0);
+const rangeBytes = (shape: CacheShape, from: number, to: number) =>
+  shape.slots.reduce((t, s, l) => {
+    const [k, v] = rowsOf(shape, l);
+    return t + (to - rangeStart(s, from, to)) * (k + v);
+  }, 0);
 
 function framed(magic: number, json: unknown): Uint8Array[] {
   const body = new TextEncoder().encode(JSON.stringify(json));
@@ -113,7 +120,10 @@ function shapeOf(json: unknown): CacheShape | undefined {
   // 0 slots: a layer that keeps no keys and values (linear attention).
   if (!h.slots.every((s) => count(s, 2 ** 24, 0)) || !h.slots.some((s) => s > 0)) return undefined;
   if (h.valueRowBytes !== undefined && !count(h.valueRowBytes, 2 ** 24)) return undefined;
-  return { kvDtype: h.kvDtype, layers: h.layers, rowBytes: h.rowBytes, ...(h.valueRowBytes !== undefined ? { valueRowBytes: h.valueRowBytes } : {}), slots: h.slots };
+  // Written only by models whose layers' rows differ in size (Gemma 4); files of others have none.
+  const layered = h.layerRowBytes;
+  if (layered !== undefined && !(Array.isArray(layered) && layered.length === h.layers && layered.every((r) => Array.isArray(r) && r.length === 2 && count(r[0], 2 ** 24) && count(r[1], 2 ** 24)))) return undefined;
+  return { kvDtype: h.kvDtype, layers: h.layers, rowBytes: h.rowBytes, ...(h.valueRowBytes !== undefined ? { valueRowBytes: h.valueRowBytes } : {}), ...(layered ? { layerRowBytes: layered } : {}), slots: h.slots };
 }
 
 /**
@@ -147,9 +157,7 @@ export async function loadPromptCache(name: string): Promise<{ snapshot: CacheSn
   // The snapshot in `LlamaModel.readKv`'s layout: per layer its first min(n, slots) K rows, then as
   // many V rows. Every row of it was stored by some segment, so it is no larger than the file.
   const n = tokens.length;
-  const row = shape.rowBytes;
-  const vrow = shape.valueRowBytes ?? row;
-  const total = shape.slots.reduce((t, s) => t + Math.min(n, s) * (row + vrow), 0);
+  const total = shape.slots.reduce((t, s, l) => t + Math.min(n, s) * (rowsOf(shape, l)[0] + rowsOf(shape, l)[1]), 0);
   if (total > blob.size) return undefined;
   const data = new Uint8Array(total);
   for (const seg of segments) {
@@ -158,8 +166,9 @@ export async function loadPromptCache(name: string): Promise<{ snapshot: CacheSn
     if (bytes.length !== seg.end - seg.data) return undefined;
     let src = 0;
     let base = 0;
-    for (const slots of shape.slots) {
+    for (const [l, slots] of shape.slots.entries()) {
       if (!slots) continue;
+      const [row, vrow] = rowsOf(shape, l);
       const held = Math.min(n, slots);
       const start = rangeStart(slots, seg.from, seg.to);
       const rows = seg.to - start;
@@ -174,7 +183,7 @@ export async function loadPromptCache(name: string): Promise<{ snapshot: CacheSn
       base += held * (row + vrow);
     }
   }
-  return { snapshot: { tokens: [...tokens], kvDtype: shape.kvDtype, layers: shape.layers, rowBytes: shape.rowBytes, ...(shape.valueRowBytes !== undefined ? { valueRowBytes: shape.valueRowBytes } : {}), data }, state: { shape, tokens, segments: segments.map((s) => ({ to: s.to, end: s.end })) } };
+  return { snapshot: { tokens: [...tokens], kvDtype: shape.kvDtype, layers: shape.layers, rowBytes: shape.rowBytes, ...(shape.valueRowBytes !== undefined ? { valueRowBytes: shape.valueRowBytes } : {}), ...(shape.layerRowBytes ? { layerRowBytes: shape.layerRowBytes } : {}), data }, state: { shape, tokens, segments: segments.map((s) => ({ to: s.to, end: s.end })) } };
 }
 
 const STATES = 0x6b737431; // "kst1"

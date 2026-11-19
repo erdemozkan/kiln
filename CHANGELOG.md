@@ -2,6 +2,39 @@
 
 ## Unreleased
 
+**A review of the tools, the skills and the engine: what it found and fixed.**
+
+Security, in `read_web_page`: the check that refuses this machine and private networks could be
+passed with a trailing dot (`localhost.`), with rare IPv6 forms, and in Node.js with any public
+name that points at a private address; it now handles all three (Node.js looks the name up first).
+Redirects are checked before each hop is requested, not after. Requests carry no cookies and no
+referrer, and the page's own site is refused by default. A page is read up to 2 MB and for 15
+seconds at most, and its HTML is read by a scanner that stays linear on hostile input (a crafted
+300 KB page took 10 to 40 s). `parseToolCalls` no longer stalls on a call marker followed by
+thousands of spaces.
+
+Tools: a call a model drafts inside a reasoning block is not run. A FunctionGemma argument such as
+`007` no longer throws. A call that opens at the end of the context ends the reply instead of
+throwing, and a tool schema the grammar cannot express is offered unchecked instead of failing
+mid-reply. `runTools` takes a `signal` that also reaches the skills' requests (`execute` gets it as
+`{ signal }`), returns a stopped reply as `unfinished`, and refuses duplicate tool names. Python's
+`run_tools` sends non-ASCII results as they are, reports a result JSON cannot hold as that tool's
+error, and takes `tool_choice`.
+
+Skills: `calculate` is exact for whole numbers up to 2^53 (it rounded past 12 digits), reads
+`max(1,500)` as two arguments, checks argument counts and gains `round(x, digits)`, `log10` and
+`log2`. Text without spaces (Japanese, Chinese) is no longer cut to one character. `get_date_time`
+takes "UTC+3" and "Kyiv". `search_wikipedia` takes editions such as "simple" and "zh-yue".
+
+Engine: on sliding-window models (Gemma 3, Gemma 4) a chat that reused a longer chat's cache could
+later read overwritten keys and write wrong text; the ring's high-water mark no longer moves back.
+Gemma 4's prompt cache was never saved (its layers differ in size); it is now. More images in a
+chat than `imageSlots` is an error instead of one image silently standing in for another, and a
+failed image or audio encode no longer poisons its slot. Unloading a model frees its vision tower
+and the GPU device opened for it. Option combinations a model cannot take are refused before the
+download, not after. A long Qwen 3.5 chat keeps the snapshot its next turn resumes from. A worker
+thread that stops by itself in Node.js fails its pending calls instead of leaving them waiting.
+
 **Fixed: garbage after a long reply on Gemma 3.** When a stop token ended a reply, the decode
 steps already queued behind it had still run and written their keys past the reply's end, but the
 engine recorded only the tokens it kept. On a sliding-window layer, whose cache is a ring, those

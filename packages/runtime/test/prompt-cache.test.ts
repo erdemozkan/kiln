@@ -1,4 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { CpuBackend } from "@kiln/kernels";
+import { LlamaModel, configFromHF } from "@kiln/models";
+import { Tokenizer } from "@kiln/tokenizers";
+import { Engine } from "../src/engine";
 import { loadPromptCache, loadRecurrentStates, promptCacheName, savePromptCache, saveRecurrentStates, type PromptCacheSource } from "../src/prompt-cache";
 
 /** In-memory OPFS: the directory calls and sync-handle methods the cache files use. */
@@ -213,5 +217,84 @@ describe("prompt cache", () => {
     expect(back?.snapshot.tokens).toEqual([5, 6, 7, 8, 9, 10]);
     expect(back?.snapshot).toEqual(e.snapshot());
     expect(back?.state).toEqual(state);
+  });
+});
+
+describe("prompt cache of a model whose layers differ in head size", () => {
+  // Gemma 4's shape: sliding layers of 32-wide heads, full-attention layers of 64, the last layers
+  // reading earlier ones' keys and values. Only the K/V matter here, so the model has no layer weights.
+  const cfg = configFromHF({
+    model_type: "gemma4_text",
+    num_hidden_layers: 10,
+    hidden_size: 64,
+    num_attention_heads: 2,
+    num_key_value_heads: 1,
+    head_dim: 32,
+    global_head_dim: 64,
+    intermediate_size: 128,
+    vocab_size: 96,
+    sliding_window: 16,
+    num_kv_shared_layers: 4,
+    layer_types: ["sliding_attention", "sliding_attention", "sliding_attention", "sliding_attention", "full_attention", "sliding_attention", "sliding_attention", "sliding_attention", "sliding_attention", "full_attention"],
+  } as never);
+  const engine = (be: CpuBackend) => {
+    const emb = be.alloc(96 * 64 * 4, "storage", "embed");
+    const m = new LlamaModel(be, cfg, new Map([["model.embed_tokens.weight", { shape: [96, 64], dtype: "f32", buf: emb }]]), { maxSeq: 512, kvDtype: "f16" });
+    return new Engine(be, m, Tokenizer.fromJSON({ model: { type: "BPE", vocab: { a: 1 }, merges: [] }, pre_tokenizer: { type: "ByteLevel" } as never } as never));
+  };
+  /**
+   * Puts `n` tokens and their K/V in the engine's cache, as a load of a snapshot would. A row's bytes
+   * depend on its layer, K or V, and position only, so a longer cache extends a shorter one.
+   */
+  const fill = (e: Engine, n: number) => {
+    const s = e.cacheShape;
+    const out: number[] = [];
+    e.model.slots.forEach((slots, l) => {
+      const held = Math.min(n, slots);
+      s.layerRowBytes![l]!.forEach((bytes, part) => {
+        for (let j = 0; j < held; j++) {
+          // Slot j holds the last position written there.
+          const p = j + Math.floor((n - 1 - j) / slots) * slots;
+          for (let b = 0; b < bytes; b++) out.push((l * 31 + part * 17 + p * 7 + b) & 255);
+        }
+      });
+    });
+    const data = Uint8Array.from(out);
+    expect(data.length).toBe(e.model.kvSnapshotBytes(n));
+    const tokens = Array.from({ length: n }, (_, i) => 1 + ((i * 7) % 90));
+    expect(e.importCache({ tokens, kvDtype: s.kvDtype, layers: s.layers, rowBytes: s.rowBytes, ...(s.valueRowBytes ? { valueRowBytes: s.valueRowBytes } : {}), layerRowBytes: s.layerRowBytes, data })).toBe(true);
+  };
+
+  it("saves, appends and restores the cache", async () => {
+    const be = new CpuBackend({ threads: 1 });
+    const e = engine(be);
+    expect(e.cacheShape.layerRowBytes?.map(([k]) => k)).toEqual([64, 64, 64, 64, 128, 64, 64, 64, 64, 128]);
+    const name = promptCacheName("org/gemma4", {});
+    fill(e, 260);
+    let state = await savePromptCache(name, e);
+    expect(state?.tokens.length).toBe(260);
+    // A turn that adds tokens appends a segment; the ring layers' rows wrap past their 272 slots.
+    fill(e, 300);
+    const after = await e.exportCache();
+    state = await savePromptCache(name, e, state);
+    expect(state?.segments.length).toBe(2);
+    const back = await loadPromptCache(name);
+    expect(back?.state).toEqual(state);
+    const f = engine(be);
+    expect(f.importCache(back!.snapshot)).toBe(true);
+    expect((await f.exportCache()).data).toEqual(after.data);
+    // Files of models whose layers are alike keep their old header: nothing per layer in it.
+    expect(new FakeEngine().cacheShape).not.toHaveProperty("layerRowBytes");
+  });
+
+  it("does not take a snapshot made with other per-layer rows", async () => {
+    const be = new CpuBackend({ threads: 1 });
+    const e = engine(be);
+    fill(e, 20);
+    const snap = await e.exportCache();
+    const f = engine(be);
+    expect(f.importCache({ ...snap, layerRowBytes: snap.layerRowBytes!.map(([k, v], l) => (l === 4 ? [k / 2, v / 2] : [k, v])) })).toBe(false);
+    expect(f.importCache({ ...snap, layerRowBytes: undefined })).toBe(false);
+    expect(f.importCache(snap)).toBe(true);
   });
 });
