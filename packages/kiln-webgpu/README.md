@@ -317,7 +317,8 @@ const { content } = await runTools(llm, [
 browser it can only read sites that allow other pages to (most do not; Wikipedia articles go through
 Wikipedia's API, which does). `maxChars` (default 2000) bounds the text a skill hands the model.
 Each skill is also exported alone (`calculatorSkill()` …), to mix with your own tools. The smallest
-models (0.5B) manage one-step questions at q8 and stumble on the rest; see the changelog.
+models (0.5B) manage one-step questions at q8 and stumble on the rest;
+[docs/skill-models.md](../../docs/skill-models.md) has the scores of each model tried.
 
 ## Retrieval (RAG)
 

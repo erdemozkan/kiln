@@ -83,6 +83,17 @@ describe("search_wikipedia", () => {
     await expect(wikipediaSkill({ fetch: none }).execute({ query: "zzzz" })).rejects.toThrow(/no article/);
     const down = (async () => new Response("", { status: 503 })) as unknown as typeof globalThis.fetch;
     await expect(wikipediaSkill({ fetch: down }).execute({ query: "x" })).rejects.toThrow(/answered 503/);
+    // Refused for too many requests: one more try, with the application's name when one is given.
+    const seen: (string | undefined)[] = [];
+    let n = 0;
+    const busy = (async (_url: string, init: { headers: Record<string, string> }) => {
+      seen.push(init.headers["Api-User-Agent"]);
+      return n++ === 0 ? new Response("", { status: 429, headers: { "retry-after": "0" } }) : respond(JSON.stringify({ query: { pages: { "1": { index: 1, title: "X", extract: "An x." } } } }), "application/json");
+    }) as unknown as typeof globalThis.fetch;
+    expect(await wikipediaSkill({ fetch: busy, userAgent: "my-app/1.0" }).execute({ query: "x" })).toMatchObject({ title: "X" });
+    expect(seen).toEqual(["my-app/1.0", "my-app/1.0"]);
+    const refusing = (async () => new Response("", { status: 429, headers: { "retry-after": "0" } })) as unknown as typeof globalThis.fetch;
+    await expect(wikipediaSkill({ fetch: refusing }).execute({ query: "x" })).rejects.toThrow(/refusing requests for now/);
     const blocked = (async () => Promise.reject(new TypeError("Failed to fetch"))) as unknown as typeof globalThis.fetch;
     await expect(wikipediaSkill({ fetch: blocked }).execute({ query: "x" })).rejects.toThrow(/could not reach Wikipedia/);
   });

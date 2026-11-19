@@ -12,7 +12,17 @@ The playground's tools page now runs these instead of made-up tools. With Qwen2.
 the live network, the one-step questions work at q8 (a product and a sum, the time in Tokyo, today's
 weekday, who Ada Lovelace was, what a README says); at q4 the model mostly asks back instead of
 calling, and at either size it fails the two-step question (look up a height, then halve it) and
-misuses the calculator when no skill is needed. A larger model has not been tried yet.
+misuses the calculator when no skill is needed. docs/skill-models.md keeps the scores of every model
+tried, on eight questions: Qwen2.5-1.5B passes six, Hermes 3 (3B) six with its own prompt and
+three with `SKILL_INSTRUCTIONS` in front of it. A Wikipedia request refused for too many requests
+(HTTP 429) is tried once more, and `userAgent` names your application to Wikipedia.
+
+**Hermes models take tools.** Hermes 2 Pro and Hermes 3 ship a plain ChatML template and expect
+their tools in the system message, in the wording they were trained with. Kiln now writes that
+prompt when `tools` are given (function signatures between `<tools>` tags, earlier calls as
+`<tool_call>`, results as `<tool_response>`), so `chat(messages, { tools })`, `toolChoice` and
+`runTools` work with them, calls checked as for Qwen. Hermes-3-Llama-3.2-3B (Q4_K_M GGUF) ran
+Kiln's skills on an M3 MacBook Air's GPU: 2 to 16 s a question, the skill's network request included.
 
 **Tool calls, run and checked.** `runTools(llm, messages, { tools })` is the whole loop: each tool
 is an OpenAI-style function spec with an `execute` function; the model's calls are run, their answers

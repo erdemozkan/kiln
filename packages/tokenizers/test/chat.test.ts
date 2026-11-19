@@ -1,7 +1,7 @@
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
-import { chatml, llama3, parseToolCalls, templateFormat, type ChatMessage, type ToolSpec } from "../src/chat";
+import { chatml, hermesToolFormat, llama3, parseToolCalls, templateFormat, type ChatMessage, type ToolSpec } from "../src/chat";
 
 interface Fixture {
   conversations: Record<string, ChatMessage[]>;
@@ -52,6 +52,40 @@ describe("chat formats with tools", () => {
       expect(() => f.render([...msgs, { role: "tool", content: "18" }])).toThrow(/chat template/);
       expect(f.render(msgs, { tools: [] })).toContain("hi");
     }
+  });
+});
+
+describe("Hermes tool format", () => {
+  // Hermes 3's template: plain ChatML, any role.
+  const source = "{% for message in messages %}{{'<|im_start|>' + message['role'] + '\\n' + message['content'] + '<|im_end|>' + '\\n'}}{% endfor %}{% if add_generation_prompt %}{{ '<|im_start|>assistant\\n' }}{% endif %}";
+  const f = hermesToolFormat(templateFormat({ source, eosToken: "<|im_end|>" }));
+  const spec: ToolSpec = { type: "function", function: { name: "get_time", description: "The time in a city", parameters: { type: "object", properties: { city: { type: "string" } }, required: ["city"] } } };
+
+  it("puts the tools in the system message, after the caller's own", () => {
+    const p = f.render([{ role: "system", content: "Be brief." }, { role: "user", content: "Time in Rome?" }], { tools: [spec] });
+    expect(p.startsWith("<|im_start|>system\nBe brief.\n\nYou are a function calling AI model.")).toBe(true);
+    expect(p).toContain(`<tools> ${JSON.stringify(spec)} </tools>`);
+    expect(p).toContain('<tool_call>\n{"name": <function-name>, "arguments": <args-dict>}\n</tool_call><|im_end|>\n<|im_start|>user\nTime in Rome?<|im_end|>\n<|im_start|>assistant\n');
+    expect(f.toolCallTags).toBe(true);
+    // Without tools it is the template alone.
+    expect(f.render([{ role: "user", content: "Hi" }])).toBe("<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n");
+  });
+
+  it("writes earlier calls and their results the way the model was trained on", () => {
+    const call = (city: string) => ({ type: "function" as const, function: { name: "get_time", arguments: { city } } });
+    const p = f.render(
+      [
+        { role: "user", content: "Time in Rome and Oslo?" },
+        { role: "assistant", content: "", tool_calls: [call("Rome"), call("Oslo")] },
+        { role: "tool", name: "get_time", content: '{"time":"10:00"}' },
+        { role: "tool", name: "get_time", content: '{"time":"10:00"}' },
+      ],
+      { tools: [spec] },
+    );
+    expect(p).toContain('<|im_start|>assistant\n<tool_call>\n{"name":"get_time","arguments":{"city":"Rome"}}\n</tool_call>\n<tool_call>\n{"name":"get_time","arguments":{"city":"Oslo"}}\n</tool_call><|im_end|>\n');
+    expect(p).toContain('<|im_start|>tool\n<tool_response>\n{"time":"10:00"}\n</tool_response>\n<tool_response>\n{"time":"10:00"}\n</tool_response><|im_end|>\n<|im_start|>assistant\n');
+    const made = parseToolCalls('<tool_call>\n{"arguments": {"city": "Rome"}, "name": "get_time"}\n</tool_call>');
+    expect(made.toolCalls).toEqual([call("Rome")]);
   });
 });
 

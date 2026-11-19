@@ -131,10 +131,52 @@ export function templateFormat(t: ChatTemplate): ChatFormat {
   };
 }
 
+/**
+ * Hermes models (Hermes 2 Pro, Hermes 3) ship a plain ChatML template and take their tools in the
+ * system message, in the wording their makers trained them with: function signatures between
+ * `<tools>` tags, calls as `<tool_call>{…}</tool_call>`, results as `<tool_response>` in a `tool` turn.
+ */
+const HERMES_TOOLS = (tools: readonly ToolSpec[]) =>
+  `You are a function calling AI model. You are provided with function signatures within <tools></tools> XML tags. You may call one or more functions to assist with the user query. Don't make assumptions about what values to plug into functions. Here are the available tools: <tools> ${tools.map((t) => JSON.stringify(t)).join(" ")} </tools> Use the following pydantic model json schema for each tool call you will make: {"properties": {"name": {"title": "Name", "type": "string"}, "arguments": {"title": "Arguments", "type": "object"}}, "required": ["name", "arguments"], "title": "FunctionCall", "type": "object"} For each function call return a json object with function name and arguments within <tool_call></tool_call> XML tags as follows:\n<tool_call>\n{"name": <function-name>, "arguments": <args-dict>}\n</tool_call>`;
+
+/** `format` (a ChatML template without tool support) with Hermes' tool convention on top. */
+export function hermesToolFormat(format: ChatFormat): ChatFormat {
+  const text = (m: ChatMessage) => (typeof m.content === "string" ? m.content : m.content.map((p) => (p.type === "text" ? p.text : "")).join(""));
+  return {
+    ...format,
+    toolCallTags: true,
+    render(messages, opts = {}) {
+      const uses = !!opts.tools?.length || messages.some((m) => m.role === "tool" || m.tool_calls?.length);
+      if (!uses) return format.render(messages, opts);
+      const out: ChatMessage[] = [];
+      const first = messages[0]?.role === "system" ? messages[0] : undefined;
+      // The caller's own instructions come first, then the tool wording.
+      if (opts.tools?.length) out.push({ role: "system", content: `${first ? `${text(first)}\n\n` : ""}${HERMES_TOOLS(opts.tools)}` });
+      else if (first) out.push(first);
+      for (const m of first ? messages.slice(1) : messages) {
+        if (m.role === "tool") {
+          const body = `<tool_response>\n${text(m)}\n</tool_response>`;
+          const prev = out[out.length - 1];
+          // Several results in a row are one tool turn.
+          if (prev?.role === "tool") prev.content = `${prev.content as string}\n${body}`;
+          else out.push({ role: "tool", content: body });
+        } else if (m.tool_calls?.length) {
+          const calls = m.tool_calls.map((c) => `<tool_call>\n${JSON.stringify({ name: c.function.name, arguments: c.function.arguments })}\n</tool_call>`).join("\n");
+          out.push({ role: "assistant", content: [text(m), calls].filter(Boolean).join("\n") });
+        } else out.push(m);
+      }
+      return format.render(out, { ...opts, tools: undefined });
+    },
+  };
+}
+
 export function detectChatFormat(tok: Tokenizer): ChatFormat {
   if (tok.chatTemplate) {
     try {
-      return templateFormat(tok.chatTemplate);
+      const format = templateFormat(tok.chatTemplate);
+      // A ChatML template that never reads `tools`, in a vocabulary with Hermes' call tokens.
+      const hermes = !/\btools\b/.test(tok.chatTemplate.source) && tok.chatTemplate.source.includes("<|im_start|>") && tok.tokenId("<tool_call>") !== undefined && tok.tokenId("<tool_response>") !== undefined;
+      return hermes ? hermesToolFormat(format) : format;
     } catch (err) {
       if (!(err instanceof TemplateError)) throw err;
       console.warn(`[kiln] the model's chat template uses unsupported Jinja (${err.message}); falling back to a built-in format`);

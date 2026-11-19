@@ -54,11 +54,14 @@ let model: KilnModel | undefined;
 let current = SCENARIOS[0]!;
 let abort: AbortController | undefined;
 
+/** The system message for this run. Hermes brings a tool prompt of its own and does worse with another in front of it. */
+const instructions = (): string | undefined => current.system ?? (/hermes/i.test(modelSelect.value) ? undefined : SKILL_INSTRUCTIONS);
+
 function pick(s: Scenario): void {
   current = s;
   prompt.value = s.prompt;
   choice.value = s.choice ?? "auto";
-  specs.textContent = JSON.stringify(s.tools.map((t) => t.function), null, 2) + `\n\nSystem message: ${s.system ?? SKILL_INSTRUCTIONS}`;
+  specs.textContent = JSON.stringify(s.tools.map((t) => t.function), null, 2) + `\n\nSystem message: ${s.system ?? SKILL_INSTRUCTIONS} (not sent to Hermes, which has its own)`;
   for (const b of scenarioBox.children) b.setAttribute("aria-pressed", String((b as HTMLElement).dataset.title === s.title));
 }
 for (const s of SCENARIOS) {
@@ -133,7 +136,7 @@ runBtn.onclick = async () => {
   let reply: HTMLElement | undefined;
   const t0 = performance.now();
   try {
-    const r = await runTools(model, [{ role: "system", content: current.system ?? SKILL_INSTRUCTIONS }, { role: "user", content: prompt.value.trim() }], {
+    const r = await runTools(model, [...(instructions() ? [{ role: "system" as const, content: instructions()! }] : []), { role: "user", content: prompt.value.trim() }], {
       tools: current.tools,
       toolChoice: choice.value as "auto" | "required",
       checkToolCalls: check.checked,

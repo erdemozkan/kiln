@@ -15,6 +15,11 @@ export interface SkillOptions {
    * suggest one.
    */
   allowUrl?(url: URL): boolean;
+  /**
+   * A name for your application, sent to Wikipedia as `Api-User-Agent`. Wikimedia asks clients to
+   * identify themselves and limits anonymous ones sooner; none is sent by default.
+   */
+  userAgent?: string;
 }
 
 const skill = (name: string, description: string, properties: Record<string, unknown>, required: string[], execute: RunnableTool["execute"]): RunnableTool => ({
@@ -202,17 +207,28 @@ function clip(text: string, max: number): string {
   return `${(stop > max * 0.6 ? head.slice(0, stop + 1) : head.slice(0, Math.max(head.lastIndexOf(" "), 1))).trimEnd()} […]`;
 }
 
-async function get(f: typeof fetch, url: string, what: string): Promise<Response> {
-  let res: Response;
-  try {
-    res = await f(url, { headers: { Accept: "text/html,application/json;q=0.9,text/plain;q=0.8,*/*;q=0.1" } });
-  } catch (err) {
-    // In a browser this is also what a site that forbids other pages to read it looks like.
-    throw new Error(`could not reach ${what} (${err instanceof Error ? err.message : String(err)}); the site may be down or may not allow being read from here`);
+async function get(f: typeof fetch, url: string, what: string, headers: Record<string, string> = {}): Promise<Response> {
+  const once = async (): Promise<Response> => {
+    try {
+      return await f(url, { headers: { Accept: "text/html,application/json;q=0.9,text/plain;q=0.8,*/*;q=0.1", ...headers } });
+    } catch (err) {
+      // In a browser this is also what a site that forbids other pages to read it looks like.
+      throw new Error(`could not reach ${what} (${err instanceof Error ? err.message : String(err)}); the site may be down or may not allow being read from here`);
+    }
+  };
+  let res = await once();
+  if (res.status === 429) {
+    // Too many requests: one more try after the pause the site asks for (a few seconds at most).
+    const asked = Number(res.headers.get("retry-after"));
+    await new Promise((r) => setTimeout(r, Math.min(Number.isFinite(asked) && asked >= 0 ? asked : 2, 5) * 1000));
+    res = await once();
   }
+  if (res.status === 429) throw new Error(`${what} is refusing requests for now (too many, HTTP 429); try again in a minute`);
   if (!res.ok) throw new Error(`${what} answered ${res.status}`);
   return res;
 }
+
+const wikiHeaders = (opts: SkillOptions): Record<string, string> => (opts.userAgent ? { "Api-User-Agent": opts.userAgent } : {});
 
 /** Wikipedia's article for a search: what a model was never trained on, or half remembers. */
 export function wikipediaSkill(opts: SkillOptions = {}): RunnableTool {
@@ -227,7 +243,7 @@ export function wikipediaSkill(opts: SkillOptions = {}): RunnableTool {
       const q = String(query ?? "").trim();
       if (!q) throw new Error("the query is empty");
       const api = `https://${lang}.wikipedia.org/w/api.php?action=query&format=json&origin=*&generator=search&gsrlimit=3&gsrsearch=${encodeURIComponent(q)}&prop=extracts%7Cinfo&exintro=1&explaintext=1&inprop=url&redirects=1`;
-      const json = (await (await get(opts.fetch ?? fetch, api, "Wikipedia")).json()) as { query?: { pages?: Record<string, { index: number; title: string; extract?: string; fullurl?: string }> } };
+      const json = (await (await get(opts.fetch ?? fetch, api, "Wikipedia", wikiHeaders(opts))).json()) as { query?: { pages?: Record<string, { index: number; title: string; extract?: string; fullurl?: string }> } };
       const pages = Object.values(json.query?.pages ?? {}).sort((a, b) => a.index - b.index);
       const page = pages.find((p) => p.extract?.trim());
       if (!page) throw new Error(`Wikipedia (${lang}) has no article for ${JSON.stringify(q)}`);
@@ -307,7 +323,7 @@ export function webPageSkill(opts: SkillOptions = {}): RunnableTool {
       const wiki = /^([a-z-]+)(?:\.m)?\.wikipedia\.org$/.exec(u.hostname);
       if (wiki && u.pathname.startsWith("/wiki/") && u.pathname.length > 6) {
         const api = `https://${wiki[1]}.wikipedia.org/w/api.php?action=query&format=json&origin=*&prop=extracts&explaintext=1&redirects=1&titles=${encodeURIComponent(decodeURIComponent(u.pathname.slice(6)).replace(/_/g, " "))}`;
-        const json = (await (await get(opts.fetch ?? fetch, api, "Wikipedia")).json()) as { query?: { pages?: Record<string, { title: string; extract?: string }> } };
+        const json = (await (await get(opts.fetch ?? fetch, api, "Wikipedia", wikiHeaders(opts))).json()) as { query?: { pages?: Record<string, { title: string; extract?: string }> } };
         const article = Object.values(json.query?.pages ?? {}).find((p) => p.extract?.trim());
         if (!article) throw new Error(`Wikipedia (${wiki[1]}) has no article at ${u.href}; try search_wikipedia`);
         return { url: u.href, title: article.title, text: clip(article.extract!.trim(), max) };
@@ -327,7 +343,8 @@ export function webPageSkill(opts: SkillOptions = {}): RunnableTool {
 
 /**
  * A system message for a chat with skills. Small models otherwise ask the user for what a skill
- * would tell them, or answer from memory.
+ * would tell them, or answer from memory. *
+ * Not for models that bring a tool prompt of their own: Hermes 3 does worse with this in front of it.
  */
 export const SKILL_INSTRUCTIONS =
   "You are a helpful assistant with tools. When a tool can find or compute what is asked, call it right away instead of asking the user or answering from memory: calculate for any arithmetic, get_date_time for the date or the time anywhere, search_wikipedia for facts, read_web_page for a link. Then answer briefly from the tool's result. If no tool fits, just answer.";
