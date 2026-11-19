@@ -376,12 +376,24 @@ function phi3(c: HFConfig, plain: LlamaConfig): LlamaConfig {
   const factor = c.partial_rotary_factor;
   const base = typeof factor === "number" && factor !== 1 ? { ...plain, rotaryDims: partialRotary(plain.headDim, Math.floor(plain.headDim * factor)) } : plain;
   const s = c.rope_scaling as HFConfig | null | undefined;
-  if (!s) return base;
+  if (!s) return phi3Window(c, base);
   const type = s.rope_type ?? s.type;
   if (type !== "longrope" && type !== "su" && type !== "yarn") throw new UnsupportedModelError(`phi3 rope_scaling type "${String(type)}" is not supported yet`);
   if (type === "yarn") throw new UnsupportedModelError('phi3 rope_scaling type "yarn" is not supported yet (longrope is)');
   const original = num(c, "original_max_position_embeddings");
-  return longRope(base, s.short_factor, original, base.contextLength ?? original, optNum(s.attention_factor));
+  return phi3Window(c, longRope(base, s.short_factor, original, base.contextLength ?? original, optNum(s.attention_factor)));
+}
+
+/**
+ * Phi-3's `sliding_window`: every layer sees a token and the window - 1 before it, as transformers
+ * masks it. Phi-3 mini 4k sets 2047, half its context; the long-context variants set a window as
+ * large as their context, which cuts nothing. (A GGUF file is read as llama.cpp reads it: no window.)
+ */
+function phi3Window(c: HFConfig, cfg: LlamaConfig): LlamaConfig {
+  const window = c.sliding_window;
+  if (typeof window !== "number" || !Number.isInteger(window) || window < 1) return cfg;
+  if (window >= (cfg.maxPositions ?? cfg.contextLength ?? Infinity)) return cfg;
+  return { ...cfg, slidingWindow: window, slidingLayers: Array.from({ length: cfg.numLayers }, () => true) };
 }
 
 /** Checks a partial rotary size: an even number of a head's elements, at least one pair, at most all. */

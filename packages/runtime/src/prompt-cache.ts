@@ -73,7 +73,9 @@ function framed(magic: number, json: unknown): Uint8Array[] {
  * data length) and those positions' K/V as `LlamaModel.readKvRange` returns them. With `prev` (the
  * state the last save or load returned) only what changed is written: segments that end inside the
  * tokens both share stay, the file is cut after them, and one segment with the rest follows. A chat
- * turn so costs its own tokens' rows, not the whole conversation's again.
+ * turn so costs its own tokens' rows, not the whole conversation's again. Before appending, the
+ * kept segments' headers are read back from the file; if they are not what `prev` says (another tab
+ * wrote the file), the file starts over.
  */
 export async function savePromptCache(name: string, e: PromptCacheSource, prev?: PromptCacheState): Promise<PromptCacheState | undefined> {
   const shape = e.cacheShape;
@@ -83,11 +85,20 @@ export async function savePromptCache(name: string, e: PromptCacheSource, prev?:
   if (old) while (common < old.tokens.length && common < now.length && old.tokens[common] === now[common]) common++;
   // Nothing changed: no GPU readback, no write.
   if (old && common === old.tokens.length && common === now.length) return old;
-  const kept = old ? old.segments.filter((s) => s.to <= common) : [];
-  const from = kept.at(-1)?.to ?? 0;
-  const at = kept.at(-1)?.end ?? 0;
+  let kept = old ? old.segments.filter((s) => s.to <= common) : [];
+  let from = kept.at(-1)?.to ?? 0;
+  let at = kept.at(-1)?.end ?? 0;
   // Taken in the same task as `now`, so both describe the same cache.
-  const { tokens, parts } = now.length > from ? await e.exportCacheFrom(from) : { tokens: now.slice(0, from), parts: [] };
+  let { tokens, parts } = now.length > from ? await e.exportCacheFrom(from) : { tokens: now.slice(0, from), parts: [] as Uint8Array[] };
+  // `prev` is what this caller last knew of the file. Another tab on the same model may have
+  // rewritten it since: appending to segments that are no longer these would save keys and values
+  // of one conversation under the tokens of another. Then the file starts over.
+  if (kept.length && !(await fileHolds(name, shape, tokens, kept))) {
+    kept = [];
+    from = at = 0;
+    // Tokens and rows of one moment again (the cache may have moved on while the file was read).
+    ({ tokens, parts } = await e.exportCacheFrom(0));
+  }
   const out: Uint8Array[] = at === 0 ? framed(MAGIC, shape) : [];
   if (tokens.length > from) {
     const bytes = parts.reduce((n, p) => n + p.length, 0);
@@ -97,6 +108,26 @@ export async function savePromptCache(name: string, e: PromptCacheSource, prev?:
   if (!(await writeCacheFile(name, out, at))) return undefined;
   const end = at + out.reduce((n, p) => n + p.length, 0);
   return { shape, tokens, segments: tokens.length > from ? [...kept, { to: tokens.length, end }] : kept };
+}
+
+/** True when the file's first segments are `kept`: the same shape, the same ends, and these `tokens`. */
+async function fileHolds(name: string, shape: CacheShape, tokens: readonly number[], kept: readonly { to: number; end: number }[]): Promise<boolean> {
+  const blob = await readCacheBlob(name);
+  const head = blob && (await readFramed(blob, 0, MAGIC));
+  const stored = head && shapeOf(head.json);
+  if (!blob || !head || !stored || !sameShape(stored, shape)) return false;
+  let at = head.end;
+  let n = 0;
+  for (const k of kept) {
+    const seg = await readFramed(blob, at, SEGMENT);
+    const h = seg?.json as { from?: unknown; to?: unknown; tokens?: unknown; bytes?: unknown } | undefined;
+    if (!seg || !h || h.from !== n || h.to !== k.to || !Array.isArray(h.tokens) || h.tokens.length !== k.to - n) return false;
+    if (seg.end + rangeBytes(shape, n, k.to) !== k.end || k.end > blob.size) return false;
+    if (!(h.tokens as unknown[]).every((t, i) => t === tokens[n + i])) return false;
+    n = k.to;
+    at = k.end;
+  }
+  return true;
 }
 
 /** A u32-framed JSON block at `at`: its value and the offset just past it, or undefined if it is not there. */

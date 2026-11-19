@@ -138,6 +138,28 @@ describe("prompt cache", () => {
     }
   });
 
+  it("starts the file over when another tab rewrote it since this one last saved", async () => {
+    const name = promptCacheName("org/model", {});
+    const mine = new FakeEngine();
+    mine.set([1, 2, 3, 4]);
+    const first = await savePromptCache(name, mine);
+    // Another tab, another conversation of the same length: the file's segment ends where mine did.
+    const other = new FakeEngine();
+    other.set([9, 8, 7, 6]);
+    await savePromptCache(name, other);
+    expect(files.get(name)!.length).toBe(first!.segments[0]!.end);
+    mine.set([1, 2, 3, 4, 5, 6]);
+    const second = await savePromptCache(name, mine, first);
+    // Not an append onto the other tab's rows: one segment with all of mine.
+    expect(second?.segments.map((s) => s.to)).toEqual([6]);
+    expect((await loadPromptCache(name))?.snapshot).toEqual(mine.snapshot());
+    // And a file that is gone is written whole as well.
+    files.delete(name);
+    mine.set([1, 2, 3, 4, 5, 6, 7]);
+    expect((await savePromptCache(name, mine, second))?.segments.map((s) => s.to)).toEqual([7]);
+    expect((await loadPromptCache(name))?.snapshot).toEqual(mine.snapshot());
+  });
+
   it("starts the file over when the state is unknown or was made for another shape", async () => {
     const name = promptCacheName("org/model", {});
     const e = new FakeEngine();

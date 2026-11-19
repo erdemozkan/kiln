@@ -35,6 +35,12 @@ and the GPU device opened for it. Option combinations a model cannot take are re
 download, not after. A long Qwen 3.5 chat keeps the snapshot its next turn resumes from. A worker
 thread that stops by itself in Node.js fails its pending calls instead of leaving them waiting.
 
+Two more from the same review. Phi-3 mini 4k's `sliding_window` (2047) is applied, as transformers
+applies it: past 2047 tokens a layer no longer sees the oldest ones (a GGUF file is still read as
+llama.cpp reads it, without a window). And the prompt cache file is checked before a turn is
+appended to it: if another tab on the same model rewrote it meanwhile, the file starts over
+instead of taking one conversation's rows under another's tokens.
+
 **Fixed: garbage after a long reply on Gemma 3.** When a stop token ended a reply, the decode
 steps already queued behind it had still run and written their keys past the reply's end, but the
 engine recorded only the tokens it kept. On a sliding-window layer, whose cache is a ring, those

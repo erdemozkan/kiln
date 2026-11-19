@@ -41,4 +41,16 @@ describe("ring caches", () => {
     expect(b.cached).toBe(280);
     expect(b.out).toEqual((await run(engine(be), B, 6, false)).out);
   }, 120_000);
+
+  it("give the same text as a cache that keeps every position (a window on every layer, as Phi-3 mini 4k)", async () => {
+    const be = new CpuBackend({ threads: 1 });
+    const A = Array.from(rand(200, 11, 1), (v) => 1 + Math.floor((v + 1) * 47));
+    // 264 slots for 300 positions (a ring that wraps) against one slot per position.
+    const ring = new Engine(be, new LlamaModel(be, CFG, tinyWeights(be, CFG), { maxSeq: 1024, kvDtype: "f32" }), tinyTokenizer());
+    const flat = new Engine(be, new LlamaModel(be, CFG, tinyWeights(be, CFG), { maxSeq: 260, kvDtype: "f32" }), tinyTokenizer());
+    expect((await run(ring, A, 40, false)).out).toEqual((await run(flat, A, 40, false)).out);
+    // And the window does cut: without it the same weights write something else.
+    const open = new Engine(be, new LlamaModel(be, TINY, tinyWeights(be, TINY), { maxSeq: 260, kvDtype: "f32" }), tinyTokenizer());
+    expect((await run(open, A, 40, false)).out).not.toEqual((await run(flat, A, 40, false)).out);
+  }, 120_000);
 });

@@ -31,6 +31,16 @@ describe("Phi-3", () => {
     expect(c.maxPositions).toBeUndefined();
   });
 
+  it("slides every layer over the config's window, when it is shorter than the context", () => {
+    const c = configFromHF({ ...mini4k, sliding_window: 2047 });
+    expect(c.slidingWindow).toBe(2047);
+    expect(c.slidingLayers).toEqual(Array.from({ length: 32 }, () => true));
+    // Phi-3.5 mini and the 128k variants: a window as long as the context cuts nothing.
+    for (const window of [4096, 262144, null, undefined]) expect(configFromHF({ ...mini4k, sliding_window: window }).slidingLayers, String(window)).toBeUndefined();
+    const long = configFromHF({ ...mini4k, max_position_embeddings: 131072, sliding_window: 262144, rope_scaling: { type: "longrope", short_factor: short, long_factor: short } });
+    expect(long.slidingLayers).toBeUndefined();
+  });
+
   it("applies LongRoPE's short factors and attention factor, within the original context", () => {
     const c = configFromHF({ ...mini4k, max_position_embeddings: 131072, rope_scaling: { type: "longrope", short_factor: short, long_factor: short.map((v) => v * 10) } });
     expect(c.ropeFactors).toEqual(short);
