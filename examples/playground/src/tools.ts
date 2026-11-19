@@ -69,14 +69,14 @@ let loaded = "";
 let current = SCENARIOS[0]!;
 let abort: AbortController | undefined;
 
-/** The system message for this run. Only the small Qwen models gain from Kiln's; the others do better with the prompt they were trained on (docs/skill-models.md). */
-const instructions = (): string | undefined => current.system ?? (/hermes|granite|functiongemma/i.test(loaded) ? undefined : SKILL_INSTRUCTIONS);
+/** The system message for this run. Only the small Qwen2.5 models gain from Kiln's (Qwen3 0.6B, not scored, gets it too); the others do better with the prompt they were trained on (docs/skill-models.md). */
+const instructions = (): string | undefined => current.system ?? (/hermes|granite|functiongemma|qwen3-4b/i.test(loaded) ? undefined : SKILL_INSTRUCTIONS);
 
 function pick(s: Scenario): void {
   current = s;
   prompt.value = s.prompt;
   choice.value = s.choice ?? "auto";
-  specs.textContent = JSON.stringify(s.tools.map((t) => t.function), null, 2) + `\n\nSystem message: ${s.system ?? SKILL_INSTRUCTIONS} (sent to the Qwen models only)`;
+  specs.textContent = JSON.stringify(s.tools.map((t) => t.function), null, 2) + `\n\nSystem message: ${s.system ?? SKILL_INSTRUCTIONS} (sent to the small Qwen models only)`;
   for (const b of scenarioBox.children) b.setAttribute("aria-pressed", String((b as HTMLElement).dataset.title === s.title));
 }
 for (const s of SCENARIOS) {
@@ -119,6 +119,8 @@ loadBtn.onclick = async () => {
     model = await load(id, {
       // The smallest models pick skills far better at 8 bits than at 4.
       quant: /0\.5B|350m/i.test(modelSelect.value) ? "q8" : /functiongemma/i.test(modelSelect.value) ? "f32" : "auto",
+      // Qwen3 4B with its full context does not fit beside the weights on a 16 GB machine.
+      ...(/qwen3-4b/i.test(id) ? { maxSeq: 2048 } : {}),
       ...(endpoint ? { endpoint } : {}),
       device: device.value as "auto" | "gpu" | "cpu",
       onProgress: (p) => {

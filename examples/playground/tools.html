@@ -26,18 +26,19 @@
       <p class="sub">
         A chat model asks for a skill, this page runs it and passes the answer back. The skills are real: exact arithmetic, the clock, a live Wikipedia search and a web page reader.
         The last two send the model's search words or the page address to that site; nothing else leaves this page.
-        <a href="./">Playground</a>
+        <a href="https://github.com/erdemozkan/kiln/blob/main/docs/tools.md">Guide</a> · <a href="https://github.com/erdemozkan/kiln/blob/main/docs/skill-models.md">Model scores</a> · <a href="./">Playground</a>
       </p>
 
       <div class="row">
         <select id="model" aria-label="Model" style="flex: 1 1 280px">
-          <option value="ibm-granite/granite-4.0-1b-GGUF/granite-4.0-1b-Q8_0.gguf">Granite 4.0 1B (about 1.7 GB; the best at skills so far, slow without a GPU)</option>
-          <option value="unsloth/functiongemma-270m-it">FunctionGemma 270M (about 0.5 GB; one-step questions in English)</option>
-          <option value="Qwen/Qwen2.5-0.5B-Instruct">Qwen2.5 0.5B Instruct (about 1 GB, quick; one-step questions only)</option>
-          <option value="Qwen/Qwen2.5-1.5B-Instruct">Qwen2.5 1.5B Instruct (about 3 GB)</option>
-          <option value="NousResearch/Hermes-3-Llama-3.2-3B-GGUF/Hermes-3-Llama-3.2-3B.Q4_K_M.gguf">Hermes 3, Llama 3.2 3B (about 2 GB; needs a GPU)</option>
-          <option value="Qwen/Qwen3-0.6B">Qwen3 0.6B (about 1.5 GB)</option>
-          <option value="ibm-granite/granite-4.0-350m">Granite 4.0 350M (about 0.7 GB)</option>
+          <option value="ibm-granite/granite-4.0-1b-GGUF/granite-4.0-1b-Q8_0.gguf">Granite 4.0 1B (1.7 GB; 8 of 8 in our test, the best so far; slow without a GPU)</option>
+          <option value="Qwen/Qwen3-4B-GGUF/Qwen3-4B-Q4_K_M.gguf">Qwen3 4B (2.5 GB; 7 of 8; needs a GPU)</option>
+          <option value="NousResearch/Hermes-3-Llama-3.2-3B-GGUF/Hermes-3-Llama-3.2-3B.Q4_K_M.gguf">Hermes 3, Llama 3.2 3B (2 GB; 6 of 8, no calculator; needs a GPU)</option>
+          <option value="Qwen/Qwen2.5-1.5B-Instruct">Qwen2.5 1.5B Instruct (3 GB; 6 of 8)</option>
+          <option value="unsloth/functiongemma-270m-it">FunctionGemma 270M (0.5 GB; 5 of 8: one-step questions in English)</option>
+          <option value="Qwen/Qwen2.5-0.5B-Instruct">Qwen2.5 0.5B Instruct (1 GB, quick; 5 of 8: one-step questions)</option>
+          <option value="Qwen/Qwen3-0.6B">Qwen3 0.6B (1.5 GB; not scored)</option>
+          <option value="ibm-granite/granite-4.0-350m">Granite 4.0 350M (0.7 GB; not scored)</option>
         </select>
         <select id="device" aria-label="Device">
           <option value="auto">auto</option>
