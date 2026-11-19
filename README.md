@@ -10,7 +10,7 @@
   <a href="https://github.com/erdemozkan/kiln/actions/workflows/ci.yml"><img alt="CI status" src="https://github.com/erdemozkan/kiln/actions/workflows/ci.yml/badge.svg"></a>
   <img alt="MIT license" src="https://img.shields.io/badge/license-MIT-green">
   <img alt="Runs on WebGPU" src="https://img.shields.io/badge/runs%20on-WebGPU-005a9c">
-  <img alt="260 KB gzipped" src="https://img.shields.io/badge/size-260%20KB%20gzipped-8a2be2">
+  <img alt="320 KB gzipped" src="https://img.shields.io/badge/size-320%20KB%20gzipped-8a2be2">
   <img alt="Written in TypeScript" src="https://img.shields.io/badge/TypeScript-3178c6?logo=typescript&logoColor=white">
 </p>
 
@@ -29,12 +29,12 @@ most existing code moves over by changing the import and the model id.
 - **Not tied to the Hub.** Pass `endpoint` to load the same files from a mirror or your own static server, including models you trained yourself. A single `.gguf` also loads from any URL. Models on the user's own computer load too, from a picked `.gguf` file or a picked model folder, read in place with nothing uploaded. In Node.js, give the path of a folder or a `.gguf` file.
 - **Gated and private models.** `setAccessToken(token)` adds a Hugging Face access token to requests for repo files. It is sent to `https://huggingface.co` only, never to a mirror, an `endpoint` or the URL of a single file.
 - **A familiar API.** `pipeline`, `AutoTokenizer`, `AutoModel` and `TextStreamer` with transformers.js's option names and output shapes.
-- **Many tasks.** Chat and text generation, embeddings, classification, NER, question answering, translation, summarization, speech recognition, text-to-speech, image classification, object detection, segmentation, Segment Anything (click or box an object to cut it out), depth, background removal, image or document questions, and pictures from text.
+- **Many tasks.** Chat and text generation, chat about images, audio and video, embeddings, classification, NER, question answering, fill-mask, translation, summarization, speech recognition, audio classification, text-to-speech, image classification, object detection (for fixed labels or any label), segmentation, Segment Anything (click or box an object to cut it out), depth, background removal, upscaling, captions and OCR, document questions, and pictures from text. See [supported models](#supported-models).
 - **Structured output.** Constrain any LLM's reply to a JSON schema, a regex, a grammar or a list of choices.
 - **More for LLMs.** [Tool calls and built-in skills](docs/tools.md), LoRA adapters, a retrieval helper, and prompt caching across calls and reloads.
 - **Loads once.** Downloads are cached in the browser, resume if interrupted, and cached models load offline.
 - **Stays out of the way.** Models run in a worker and stream text back; the page never blocks.
-- **Small.** One 260 KB (gzipped) ES module that also works straight from a CDN, with a CPU fallback where there is no WebGPU.
+- **Small.** One 320 KB (gzipped) ES module that also works straight from a CDN, with a CPU fallback where there is no WebGPU.
 
 ## Principles
 
@@ -42,7 +42,7 @@ most existing code moves over by changing the import and the model id.
 - **Correct before fast.** Every model is checked against transformers.js or Python on the same inputs. A speed-up that changes the output isn't one.
 - **Modest hardware first.** The benchmarks are measured on a 2017 laptop with integrated graphics, because that is the kind of machine Kiln was built to put back to work.
 - **Honest numbers.** The benchmarks list where Kiln is slower, not only where it wins.
-- **Small footprint.** One 260 KB file with its worker inside, no runtime dependencies and no WASM runtime to download.
+- **Small footprint.** One 320 KB file (gzipped) with its worker inside, no runtime dependencies and no WASM runtime to download.
 - **Nothing leaves the browser.** Models run on the user's own device. Prompts, images and audio are never sent to a server.
 
 ## Prerequisites
@@ -140,6 +140,28 @@ To try the playground from the animation above:
 git clone https://github.com/erdemozkan/kiln.git && cd kiln && npm install && npm run dev
 ```
 
+## Supported models
+
+Kiln runs a model family once its architecture is written as Kiln kernels. These are the families that load today, from a model's own files on the Hub.
+
+| Area | Models | What they do |
+| --- | --- | --- |
+| Chat and text generation | Llama 2 and 3 (TinyLlama, Llama 3.2), Qwen2 and 2.5, Qwen3, Qwen 3.5, SmolLM2, Granite 3 and 4, Phi-3, Phi-3.5 and Phi-4 mini, Gemma 3, Gemma 4 (E2B, E4B), and fine-tunes of these such as Hermes 3, FunctionGemma and the DeepSeek-R1 distills | chat, completion, tools, structured output, LoRA |
+| Chat about media | SmolVLM and Gemma 3 (4B and larger): images. Qwen 3.5: images and video. Gemma 4: images, audio and video | questions about pictures, clips and recordings |
+| Text encoders | BERT, DistilBERT, RoBERTa, MiniLM, BGE | embeddings, classification, NER, question answering, fill-mask, zero-shot classification |
+| Text to text | BART and DistilBART, T5, Flan-T5 and mT5, Marian (OPUS-MT), M2M100 and NLLB | summarization, translation |
+| Speech to text | Whisper, wav2vec2, HuBERT | transcription with timestamps, audio classification |
+| Text to speech | MMS-TTS (VITS), SpeechT5, Kokoro | speech from text |
+| Image understanding | ViT, DeiT, DINOv2, ResNet, ConvNeXt, CLIP | classification, zero-shot classification, image embeddings |
+| Detection and segmentation | DETR, YOLOS, OWL-ViT and OWLv2, SegFormer, Segment Anything (SAM, SlimSAM) | boxes, boxes for any label, segmentation, masks from a click or a box |
+| Other image tasks | Depth Anything V2, RMBG-1.4, Swin2SR | depth, background removal, 2× upscaling |
+| Image to text | ViT-GPT2, Florence-2, Donut | captions, OCR, questions about a document |
+| Text to image | SDXS | a 512 × 512 picture in one step |
+
+Chat models load from safetensors or from a single GGUF file (F32, F16, BF16, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q4_K, Q5_K, Q6_K); the others load from the safetensors or `pytorch_model.bin` of their original repos.
+
+Not supported yet: SmolLM3, Gemma 1 and 2, Llama 4, mixture-of-experts models and the hybrid (Mamba) Granite 4 sizes among chat models; ModernBERT, MPNet, DeBERTa and XLM-R among encoders. Mistral loads through the Llama code but has not been run, because its smallest model is 7B. The [technical notes](docs/technical-notes.md) list each model that was run and how it was checked, and [skill-models.md](docs/skill-models.md) has the scores for tool use.
+
 ## Benchmarks
 
 Kiln against transformers.js in the same browser on the same machine, on the same inputs. Across 31 task and model pairs, Kiln was faster end to end on every one, with a median speed-up of 2.2×.
@@ -162,7 +184,7 @@ So Kiln was born from one idea: don't kill the potential of the hardware we alre
 
 ## About
 
-Kiln implements each model family itself, as WebGPU kernels, instead of running an exported ONNX graph. That is what lets it load original weights and GGUF files, and it is also why its list of supported architectures is shorter than transformers.js's.
+Kiln implements each model family itself, as WebGPU kernels, instead of running an exported ONNX graph. That is what lets it load original weights and GGUF files, and it is also why its [list of supported architectures](#supported-models) is shorter than transformers.js's.
 
 - **Guide and API:** [package README](packages/kiln-webgpu/README.md)
 - **Docs site, examples and migration guide:** in [`site/`](site); `npm run dev:site` serves it locally

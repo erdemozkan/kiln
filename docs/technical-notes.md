@@ -337,7 +337,7 @@ since transformers.js leaves more work to the first call. Kiln's unbundled dev b
 start (2.1 s to ready, 2.4 s to the first tokens, in the same session). Before the converted-weight
 cache the pair measured 1.8 s against 0.9 s. transformers.js
 downloads less (its files are pre-quantized), and its runtime adds 6.7 MB (gzipped) of WASM to
-Kiln's 260 KB (the whole package, its worker included).
+Kiln's 320 KB (the whole package, its worker included).
 
 SmolLM2-135M-Instruct, q4, Intel Gen-9 integrated GPU (Intel Mac), Chrome/Dawn. GPU clocks on this
 machine drift 10–15% between runs, so comparisons below are always from one session.

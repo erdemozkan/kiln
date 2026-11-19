@@ -27,7 +27,7 @@ model to see that no skill fits: these two separate the models.
 
 ## Results
 
-Run in Node.js on the CPU of an Intel Mac (2019 MacBook Pro), so the times show how the models
+Run in Node.js on the CPU of an Intel Mac (2017 MacBook Pro), so the times show how the models
 compare with each other, not how fast they are on a GPU. Sizes are the download.
 
 | Model | Weights | Download | Passed | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | Time per question |

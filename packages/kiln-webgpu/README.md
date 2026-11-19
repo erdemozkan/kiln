@@ -543,14 +543,18 @@ The reply always parses and fits the schema; whether the values are right is sti
 
 ## Models
 
-Llama, Mistral, Qwen2, Qwen3, SmolLM, Granite 3 and 4 (350M to 2B), Phi-3 and 3.5 (the 128k variants
-up to 4096 tokens of context), Gemma 3 (270M to 4B and larger;
-images as above) and SmolVLM (images as above) decoders, from
+Llama, Mistral, Qwen2, Qwen3, Qwen 3.5 (text, images and video), SmolLM, Granite 3 and 4 (350M to
+2B), Phi-3, 3.5 and Phi-4 mini (the 128k variants up to 4096 tokens of context), Gemma 3 (270M to 4B
+and larger; images as above), Gemma 4 (E2B and E4B: text, images, audio and video) and SmolVLM
+(images as above) decoders, and fine-tunes of these (Hermes 3, FunctionGemma), from
 safetensors (F32/F16/BF16) or GGUF (F32/F16/BF16/Q4_0/Q4_1/Q5_0/Q5_1/Q8_0/Q4_K/Q5_K/Q6_K).
 Weights are held on the GPU as q4, q8 or f32. The default, `quant: "auto"`, stores float weights as q4
 and keeps a GGUF file's tensors at their own precision (exactly, except Q6_K, which becomes q8);
 `"q4"`, `"q8"` or `"f32"` force one format. Gemma 3 270M and
 Granite 4 350M need `"q8"` or `"f32"`.
+
+The other families (text encoders, seq2seq, speech, vision, text to image) are in the sections
+above; the repository's README has [the whole list](https://github.com/erdemozkan/kiln#supported-models).
 
 ## Requirements
 

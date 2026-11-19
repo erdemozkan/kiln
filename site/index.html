@@ -26,7 +26,7 @@
       <div class="stats">
         <div class="stat"><div class="value">4.8×</div><div class="label">faster LLM decoding than transformers.js<br />(SmolLM2-135M, q4, same GPU)</div></div>
         <div class="stat"><div class="value">24</div><div class="label">pipeline tasks, transformers.js's<br />names and output shapes</div></div>
-        <div class="stat"><div class="value">260 KB</div><div class="label">gzipped, worker included;<br />no WASM runtime to download</div></div>
+        <div class="stat"><div class="value">320 KB</div><div class="label">gzipped, worker included;<br />no WASM runtime to download</div></div>
       </div>
 
       <h2 id="quick">Quick start</h2>
@@ -59,12 +59,12 @@ const [{ generated_text }] = await generator([{ role: "user", content: "Hello!" 
         <table>
           <thead><tr><th>Area</th><th>Models</th><th>Tasks</th></tr></thead>
           <tbody>
-            <tr><td>Language</td><td>Llama, Mistral, Qwen2/3/3.5, SmolLM, Granite 3 and 4, Phi-3 and Phi-4 mini, Gemma 3 and 4; safetensors or GGUF</td><td>chat, completion, tools, structured output, LoRA, <code>text-generation</code></td></tr>
+            <tr><td>Language</td><td>Llama, Mistral, Qwen2/3/3.5, SmolLM, Granite 3 and 4, Phi-3 and Phi-4 mini, Gemma 3 and 4, and fine-tunes such as Hermes 3 and FunctionGemma; safetensors or GGUF</td><td>chat, completion, tools, structured output, LoRA, <code>text-generation</code></td></tr>
             <tr><td>Text encoders</td><td>BERT, DistilBERT, RoBERTa, MiniLM, BGE</td><td>embeddings, classification, NER, QA, fill-mask, zero-shot</td></tr>
-            <tr><td>Seq2seq</td><td>BART, T5 / Flan-T5, Marian, M2M100 / NLLB</td><td>summarization, translation, text2text</td></tr>
+            <tr><td>Seq2seq</td><td>BART, T5 / Flan-T5 / mT5, Marian, M2M100 / NLLB</td><td>summarization, translation, text2text</td></tr>
             <tr><td>Speech</td><td>Whisper, wav2vec2, HuBERT, SpeechT5, MMS-VITS, Kokoro</td><td>speech recognition with timestamps, audio classification, text-to-speech</td></tr>
-            <tr><td>Vision</td><td>ViT, DeiT, DINOv2, CLIP, ResNet, ConvNeXt, DETR, YOLOS, OWL-ViT / OWLv2, SegFormer, Depth Anything, RMBG, Swin2SR</td><td>classification, detection, zero-shot detection, segmentation, depth, background removal, upscaling</td></tr>
-            <tr><td>Multimodal</td><td>Gemma 3, SmolVLM, Florence-2, Donut, ViT-GPT2</td><td>chat about images, captions, OCR, document QA</td></tr>
+            <tr><td>Vision</td><td>ViT, DeiT, DINOv2, CLIP, ResNet, ConvNeXt, DETR, YOLOS, OWL-ViT / OWLv2, SegFormer, Segment Anything, Depth Anything, RMBG, Swin2SR, SDXS</td><td>classification, detection, zero-shot detection, segmentation, masks from a click, depth, background removal, upscaling, pictures from text</td></tr>
+            <tr><td>Multimodal</td><td>Gemma 3 and 4, Qwen 3.5, SmolVLM, Florence-2, Donut, ViT-GPT2</td><td>chat about images, audio and video, captions, OCR, document QA</td></tr>
           </tbody>
         </table>
       </div>
