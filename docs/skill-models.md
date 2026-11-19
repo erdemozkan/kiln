@@ -88,6 +88,14 @@ On an M3 MacBook Air (16 GB, macOS 15, Node.js through Dawn):
 
 Qwen2.5-0.5B has not run this test on a GPU; there it writes one checked tool call in 0.1 to 0.7 s.
 
+## Not run
+
+- **Qwen3 4B** (Q4_K_M GGUF, 2.5 GB). Kiln's CPU backend holds at most 4 GiB, and the model needs
+  slightly more. On the M3 MacBook Air (16 GB) it loaded on the GPU in 36 s, but the machine was
+  already 4 GB into swap with its disk 99% full; the first question pushed swap up by another 4 GB
+  within a minute and the run was stopped before any answer. It needs a machine with free memory
+  and disk, or a smaller context (`maxSeq`).
+
 ## Picking a model
 
 - **First choice: Granite 4.0 1B** (`ibm-granite/granite-4.0-1b-GGUF/granite-4.0-1b-Q8_0.gguf`,
@@ -104,7 +112,7 @@ Qwen2.5-0.5B has not run this test on a GPU; there it writes one checked tool ca
 
 ## To try
 
-- Qwen3 1.7B and 4B, with and without thinking.
+- Qwen3 1.7B, and 4B on a machine with room for it, with and without thinking.
 - Granite 4.0 3B (micro), and Granite 4.0 1B on a GPU.
 - FunctionGemma is meant to be fine-tuned on an application's own functions; untuned is what was tried.
 - The same test on a GPU, for real speeds.
