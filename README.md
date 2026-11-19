@@ -31,7 +31,7 @@ most existing code moves over by changing the import and the model id.
 - **A familiar API.** `pipeline`, `AutoTokenizer`, `AutoModel` and `TextStreamer` with transformers.js's option names and output shapes.
 - **Many tasks.** Chat and text generation, embeddings, classification, NER, question answering, translation, summarization, speech recognition, text-to-speech, image classification, object detection, segmentation, Segment Anything (click or box an object to cut it out), depth, background removal, image or document questions, and pictures from text.
 - **Structured output.** Constrain any LLM's reply to a JSON schema, a regex, a grammar or a list of choices.
-- **More for LLMs.** Tool calls, LoRA adapters, a retrieval helper, and prompt caching across calls and reloads.
+- **More for LLMs.** [Tool calls and built-in skills](docs/tools.md), LoRA adapters, a retrieval helper, and prompt caching across calls and reloads.
 - **Loads once.** Downloads are cached in the browser, resume if interrupted, and cached models load offline.
 - **Stays out of the way.** Models run in a worker and stream text back; the page never blocks.
 - **Small.** One 260 KB (gzipped) ES module that also works straight from a CDN, with a CPU fallback where there is no WebGPU.
@@ -121,6 +121,19 @@ embed = pipeline("feature-extraction", "sentence-transformers/all-MiniLM-L6-v2")
 vectors = embed(["Hello world", "Hi"], pooling="mean", normalize=True)
 ```
 
+### Tools and skills
+
+A chat model can call your functions, and Kiln ships four ready-made skills: a calculator, the date and time, a Wikipedia lookup and a web page reader. Calls are generated under a grammar, so their names and arguments always match your tools.
+
+```js
+import { load, runTools, skills } from "kiln-webgpu";
+
+const llm = await load("ibm-granite/granite-4.0-1b-GGUF/granite-4.0-1b-Q8_0.gguf");
+const { content } = await runTools(llm, [{ role: "user", content: "What time is it in Tokyo right now?" }], { tools: skills() });
+```
+
+The [tools and skills guide](docs/tools.md) covers writing your own tools, the options, privacy, Python, and [which model to pick](docs/skill-models.md). To try it, open the playground's [Skills page](https://erdemozkan.github.io/kiln/playground/tools.html), which has ready scenarios.
+
 To try the playground from the animation above:
 
 ```bash
@@ -154,6 +167,7 @@ Kiln implements each model family itself, as WebGPU kernels, instead of running 
 - **Guide and API:** [package README](packages/kiln-webgpu/README.md)
 - **Docs site, examples and migration guide:** in [`site/`](site); `npm run dev:site` serves it locally
 - **Design, measurements and per-model notes:** [technical notes](docs/technical-notes.md)
+- **Tools and skills:** [guide](docs/tools.md) and [model scores](docs/skill-models.md)
 - **Changes:** [CHANGELOG](CHANGELOG.md)
 
 ## Contributing
