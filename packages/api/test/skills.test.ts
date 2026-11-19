@@ -92,6 +92,8 @@ describe("search_wikipedia", () => {
     }) as unknown as typeof globalThis.fetch;
     expect(await wikipediaSkill({ fetch: busy, userAgent: "my-app/1.0" }).execute({ query: "x" })).toMatchObject({ title: "X" });
     expect(seen).toEqual(["my-app/1.0", "my-app/1.0"]);
+    await wikipediaSkill({ fetch: busy }).execute({ query: "x" });
+    expect(seen[2]).toBe("Rectus");
     const refusing = (async () => new Response("", { status: 429, headers: { "retry-after": "0" } })) as unknown as typeof globalThis.fetch;
     await expect(wikipediaSkill({ fetch: refusing }).execute({ query: "x" })).rejects.toThrow(/refusing requests for now/);
     const blocked = (async () => Promise.reject(new TypeError("Failed to fetch"))) as unknown as typeof globalThis.fetch;

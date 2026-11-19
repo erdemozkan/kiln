@@ -55,6 +55,33 @@ describe("chat formats with tools", () => {
   });
 });
 
+describe("FunctionGemma calls", () => {
+  it("reads call:name{…} with escaped strings, numbers, lists and nested values", () => {
+    const r = parseToolCalls('<start_function_call>call:get_date_time{place:<escape>New York, USA<escape>}<end_function_call>');
+    expect(r).toEqual({ content: "", toolCalls: [{ type: "function", function: { name: "get_date_time", arguments: { place: "New York, USA" } } }] });
+    const many = parseToolCalls(
+      'Sure.<start_function_call>call:set_light{brightness:50,on:true,room:<escape>kitchen<escape>,tags:[<escape>a}b<escape>,2],opts:{<escape>k<escape>:null,x:-1.5e2}}<end_function_call><start_function_call>call:noargs{}<end_function_call>',
+    );
+    expect(many.content).toBe("Sure.");
+    expect(many.toolCalls.map((c) => c.function)).toEqual([
+      { name: "set_light", arguments: { brightness: 50, on: true, room: "kitchen", tags: ["a}b", 2], opts: { k: null, x: -150 } } },
+      { name: "noargs", arguments: {} },
+    ]);
+    // The end marker may be missing (the reply stops at the response marker), and a string may come unescaped.
+    expect(parseToolCalls("<start_function_call>call:calculate{expression:2 + 2}").toolCalls[0]!.function).toEqual({ name: "calculate", arguments: { expression: "2 + 2" } });
+    expect(parseToolCalls("<start_function_call>call:f{a:<escape>never closed").toolCalls).toEqual([]);
+    expect(parseToolCalls("<start_function_call>hello").content).toBe("<start_function_call>hello");
+  });
+
+  it("ends the turn at the response marker and hands results to the template as mappings", () => {
+    const source = "{{ bos_token }}{% for m in messages %}{% if m['role'] == 'tool' %}<start_function_response>response:{{ m['name'] }}{% if m['content'] is mapping %}{ {%- for k, v in m['content'] | dictsort %}{{ k }}:{{ v }},{% endfor -%} }{% else %}RAW{% endif %}<end_function_response>{% else %}{{ m['content'] }}<end_of_turn>{% endif %}{% endfor %}{% if tools %}<start_function_call>{% endif %}";
+    const f = templateFormat({ source, bosToken: "<bos>", eosToken: "<eos>" });
+    expect(f.stop).toContain("<start_function_response>");
+    const p = f.render([{ role: "user", content: "hi" }, { role: "tool", name: "f", content: '{"b":2,"a":1}' }, { role: "tool", name: "g", content: "plain" }]);
+    expect(p).toBe("<bos>hi<end_of_turn><start_function_response>response:f{a:1,b:2,}<end_function_response><start_function_response>response:gRAW<end_function_response>");
+  });
+});
+
 describe("Hermes tool format", () => {
   // Hermes 3's template: plain ChatML, any role.
   const source = "{% for message in messages %}{{'<|im_start|>' + message['role'] + '\\n' + message['content'] + '<|im_end|>' + '\\n'}}{% endfor %}{% if add_generation_prompt %}{{ '<|im_start|>assistant\\n' }}{% endif %}";

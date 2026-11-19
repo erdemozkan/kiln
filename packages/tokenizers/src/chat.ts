@@ -90,6 +90,12 @@ export const llama3: ChatFormat = {
   },
 };
 
+/**
+ * FunctionGemma ends a call by opening the function's response, which is the caller's to write:
+ * the token ends the model's turn.
+ */
+const FUNCTION_RESPONSE = "<start_function_response>";
+
 /** A model's Jinja chat template, from `tokenizer_config.json`, `chat_template.jinja` or GGUF metadata. */
 export interface ChatTemplate {
   source: string;
@@ -98,7 +104,7 @@ export interface ChatTemplate {
 }
 
 /** Turn-ending tokens that, when a template writes them, also end generation. */
-const TURN_ENDS = ["<|im_end|>", "<|eot_id|>", "<|end|>", "<end_of_turn>", "<|end_of_text|>", "<|endoftext|>", "<|eom_id|>", "</s>"];
+const TURN_ENDS = ["<|im_end|>", "<|eot_id|>", "<|end|>", "<end_of_turn>", "<|end_of_text|>", "<|endoftext|>", "<|eom_id|>", "</s>", FUNCTION_RESPONSE];
 
 /** A chat format that runs the model's own template, rendering the prompt for the assistant's next turn. */
 export function templateFormat(t: ChatTemplate): ChatFormat {
@@ -108,12 +114,15 @@ export function templateFormat(t: ChatTemplate): ChatFormat {
   const reads = (name: string) => new RegExp(`\\b${name}\\b`).test(t.source);
   const readsTools = reads("tools");
   const readsDocuments = reads("documents");
+  const functionCalls = t.source.includes("<start_function_call>");
   return {
     name: "chat_template",
     stop,
     toolCallTags: readsTools && t.source.includes("<tool_call>"),
     toolCallList: readsTools && !t.source.includes("<tool_call>") && t.source.includes("<|tool_call|>"),
     render(messages, opts = {}) {
+      // FunctionGemma's template writes a result field by field when it is a mapping; a JSON string would go in whole, as one quoted value.
+      if (functionCalls) messages = messages.map((m) => (m.role === "tool" && typeof m.content === "string" ? { ...m, content: (jsonObject(m.content) ?? m.content) as never } : m));
       if (opts.tools?.length && !readsTools) throw new Error("this model's chat template has no tool support (it never reads `tools`)");
       if (opts.documents?.length && !readsDocuments) throw new Error("this model's chat template has no document support (it never reads `documents`)");
       return tpl.render({
@@ -129,6 +138,15 @@ export function templateFormat(t: ChatTemplate): ChatFormat {
       });
     },
   };
+}
+
+function jsonObject(text: string): Record<string, unknown> | undefined {
+  try {
+    const v: unknown = JSON.parse(text);
+    return v && typeof v === "object" && !Array.isArray(v) ? (v as Record<string, unknown>) : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 /**
@@ -193,7 +211,7 @@ const TOOL_CALL = /<tool_call>\s*([\s\S]*?)\s*<\/tool_call>/g;
  * Special tokens that mark tool calls. The decoder keeps them in the text (it drops other special
  * tokens), so `parseToolCalls` can find the calls of templates that use them.
  */
-export const TOOL_CALL_MARKERS: readonly string[] = ["[TOOL_CALLS]", "[CALL_ID]", "[ARGS]", "<|tool_call|>"];
+export const TOOL_CALL_MARKERS: readonly string[] = ["[TOOL_CALLS]", "[CALL_ID]", "[ARGS]", "<|tool_call|>", "<start_function_call>", "<end_function_call>", "<escape>"];
 
 /** One call from a parsed `{"name": …, "arguments": …}` value, or undefined when it is not one. */
 function toCall(v: unknown): ToolCall | undefined {
@@ -285,6 +303,87 @@ function mistralCalls(s: string, i: number): [ToolCall[], number] | undefined {
   return calls.length ? [calls, i] : undefined;
 }
 
+const ESCAPE = "<escape>";
+
+/**
+ * FunctionGemma's argument syntax at `s[i]`: `<escape>text<escape>`, a number, true / false / null,
+ * `[…]`, or `{key:value,…}` (keys bare, or escaped inside nested values). Returns the value and
+ * where it ends, or undefined if `s` does not hold one there.
+ */
+function gemmaValue(s: string, i: number): [unknown, number] | undefined {
+  if (s.startsWith(ESCAPE, i)) {
+    const end = s.indexOf(ESCAPE, i + ESCAPE.length);
+    return end < 0 ? undefined : [s.slice(i + ESCAPE.length, end), end + ESCAPE.length];
+  }
+  if (s[i] === "{") {
+    const out: Record<string, unknown> = {};
+    i++;
+    while (s[i] !== "}") {
+      let key: string;
+      if (s.startsWith(ESCAPE, i)) {
+        const k = gemmaValue(s, i);
+        if (!k) return undefined;
+        [key, i] = k as [string, number];
+      } else {
+        const colon = s.indexOf(":", i);
+        if (colon < 0) return undefined;
+        key = s.slice(i, colon).trim();
+        i = colon;
+      }
+      if (!key || s[i] !== ":") return undefined;
+      const v = gemmaValue(s, i + 1);
+      if (!v) return undefined;
+      out[key] = v[0];
+      i = v[1];
+      if (s[i] === ",") i++;
+      else if (s[i] !== "}") return undefined;
+    }
+    return [out, i + 1];
+  }
+  if (s[i] === "[") {
+    const out: unknown[] = [];
+    i++;
+    while (s[i] !== "]") {
+      const v = gemmaValue(s, i);
+      if (!v) return undefined;
+      out.push(v[0]);
+      i = v[1];
+      if (s[i] === ",") i++;
+      else if (s[i] !== "]") return undefined;
+    }
+    return [out, i + 1];
+  }
+  const word = /^(true|false|null|-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)(?=[,}\]]|$)/.exec(s.slice(i, i + 40));
+  if (word) return [JSON.parse(word[0]), i + word[0].length];
+  // A bare word: a string the model forgot to escape. It ends at the next separator.
+  const bare = /^[^,}\]<]+/.exec(s.slice(i));
+  return bare ? [bare[0].trim(), i + bare[0].length] : undefined;
+}
+
+/** FunctionGemma's calls: `<start_function_call>call:name{…}<end_function_call>`, one after another. */
+function gemmaCalls(text: string): { content: string; toolCalls: ToolCall[] } {
+  const toolCalls: ToolCall[] = [];
+  let content = "";
+  let at = 0;
+  for (;;) {
+    const open = text.indexOf("<start_function_call>", at);
+    if (open < 0) break;
+    const head = /^call:([\w.-]+)/.exec(text.slice(open + 21, open + 121));
+    const args = head ? gemmaValue(text, open + 21 + head[0].length) : undefined;
+    if (!head || !args || typeof args[0] !== "object" || Array.isArray(args[0])) {
+      // Not a call after all: it stays text.
+      content += text.slice(at, open + 21);
+      at = open + 21;
+      continue;
+    }
+    content += text.slice(at, open);
+    toolCalls.push({ type: "function", function: { name: head[1]!, arguments: args[0] as Record<string, unknown> } });
+    at = text.startsWith("<end_function_call>", args[1]) ? args[1] + 19 : args[1];
+  }
+  content += text.slice(at);
+  return { content: toolCalls.length ? content.trim() : text, toolCalls };
+}
+
 /**
  * Splits a reply into text and tool calls. It reads the formats that chat templates ask for:
  * `<tool_call>{"name": …, "arguments": …}</tool_call>` blocks (Qwen2.5, Qwen3, SmolLM3, Hermes),
@@ -294,6 +393,7 @@ function mistralCalls(s: string, i: number): [ToolCall[], number] | undefined {
  * (and object arguments) stays in the text.
  */
 export function parseToolCalls(text: string): { content: string; toolCalls: ToolCall[] } {
+  if (text.includes("<start_function_call>")) return gemmaCalls(text);
   const toolCalls: ToolCall[] = [];
   let content = text.replace(TOOL_CALL, (block, body: string) => {
     let v: unknown;

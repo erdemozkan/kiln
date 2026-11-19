@@ -16,8 +16,8 @@ export interface SkillOptions {
    */
   allowUrl?(url: URL): boolean;
   /**
-   * A name for your application, sent to Wikipedia as `Api-User-Agent`. Wikimedia asks clients to
-   * identify themselves and limits anonymous ones sooner; none is sent by default.
+   * The application's name, sent to Wikipedia as `Api-User-Agent` (default "Rectus"). Wikimedia asks
+   * clients to identify themselves and limits anonymous ones sooner. It is sent to Wikipedia only.
    */
   userAgent?: string;
 }
@@ -228,7 +228,7 @@ async function get(f: typeof fetch, url: string, what: string, headers: Record<s
   return res;
 }
 
-const wikiHeaders = (opts: SkillOptions): Record<string, string> => (opts.userAgent ? { "Api-User-Agent": opts.userAgent } : {});
+const wikiHeaders = (opts: SkillOptions): Record<string, string> => ({ "Api-User-Agent": opts.userAgent || "Rectus" });
 
 /** Wikipedia's article for a search: what a model was never trained on, or half remembers. */
 export function wikipediaSkill(opts: SkillOptions = {}): RunnableTool {

@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+**Fixed: garbage after a long reply on Gemma 3.** When a stop token ended a reply, the decode
+steps already queued behind it had still run and written their keys past the reply's end, but the
+engine recorded only the tokens it kept. On a sliding-window layer, whose cache is a ring, those
+few steps could wrap and overwrite the conversation's first keys; the next chat then reused a
+prefix that was no longer there and wrote nonsense. It took a conversation that ended within a few
+tokens of the ring's size (768 for Gemma 3's 512-token window), which a tool result of several
+hundred tokens produced. The engine now counts every submitted step.
+
+**FunctionGemma's calls.** `parseToolCalls` reads `<start_function_call>call:name{key:<escape>text<escape>,…}<end_function_call>`,
+the model's turn ends where it opens `<start_function_response>`, and a tool's JSON result goes to
+the template as a mapping, so it is written field by field. FunctionGemma 270M then runs Kiln's
+skills: five of the eight questions in docs/skill-models.md, in 3 to 17 s each on an Intel Mac's CPU.
+Its calls are not checked against the tools' schemas (the format is not JSON).
+
 **Built-in skills.** `skills()` returns four tools that do real work, ready for `runTools`:
 `calculate` (exact arithmetic, through a parser of its own, so a model's text is never run as code),
 `get_date_time` (the clock, here or in a city or time zone), `search_wikipedia` (the start of the
@@ -15,7 +29,8 @@ calling, and at either size it fails the two-step question (look up a height, th
 misuses the calculator when no skill is needed. docs/skill-models.md keeps the scores of every model
 tried, on eight questions: Qwen2.5-1.5B passes six, Hermes 3 (3B) six with its own prompt and
 three with `SKILL_INSTRUCTIONS` in front of it. A Wikipedia request refused for too many requests
-(HTTP 429) is tried once more, and `userAgent` names your application to Wikipedia.
+(HTTP 429) is tried once more, and the skill names itself to Wikipedia, as Wikimedia asks of
+clients (`userAgent` replaces the name it sends).
 
 **Hermes models take tools.** Hermes 2 Pro and Hermes 3 ship a plain ChatML template and expect
 their tools in the system message, in the wording they were trained with. Kiln now writes that

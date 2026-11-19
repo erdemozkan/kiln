@@ -36,6 +36,7 @@ compare with each other, not how fast they are on a GPU. Sizes are the download.
 | Qwen2.5-0.5B-Instruct | q8 | 1.0 GB | 5 of 8 | yes | yes | yes | yes | yes | no | no | no | 8 to 55 s |
 | Qwen2.5-1.5B-Instruct | q4 | 3.1 GB | 6 of 8 | yes | yes | yes | yes | yes | no | yes | no | 20 to 114 s |
 
+| FunctionGemma 270M, its own developer prompt only | f32 | 0.5 GB | 5 of 8 | yes | yes | yes | yes | yes | no | no | no | 3 to 17 s |
 | Hermes 3 (Llama 3.2 3B), its own tool prompt only | Q4_K_M GGUF | 2.0 GB | 6 of 8 | no | yes | yes | yes | yes | no | yes | yes | see below (GPU) |
 | Hermes 3 (Llama 3.2 3B), with `SKILL_INSTRUCTIONS` | Q4_K_M GGUF | 2.0 GB | 3 of 8 | no | yes | yes | – | no | no | yes | no | see below (GPU) |
 
@@ -54,6 +55,13 @@ What went wrong, by model:
   `2 * 8848`, so it doubles a height it recalled instead of looking it up and halving. Question 8:
   it searches Wikipedia for "hello French" and reports the start-up it found.
 
+- **FunctionGemma 270M** (Google's Gemma 3 270M tuned for function calling; no system message, so
+  its template writes the developer line it was trained with). The smallest model here, and every
+  one-step question in English works, arithmetic included. Question 3 it answers with Tokyo's date,
+  not the local one. Question 6: one call, `2 * Everest height / 2`. Question 7: no call, and a
+  Turkish sentence that says nothing. Question 8: it reads `example.com/french`. It writes calls in
+  a format of its own (`<start_function_call>call:name{…}`), which Kiln reads but does not check
+  against the skills' schemas. Google's repo asks for a sign-in; the test used Unsloth's copy.
 - **Hermes 3, its own tool prompt only** (Kiln writes the prompt Hermes was trained with; no other
   system message). The only model here that answers question 8 without reaching for a skill, and
   the lookups and the web page work. It never calls `calculate`: question 1 it works out in its
@@ -74,8 +82,9 @@ Qwen2.5-0.5B has not run this test on a GPU; there it writes one checked tool ca
 
 ## Picking a model
 
-- **One-step questions** (a sum, the time, a lookup, a page): Qwen2.5-0.5B at q8 is enough, and it
-  is a 1 GB download. Load it with `quant: "q8"`; at q4 it stops calling the skills.
+- **One-step questions** (a sum, the time, a lookup, a page): FunctionGemma 270M, half a gigabyte,
+  or Qwen2.5-0.5B at q8 (1 GB; load it with `quant: "q8"`, at q4 it stops calling the skills).
+  FunctionGemma is the quicker of the two and only knows English well.
 - **Other languages:** Qwen2.5-1.5B picked the right Wikipedia edition and answered in Turkish; the
   0.5B did not.
 - **Knowing when not to use a skill:** Hermes 3 (3B), given only its own tool prompt. It needs a
@@ -88,4 +97,5 @@ Qwen2.5-0.5B has not run this test on a GPU; there it writes one checked tool ca
 
 - Qwen3 1.7B and 4B, with and without thinking.
 - Granite 4.0 1B and 3B.
+- FunctionGemma is meant to be fine-tuned on an application's own functions; untuned is what was tried.
 - The same test on a GPU, for real speeds.

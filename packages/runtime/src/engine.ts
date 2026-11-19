@@ -1202,8 +1202,11 @@ export class Engine {
       // including steps still in flight, which run before anything submitted later. This also holds
       // when the consumer stops iterating early.
       if (!failed) this.cached = spoken ? spoken.slice(0, -1) : [...promptIds, ...readIds.slice(0, Math.max(0, queued - 1))];
-      // Verify passes write up to MAX_VERIFY_ROWS positions past the kept ones; plain decode none.
-      this.written = failed ? this.model.maxSeq : this.cached.length + (spoken ? MAX_VERIFY_ROWS : 0);
+      // Verify passes write up to MAX_VERIFY_ROWS positions past the kept ones. Plain decode writes
+      // one position per submitted step, read back or not: when a stop token ends the reply, the
+      // steps queued behind it have still run, past the ids kept. A ring cache (sliding layers)
+      // that those steps wrapped has lost its first keys, which only `written` can tell.
+      this.written = failed ? this.model.maxSeq : spoken ? this.cached.length + MAX_VERIFY_ROWS : Math.max(this.cached.length, promptIds.length + Math.max(0, queued - 1));
       stats.submits = this.submits;
       stats.stopReason = opts.signal?.aborted
         ? "abort"
