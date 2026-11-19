@@ -205,6 +205,40 @@ class ThroughNode(unittest.TestCase):
         with self.assertRaises(kiln_webgpu.KilnError):
             kiln_webgpu.run_tools(chat, [], tools + [tools[0]])
 
+    def test_built_in_skills(self):
+        tools = kiln_webgpu.skills(max_chars=500)
+        self.assertEqual([t["function"]["name"] for t in tools], ["calculate", "get_date_time", "search_wikipedia", "read_web_page"])
+        by = {t["function"]["name"]: t["execute"] for t in tools}
+        self.assertEqual(by["calculate"](expression="1234 * 5678 + 99")["result"], 7006751)
+        self.assertIn("weekday", by["get_date_time"](place="Tokyo"))
+        with self.assertRaisesRegex(KilnError, "time zone"):
+            by["get_date_time"](place="Nowhereville")
+        # The reader refuses this machine before any request is made.
+        with self.assertRaises(KilnError):
+            by["read_web_page"](url="http://localhost:1/")
+        self.assertEqual(kiln_webgpu.calculator_skill()["function"]["name"], "calculate")
+        self.assertEqual(kiln_webgpu.wikipedia_skill(language="tr")["function"]["name"], "search_wikipedia")
+        with self.assertRaisesRegex(KilnError, "language"):
+            kiln_webgpu.wikipedia_skill(language="not a code")
+        with self.assertRaisesRegex(KilnError, "unknown skill option"):
+            kiln_webgpu.skills(fetch=print)
+        self.assertIn("tool", kiln_webgpu.skill_instructions().lower())
+
+    def test_run_tools_with_a_built_in_skill(self):
+        replies = ['<tool_call>\n{"name": "calculate", "arguments": {"expression": "6 * 7"}}\n</tool_call>', "It is 42."]
+
+        class Scripted:
+            n = 0
+
+            def stream(self, messages, **options):
+                Scripted.n += 1
+                yield replies[Scripted.n - 1]
+
+        r = kiln_webgpu.run_tools(Scripted(), [{"role": "user", "content": "6 times 7?"}], kiln_webgpu.skills())
+        self.assertEqual(r["steps"][0]["result"]["result"], 42)
+        self.assertEqual(r["messages"][2]["content"], '{"expression": "6 * 7", "result": 42}')
+        self.assertEqual(r["content"], "It is 42.")
+
     def test_errors_come_back(self):
         with self.assertRaisesRegex(KilnError, "no function"):
             kiln_webgpu.invoke("no_such_function")

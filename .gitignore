@@ -8,4 +8,5 @@ python/kiln_webgpu/_js/index.js
 __pycache__/
 *.egg-info/
 python/build/
+python/LICENSE
 python/dist/

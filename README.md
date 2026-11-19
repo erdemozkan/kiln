@@ -34,6 +34,7 @@ most existing code moves over by changing the import and the model id.
 - **More for LLMs.** [Tool calls and built-in skills](docs/tools.md), LoRA adapters, a retrieval helper, and prompt caching across calls and reloads.
 - **Loads once.** Downloads are cached in the browser, resume if interrupted, and cached models load offline.
 - **Stays out of the way.** Models run in a worker and stream text back; the page never blocks.
+- **From Python too.** The [`kiln-webgpu` Python package](python/README.md) has the same pipelines, tools and skills, with no PyTorch and no CUDA; it drives Kiln in a Node.js process.
 - **Small.** One 320 KB (gzipped) ES module that also works straight from a CDN, with a CPU fallback where there is no WebGPU.
 
 ## Principles
@@ -112,14 +113,26 @@ const chat = await pipeline("text-generation", "/data/SmolLM2-135M-Instruct-Q8_0
 
 For the GPU in Node.js, install Dawn's WebGPU bindings next to Kiln (`npm install kiln-webgpu webgpu`). Kiln finds the package by itself and runs the same kernels as in the browser; without it, it runs on the CPU as before.
 
-From Python, the same pipelines run through the `kiln-webgpu` package in [python/](python/README.md), which drives Kiln in a Node.js process:
+### From Python
+
+The same pipelines run from Python through the `kiln-webgpu` package in [python/](python/README.md). It has no Python dependencies: it starts a Node.js process (22.12 or newer) that runs Kiln, on the CPU or on the GPU.
+
+```bash
+pip install kiln-webgpu
+```
 
 ```python
-from kiln_webgpu import pipeline
+from kiln_webgpu import pipeline, run_tools, skills
 
 embed = pipeline("feature-extraction", "sentence-transformers/all-MiniLM-L6-v2")
 vectors = embed(["Hello world", "Hi"], pooling="mean", normalize=True)
+
+chat = pipeline("text-generation", "ibm-granite/granite-4.0-1b-GGUF/granite-4.0-1b-Q8_0.gguf")
+result = run_tools(chat, [{"role": "user", "content": "What time is it in Tokyo right now?"}], skills(), max_new_tokens=200)
+print(result["content"])
 ```
+
+For the GPU, run `python -m kiln_webgpu install-gpu` once (on a Mac it needs macOS 15 or newer). The [Python README](python/README.md) has the rest.
 
 ### Tools and skills
 
@@ -190,6 +203,7 @@ Kiln implements each model family itself, as WebGPU kernels, instead of running 
 - **Docs site, examples and migration guide:** in [`site/`](site); `npm run dev:site` serves it locally
 - **Design, measurements and per-model notes:** [technical notes](docs/technical-notes.md)
 - **Tools and skills:** [guide](docs/tools.md) and [model scores](docs/skill-models.md)
+- **Python:** [package README](python/README.md)
 - **Changes:** [CHANGELOG](CHANGELOG.md)
 
 ## Contributing

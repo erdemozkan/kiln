@@ -216,8 +216,30 @@ result = run_tools(chat, [{"role": "user", "content": "Where is my order A-1001?
 print(result["content"])
 ```
 
-`execute` is called with the call's arguments as keyword arguments. The built-in skills are not
-available from Python yet.
+`execute` is called with the call's arguments as keyword arguments.
+
+The built-in skills are there too. They are the same four, run by the JavaScript library in the
+Node.js process the Python package starts:
+
+```python
+from kiln_webgpu import pipeline, run_tools, skills
+
+chat = pipeline("text-generation", "ibm-granite/granite-4.0-1b-GGUF/granite-4.0-1b-Q8_0.gguf")
+result = run_tools(chat, [{"role": "user", "content": "What time is it in Tokyo right now?"}], skills(), max_new_tokens=200)
+for step in result["steps"]:
+    print(step["call"]["function"]["name"], step.get("result", step.get("error")))
+print(result["content"])
+```
+
+| Python | JavaScript |
+| --- | --- |
+| `skills(max_chars=…, language=…, user_agent=…)` | `skills({ maxChars, language, userAgent })` |
+| `calculator_skill()`, `date_time_skill()`, `wikipedia_skill()`, `web_page_skill()` | `calculatorSkill()` … |
+| `skill_instructions()` | `SKILL_INSTRUCTIONS` |
+| `skills(allow_private=True)` | `allowUrl: () => true` |
+
+`allow_private=True` lets `read_web_page` read this machine and private networks. A function of your
+own for `allowUrl` or `fetch` cannot be passed from Python.
 
 ## Running the loop yourself
 

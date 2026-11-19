@@ -137,6 +137,30 @@ const ops = {
     if (typeof f !== "function") throw new Error(`Kiln exports no function "${name}"`);
     return f(...args);
   },
+  /** One of Kiln's exported strings by name (SKILL_INSTRUCTIONS). */
+  constant({ name }) {
+    if (typeof kiln[name] !== "string") throw new Error(`Kiln exports no text "${name}"`);
+    return kiln[name];
+  },
+  /** Kiln's built-in skills, kept here to run: their specs go to Python, which calls `skill` for each call. */
+  skills({ only, options }) {
+    const { allowPrivate, ...opts } = options ?? {};
+    if (allowPrivate) opts.allowUrl = () => true;
+    const make = { calculate: kiln.calculatorSkill, get_date_time: () => kiln.dateTimeSkill(), search_wikipedia: kiln.wikipediaSkill, read_web_page: kiln.webPageSkill };
+    const names = only ?? Object.keys(make);
+    const tools = names.map((n) => {
+      if (!Object.hasOwn(make, n)) throw new Error(`Kiln has no skill "${n}"`);
+      return make[n](opts);
+    });
+    const handle = nextHandle++;
+    handles.set(handle, new Map(tools.map((t) => [t.function.name, t])));
+    return { handle, specs: tools.map((t) => ({ type: t.type, function: t.function })) };
+  },
+  async skill({ handle, name, args }) {
+    const tool = handles.get(handle)?.get?.(name);
+    if (!tool) throw new Error(`no skill "${name}" here`);
+    return tool.execute(args ?? {}, {});
+  },
   /** Sets fields of Kiln's `env`. */
   env({ values }) {
     Object.assign(kiln.env, values);

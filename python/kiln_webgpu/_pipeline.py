@@ -214,6 +214,64 @@ def run_tools(pipe, messages, tools, max_rounds=5, on_text=None, on_tool_call=No
     return {"content": content, "messages": history, "steps": steps, "unfinished": True}
 
 
+_SKILL_OPTIONS = {"max_chars": "maxChars", "language": "language", "user_agent": "userAgent", "allow_private": "allowPrivate"}
+
+
+def _skills(only, options):
+    unknown = sorted(set(options) - set(_SKILL_OPTIONS))
+    if unknown:
+        raise KilnError("unknown skill option %r (the options are %s)" % (unknown[0], ", ".join(sorted(_SKILL_OPTIONS))))
+    r = BRIDGE.request("skills", {"only": only, "options": {_SKILL_OPTIONS[k]: v for k, v in options.items() if v is not None}})
+    handle = r["handle"]
+
+    def runner(name):
+        return lambda **args: BRIDGE.request("skill", {"handle": handle, "name": name, "args": args})
+
+    return [dict(spec, execute=runner(spec["function"]["name"])) for spec in r["specs"]]
+
+
+def skills(**options):
+    """Kiln's four built-in skills as tools for `run_tools`: `calculate` (exact arithmetic),
+    `get_date_time` (the clock, here or in a city), `search_wikipedia` and `read_web_page`.
+
+        result = run_tools(chat, [{"role": "user", "content": "What time is it in Tokyo?"}], skills(), max_new_tokens=200)
+
+    They are the JavaScript library's skills and run in its Node.js process; the last two use the
+    network (the query goes to Wikipedia, the address to that site). Options: `max_chars` (most
+    characters of text a network skill hands the model, default 2000), `language` (the Wikipedia
+    edition when the model names none, default "en"), `user_agent` (your application's name, sent
+    to Wikipedia only) and `allow_private` (True lets `read_web_page` read this machine and private
+    networks, which it refuses by default).
+    """
+    return _skills(None, options)
+
+
+def calculator_skill():
+    """The `calculate` skill alone, to mix with your own tools."""
+    return _skills(["calculate"], {})[0]
+
+
+def date_time_skill():
+    """The `get_date_time` skill alone."""
+    return _skills(["get_date_time"], {})[0]
+
+
+def wikipedia_skill(**options):
+    """The `search_wikipedia` skill alone; options as for `skills`."""
+    return _skills(["search_wikipedia"], options)[0]
+
+
+def web_page_skill(**options):
+    """The `read_web_page` skill alone; options as for `skills`."""
+    return _skills(["read_web_page"], options)[0]
+
+
+def skill_instructions():
+    """Kiln's system message that tells a small model (Qwen2.5) to use the skills instead of asking
+    the user. Leave it out for Granite 4.0, Hermes 3 and FunctionGemma."""
+    return BRIDGE.request("constant", {"name": "SKILL_INSTRUCTIONS"})
+
+
 def invoke(name, *args):
     """Calls one of Kiln's exported functions by name, for example invoke("cos_sim", a, b)."""
     return BRIDGE.request("invoke", {"name": name, "args": list(args)})

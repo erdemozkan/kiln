@@ -69,6 +69,22 @@ masks[0]["mask"].save("mask.png")
   answers in words; each tool is an OpenAI-style function spec with the Python function that runs
   it under `"execute"` (called with the call's arguments as keyword arguments). It returns the
   answer, every call with its result or error, and the conversation.
+- **Built-in skills:** `skills()` returns four ready tools for `run_tools`: a calculator, the date
+  and time, a Wikipedia lookup and a web page reader.
+
+  ```python
+  from kiln_webgpu import pipeline, run_tools, skills
+
+  chat = pipeline("text-generation", "ibm-granite/granite-4.0-1b-GGUF/granite-4.0-1b-Q8_0.gguf")
+  result = run_tools(chat, [{"role": "user", "content": "What time is it in Tokyo right now?"}], skills(), max_new_tokens=200)
+  print(result["content"])
+  ```
+
+  Options: `max_chars`, `language`, `user_agent`, `allow_private`. Each skill also comes alone
+  (`calculator_skill()`, `date_time_skill()`, `wikipedia_skill()`, `web_page_skill()`), to mix with
+  your own tools, and `skill_instructions()` is the system message for the small Qwen2.5 models.
+  The [tools guide](https://github.com/erdemozkan/kiln/blob/main/docs/tools.md) has the details,
+  privacy included.
 - `pipe.dispose()` unloads a model (or use `with pipeline(...) as pipe:`); `shutdown()` stops Node.
 
 Requests run one at a time. Downloads are not cached in Node.js yet, so a model from the Hub is

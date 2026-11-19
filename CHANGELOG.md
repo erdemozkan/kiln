@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+**The built-in skills from Python.** The `kiln-webgpu` Python package gains `skills()`: the
+calculator, the date and time, the Wikipedia lookup and the web page reader as tools for
+`run_tools`, with `max_chars`, `language`, `user_agent` and `allow_private`. Each also comes alone
+(`calculator_skill()`, `date_time_skill()`, `wikipedia_skill()`, `web_page_skill()`), and
+`skill_instructions()` returns the system message for the small Qwen2.5 models. They are the
+JavaScript skills, run in the Node.js process the package starts, so they behave the same and the
+reader keeps its checks. The README has a "From Python" section and a list of supported models.
+
 **A review of the tools, the skills and the engine: what it found and fixed.**
 
 Security, in `read_web_page`: the check that refuses this machine and private networks could be
