@@ -27,8 +27,8 @@ the live network, the one-step questions work at q8 (a product and a sum, the ti
 weekday, who Ada Lovelace was, what a README says); at q4 the model mostly asks back instead of
 calling, and at either size it fails the two-step question (look up a height, then halve it) and
 misuses the calculator when no skill is needed. docs/skill-models.md keeps the scores of every model
-tried, on eight questions: Qwen2.5-1.5B passes six, Hermes 3 (3B) six with its own prompt and
-three with `SKILL_INSTRUCTIONS` in front of it. A Wikipedia request refused for too many requests
+tried, on eight questions: Granite 4.0 1B passes all eight, Qwen2.5-1.5B six, Hermes 3 (3B) six
+with its own prompt and three with `SKILL_INSTRUCTIONS` in front of it. A Wikipedia request refused for too many requests
 (HTTP 429) is tried once more, and the skill names itself to Wikipedia, as Wikimedia asks of
 clients (`userAgent` replaces the name it sends).
 

@@ -36,6 +36,8 @@ compare with each other, not how fast they are on a GPU. Sizes are the download.
 | Qwen2.5-0.5B-Instruct | q8 | 1.0 GB | 5 of 8 | yes | yes | yes | yes | yes | no | no | no | 8 to 55 s |
 | Qwen2.5-1.5B-Instruct | q4 | 3.1 GB | 6 of 8 | yes | yes | yes | yes | yes | no | yes | no | 20 to 114 s |
 
+| Granite 4.0 1B, no system message | Q8_0 GGUF | 1.7 GB | 8 of 8 | yes | yes | yes | yes | yes | yes | yes | yes | 5 to 127 s |
+| Granite 4.0 1B, with `SKILL_INSTRUCTIONS` | Q8_0 GGUF | 1.7 GB | 7 of 8 | yes | yes | yes | yes | yes | yes | no | yes | 6 to 141 s |
 | FunctionGemma 270M, its own developer prompt only | f32 | 0.5 GB | 5 of 8 | yes | yes | yes | yes | yes | no | no | no | 3 to 17 s |
 | Hermes 3 (Llama 3.2 3B), its own tool prompt only | Q4_K_M GGUF | 2.0 GB | 6 of 8 | no | yes | yes | yes | yes | no | yes | yes | see below (GPU) |
 | Hermes 3 (Llama 3.2 3B), with `SKILL_INSTRUCTIONS` | Q4_K_M GGUF | 2.0 GB | 3 of 8 | no | yes | yes | – | no | no | yes | no | see below (GPU) |
@@ -55,6 +57,12 @@ What went wrong, by model:
   `2 * 8848`, so it doubles a height it recalled instead of looking it up and halving. Question 8:
   it searches Wikipedia for "hello French" and reports the start-up it found.
 
+- **Granite 4.0 1B, no system message.** Nothing went wrong: the only model to pass every
+  question. For question 6 it looks Mount Everest up, reads 8,848.86 m and halves it itself,
+  correctly (4,424.43 m), without calling `calculate`; question 7 it searches the Turkish Wikipedia
+  and answers in Turkish; question 8 it just answers.
+- **Granite 4.0 1B, with `SKILL_INSTRUCTIONS`.** The same, except question 7: it searches the
+  English Wikipedia, and its Turkish answer has errors. The system message does not help it.
 - **FunctionGemma 270M** (Google's Gemma 3 270M tuned for function calling; no system message, so
   its template writes the developer line it was trained with). The smallest model here, and every
   one-step question in English works, arithmetic included. Question 3 it answers with Tokyo's date,
@@ -82,20 +90,21 @@ Qwen2.5-0.5B has not run this test on a GPU; there it writes one checked tool ca
 
 ## Picking a model
 
-- **One-step questions** (a sum, the time, a lookup, a page): FunctionGemma 270M, half a gigabyte,
-  or Qwen2.5-0.5B at q8 (1 GB; load it with `quant: "q8"`, at q4 it stops calling the skills).
-  FunctionGemma is the quicker of the two and only knows English well.
-- **Other languages:** Qwen2.5-1.5B picked the right Wikipedia edition and answered in Turkish; the
-  0.5B did not.
-- **Knowing when not to use a skill:** Hermes 3 (3B), given only its own tool prompt. It needs a
-  GPU: on the Intel Mac's CPU it did not finish the test in half an hour.
-- **Arithmetic:** the Qwen2.5 models call `calculate`; Hermes 3 does not, and gets sums wrong.
-- **Two-step questions:** none of the models above manages one. Larger and tool-trained models are
-  next on the list (below).
+- **First choice: Granite 4.0 1B** (`ibm-granite/granite-4.0-1b-GGUF/granite-4.0-1b-Q8_0.gguf`,
+  1.7 GB, Apache 2.0), without a system message. It is the only model that passed all eight
+  questions, the two-step one and the one that needs no skill included. It is slow on a CPU.
+- **Smallest: FunctionGemma 270M**, half a gigabyte, for one-step questions in English (a sum, the
+  time, a lookup, a page). Qwen2.5-0.5B does as much at q8 (1 GB; at q4 it stops calling skills).
+- **System message:** `SKILL_INSTRUCTIONS` helps the small Qwen2.5 models, which otherwise ask the
+  user instead of calling. Leave it out for Granite 4.0, Hermes 3 and FunctionGemma: each does
+  better with the prompt it was trained on.
+- **Arithmetic:** Hermes 3 never calls `calculate` and gets sums wrong; the others call it.
+- Not yet known: how any of these does on harder chains (three steps or more), and GPU speeds for
+  all but Hermes 3.
 
 ## To try
 
 - Qwen3 1.7B and 4B, with and without thinking.
-- Granite 4.0 1B and 3B.
+- Granite 4.0 3B (micro), and Granite 4.0 1B on a GPU.
 - FunctionGemma is meant to be fine-tuned on an application's own functions; untuned is what was tried.
 - The same test on a GPU, for real speeds.
