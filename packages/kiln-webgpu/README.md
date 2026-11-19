@@ -292,6 +292,33 @@ arguments always follow its `parameters` schema (`checkToolCalls: false` turns t
 loop yourself, pass `tools` to `llm.chat()` and read the reply with `parseToolCalls`. The model's
 chat template must support tools (Qwen2.5, Qwen3, Granite, Mistral; SmolLM2 does not).
 
+### Built-in skills
+
+`skills()` is a set of tools that do real work, ready for `runTools`:
+
+```js
+import { load, runTools, skills, SKILL_INSTRUCTIONS } from "kiln-webgpu";
+
+const llm = await load("Qwen/Qwen2.5-1.5B-Instruct");
+const { content } = await runTools(llm, [
+  { role: "system", content: SKILL_INSTRUCTIONS },
+  { role: "user", content: "Who was Ada Lovelace? Look it up." },
+], { tools: skills() });
+```
+
+| Skill | What it does | Network |
+| --- | --- | --- |
+| `calculate` | Exact arithmetic on an expression (its own parser; the model's text is never run as code) | none |
+| `get_date_time` | The date and time now, here or in a city or IANA time zone | none |
+| `search_wikipedia` | The start of the best matching Wikipedia article, in any language edition | the query goes to Wikipedia |
+| `read_web_page` | A page's readable text | the address goes to that site |
+
+`read_web_page` refuses this machine and private networks by default (`allowUrl` decides), and in a
+browser it can only read sites that allow other pages to (most do not; Wikipedia articles go through
+Wikipedia's API, which does). `maxChars` (default 2000) bounds the text a skill hands the model.
+Each skill is also exported alone (`calculatorSkill()` …), to mix with your own tools. The smallest
+models (0.5B) manage one-step questions at q8 and stumble on the rest; see the changelog.
+
 ## Retrieval (RAG)
 
 Embeddings, an index and generation in one library:

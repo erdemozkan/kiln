@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+**Built-in skills.** `skills()` returns four tools that do real work, ready for `runTools`:
+`calculate` (exact arithmetic, through a parser of its own, so a model's text is never run as code),
+`get_date_time` (the clock, here or in a city or time zone), `search_wikipedia` (the start of the
+best matching article, in any language edition) and `read_web_page` (a page's readable text; it
+refuses this machine and private networks, and reads Wikipedia articles through Wikipedia's API,
+which browsers may call). `SKILL_INSTRUCTIONS` is a system message that tells a model to use them.
+The playground's tools page now runs these instead of made-up tools. With Qwen2.5-0.5B on a CPU and
+the live network, the one-step questions work at q8 (a product and a sum, the time in Tokyo, today's
+weekday, who Ada Lovelace was, what a README says); at q4 the model mostly asks back instead of
+calling, and at either size it fails the two-step question (look up a height, then halve it) and
+misuses the calculator when no skill is needed. A larger model has not been tried yet.
+
 **Tool calls, run and checked.** `runTools(llm, messages, { tools })` is the whole loop: each tool
 is an OpenAI-style function spec with an `execute` function; the model's calls are run, their answers
 (or `{"error": …}` when one throws or names no tool) go back as `tool` messages, and the loop ends

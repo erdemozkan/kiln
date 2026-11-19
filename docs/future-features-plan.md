@@ -69,6 +69,13 @@ schemas, on the CPU and the GPU, from JavaScript and Python (`run_tools`); see t
 Mistral's call format (its smallest model, 7B, needs more than the CPU backend's 4 GiB and has not
 been run on a GPU), and a run of the thinking-block rule on a reasoning model (unit-tested only).
 
+Built-in skills (unreleased): `calculate`, `get_date_time`, `search_wikipedia`, `read_web_page`; see
+the changelog. Open: a run with a model large enough for two-step questions (1.5B and up), the
+skills from Python, and more skills: a code runner, search over the user's own documents, and Kiln's
+own models as skills (make a picture, look at a picture, speak and listen). After those, the user's
+aim: a skill that operates other applications. A web page cannot reach outside itself, so that
+needs a browser extension (for web apps) or Kiln in Node.js or Python driving the desktop.
+
 Found on the way: in Node.js a download that fails starts again from zero and shows no progress
 (the browser's resumes); on a slow link a 1 GB model never arrived.
 
