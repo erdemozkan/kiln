@@ -39,6 +39,7 @@ compare with each other, not how fast they are on a GPU. Sizes are the download.
 | Granite 4.0 1B, no system message | Q8_0 GGUF | 1.7 GB | 8 of 8 | yes | yes | yes | yes | yes | yes | yes | yes | 5 to 127 s |
 | Granite 4.0 1B, with `SKILL_INSTRUCTIONS` | Q8_0 GGUF | 1.7 GB | 7 of 8 | yes | yes | yes | yes | yes | yes | no | yes | 6 to 141 s |
 | FunctionGemma 270M, its own developer prompt only | f32 | 0.5 GB | 5 of 8 | yes | yes | yes | yes | yes | no | no | no | 3 to 17 s |
+| Qwen3 4B, no system message, thinking off, `maxSeq` 2048 | Q4_K_M GGUF | 2.5 GB | 7 of 8 | yes | yes | no | yes | yes | yes | yes | yes | see below (GPU) |
 | Hermes 3 (Llama 3.2 3B), its own tool prompt only | Q4_K_M GGUF | 2.0 GB | 6 of 8 | no | yes | yes | yes | yes | no | yes | yes | see below (GPU) |
 | Hermes 3 (Llama 3.2 3B), with `SKILL_INSTRUCTIONS` | Q4_K_M GGUF | 2.0 GB | 3 of 8 | no | yes | yes | – | no | no | yes | no | see below (GPU) |
 
@@ -70,6 +71,13 @@ What went wrong, by model:
   Turkish sentence that says nothing. Question 8: it reads `example.com/french`. It writes calls in
   a format of its own (`<start_function_call>call:name{…}`), which Kiln reads but does not check
   against the skills' schemas. Google's repo asks for a sign-in; the test used Unsloth's copy.
+- **Qwen3 4B, no system message, thinking off.** Question 3: no call; it says it cannot know the
+  date and offers to check. Question 6 counts as a pass on the answer (4,424 m), but it skipped the
+  lookup: it calls `calculate("8848 / 2")` with a height it recalled. The rest is right, Turkish
+  included, and question 8 it just answers.
+- **Qwen3 4B with thinking on** was run once but not scored: the test printed only the start of
+  each thinking block. It called `get_date_time` for question 3, made no call at all for
+  question 6, and took four to six times as long.
 - **Hermes 3, its own tool prompt only** (Kiln writes the prompt Hermes was trained with; no other
   system message). The only model here that answers question 8 without reaching for a skill, and
   the lookups and the web page work. It never calls `calculate`: question 1 it works out in its
@@ -85,22 +93,30 @@ On an M3 MacBook Air (16 GB, macOS 15, Node.js through Dawn):
 | Model | Load | Time per question |
 | --- | --- | --- |
 | Hermes 3 (Llama 3.2 3B), Q4_K_M | 12 to 25 s from disk | 2 to 16 s, the skill's network request included |
+| Granite 4.0 1B, Q8_0, no system message | 10 s from disk | 0.6 to 11.5 s, the skill's network request included; all eight in 58 s |
+| Qwen3 4B, Q4_K_M, `maxSeq` 2048, thinking off | 9 s from disk | 2.3 to 20.4 s; all eight in 94 s |
+| Qwen3 4B, the same with thinking on | 9 s from disk | 20 to 54 s; all eight in 5 min 40 s |
+
+Granite passed all eight again there, with another test using the machine at the same time. One
+slip in its wording: for Tokyo it wrote "00:47 (6:47 AM)".
 
 Qwen2.5-0.5B has not run this test on a GPU; there it writes one checked tool call in 0.1 to 0.7 s.
 
-## Not run
+## Memory
 
-- **Qwen3 4B** (Q4_K_M GGUF, 2.5 GB). Kiln's CPU backend holds at most 4 GiB, and the model needs
-  slightly more. On the M3 MacBook Air (16 GB) it loaded on the GPU in 36 s, but the machine was
-  already 4 GB into swap with its disk 99% full; the first question pushed swap up by another 4 GB
-  within a minute and the run was stopped before any answer. It needs a machine with free memory
-  and disk, or a smaller context (`maxSeq`).
+- Kiln's CPU backend holds at most 4 GiB. Qwen3 4B (Q4_K_M) needs slightly more, so it runs on a
+  GPU only.
+- On the 16 GB MacBook Air, Qwen3 4B with the default context filled the machine's swap and was
+  stopped before its first answer. With `maxSeq: 2048` it ran, and swap still grew by about 2 GB
+  per run (another test was using the machine). Give it a small `maxSeq` on a 16 GB machine.
 
 ## Picking a model
 
 - **First choice: Granite 4.0 1B** (`ibm-granite/granite-4.0-1b-GGUF/granite-4.0-1b-Q8_0.gguf`,
   1.7 GB, Apache 2.0), without a system message. It is the only model that passed all eight
-  questions, the two-step one and the one that needs no skill included. It is slow on a CPU.
+  questions, the two-step one and the one that needs no skill included. It is slow on a CPU; on a
+  GPU it answers in 1 to 12 s.
+- **Qwen3 4B** is no better here (7 of 8), slower, larger, and needs a GPU and a small `maxSeq`.
 - **Smallest: FunctionGemma 270M**, half a gigabyte, for one-step questions in English (a sum, the
   time, a lookup, a page). Qwen2.5-0.5B does as much at q8 (1 GB; at q4 it stops calling skills).
 - **System message:** `SKILL_INSTRUCTIONS` helps the small Qwen2.5 models, which otherwise ask the
@@ -108,11 +124,11 @@ Qwen2.5-0.5B has not run this test on a GPU; there it writes one checked tool ca
   better with the prompt it was trained on.
 - **Arithmetic:** Hermes 3 never calls `calculate` and gets sums wrong; the others call it.
 - Not yet known: how any of these does on harder chains (three steps or more), and GPU speeds for
-  all but Hermes 3.
+  the Qwen2.5 models and FunctionGemma.
 
 ## To try
 
-- Qwen3 1.7B, and 4B on a machine with room for it, with and without thinking.
-- Granite 4.0 3B (micro), and Granite 4.0 1B on a GPU.
+- Qwen3 1.7B; Qwen3 4B with thinking on, scored properly.
+- Granite 4.0 3B (micro).
 - FunctionGemma is meant to be fine-tuned on an application's own functions; untuned is what was tried.
 - The same test on a GPU, for real speeds.
