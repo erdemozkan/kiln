@@ -13,7 +13,7 @@ Or with no install and no bundler, from a CDN:
 
 ```html
 <script type="module">
-  import { pipeline } from "https://cdn.jsdelivr.net/npm/kiln-webgpu@0.2.0";
+  import { pipeline } from "https://cdn.jsdelivr.net/npm/kiln-webgpu@0.3.0";
 </script>
 ```
 

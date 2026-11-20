@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.3.0 (2026-11-20)
 
 **The built-in skills from Python.** The `kiln-webgpu` Python package gains `skills()`: the
 calculator, the date and time, the Wikipedia lookup and the web page reader as tools for
